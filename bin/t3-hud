@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+PLUGIN_DIR="${T3_HUD_DIR:-$HOME/.t3/hud-plugin}"
+BOOTSTRAP_PATH="$PLUGIN_DIR/bootstrap.cjs"
+MARKER_FILE="/tmp/t3-hud-active.pid"
+RPC_FILE="/tmp/t3-hud-rpc.json"
+
+resolve_t3_app() {
+  local candidates=(
+    "${T3_APP_PATH:-}"
+    "/Applications/T3 Code (Beta).app"
+    "/Applications/T3 Code.app"
+    "/Applications/T3 Code (Nightly).app"
+    "$HOME/Applications/T3 Code (Beta).app"
+    "$HOME/Applications/T3 Code.app"
+    "$HOME/Applications/T3 Code (Nightly).app"
+  )
+  for app in "${candidates[@]}"; do
+    [[ -n "$app" && -d "$app/Contents/MacOS" ]] || continue
+    echo "$app"
+    return 0
+  done
+  return 1
+}
+
+T3_APP="$(resolve_t3_app || true)"
+if [[ -z "$T3_APP" ]]; then
+  echo "[t3-hud] 未找到 T3 Code.app 或 T3 Code (Beta).app，可通过 T3_APP_PATH 指定路径。" >&2
+  exit 1
+fi
+
+T3_BIN="$(find "$T3_APP/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
+if [[ -z "$T3_BIN" || ! -x "$T3_BIN" ]]; then
+  echo "[t3-hud] 未找到可执行文件: $T3_APP/Contents/MacOS" >&2
+  exit 1
+fi
+
+cmd="${1:-launch}"
+
+get_main_pid() {
+  ps -ax -o pid=,command= | awk -v bin="$T3_BIN" 'index($0, bin) && !/Helper/ && !/bin\.mjs/ && !/bootstrap\.cjs/ && !/sidecar/ && !/awk/ { if (!found) { print $1; found=1 } }'
+}
+
+activate_t3() {
+  osascript -e "tell application \"$T3_APP\" to activate" >/dev/null 2>&1 || true
+}
+
+quit_t3_gracefully() {
+  local main_pid
+  main_pid="$(get_main_pid)"
+  [[ -n "$main_pid" ]] || return 0
+  osascript -e "tell application \"$T3_APP\" to quit" >/dev/null 2>&1 || true
+  for _ in {1..30}; do
+    if ! kill -0 "$main_pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  if kill -0 "$main_pid" 2>/dev/null; then
+    kill "$main_pid" 2>/dev/null || true
+    sleep 0.4
+  fi
+}
+
+launch_enhanced() {
+  T3_APP_PATH="$T3_APP" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$BOOTSTRAP_PATH"
+  sleep 0.8
+  activate_t3
+}
+
+case "$cmd" in
+  launch|start)
+    MAIN_PID="$(get_main_pid)"
+    if [[ -n "$MAIN_PID" ]]; then
+      if [[ -f "$MARKER_FILE" ]] && [[ "$(cat "$MARKER_FILE" 2>/dev/null || true)" == "$MAIN_PID" ]]; then
+        activate_t3
+        echo "[t3-hud] T3 Code (HUD 已挂载, PID $MAIN_PID) 正在运行，已切到前台。"
+      else
+        echo "[t3-hud] 检测到原版 T3 Code 正在运行，正在无缝重启以挂载 HUD..."
+        quit_t3_gracefully
+        launch_enhanced
+        echo "[t3-hud] 启动完成！"
+      fi
+    else
+      launch_enhanced
+      echo "[t3-hud] 已启动 T3 Code (HUD 悬浮窗 + Git 图谱已挂载)"
+    fi
+    ;;
+  restart)
+    echo "[t3-hud] 正在优雅重启 T3 Code 并挂载 HUD..."
+    quit_t3_gracefully
+    launch_enhanced
+    echo "[t3-hud] 重启并挂载完成！"
+    ;;
+  reload)
+    if [[ ! -f "$RPC_FILE" ]]; then
+      echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
+      exit 1
+    fi
+    ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
+      const fs = require("node:fs");
+      const cfg = JSON.parse(fs.readFileSync("/tmp/t3-hud-rpc.json", "utf8"));
+      fetch(cfg.url + "/admin/reload-ui", {
+        method: "POST",
+        headers: { "X-T3-Hud-Token": cfg.token }
+      }).then(r => r.json()).then(j => console.log("[t3-hud] 热重载完成:", JSON.stringify(j)));
+    '
+    ;;
+  status)
+    MAIN_PID="$(get_main_pid)"
+    echo "T3 应用: $T3_APP"
+    echo "插件目录: $PLUGIN_DIR"
+    if [[ -n "$MAIN_PID" ]]; then
+      if [[ -f "$MARKER_FILE" ]] && [[ "$(cat "$MARKER_FILE" 2>/dev/null || true)" == "$MAIN_PID" ]]; then
+        echo "运行状态: 运行中 (PID $MAIN_PID, HUD 已挂载)"
+      else
+        echo "运行状态: 原版运行中 (PID $MAIN_PID, HUD 未挂载 — 执行 't3-hud restart' 即可启用)"
+      fi
+    else
+      echo "运行状态: 未运行"
+    fi
+    ;;
+  *)
+    echo "用法: t3-hud [start|restart|reload|status]"
+    exit 1
+    ;;
+esac
