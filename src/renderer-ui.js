@@ -9,7 +9,7 @@
   if (!document.getElementById("root")) return;
   window.__t3HudInitialized = true;
 
-  // T3 Code Desktop uses hash routing (t3code://app/#/envId/threadId), while web uses pathname
+  // --- Route hint (hash routing + pathname fallback) ---
   function getRouteHint() {
     const hash = window.location.hash || "";
     if (hash.startsWith("#/") || hash.length > 1) {
@@ -20,19 +20,22 @@
 
   // Distinct, clean Git swimlane colors that work well on both stock Light (#fff) and stock Dark (#000/#141414)
   const LANE_COLORS = [
+    "#ea580c", // warm orange, primary lane
     "#3b82f6", // blue
     "#10b981", // emerald
     "#8b5cf6", // violet
-    "#f59e0b", // amber
     "#ec4899", // pink
-    "#06b6d4", // cyan
-    "#f97316", // orange
-    "#6366f1", // indigo
+    "#eab308", // yellow
   ];
 
   function laneColor(lane) {
     return LANE_COLORS[Math.abs(lane) % LANE_COLORS.length];
   }
+
+  const GIT_GRAPH_ICON = `<svg class="t3-git-symbol" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" aria-hidden="true"><circle cx="3.5" cy="4" r="1.7"/><circle cx="3.5" cy="12" r="1.7"/><path d="M3.5 5.7V10.3M8 2.2V13.8"/><circle cx="12.5" cy="4.5" r="1.7"/><path d="M12.5 6.2C12.5 9.2 11.3 10.6 9.8 11.5"/></svg>`;
+  const GIT_BRANCH_ICON = `<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true"><circle cx="4" cy="12" r="2"/><circle cx="12" cy="4" r="2"/><path d="M4 2V10M4 10C4 4 10 8 10 4"/></svg>`;
+  const REFRESH_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7V3M20 7H16M4 17V21M4 17H8M5.5 8A7.5 7.5 0 0 1 18 5.5L20 7M4 17L6 18.5A7.5 7.5 0 0 0 18.5 16"/></svg>`;
+  const CLOSE_ICON = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M4 4L12 12M12 4L4 12"/></svg>`;
 
   // Unified RPC caller: supports live hot-swap override RPC, Electron IPC preload bridge, and loopback HTTP
   async function callBackend(method, ...args) {
@@ -104,6 +107,245 @@
       .replace(/"/g, "&quot;");
   }
 
+  // ============================================================================
+  // Bilingual i18n (zh / en) with auto-detection
+  // ============================================================================
+  const I18N = {
+    zh: {
+      cache: "累计缓存",
+      sub: "子",
+      weekLeft: "周余",
+      graph: "图谱",
+      newSession: "新会话",
+      streaming: "生成中...",
+      contextCapacity: "上下文容量",
+      avgCacheHitRate: "平均缓存命中率",
+      agyNote: "AGY 约 26万 自动滑动压缩",
+      newSessionTitle: "新会话 / 待发消息",
+      newSessionDesc: "发送首条消息后将实时显示该会话的速度、累计缓存命中率、会话 Token 与等效费用。",
+      currentEngineQuota: "当前引擎额度剩余",
+      resetIn: "重置倒计时",
+      otherEngineQuota: "其他引擎额度速览",
+      remaining: "剩余",
+      engineModel: "引擎 / 模型",
+      streamSpeed: "流式输出速度",
+      avgSpeed: "均速",
+      avgDecodeSpeed: "会话均速",
+      lastTurnSpeed: "末轮速度",
+      e2eSpeed: "端到端速度 (含首字预填充)",
+      cumCacheRound: "累计缓存 / 本轮缓存",
+      cacheSaved: "缓存节省费用",
+      contextRatio: "上下文容量占比",
+      totalTokensWithSub: "本会话总 Token (含子代理)",
+      mainSubPrefix: "↳ 主会话 / 子代理",
+      inpCacheRead: "↳ 输入 / 缓存读取",
+      outReasoning: "↳ 输出 / 思考推理",
+      mainSessionCost: "主会话等效费用",
+      subagents: "子代理",
+      totalCost: "单会话总计",
+      unknownModel: "未知模型",
+      untitled: "未命名会话",
+      currentSession: "当前会话",
+      rounds: "轮",
+      est: " (估)",
+      gitGraph: "Git 图谱",
+      workingClean: "工作区干净",
+      noCommits: "仓库暂无提交记录",
+      noMatch: "没有匹配的提交记录",
+      loadingGraph: "正在加载 Git 图谱...",
+      loadingDetail: "加载提交详情中...",
+      noMessage: "(无提交说明)",
+      filesCount: "个文件",
+      readFail: "读取详情失败",
+      overlay: "打开/关闭 Git 图谱悬浮窗 (Option+G)",
+      refreshGraph: "刷新图谱",
+      filterCommits: "筛选提交...",
+      graphColumn: "图",
+      descriptionColumn: "描述",
+      dateColumn: "日期",
+      authorColumn: "作者",
+      commitColumn: "提交",
+      cleanStatus: "干净",
+      switchLanguage: "切换语言",
+      close: "关闭 (Esc)",
+      collapse: "收起详情",
+      uncommitted: "未提交",
+      modified: "改",
+      newFiles: "新",
+    },
+    en: {
+      cache: "Cache",
+      sub: "sub",
+      weekLeft: "Wk",
+      graph: "Graph",
+      newSession: "New",
+      streaming: "Streaming...",
+      contextCapacity: "Context Capacity",
+      avgCacheHitRate: "Avg Cache Hit Rate",
+      agyNote: "AGY auto-slides around ~260k",
+      newSessionTitle: "New session / awaiting message",
+      newSessionDesc: "After the first message, speed, cache hit rate, session tokens and cost will show live.",
+      currentEngineQuota: "Current engine quota",
+      resetIn: "Resets in",
+      otherEngineQuota: "Other engines at a glance",
+      remaining: "Left",
+      engineModel: "Engine / Model",
+      streamSpeed: "Stream speed",
+      avgSpeed: "Avg",
+      avgDecodeSpeed: "Avg Decode Speed",
+      lastTurnSpeed: "Last Turn Speed",
+      e2eSpeed: "End-to-end (incl. prefill)",
+      cumCacheRound: "Cache total / this turn",
+      cacheSaved: "Saved via cache",
+      contextRatio: "Context usage",
+      totalTokensWithSub: "Total tokens (incl. subagents)",
+      mainSubPrefix: "↳ Main / subagents",
+      inpCacheRead: "↳ Input / cache read",
+      outReasoning: "↳ Output / reasoning",
+      mainSessionCost: "Main session cost",
+      subagents: "Subagents",
+      totalCost: "Session total",
+      unknownModel: "Unknown model",
+      untitled: "Untitled",
+      currentSession: "Current session",
+      rounds: "turns",
+      est: " (est.)",
+      gitGraph: "Git Graph",
+      workingClean: "Working tree clean",
+      noCommits: "No commits yet",
+      noMatch: "No matching commits",
+      loadingGraph: "Loading Git Graph...",
+      loadingDetail: "Loading commit detail...",
+      noMessage: "(no message)",
+      filesCount: "files",
+      readFail: "Failed to load detail",
+      overlay: "Toggle Git Graph window (Option+G)",
+      refreshGraph: "Refresh graph",
+      filterCommits: "Filter commits...",
+      graphColumn: "Graph",
+      descriptionColumn: "Description",
+      dateColumn: "Date",
+      authorColumn: "Author",
+      commitColumn: "Commit",
+      cleanStatus: "Clean",
+      switchLanguage: "Switch language",
+      close: "Close (Esc)",
+      collapse: "Collapse details",
+      uncommitted: "Uncommitted",
+      modified: "mod",
+      newFiles: "new",
+    },
+  };
+
+  let hudLang = null;
+  let hudConfig = { defaultLang: "zh" };
+
+  function t(key) {
+    const dict = I18N[hudLang || "zh"] || I18N.zh;
+    return dict[key] || key;
+  }
+
+  function detectLangFromDom() {
+    try {
+      const docLang = (document.documentElement.lang || "").toLowerCase();
+      if (docLang.startsWith("zh")) return "zh";
+      if (docLang.startsWith("en")) return "en";
+      // Check composer placeholder
+      const bodyText = document.body ? document.body.innerText || "" : "";
+      const zhMarkers = ["想问什么", "本地工作副本", "新会话", "设置", "累计缓存", "图谱"];
+      const enMarkers = ["Ask anything", "Local working copy", "New thread", "Settings"];
+      let zhHits = 0;
+      let enHits = 0;
+      for (const m of zhMarkers) if (bodyText.includes(m)) zhHits++;
+      for (const m of enMarkers) if (bodyText.includes(m)) enHits++;
+      // Placeholder attribute check
+      try {
+        const ph = document.querySelector('[data-slot="composer-shell"] textarea')?.placeholder || "";
+        if (zhMarkers.some((m) => ph.includes(m))) zhHits += 2;
+        if (enMarkers.some((m) => ph.includes(m))) enHits += 2;
+      } catch {}
+      if (zhHits > 0 && zhHits > enHits) return "zh";
+      if (enHits > 0 && enHits > zhHits) return "en";
+    } catch {}
+    return null;
+  }
+
+  function resolveLang() {
+    // a) explicit localStorage or userLang
+    try {
+      const ls = localStorage.getItem("t3-hud-lang");
+      if (ls === "zh" || ls === "en") return ls;
+    } catch {}
+    if (hudConfig && (hudConfig.userLang === "zh" || hudConfig.userLang === "en")) {
+      return hudConfig.userLang;
+    }
+    // b) DOM detection
+    const domLang = detectLangFromDom();
+    if (domLang) return domLang;
+    // c) config.defaultLang
+    if (hudConfig && (hudConfig.defaultLang === "en" || hudConfig.defaultLang === "zh")) {
+      return hudConfig.defaultLang;
+    }
+    return "zh";
+  }
+
+  async function switchLang(target) {
+    // target: "zh" | "en" | "auto"
+    try {
+      const nowTs = Date.now();
+      if (target === "auto") {
+        localStorage.removeItem("t3-hud-lang");
+        localStorage.setItem("t3-hud-lang-ts", String(nowTs));
+        await callBackend("setConfig", { userLang: "auto", langUpdatedAt: nowTs });
+        hudConfig.userLang = "auto";
+      } else {
+        localStorage.setItem("t3-hud-lang", target);
+        localStorage.setItem("t3-hud-lang-ts", String(nowTs));
+        await callBackend("setConfig", { userLang: target, langUpdatedAt: nowTs });
+        hudConfig.userLang = target;
+      }
+    } catch {}
+    hudLang = resolveLang();
+    applyLangToDom();
+    if (latestStats) renderTopbarStats(latestStats);
+    if (drawerOpen) renderGitGraphList();
+    if (selectedCommitDetail) renderCommitDetail(selectedCommitDetail);
+    if (popover.classList.contains("visible")) {
+      if (currentPopoverMode === "context") renderContextRingPopover();
+      else renderStatsPopover();
+      updateLangSwitchButtons();
+    }
+  }
+
+  // Pull config.json language + timestamp (CLI `t3-hud lang` writes both);
+  // when newer than our localStorage timestamp, adopt its language and re-render.
+  async function syncConfigLang() {
+    try {
+      const cfg = await callBackend("getConfig");
+      if (!cfg || !cfg.ok) return;
+      hudConfig = { defaultLang: cfg.defaultLang === "en" ? "en" : "zh", userLang: cfg.userLang };
+      const remoteTs = Number(cfg.langUpdatedAt);
+      if (!Number.isFinite(remoteTs) || remoteTs <= 0) return;
+      const localTs = Number(localStorage.getItem("t3-hud-lang-ts")) || 0;
+      if (remoteTs <= localTs) return;
+      localStorage.setItem("t3-hud-lang-ts", String(remoteTs));
+      if (cfg.userLang === "zh" || cfg.userLang === "en") {
+        localStorage.setItem("t3-hud-lang", cfg.userLang);
+      } else if (cfg.userLang === null || cfg.userLang === "auto") {
+        localStorage.removeItem("t3-hud-lang");
+      }
+      hudLang = resolveLang();
+      applyLangToDom();
+    } catch {}
+  }
+
+  function langSwitchLabel() {
+    return hudLang === "zh" ? "EN" : "中文";
+  }
+  function langSwitchTarget() {
+    return hudLang === "zh" ? "en" : "zh";
+  }
+
   // Inject stock-themed styles matching T3 Code's original light & dark CSS variables
   const styleEl = document.createElement("style");
   styleEl.id = "t3-hud-styles";
@@ -165,6 +407,7 @@
       user-select: none;
       transition: opacity 0.15s ease;
       max-width: calc(100vw - 80px);
+      z-index: 30;
     }
     #t3-hud-topbar.is-hidden {
       display: none !important;
@@ -231,8 +474,8 @@
       flex: none;
     }
     .t3-hud-dot.running {
-      background: #10b981;
-      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
+      background: #3b82f6;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
       animation: t3HudPulse 1.2s ease-in-out infinite;
     }
     .t3-hud-dot.ready {
@@ -304,11 +547,12 @@
       opacity: 0;
       transform: translateY(3px);
       transition: opacity 0.12s ease, transform 0.12s ease;
-      z-index: 9999;
+      z-index: 60;
     }
     #t3-hud-popover.visible {
       opacity: 1;
       transform: translateY(0);
+      pointer-events: auto;
     }
     .t3-pop-sec-hdr {
       font-size: 10.5px;
@@ -384,34 +628,55 @@
     .t3-pop-row span:last-child {
       font-weight: 500;
     }
+    .t3-lang-switch {
+      border: 1px solid var(--hud-border);
+      background: var(--hud-surface);
+      color: var(--hud-fg);
+      font: inherit;
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 999px;
+      cursor: pointer;
+      flex: none;
+      line-height: 1.2;
+      transition: background 0.12s ease;
+    }
+    .t3-lang-switch:hover {
+      background: var(--hud-hover);
+    }
 
-    /* Right-side Floating Git Graph Drawer */
+    /* Non-modal, draggable Git Graph window. Host dialogs always take priority. */
     #t3-hud-git-drawer {
+      --git-graph-width: 52px;
+      --git-columns: var(--git-graph-width) minmax(0, 1fr) 112px 112px 88px;
+      --git-lane-bg: color-mix(in srgb, var(--hud-fg) 2%, var(--hud-bg-solid));
+      box-sizing: border-box;
       pointer-events: auto;
       -webkit-app-region: no-drag;
       position: fixed;
-      top: 48px;
-      right: 12px;
-      bottom: 14px;
-      width: 460px;
-      max-width: calc(100vw - 24px);
+      width: min(920px, calc(100vw - 48px));
+      height: min(600px, calc(100vh - 96px));
+      left: calc((100vw - min(920px, calc(100vw - 48px))) / 2);
+      top: calc((100vh - min(600px, calc(100vh - 96px))) / 2);
       display: flex;
       flex-direction: column;
-      border-radius: 11px;
+      border-radius: 14px;
       background: var(--hud-bg-solid);
       border: 1px solid var(--hud-border);
       box-shadow: var(--hud-shadow);
       overflow: hidden;
       z-index: 9995;
-      transition: width 0.18s ease, opacity 0.15s ease, transform 0.15s ease;
+      transition: opacity 0.15s ease, visibility 0.15s ease;
     }
-    #t3-hud-git-drawer.wide {
-      width: 680px;
+    #t3-hud-git-drawer * {
+      box-sizing: border-box;
     }
-    #t3-hud-git-drawer.closed {
+    #t3-hud-git-drawer.closed,
+    #t3-hud-git-drawer.occluded {
+      visibility: hidden;
       opacity: 0;
       pointer-events: none;
-      transform: translateX(14px);
     }
 
     .t3-git-hdr {
@@ -419,11 +684,14 @@
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 9px 12px;
+      flex: none;
+      height: 44px;
+      padding: 0 14px;
       border-bottom: 1px solid var(--hud-border);
-      background: var(--hud-surface);
+      background: color-mix(in srgb, var(--hud-surface) 45%, var(--hud-bg-solid));
       cursor: grab;
       user-select: none;
+      touch-action: none;
     }
     .t3-git-hdr:active {
       cursor: grabbing;
@@ -437,25 +705,32 @@
     }
     .t3-git-repo {
       font-weight: 600;
-      font-size: 12.5px;
+      font-size: 13px;
+      flex: none;
       white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+    }
+    .t3-git-symbol {
+      display: block;
+      flex: none;
+    }
+    .t3-git-repo-state {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      max-width: 240px;
+      padding: 3px 7px;
+      border: 1px solid var(--hud-border);
+      border-radius: 6px;
+      background: var(--hud-bg-solid);
+      color: var(--hud-muted);
+      font-size: 10.5px;
     }
     .t3-git-branch-pill {
-      font-size: 11px;
-      padding: 2px 6px;
-      border-radius: 5px;
-      background: color-mix(in srgb, #3b82f6 14%, transparent);
-      color: #2563eb;
-      font-weight: 500;
-      white-space: nowrap;
-      max-width: 150px;
+      min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
-    }
-    html.dark .t3-git-branch-pill {
-      color: #60a5fa;
+      white-space: nowrap;
     }
     .t3-git-hdr-actions {
       display: flex;
@@ -467,14 +742,14 @@
       border: 1px solid transparent;
       background: transparent;
       color: var(--hud-muted);
-      width: 25px;
-      height: 25px;
-      border-radius: 5px;
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      border-radius: 6px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      font-size: 12px;
       transition: background 0.12s, color 0.12s;
     }
     .t3-git-icon-btn:hover {
@@ -482,22 +757,16 @@
       color: var(--hud-fg);
     }
 
-    .t3-git-subbar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
-      border-bottom: 1px solid var(--hud-border);
-      font-size: 11px;
-    }
     .t3-git-search {
-      flex: 1;
+      flex: 1 1 150px;
       min-width: 0;
-      height: 24px;
+      max-width: 210px;
+      height: 26px;
+      margin-left: auto;
       padding: 0 8px;
-      border-radius: 5px;
+      border-radius: 6px;
       border: 1px solid var(--hud-border);
-      background: transparent;
+      background: var(--hud-bg-solid);
       color: var(--hud-fg);
       font: inherit;
       font-size: 11.5px;
@@ -506,84 +775,134 @@
     .t3-git-search:focus {
       border-color: #3b82f6;
     }
+    #t3-hud-git-drawer button:focus-visible,
+    .t3-git-row:focus-visible {
+      outline: 2px solid #3b82f6;
+      outline-offset: -2px;
+    }
     .t3-git-status-badge {
-      font-size: 10.5px;
-      color: var(--hud-muted);
+      flex: none;
+      padding-left: 6px;
+      border-left: 1px solid var(--hud-border);
       white-space: nowrap;
       font-variant-numeric: tabular-nums;
     }
 
     .t3-git-list {
-      flex: 1;
+      flex: 1 1 0;
+      min-height: 0;
       overflow-y: auto;
       overflow-x: hidden;
     }
+    .t3-git-table-head,
     .t3-git-row {
-      display: flex;
+      display: grid;
+      grid-template-columns: var(--git-columns);
       align-items: stretch;
-      min-height: 30px;
-      padding-right: 10px;
+    }
+    .t3-git-table-head {
+      height: 34px;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: color-mix(in srgb, var(--hud-surface) 70%, var(--hud-bg-solid));
+      box-shadow: 0 1px 0 var(--hud-border);
+      color: var(--hud-muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .t3-git-table-head > div {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      padding: 0 12px;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .t3-git-table-head > div + div {
+      border-left: 1px solid var(--hud-border);
+    }
+    .t3-git-table-head > div:nth-child(2) {
+      border-left: 0;
+    }
+    .t3-git-table-head > div::before { display: none; }
+    .t3-git-row {
+      height: 38px;
       cursor: pointer;
-      border-bottom: 1px solid color-mix(in srgb, var(--hud-border) 45%, transparent);
+      font-variant-numeric: tabular-nums;
       transition: background 0.1s ease;
+    }
+    .t3-git-row > div:not(.t3-git-graph-cell) {
+      border-bottom: 1px solid color-mix(in srgb, var(--hud-border) 55%, transparent);
     }
     .t3-git-row:hover {
       background: var(--hud-hover);
     }
     .t3-git-row.selected {
-      background: color-mix(in srgb, #3b82f6 11%, transparent);
+      background: var(--hud-hover);
+    }
+    .t3-git-graph-cell,
+    .t3-git-table-head > div:first-child {
+      background: var(--git-lane-bg);
+      border-right: 1px solid var(--hud-border);
     }
     .t3-git-graph-cell {
-      flex: none;
       display: flex;
       align-items: center;
-      padding-left: 6px;
+      overflow: hidden;
     }
     .t3-git-main-cell {
-      flex: 1;
       min-width: 0;
       display: flex;
       align-items: center;
-      gap: 5px;
-      padding: 4px 0 4px 4px;
-      font-size: 12px;
+      gap: 7px;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+    .t3-git-refs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 78%;
     }
     .t3-git-ref {
-      font-size: 10px;
-      font-weight: 600;
-      padding: 1px 5px;
-      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      max-width: 155px;
+      height: 21px;
+      padding: 0 5px;
+      border-radius: 6px;
+      border: 1px solid var(--hud-border);
+      background: var(--hud-surface);
+      color: var(--hud-muted);
+      font-size: 11px;
+      font-weight: 400;
       white-space: nowrap;
+      flex: 0 1 auto;
+      overflow: hidden;
+    }
+    .t3-git-ref svg {
       flex: none;
-      max-width: 135px;
+    }
+    .t3-git-ref.short {
+      flex-shrink: 0;
+    }
+    .t3-git-ref-label {
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .t3-git-ref.head {
-      background: color-mix(in srgb, #10b981 18%, transparent);
-      color: #059669;
-      border: 1px solid color-mix(in srgb, #10b981 35%, transparent);
+      flex: none;
+      background: rgba(245, 158, 11, 0.14);
+      border-color: rgba(245, 158, 11, 0.55);
+      color: #b45309;
+      font-weight: 600;
     }
     html.dark .t3-git-ref.head {
-      color: #34d399;
-    }
-    .t3-git-ref.branch {
-      background: color-mix(in srgb, #3b82f6 16%, transparent);
-      color: #2563eb;
-    }
-    html.dark .t3-git-ref.branch {
-      color: #60a5fa;
-    }
-    .t3-git-ref.remote {
-      background: var(--hud-surface);
-      color: var(--hud-muted);
-      border: 1px solid var(--hud-border);
-    }
-    .t3-git-ref.tag {
-      background: color-mix(in srgb, #f59e0b 18%, transparent);
-      color: #d97706;
-    }
-    html.dark .t3-git-ref.tag {
       color: #fbbf24;
     }
 
@@ -595,25 +914,44 @@
       text-overflow: ellipsis;
       color: var(--hud-fg);
     }
-    .t3-git-meta {
-      flex: none;
+    .t3-git-date,
+    .t3-git-author,
+    .t3-git-sha {
+      position: relative;
       display: flex;
       align-items: center;
-      gap: 6px;
+      min-width: 0;
+      padding: 0 12px;
       color: var(--hud-muted);
-      font-size: 10.5px;
-      font-variant-numeric: tabular-nums;
+      font-size: 12.5px;
+    }
+    .t3-git-date::before,
+    .t3-git-author::before,
+    .t3-git-sha::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 10px;
+      bottom: 10px;
+      width: 1px;
+      background: var(--hud-border);
+    }
+    .t3-git-cell-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .t3-git-sha {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 10.5px;
-      opacity: 0.85;
+      font-size: 12px;
     }
 
     /* Commit detail split pane inside drawer */
     #t3-hud-commit-pane {
       border-top: 1px solid var(--hud-border);
       background: var(--hud-surface);
+      flex: 0 0 44%;
+      min-height: 0;
       max-height: 44%;
       display: flex;
       flex-direction: column;
@@ -630,6 +968,7 @@
       padding: 8px 10px 6px;
       border-bottom: 1px solid var(--hud-border);
       font-size: 11.5px;
+      flex: none;
     }
     .t3-commit-msg {
       font-weight: 600;
@@ -638,8 +977,14 @@
       max-height: 54px;
       overflow-y: auto;
     }
+    #t3-commit-meta {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .t3-commit-body {
       flex: 1;
+      min-height: 0;
       overflow: auto;
       padding: 6px 10px 10px;
       font-size: 11px;
@@ -680,6 +1025,43 @@
       color: var(--hud-muted);
       font-size: 12px;
     }
+    @media (max-width: 679px) {
+      #t3-hud-git-drawer {
+        --git-columns: var(--git-graph-width) minmax(0, 1fr) 96px 72px;
+      }
+      .t3-git-repo-state,
+      .t3-git-row > .t3-git-author,
+      .t3-git-table-head > .t3-git-author {
+        display: none;
+      }
+      .t3-git-hdr { padding: 0 10px; }
+      .t3-git-hdr-left { gap: 6px; }
+      .t3-git-hdr-actions { gap: 2px; }
+      .t3-git-main-cell { padding: 0 9px; gap: 5px; }
+      .t3-git-date, .t3-git-sha { padding: 0 9px; font-size: 11px; }
+      .t3-git-refs { max-width: 55%; }
+      .t3-git-ref { max-width: 95px; font-size: 10px; }
+      .t3-git-ref:nth-child(n+2) { display: none; }
+      #t3-hud-topbar { max-width: calc(100vw - 24px); }
+      #t3-hud-quota-item, #t3-hud-quota-sep { display: none !important; }
+      #t3-hud-cache-lbl { display: none; }
+    }
+    @media (max-width: 559px) {
+      .t3-hud-compact-hide { display: none; }
+      #t3-hud-dirty { display: none !important; }
+      #t3-hud-topbar { font-size: 10.5px; padding: 0 5px; gap: 0; }
+      .t3-hud-metric { padding: 0 4px; }
+      #t3-hud-git-btn { font-size: 10.5px; padding: 0 5px; }
+    }
+    @media (max-width: 399px) {
+      #t3-hud-git-drawer {
+        width: calc(100vw - 24px);
+        left: 12px;
+        --git-columns: var(--git-graph-width) minmax(0, 1fr) 80px 62px;
+      }
+      .t3-git-hdr-left .t3-git-symbol { display: none; }
+      .t3-git-date, .t3-git-sha { padding: 0 5px; font-size: 10px; }
+    }
   `;
   document.head.appendChild(styleEl);
 
@@ -696,11 +1078,11 @@
       </div>
       <span class="t3-hud-sep"></span>
       <div class="t3-hud-metric" data-hud-hover="stats">
-        <span class="lbl">累计缓存</span>
+        <span class="lbl" id="t3-hud-cache-lbl">累计缓存</span>
         <span id="t3-hud-cache" class="val">--%</span>
       </div>
-      <span class="t3-hud-sep"></span>
-      <div class="t3-hud-metric" data-hud-hover="stats">
+      <span class="t3-hud-sep t3-hud-compact-hide"></span>
+      <div class="t3-hud-metric t3-hud-compact-hide" data-hud-hover="stats">
         <span id="t3-hud-tokens" class="val">0 tok</span>
       </div>
       <span class="t3-hud-sep"></span>
@@ -709,7 +1091,7 @@
       </div>
       <span id="t3-hud-quota-sep" class="t3-hud-sep" style="display:none"></span>
       <div id="t3-hud-quota-item" class="t3-hud-metric" data-hud-hover="stats" style="display:none">
-        <span class="lbl">周余</span>
+        <span class="lbl" id="t3-hud-week-lbl">周余</span>
         <span id="t3-hud-quota" class="val">--%</span>
       </div>
       <span class="t3-hud-sep"></span>
@@ -721,33 +1103,33 @@
         <span id="t3-hud-ctx-pct" class="val">--%</span>
       </div>
       <span class="t3-hud-sep"></span>
-      <button id="t3-hud-git-btn" type="button" title="打开/关闭右侧 Git 图谱悬浮窗 (Option+G)">
-        <span>🌿</span>
-        <span id="t3-hud-branch" class="t3-hud-branch-text">图谱</span>
+      <button id="t3-hud-git-btn" type="button" title="打开/关闭 Git 图谱悬浮窗 (Option+G)" aria-controls="t3-hud-git-drawer" aria-expanded="false">
+        ${GIT_GRAPH_ICON}
+        <span id="t3-hud-branch" class="t3-hud-branch-text">Git 图谱</span>
         <span id="t3-hud-dirty" class="t3-hud-dirty-dot" style="display:none"></span>
       </button>
     </div>
 
     <div id="t3-hud-popover"></div>
 
-    <aside id="t3-hud-git-drawer" class="closed" aria-label="Git 图谱悬浮窗">
+    <aside id="t3-hud-git-drawer" class="closed" aria-label="Git 图谱" aria-hidden="true">
       <div class="t3-git-hdr" id="t3-git-drag-handle">
         <div class="t3-git-hdr-left">
-          <span>🌿</span>
+          ${GIT_GRAPH_ICON}
           <span class="t3-git-repo" id="t3-git-repo-title">Git 图谱</span>
-          <span class="t3-git-branch-pill" id="t3-git-branch-pill">HEAD</span>
+          <span class="t3-git-repo-state">
+            <span class="t3-git-branch-pill" id="t3-git-branch-pill">HEAD</span>
+            <span id="t3-git-worktree-status" class="t3-git-status-badge"></span>
+          </span>
+          <input id="t3-git-search-input" class="t3-git-search" type="search" placeholder="筛选提交..." aria-label="筛选提交..." />
         </div>
         <div class="t3-git-hdr-actions">
-          <button class="t3-git-icon-btn" id="t3-git-refresh" type="button" title="刷新图谱">↻</button>
-          <button class="t3-git-icon-btn" id="t3-git-wide" type="button" title="切换宽/窄视图">⇔</button>
-          <button class="t3-git-icon-btn" id="t3-git-close" type="button" title="关闭 (Esc)">✕</button>
+          <button class="t3-lang-switch" id="t3-git-lang" type="button" title="Switch language">EN</button>
+          <button class="t3-git-icon-btn" id="t3-git-refresh" type="button" title="刷新图谱" aria-label="刷新图谱">${REFRESH_ICON}</button>
+          <button class="t3-git-icon-btn" id="t3-git-close" type="button" title="关闭 (Esc)" aria-label="关闭 (Esc)">${CLOSE_ICON}</button>
         </div>
       </div>
-      <div class="t3-git-subbar">
-        <input id="t3-git-search-input" class="t3-git-search" type="text" placeholder="过滤提交说明 / 分支 / 作者 / SHA..." />
-        <span id="t3-git-worktree-status" class="t3-git-status-badge"></span>
-      </div>
-      <div class="t3-git-list" id="t3-git-list">
+      <div class="t3-git-list" id="t3-git-list" role="table" aria-label="Git 图谱">
         <div class="t3-empty-msg">正在加载 Git 图谱...</div>
       </div>
       <div id="t3-hud-commit-pane" class="hidden">
@@ -756,7 +1138,7 @@
             <div class="t3-commit-msg" id="t3-commit-msg"></div>
             <div style="color:var(--hud-muted);font-size:10.5px;margin-top:2px" id="t3-commit-meta"></div>
           </div>
-          <button class="t3-git-icon-btn" id="t3-commit-close" type="button" title="收起详情">✕</button>
+          <button class="t3-git-icon-btn" id="t3-commit-close" type="button" title="收起详情" aria-label="收起详情">${CLOSE_ICON}</button>
         </div>
         <div class="t3-commit-body" id="t3-commit-body"></div>
       </div>
@@ -769,6 +1151,8 @@
   const dotEl = document.getElementById("t3-hud-dot");
   const speedEl = document.getElementById("t3-hud-speed");
   const cacheEl = document.getElementById("t3-hud-cache");
+  const cacheLblEl = document.getElementById("t3-hud-cache-lbl");
+  const weekLblEl = document.getElementById("t3-hud-week-lbl");
   const tokensEl = document.getElementById("t3-hud-tokens");
   const costEl = document.getElementById("t3-hud-cost");
   const quotaSepEl = document.getElementById("t3-hud-quota-sep");
@@ -780,6 +1164,7 @@
   const dirtyBadge = document.getElementById("t3-hud-dirty");
   const gitBtn = document.getElementById("t3-hud-git-btn");
   const popover = document.getElementById("t3-hud-popover");
+  const gitLangBtn = document.getElementById("t3-git-lang");
 
   const drawer = document.getElementById("t3-hud-git-drawer");
   const repoTitleEl = document.getElementById("t3-git-repo-title");
@@ -797,12 +1182,15 @@
   let latestGraph = null;
   let drawerOpen = false;
   let selectedCommitHash = null;
+  let selectedCommitDetail = null;
   let currentPathHint = getRouteHint();
   let lastLoadedGraphThreadId = null;
   let customDrawerPos = null;
   let spacedComposerStack = null;
+  let currentPopoverMode = "stats";
+  let popoverHideTimer = null;
 
-  let lastLayoutState = { hidden: null, top: "", left: "", right: "", drawerTop: "" };
+  let lastLayoutState = { hidden: null, top: "", left: "", right: "" };
   let observedHeader = null;
   let observedChatCol = null;
   let observedComposer = null;
@@ -837,13 +1225,96 @@
     spacedComposerStack = stackEl || null;
   }
 
+  // Audit: NEVER cover Settings, Non-Chat Routes, or Modals/Dialogs
+  function isChatComposerVisibleAndUncovered() {
+    // 1) Route check
+    try {
+      const hint = getRouteHint();
+      const check = (s) => s === "/settings" || s.startsWith("/settings/") || s === "/usage" || s.startsWith("/usage/") || s === "/pair" || s.startsWith("/pair/");
+      if (check(hint)) return null;
+      const path = window.location.pathname || "";
+      if (check(path)) return null;
+    } catch {}
+    // 2) Dialog/Modal check
+    try {
+      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-slot="dialog-popup"], [data-slot="sheet-popup"], [data-slot="drawer-popup"]');
+      for (const d of dialogs) {
+        try {
+          const r = d.getBoundingClientRect();
+          if (r.width > 100 && r.height > 80) return null;
+        } catch {}
+      }
+    } catch {}
+    // 3) Composer check
+    const shell = document.querySelector('[data-slot="composer-shell"]');
+    if (!shell) return null;
+    let surface = null;
+    try {
+      surface = shell.querySelector("textarea")?.closest("div") || shell.children[0] || shell;
+    } catch {
+      surface = shell;
+    }
+    let sRect = null;
+    try {
+      sRect = surface.getBoundingClientRect();
+    } catch {}
+    if (!sRect) return null;
+    if (!(sRect.width >= 180 && sRect.height >= 28 && sRect.top > 40 && sRect.bottom <= window.innerHeight + 4)) {
+      return null;
+    }
+    // 4) Occlusion check
+    try {
+      const hit = document.elementFromPoint(sRect.left + sRect.width / 2, Math.max(4, sRect.top + 10));
+      if (hit && !shell.contains(hit) && !root.contains(hit)) {
+        // Ignore hits that are our own topbar/popover
+        if (hit !== popover && !popover.contains(hit) && hit !== topbar && !topbar.contains(hit)) {
+          return null;
+        }
+      }
+    } catch {}
+    return { shell, surface, sRect };
+  }
+
+  function syncUiVisibility() {
+    const vis = isChatComposerVisibleAndUncovered();
+    drawer.classList.toggle("occluded", !vis);
+    drawer.setAttribute("aria-hidden", String(!vis || !drawerOpen));
+    if (!vis) {
+      // Hide topbar, popover; close drawer if navigating to /settings
+      if (lastLayoutState.hidden !== true) {
+        topbar.classList.add("is-hidden");
+        lastLayoutState.hidden = true;
+      }
+      if (popover.classList.contains("visible")) popover.classList.remove("visible");
+      try {
+        const hint = getRouteHint();
+        if ((hint === "/settings" || hint.startsWith("/settings/")) && drawerOpen) {
+          toggleDrawer(false);
+        }
+      } catch {}
+      return false;
+    }
+    return true;
+  }
+
   // Position HUD capsule centered directly ABOVE the chat composer box!
   function updateLayoutPosition() {
     if (document.hidden) return;
+    const graphLabel = t(window.innerWidth < 640 ? "graph" : "gitGraph");
+    if (branchBtnText.textContent !== graphLabel) branchBtnText.textContent = graphLabel;
+    if (customDrawerPos) {
+      const rect = drawer.getBoundingClientRect();
+      customDrawerPos.left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, customDrawerPos.left));
+      customDrawerPos.top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, customDrawerPos.top));
+      drawer.style.left = `${customDrawerPos.left}px`;
+      drawer.style.top = `${customDrawerPos.top}px`;
+    }
     const header = document.querySelector("header[data-chat-header]");
     const chatCol = document.querySelector("[data-chat-column]");
     const composer = document.querySelector('[data-slot="composer-shell"]');
     ensureLayoutObservers(header, chatCol, composer);
+
+    if (!syncUiVisibility()) return;
 
     if (!chatCol && !header) {
       setComposerTopSpacing(null);
@@ -909,15 +1380,6 @@
       lastLayoutState.right = nextRight;
     }
 
-    if (!customDrawerPos && drawerOpen) {
-      const nextDrawerTop = hRect ? `${Math.max(44, Math.round(hRect.bottom + 6))}px` : "52px";
-      if (lastLayoutState.drawerTop !== nextDrawerTop) {
-        drawer.style.top = nextDrawerTop;
-        drawer.style.right = "14px";
-        drawer.style.left = "auto";
-        lastLayoutState.drawerTop = nextDrawerTop;
-      }
-    }
   }
 
   // Draggable floating drawer support
@@ -929,9 +1391,10 @@
     let origLeft = 0;
     let origTop = 0;
 
-    function onMouseMove(e) {
-      const nextLeft = Math.max(8, Math.min(window.innerWidth - 120, origLeft + (e.clientX - startX)));
-      const nextTop = Math.max(8, Math.min(window.innerHeight - 80, origTop + (e.clientY - startY)));
+    function onPointerMove(e) {
+      const rect = drawer.getBoundingClientRect();
+      const nextLeft = Math.max(8, Math.min(window.innerWidth - rect.width - 8, origLeft + (e.clientX - startX)));
+      const nextTop = Math.max(8, Math.min(window.innerHeight - rect.height - 8, origTop + (e.clientY - startY)));
       customDrawerPos = { left: nextLeft, top: nextTop };
       drawer.style.left = `${nextLeft}px`;
       drawer.style.top = `${nextTop}px`;
@@ -939,21 +1402,23 @@
     }
 
     function stopDrag() {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", stopDrag);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopDrag);
+      window.removeEventListener("pointercancel", stopDrag);
       cleanupDragListeners = null;
     }
 
-    handle.addEventListener("mousedown", (e) => {
-      if (e.target.closest("button")) return;
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || e.target.closest("button, input")) return;
       const rect = drawer.getBoundingClientRect();
       startX = e.clientX;
       startY = e.clientY;
       origLeft = rect.left;
       origTop = rect.top;
       stopDrag();
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", stopDrag);
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", stopDrag);
+      window.addEventListener("pointercancel", stopDrag);
       cleanupDragListeners = stopDrag;
       e.preventDefault();
     });
@@ -1023,15 +1488,19 @@
     // Prefer live composer-selected model so switching Gemini <-> Opus/Sonnet updates 周余 immediately!
     const activeModelRaw = (selectedModel || stats?.model || "").toLowerCase();
 
-    // Prefer backend's deduplicated native contextUsed & empirical contextMax (e.g., AGY 300k ceiling)
-    // so we NEVER display T3's 2x geminiPromptUsage double-counted bug!
-    const ctxUsed = stats?.tokens?.contextUsed ?? live?.contextWindow?.usedTokens ?? null;
-    const ctxMax =
-      activeProviderRaw === "antigravity"
-        ? Math.max(300000, ctxUsed || 0)
-        : stats?.tokens?.contextMax ?? live?.contextWindow?.maxTokens ?? null;
-    const ctxPct =
-      ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
+    let ctxUsed;
+    let ctxMax;
+    let ctxPct;
+    if (!stats || !stats.ok) {
+      ctxUsed = 0;
+      ctxMax = stats?.tokens?.contextMax ?? null;
+      ctxPct = 0;
+    } else {
+      ctxUsed = stats?.tokens?.contextUsed ?? live?.contextWindow?.usedTokens ?? null;
+      ctxMax = stats?.tokens?.contextMax ?? live?.contextWindow?.maxTokens ?? null;
+      ctxPct =
+        ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
+    }
 
     if (!live || !Array.isArray(live.providers)) {
       return {
@@ -1130,31 +1599,91 @@
       .join("");
   }
 
+  function formatContextPair(used, max) {
+    if (hudLang === "en") {
+      const u = formatCompactTokens(used);
+      const m = formatCompactTokens(max);
+      return `${u} / ${m}`;
+    }
+    return `${formatWanTokens(used)} / ${formatWanTokens(max)}`;
+  }
+
+  function updateLangSwitchButtons() {
+    const lbl = langSwitchLabel();
+    const titleZh = t("switchLanguage");
+    [gitLangBtn].forEach((b) => {
+      if (b) {
+        b.textContent = lbl;
+        b.title = titleZh;
+        b.setAttribute("aria-label", titleZh);
+      }
+    });
+    popover.querySelectorAll(".t3-lang-switch").forEach((b) => {
+      b.textContent = lbl;
+    });
+  }
+
+  function applyLangToDom() {
+    if (cacheLblEl) cacheLblEl.textContent = t("cache");
+    if (weekLblEl) weekLblEl.textContent = t("weekLeft");
+    if (gitBtn) gitBtn.title = t("overlay");
+    gitBtn.setAttribute("aria-label", t("gitGraph"));
+    repoTitleEl.textContent = t("gitGraph");
+    drawer.setAttribute("aria-label", t("gitGraph"));
+    gitListEl.setAttribute("aria-label", t("gitGraph"));
+    if (searchInput) {
+      searchInput.placeholder = t("filterCommits");
+      searchInput.setAttribute("aria-label", t("filterCommits"));
+    }
+    const refresh = document.getElementById("t3-git-refresh");
+    const close = document.getElementById("t3-git-close");
+    const cclose = document.getElementById("t3-commit-close");
+    for (const [button, key] of [[refresh, "refreshGraph"], [close, "close"], [cclose, "collapse"]]) {
+      if (button) {
+        button.title = t(key);
+        button.setAttribute("aria-label", t(key));
+      }
+    }
+    updateLangSwitchButtons();
+  }
+
   function renderContextRingPopover() {
     const qInfo = computeQuotaAndContext(latestStats);
     const s = latestStats && latestStats.ok ? latestStats : null;
-    const usedTxt = qInfo.ctxUsed != null ? formatWanTokens(qInfo.ctxUsed) : "0";
-    const maxTxt = qInfo.ctxMax != null ? formatWanTokens(qInfo.ctxMax) : "30万";
+    const usedTxt = qInfo.ctxUsed != null ? formatContextPair(qInfo.ctxUsed, qInfo.ctxMax) : "0";
     const pctNum = qInfo.ctxPct != null ? qInfo.ctxPct : 0;
     const pctTxt = qInfo.ctxPct != null ? `${qInfo.ctxPct.toFixed(1)}%` : "0.0%";
     const barTone = pctNum >= 90 ? "err" : pctNum >= 75 ? "warn" : "";
     const avgCacheTxt =
       s && s.cache.sessionRate != null ? `${(s.cache.sessionRate * 100).toFixed(1)}%` : "--";
+    const showAgyNote =
+      (qInfo.activeProviderRaw === "antigravity" || s?.provider === "antigravity") &&
+      qInfo.ctxUsed != null &&
+      qInfo.ctxUsed > 180000;
 
     popover.style.width = "268px";
     popover.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-variant-numeric:tabular-nums">
-        <span style="font-weight:600;font-size:13px;color:var(--hud-fg)">上下文容量</span>
-        <span style="font-size:12px;color:var(--hud-muted)">${escapeHtml(usedTxt)}/${escapeHtml(maxTxt)} (${escapeHtml(pctTxt)})</span>
+        <span style="font-weight:600;font-size:13px;color:var(--hud-fg)">${escapeHtml(t("contextCapacity"))}</span>
+        <span style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:12px;color:var(--hud-muted)">${escapeHtml(usedTxt)} (${escapeHtml(pctTxt)})</span>
+          <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
+        </span>
       </div>
       <div class="t3-ctx-bar-track">
         <div class="t3-ctx-bar-fill ${barTone}" style="width:${Math.min(100, Math.max(0, pctNum)).toFixed(1)}%"></div>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;font-variant-numeric:tabular-nums;font-size:12px">
-        <span style="color:var(--hud-muted)">平均缓存命中率</span>
+        <span style="color:var(--hud-muted)">${escapeHtml(t("avgCacheHitRate"))}</span>
         <span style="font-weight:600;color:var(--hud-fg)">${escapeHtml(avgCacheTxt)}</span>
       </div>
+      <div style="margin-top:4px;font-size:10.5px;color:var(--hud-muted)">${escapeHtml(t("cache"))} ${escapeHtml(avgCacheTxt)}</div>
+      ${showAgyNote ? `<div style="margin-top:6px;font-size:10.5px;color:var(--hud-muted)">${escapeHtml(t("agyNote"))}</div>` : ""}
     `;
+    popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      switchLang(langSwitchTarget());
+    });
   }
 
   function renderStatsPopover() {
@@ -1165,13 +1694,13 @@
         ? `
           ${
             qInfo.currentWindows.length
-              ? `<div class="t3-pop-sec-hdr"><span>当前引擎额度剩余</span><span>重置倒计时</span></div>
+              ? `<div class="t3-pop-sec-hdr"><span>${escapeHtml(t("currentEngineQuota"))}</span><span>${escapeHtml(t("resetIn"))}</span></div>
                  ${renderQuotaRowsHtml(qInfo.currentWindows)}`
               : ""
           }
           ${
             qInfo.otherWindows.length
-              ? `<div class="t3-pop-sec-hdr"><span>其他引擎额度速览</span><span>剩余</span></div>
+              ? `<div class="t3-pop-sec-hdr"><span>${escapeHtml(t("otherEngineQuota"))}</span><span>${escapeHtml(t("remaining"))}</span></div>
                  ${renderQuotaRowsHtml(qInfo.otherWindows)}`
               : ""
           }
@@ -1179,65 +1708,78 @@
         : "";
 
     if (!latestStats || !latestStats.ok) {
-      popover.innerHTML = `<div class="t3-pop-title"><span>新会话 / 待发消息</span></div>
-        <div style="color:var(--hud-muted)">发送首条消息后将实时显示该会话的速度、累计缓存命中率、会话 Token 与等效费用。</div>
+      popover.innerHTML = `<div class="t3-pop-title"><span>${escapeHtml(t("newSessionTitle"))}</span><button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button></div>
+        <div style="color:var(--hud-muted)">${escapeHtml(t("newSessionDesc"))}</div>
         ${allQuotasHtml}`;
+      popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        switchLang(langSwitchTarget());
+      });
       return;
     }
 
     const s = latestStats;
     const shownModel = qInfo.activeModelRaw || s.model;
-    const providerBadge = [qInfo.activeProviderRaw || s.provider, shownModel].filter(Boolean).join(" · ") || "未知模型";
+    const providerBadge = [qInfo.activeProviderRaw || s.provider, shownModel].filter(Boolean).join(" · ") || t("unknownModel");
     const ctxLine =
       qInfo.ctxUsed != null
-        ? `${formatWanTokens(qInfo.ctxUsed)} / ${formatWanTokens(qInfo.ctxMax)}${qInfo.ctxPct != null ? ` (${qInfo.ctxPct.toFixed(1)}%)` : ""}`
+        ? `${formatContextPair(qInfo.ctxUsed, qInfo.ctxMax)}${qInfo.ctxPct != null ? ` (${qInfo.ctxPct.toFixed(1)}%)` : ""}`
         : "--";
 
     const lastCache = s.cache.lastTurnRate != null ? (s.cache.lastTurnRate * 100).toFixed(1) + "%" : "--";
     const sessCache = s.cache.sessionRate != null ? (s.cache.sessionRate * 100).toFixed(1) + "%" : "--";
-    const primarySpd = liveStreamTps ?? s.speed.lastDecodeTps ?? s.speed.tokPerSec;
-    const speedDetail =
-      primarySpd != null
-        ? `${primarySpd.toFixed(1)} tok/s${s.speed.tokPerSec != null ? ` (均 ${s.speed.tokPerSec.toFixed(1)})` : ""}`
-        : "--";
+    const formatSpeed = (value) => value != null ? `${value.toFixed(1)} tok/s` : "--";
+    const liveSpeedLine = liveStreamTps != null
+      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span>${formatSpeed(liveStreamTps)}</span></div>`
+      : "";
     const e2eLine =
       s.speed.e2eTokPerSec != null
-        ? `<div class="t3-pop-row"><span>端到端速度 (含首字预填充)</span><span>${s.speed.e2eTokPerSec.toFixed(1)} tok/s</span></div>`
+        ? `<div class="t3-pop-row"><span>${escapeHtml(t("e2eSpeed"))}</span><span>${s.speed.e2eTokPerSec.toFixed(1)} tok/s</span></div>`
         : "";
     const subTokLine =
       s.cost.subagentCount > 0 && s.tokens.subagentTokens > 0
-        ? `<div class="t3-pop-row"><span>↳ 主会话 / 子代理 (${s.cost.subagentCount}个)</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
+        ? `<div class="t3-pop-row"><span>${escapeHtml(t("mainSubPrefix"))} (${s.cost.subagentCount})</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
         : "";
 
     popover.innerHTML = `
       <div class="t3-pop-title">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.title || "当前会话")}</span>
-        <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${s.turnCount} 轮</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.title || t("untitled"))}</span>
+        <span style="display:flex;align-items:center;gap:6px">
+          <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${s.turnCount} ${escapeHtml(t("rounds"))}</span>
+          <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
+        </span>
       </div>
-      <div class="t3-pop-row"><span>引擎 / 模型</span><span>${escapeHtml(providerBadge)}</span></div>
-      <div class="t3-pop-row"><span>流式输出速度</span><span>${speedDetail}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("engineModel"))}</span><span>${escapeHtml(providerBadge)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("avgDecodeSpeed"))}</span><span>${formatSpeed(s.speed.tokPerSec)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("lastTurnSpeed"))}</span><span>${formatSpeed(s.speed.lastDecodeTps)}</span></div>
+      ${liveSpeedLine}
       ${e2eLine}
-      <div class="t3-pop-row"><span>累计缓存 / 本轮缓存</span><span>${sessCache} / ${lastCache}</span></div>
-      <div class="t3-pop-row"><span>缓存节省费用</span><span style="color:#10b981">${formatUsd(s.cache.savedUsd)}</span></div>
-      <div class="t3-pop-row"><span>上下文容量占比</span><span>${ctxLine}</span></div>
-      <div class="t3-pop-row"><span>本会话总 Token (含子代理)</span><span style="font-weight:600">${formatCompactTokens(s.tokens.total)} tok</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("cumCacheRound"))}</span><span>${sessCache} / ${lastCache}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("cacheSaved"))}</span><span style="color:#10b981">${formatUsd(s.cache.savedUsd)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("contextRatio"))}</span><span>${ctxLine}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("totalTokensWithSub"))}</span><span style="font-weight:600">${formatCompactTokens(s.tokens.total)} tok</span></div>
       ${subTokLine}
-      <div class="t3-pop-row"><span>↳ 输入 / 缓存读取</span><span>${formatCompactTokens(s.tokens.input)} / ${formatCompactTokens(s.cache.cachedTokens)}</span></div>
-      <div class="t3-pop-row"><span>↳ 输出 / 思考推理</span><span>${formatCompactTokens(s.tokens.output)} / ${formatCompactTokens(s.tokens.reasoning)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("inpCacheRead"))}</span><span>${formatCompactTokens(s.tokens.input)} / ${formatCompactTokens(s.cache.cachedTokens)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("outReasoning"))}</span><span>${formatCompactTokens(s.tokens.output)} / ${formatCompactTokens(s.tokens.reasoning)}</span></div>
       <div class="t3-pop-row" style="border-top:1px solid var(--hud-border);margin-top:4px;padding-top:4px">
-        <span>主会话等效费用</span><span>${formatUsd(s.cost.sessionUsd)}${s.cost.estimated ? " (估)" : ""}</span>
+        <span>${escapeHtml(t("mainSessionCost"))}</span><span>${formatUsd(s.cost.sessionUsd)}${s.cost.estimated ? escapeHtml(t("est")) : ""}</span>
       </div>
       ${
         s.cost.subagentCount > 0
-          ? `<div class="t3-pop-row"><span>子代理 (${s.cost.subagentCount} 个)</span><span>+${formatUsd(s.cost.subagentUsd)}</span></div>
-             <div class="t3-pop-row"><span>单会话总计</span><span style="font-weight:700">${formatUsd(s.cost.withSubagentsUsd)}</span></div>`
+          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${s.cost.subagentCount})</span><span>+${formatUsd(s.cost.subagentUsd)}</span></div>
+             <div class="t3-pop-row"><span>${escapeHtml(t("totalCost"))}</span><span style="font-weight:700">${formatUsd(s.cost.withSubagentsUsd)}</span></div>`
           : ""
       }
       ${allQuotasHtml}
     `;
+    popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      switchLang(langSwitchTarget());
+    });
   }
 
   function showPopoverAbove(anchorEl, mode) {
+    currentPopoverMode = mode;
     if (mode === "context") renderContextRingPopover();
     else renderStatsPopover();
     const popW = mode === "context" ? 268 : 324;
@@ -1256,11 +1798,25 @@
     popover.classList.add("visible");
   }
 
+  function hidePopoverDelayed() {
+    clearTimeout(popoverHideTimer);
+    popoverHideTimer = setTimeout(() => {
+      if (!popover.matches(":hover")) popover.classList.remove("visible");
+    }, 140);
+  }
+
   topbar.querySelectorAll("[data-hud-hover]").forEach((el) => {
     const mode = el.getAttribute("data-hud-hover");
-    el.addEventListener("mouseenter", () => showPopoverAbove(el, mode));
-    el.addEventListener("mouseleave", () => popover.classList.remove("visible"));
+    el.addEventListener("mouseenter", () => {
+      clearTimeout(popoverHideTimer);
+      showPopoverAbove(el, mode);
+    });
+    el.addEventListener("mouseleave", () => hidePopoverDelayed());
   });
+  popover.addEventListener("mouseenter", () => clearTimeout(popoverHideTimer));
+  popover.addEventListener("mouseleave", () => hidePopoverDelayed());
+
+  gitLangBtn?.addEventListener("click", () => switchLang(langSwitchTarget()));
 
   let lastTopbarSig = "";
   function renderTopbarStats(stats) {
@@ -1280,24 +1836,24 @@
     const nextRingOffset = (RING_CIRC * (1 - Math.max(0, Math.min(100, qInfo.ctxPct || 0)) / 100)).toFixed(2);
     const nextRingColor =
       ctxPctNum >= 90 ? "#ef4444" : ctxPctNum >= 75 ? "#f59e0b" : "var(--hud-fg)";
-    let nextBranch = "图谱";
+    let nextBranch = t(window.innerWidth < 640 ? "graph" : "gitGraph");
     let hideDirty = false;
 
     if (!stats || !stats.ok) {
       nextDotClass = "t3-hud-dot";
-      nextSpeed = stats?.nonThreadRoute === "new" ? "新会话" : "-- tok/s";
+      nextSpeed = stats?.nonThreadRoute === "new" ? t("newSession") : "-- tok/s";
       nextCache = "--%";
       nextTokens = "0 tok";
       nextCost = "$0.00";
       hideDirty = true;
     } else {
-      const activelyStreaming = Boolean(stats.isRunning || liveStreamTps != null);
+      const activelyStreaming = liveStreamTps != null;
       nextDotClass = "t3-hud-dot " + (activelyStreaming ? "running" : "ready");
-      const primarySpd = liveStreamTps ?? stats.speed.lastDecodeTps ?? stats.speed.tokPerSec;
+      const primarySpd = liveStreamTps ?? stats.speed.tokPerSec ?? stats.speed.lastDecodeTps;
       if (primarySpd != null) {
-        nextSpeed = `${primarySpd.toFixed(1)} tok/s`;
-      } else if (activelyStreaming) {
-        nextSpeed = "生成中...";
+        nextSpeed = `${activelyStreaming ? "" : t("avgSpeed") + " "}${primarySpd.toFixed(1)} tok/s`;
+      } else if (stats.isRunning) {
+        nextSpeed = t("streaming");
       } else {
         nextSpeed = "-- tok/s";
       }
@@ -1305,11 +1861,11 @@
       nextCache = rate != null ? `${Math.round(rate * 100)}%` : "--%";
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
       const totalUsd = stats.cost.withSubagentsUsd;
-      const subSuffix = stats.cost.subagentCount > 0 ? ` (+${stats.cost.subagentCount}子)` : "";
+      const subSuffix = stats.cost.subagentCount > 0 ? ` (+${stats.cost.subagentCount}${t("sub")})` : "";
       nextCost = `${formatUsd(totalUsd)}${subSuffix}`;
     }
 
-    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextBranch}|${hideDirty}`;
+    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextBranch}|${hideDirty}|${hudLang}`;
     if (sig !== lastTopbarSig) {
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
@@ -1337,129 +1893,154 @@
     updateLayoutPosition();
   }
 
-  // Render SVG cell for a commit row
-  function buildRowSvg(commit, maxLanes) {
-    const laneStep = 14;
-    const padX = 10;
-    const rowH = 30;
-    const midY = rowH / 2;
-    const lanesShown = Math.max(1, Math.min(maxLanes || 1, 10));
-    const width = padX * 2 + (lanesShown - 1) * laneStep;
-    const cx = padX + Math.min(commit.lane, 9) * laneStep;
+  function graphLaneCount(maxLanes) {
+    return Math.max(1, Math.min(64, Math.floor(Number(maxLanes) || 1)));
+  }
 
+  function graphColumnWidth(maxLanes) {
+    return Math.max(52, Math.min(130, graphLaneCount(maxLanes) * 16 + 28));
+  }
+
+  // One 38px SVG per row, flush with its neighbors so swimlanes stay continuous.
+  function buildRowSvg(commit, maxLanes) {
+    const lanesShown = graphLaneCount(maxLanes);
+    const width = graphColumnWidth(maxLanes) - 1;
+    const laneStep = Math.min(16, (width - 28) / Math.max(1, lanesShown - 1));
+    const laneIndex = (value) => Math.max(0, Math.min(lanesShown - 1, Math.floor(Number(value) || 0)));
+    const xFor = (value) => 14 + laneIndex(value) * laneStep;
+    const rowH = 38;
+    const midY = rowH / 2;
+    const lane = laneIndex(commit.lane);
+    const cx = xFor(lane);
     let paths = "";
 
-    // Pass-through vertical lines
     for (const l of commit.passThroughLanes || []) {
-      if (l > 9) continue;
-      const x = padX + l * laneStep;
-      paths += `<line x1="${x}" y1="0" x2="${x}" y2="${rowH}" stroke="${laneColor(l)}" stroke-width="1.75" stroke-opacity="0.8" />`;
+      const x = xFor(l);
+      paths += `<line x1="${x}" y1="0" x2="${x}" y2="${rowH}" stroke="${laneColor(laneIndex(l))}" stroke-width="1.6" stroke-opacity="0.6" />`;
     }
-
-    // Incoming lines from top half into commit node
     for (const inLane of commit.incomingLanes || []) {
-      if (inLane > 9) continue;
-      const ix = padX + inLane * laneStep;
-      if (ix === cx) {
-        paths += `<line x1="${cx}" y1="0" x2="${cx}" y2="${midY}" stroke="${laneColor(inLane)}" stroke-width="1.75" />`;
-      } else {
-        paths += `<path d="M ${ix} 0 C ${ix} ${midY * 0.75}, ${cx} ${midY * 0.35}, ${cx} ${midY}" fill="none" stroke="${laneColor(inLane)}" stroke-width="1.75" />`;
-      }
+      const ix = xFor(inLane);
+      const col = laneColor(laneIndex(inLane));
+      paths += ix === cx
+        ? `<line x1="${cx}" y1="0" x2="${cx}" y2="${midY}" stroke="${col}" stroke-width="1.6" stroke-opacity="0.6" />`
+        : `<path d="M ${ix} 0 C ${ix} 10, ${cx} 9, ${cx} ${midY}" fill="none" stroke="${col}" stroke-width="1.6" stroke-opacity="0.75" />`;
     }
-
-    // Outgoing lines from commit node to bottom half (parents)
     for (const conn of commit.parentConnections || []) {
-      const toL = Math.min(conn.toLane, 9);
-      const tx = padX + toL * laneStep;
-      const col = conn.type === "branch-parent" ? laneColor(toL) : laneColor(commit.lane);
-      if (tx === cx) {
-        paths += `<line x1="${cx}" y1="${midY}" x2="${cx}" y2="${rowH}" stroke="${col}" stroke-width="1.75" />`;
+      const tx = xFor(conn.toLane);
+      const col = laneColor(conn.type === "branch-parent" ? laneIndex(conn.toLane) : lane);
+      paths += tx === cx
+        ? `<line x1="${cx}" y1="${midY}" x2="${cx}" y2="${rowH}" stroke="${col}" stroke-width="1.6" stroke-opacity="0.6" />`
+        : `<path d="M ${cx} ${midY} C ${cx} 29, ${tx} 28, ${tx} ${rowH}" fill="none" stroke="${col}" stroke-width="1.6" stroke-opacity="0.75" />`;
+    }
+
+    const isHead = (commit.refs || []).some((r) => r.isHead || r.kind === "head");
+    const nodeSvg = isHead
+      ? `<circle cx="${cx}" cy="${midY}" r="5.5" fill="var(--git-lane-bg)" stroke="#ea580c" stroke-width="1.5" /><circle cx="${cx}" cy="${midY}" r="2.6" fill="#ea580c" />`
+      : `<circle cx="${cx}" cy="${midY}" r="3.2" fill="${laneColor(lane)}" />`;
+    return `<svg width="${width}" height="${rowH}" viewBox="0 0 ${width} ${rowH}" style="display:block" aria-hidden="true">${paths}${nodeSvg}</svg>`;
+  }
+
+  // Accept both existing backend HEAD-as-branch records and separately emitted HEAD refs.
+  function displayCommitRefs(refs) {
+    const expanded = [];
+    for (const ref of refs || []) {
+      const label = String(ref.label || "");
+      if (ref.isHead || ref.kind === "head" || label.startsWith("HEAD -> ")) {
+        expanded.push({ kind: "head", label: "HEAD", isHead: true });
+        const branch = label.replace(/^HEAD\s*(?:->|→)\s*/, "");
+        if (branch && branch !== "HEAD") expanded.push({ kind: "branch", label: branch, isHead: false });
       } else {
-        paths += `<path d="M ${cx} ${midY} C ${cx} ${midY + (rowH - midY) * 0.65}, ${tx} ${midY + (rowH - midY) * 0.25}, ${tx} ${rowH}" fill="none" stroke="${col}" stroke-width="1.75" />`;
+        expanded.push({ kind: ["branch", "remote", "tag"].includes(ref.kind) ? ref.kind : "branch", label, isHead: false });
       }
     }
+    const seen = new Set();
+    return expanded.filter((ref) => {
+      if (!ref.label || seen.has(ref.label)) return false;
+      seen.add(ref.label);
+      return true;
+    });
+  }
 
-    const isMerge = (commit.parents || []).length > 1;
-    const isHead = (commit.refs || []).some((r) => r.isHead);
-    const nodeCol = laneColor(commit.lane);
-
-    let nodeSvg = "";
-    if (isHead) {
-      nodeSvg = `
-        <circle cx="${cx}" cy="${midY}" r="5.5" fill="var(--hud-bg-solid)" stroke="${nodeCol}" stroke-width="2.2" />
-        <circle cx="${cx}" cy="${midY}" r="2.5" fill="${nodeCol}" />
-      `;
-    } else if (isMerge) {
-      nodeSvg = `<circle cx="${cx}" cy="${midY}" r="4.2" fill="var(--hud-bg-solid)" stroke="${nodeCol}" stroke-width="2" />`;
-    } else {
-      nodeSvg = `<circle cx="${cx}" cy="${midY}" r="3.6" fill="${nodeCol}" />`;
+  function formatCommitDate(commit) {
+    if (Number(commit.timestamp) > 0) {
+      const date = new Date(Number(commit.timestamp) * 1000);
+      if (Number.isFinite(date.getTime())) {
+        const two = (n) => String(n).padStart(2, "0");
+        return `${two(date.getMonth() + 1)}/${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}`;
+      }
     }
+    return commit.relTime || "--";
+  }
 
-    return `<svg width="${width}" height="${rowH}" viewBox="0 0 ${width} ${rowH}" style="display:block;overflow:visible">${paths}${nodeSvg}</svg>`;
+  function gitTableHeader() {
+    return `<div class="t3-git-table-head" role="row">
+      <div role="columnheader">${escapeHtml(t("graphColumn"))}</div>
+      <div role="columnheader">${escapeHtml(t("descriptionColumn"))}</div>
+      <div class="t3-git-date" role="columnheader">${escapeHtml(t("dateColumn"))}</div>
+      <div class="t3-git-author" role="columnheader">${escapeHtml(t("authorColumn"))}</div>
+      <div class="t3-git-sha" role="columnheader">${escapeHtml(t("commitColumn"))}</div>
+    </div>`;
   }
 
   function renderGitGraphList() {
     if (!latestGraph) return;
+    repoTitleEl.textContent = t("gitGraph");
+    const header = gitTableHeader();
     if (!latestGraph.ok) {
-      repoTitleEl.textContent = "Git 图谱";
       branchPillEl.textContent = "--";
+      branchPillEl.title = "";
       statusBadgeEl.textContent = "";
+      statusBadgeEl.title = "";
       dirtyBadge.style.display = "none";
-      gitListEl.innerHTML = `<div class="t3-empty-msg">${escapeHtml(latestGraph.error || "暂无 Git 仓库信息")}</div>`;
+      gitListEl.innerHTML = header + `<div class="t3-empty-msg">${escapeHtml(latestGraph.error || t("noCommits"))}</div>`;
       return;
     }
 
-    repoTitleEl.textContent = latestGraph.projectTitle || "Git 仓库";
-    branchPillEl.textContent = latestGraph.currentBranch || "HEAD";
-    branchBtnText.textContent = "图谱";
+    drawer.style.setProperty("--git-graph-width", `${graphColumnWidth(latestGraph.maxLanes)}px`);
+    branchPillEl.textContent = latestGraph.projectTitle || latestGraph.currentBranch || "HEAD";
+    branchPillEl.title = [latestGraph.repoPath, latestGraph.currentBranch].filter(Boolean).join(" · ");
+    branchBtnText.textContent = t(window.innerWidth < 640 ? "graph" : "gitGraph");
 
     const wt = latestGraph.workingTree;
     if (wt && !wt.clean) {
-      statusBadgeEl.textContent = `未提交: ${wt.total} (${wt.modified}改/${wt.untracked}新)`;
+      statusBadgeEl.textContent = `${wt.total} ${t("uncommitted")}`;
+      statusBadgeEl.title = `${t("uncommitted")}: ${wt.total} (${wt.modified} ${t("modified")} / ${wt.untracked} ${t("newFiles")})`;
       dirtyBadge.textContent = `*${wt.total}`;
       dirtyBadge.style.display = "inline-block";
     } else {
-      statusBadgeEl.textContent = "工作区干净";
+      statusBadgeEl.textContent = t("cleanStatus");
+      statusBadgeEl.title = t("workingClean");
       dirtyBadge.style.display = "none";
     }
+    scheduleLayoutSync();
 
     const q = (searchInput.value || "").trim().toLowerCase();
     const commits = (latestGraph.commits || []).filter((c) => {
       if (!q) return true;
-      if (c.subject.toLowerCase().includes(q)) return true;
-      if (c.shortHash.toLowerCase().includes(q) || c.hash.toLowerCase().includes(q)) return true;
-      if (c.author.toLowerCase().includes(q)) return true;
-      return (c.refs || []).some((r) => r.label.toLowerCase().includes(q));
+      return [c.subject, c.shortHash, c.hash, c.author, ...displayCommitRefs(c.refs).map((r) => r.label)]
+        .some((value) => String(value || "").toLowerCase().includes(q));
     });
 
     if (commits.length === 0) {
-      gitListEl.innerHTML = `<div class="t3-empty-msg">${q ? "没有匹配的提交记录" : "仓库暂无提交记录"}</div>`;
+      gitListEl.innerHTML = header + `<div class="t3-empty-msg">${escapeHtml(t(q ? "noMatch" : "noCommits"))}</div>`;
       return;
     }
 
-    gitListEl.innerHTML = commits
-      .map((c) => {
-        const refsHtml = (c.refs || [])
-          .slice(0, 3)
-          .map((r) => `<span class="t3-git-ref ${escapeHtml(r.kind)}" title="${escapeHtml(r.label)}">${escapeHtml(r.isHead && r.label !== "HEAD" ? "HEAD → " + r.label : r.label)}</span>`)
-          .join("");
-        const selClass = c.hash === selectedCommitHash ? " selected" : "";
-        return `
-          <div class="t3-git-row${selClass}" data-hash="${escapeHtml(c.hash)}">
-            <div class="t3-git-graph-cell">${q ? "" : buildRowSvg(c, latestGraph.maxLanes)}</div>
-            <div class="t3-git-main-cell">
-              ${refsHtml}
-              <span class="t3-git-subj" title="${escapeHtml(c.subject)}">${escapeHtml(c.subject)}</span>
-              <span class="t3-git-meta">
-                <span>${escapeHtml(c.author.slice(0, 12))}</span>
-                <span>${escapeHtml(c.relTime.replace(" ago", ""))}</span>
-                <span class="t3-git-sha">${escapeHtml(c.shortHash)}</span>
-              </span>
-            </div>
-          </div>
-        `;
-      })
-      .join("");
+    gitListEl.innerHTML = header + commits.map((c) => {
+      const refs = displayCommitRefs(c.refs);
+      const refsHtml = refs.length ? `<span class="t3-git-refs">${refs.map((r) =>
+        `<span class="t3-git-ref ${r.kind}${r.label.length <= 18 ? " short" : ""}" title="${escapeHtml(r.label)}">${GIT_BRANCH_ICON}<span class="t3-git-ref-label">${escapeHtml(r.label)}</span></span>`
+      ).join("")}</span>` : "";
+      const selected = c.hash === selectedCommitHash;
+      const shortHash = String(c.shortHash || c.hash || "").slice(0, 7);
+      return `<div class="t3-git-row${selected ? " selected" : ""}" role="row" tabindex="0" aria-selected="${selected}" data-hash="${escapeHtml(c.hash)}">
+        <div class="t3-git-graph-cell" role="cell">${q ? "" : buildRowSvg(c, latestGraph.maxLanes)}</div>
+        <div class="t3-git-main-cell" role="cell">${refsHtml}<span class="t3-git-subj" title="${escapeHtml(c.subject)}">${escapeHtml(c.subject)}</span></div>
+        <div class="t3-git-date" role="cell"><span class="t3-git-cell-text" title="${escapeHtml(c.relTime)}">${escapeHtml(formatCommitDate(c))}</span></div>
+        <div class="t3-git-author" role="cell"><span class="t3-git-cell-text" title="${escapeHtml(c.author)}">${escapeHtml(c.author)}</span></div>
+        <div class="t3-git-sha" role="cell"><span class="t3-git-cell-text" title="${escapeHtml(c.hash)}">${escapeHtml(shortHash)}</span></div>
+      </div>`;
+    }).join("");
   }
 
   function formatColoredPatch(patch) {
@@ -1481,6 +2062,7 @@
 
   function clearCommitPaneDom() {
     selectedCommitHash = null;
+    selectedCommitDetail = null;
     commitPane.classList.add("hidden");
     commitMsgEl.textContent = "";
     commitMetaEl.textContent = "";
@@ -1501,20 +2083,26 @@
       return;
     }
     selectedCommitHash = hash;
+    selectedCommitDetail = null;
     renderGitGraphList();
     commitPane.classList.remove("hidden");
-    commitMsgEl.textContent = "加载提交详情中...";
+    commitMsgEl.textContent = t("loadingDetail");
     commitMetaEl.textContent = hash.slice(0, 10);
     commitBodyEl.textContent = "";
 
     const res = await callBackend("getCommitDetail", getRouteHint(), hash);
     if (selectedCommitHash !== hash || !drawerOpen) return;
     if (!res || !res.ok) {
-      commitMsgEl.textContent = res?.error || "读取详情失败";
+      commitMsgEl.textContent = res?.error || t("readFail");
       return;
     }
-    commitMsgEl.textContent = res.message || "(无提交说明)";
-    commitMetaEl.textContent = `${res.authorName || ""} <${res.authorEmail || ""}> · ${res.hash.slice(0, 10)} · ${res.files.length} 个文件`;
+    selectedCommitDetail = res;
+    renderCommitDetail(res);
+  }
+
+  function renderCommitDetail(res) {
+    commitMsgEl.textContent = res.message || t("noMessage");
+    commitMetaEl.textContent = `${res.authorName || ""} <${res.authorEmail || ""}> · ${res.hash.slice(0, 10)} · ${res.files.length} ${t("filesCount")}`;
 
     const filesHtml = (res.files || [])
       .map(
@@ -1539,6 +2127,15 @@
   gitListEl.addEventListener("click", (e) => {
     const row = e.target.closest(".t3-git-row");
     if (!row) return;
+    const hash = row.getAttribute("data-hash");
+    if (hash) openCommitDetail(hash);
+  });
+
+  gitListEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const row = e.target.closest(".t3-git-row");
+    if (!row) return;
+    e.preventDefault();
     const hash = row.getAttribute("data-hash");
     if (hash) openCommitDetail(hash);
   });
@@ -1588,11 +2185,16 @@
   }
 
   function toggleDrawer(forceState) {
-    drawerOpen = typeof forceState === "boolean" ? forceState : !drawerOpen;
+    const nextOpen = typeof forceState === "boolean" ? forceState : !drawerOpen;
+    if (nextOpen && !isChatComposerVisibleAndUncovered()) return;
+    drawerOpen = nextOpen;
     drawer.classList.toggle("closed", !drawerOpen);
+    drawer.setAttribute("aria-hidden", String(!drawerOpen));
     gitBtn.classList.toggle("active", drawerOpen);
+    gitBtn.setAttribute("aria-expanded", String(drawerOpen));
     updateLayoutPosition();
     if (drawerOpen) {
+      if (!latestGraph) gitListEl.innerHTML = gitTableHeader() + `<div class="t3-empty-msg">${escapeHtml(t("loadingGraph"))}</div>`;
       refreshGitGraph(true);
     } else {
       // Release 120 SVG rows + diff DOM nodes when drawer is closed
@@ -1603,9 +2205,6 @@
   gitBtn.addEventListener("click", () => toggleDrawer());
   document.getElementById("t3-git-close").addEventListener("click", () => toggleDrawer(false));
   document.getElementById("t3-git-refresh").addEventListener("click", () => refreshGitGraph(true));
-  document.getElementById("t3-git-wide").addEventListener("click", () => {
-    drawer.classList.toggle("wide");
-  });
 
   function onKeyDown(e) {
     if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === "KeyG") {
@@ -1821,6 +2420,12 @@
     window.__t3HudInitialized = false;
   };
 
-  refreshStats(true);
-  pollTimer = setTimeout(pollLoop, 1200);
+  // Boot: load language config, resolve language, then start polling
+  (async () => {
+    await syncConfigLang();
+    hudLang = resolveLang();
+    applyLangToDom();
+    refreshStats(true);
+    pollTimer = setTimeout(pollLoop, 1200);
+  })();
 })();

@@ -27,6 +27,7 @@ const CODEX_HOME_ROOT = process.env.CODEX_HOME
   : path.join(HOME_DIR, ".codex");
 const CODEX_SESSIONS_ROOT = path.join(CODEX_HOME_ROOT, "sessions");
 const AGY_PROVIDERS_ROOT = path.join(T3_USERDATA, "providers", "antigravity");
+const HUD_CONFIG_PATH = path.join(HOME_DIR, ".t3", "hud-plugin", "config.json");
 
 // ============================================================================
 // 1. Official T3 / LiteLLM Model Rate Catalog Loader (5,900+ models + tiers)
@@ -131,6 +132,45 @@ function normalizeModelForRate(model) {
   m = m.replace(/-(?:extra-low|low|medium|high|tiered|control|thinking|agent)$/, "");
   if (m === "muse-wonder-full-1.0") return "muse-wonder-1.0";
   return m;
+}
+
+function lookupCatalogContextMax(model, provider) {
+  if (!model) return null;
+  try {
+    const st = fs.statSync(MODEL_RATES_PATH);
+    void st;
+    const raw = JSON.parse(fs.readFileSync(MODEL_RATES_PATH, "utf8"));
+    const doc = raw?.document || raw;
+    if (!doc || typeof doc !== "object") return null;
+    const norm = normalizeModelForRate(model);
+    const candidates = [
+      norm,
+      provider ? `${String(provider).toLowerCase()}/${norm}` : "",
+      `meta/${norm}`,
+      `gemini/${norm}`,
+      `openai/${norm}`,
+      `anthropic/${norm}`,
+    ].filter(Boolean);
+    for (const key of candidates) {
+      const entry = doc[key];
+      if (!entry || typeof entry !== "object") continue;
+      const v =
+        entry.max_input_tokens ?? entry.maxInputTokens ?? entry.context_window ?? entry.contextWindow;
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+    }
+    // Case-insensitive scan for exact model name
+    for (const [name, entry] of Object.entries(doc)) {
+      if (!entry || typeof entry !== "object") continue;
+      if (name.toLowerCase() === norm) {
+        const v =
+          entry.max_input_tokens ?? entry.maxInputTokens ?? entry.context_window ?? entry.contextWindow;
+        if (typeof v === "number" && v > 0) return v;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function resolveModelRate(model, provider, promptTokens = 0) {
@@ -374,9 +414,12 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     savedUsd: sumSavedUsd,
     lastStepCacheRate,
     lastContextPrompt,
+    contextMax: null,
     tokPerSec: avgDecodeTps ?? lastDecodeTps ?? avgE2eTps,
     lastDecodeTps,
     avgDecodeTps,
+    decodeTokensSum,
+    decodeSecSum,
     e2eTokPerSec: avgE2eTps,
     durationSec: lastDecodeSec ?? (decodeSecSum > 0 ? decodeSecSum : null),
   };
@@ -478,9 +521,25 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
   let adb;
   try {
     adb = new DatabaseSync(dbFile, { open: true, readOnly: true });
-    const rows = adb
-      .prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
-      .all();
+    let rows;
+    // Detect step_type column lazily: use it when present to filter inference steps.
+    try {
+      const cols = adb.prepare("PRAGMA table_info(steps)").all();
+      const hasStepType = cols.some((c) => c.name === "step_type");
+      if (hasStepType) {
+        rows = adb
+          .prepare("SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
+          .all();
+      } else {
+        rows = adb
+          .prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
+          .all();
+      }
+    } catch {
+      rows = adb
+        .prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
+        .all();
+    }
 
     let sumUncached = 0;
     let sumCached = 0;
@@ -504,6 +563,17 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
 
     for (const r of rows) {
       if (!r.metadata) continue;
+      // step_type === 15 marks inference/token-usage steps; when the column exists, prefer it.
+      // We still accept any step with f[9] usage metadata for backward compatibility.
+      if (r.step_type != null && Number(r.step_type) !== 15) {
+        const probe = parseProtoSimple(Buffer.from(r.metadata));
+        if (!probe[9]?.[0]) continue;
+        const uProbe = parseProtoSimple(probe[9][0]);
+        const probeTotal =
+          (Number(uProbe[2]?.[0]) || 0) + (Number(uProbe[5]?.[0]) || 0) + (Number(uProbe[4]?.[0]) || 0) +
+          Math.max(Number(uProbe[3]?.[0]) || 0, (Number(uProbe[9]?.[0]) || 0) + (Number(uProbe[10]?.[0]) || 0));
+        if (probeTotal === 0) continue;
+      }
       const f = parseProtoSimple(Buffer.from(r.metadata));
       if (!f[9]?.[0]) continue;
 
@@ -586,10 +656,12 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       savedUsd: sumSavedUsd,
       lastStepCacheRate,
       lastContextPrompt,
-      contextMax: Math.max(300000, lastContextPrompt || 0),
+      contextMax: null,
       tokPerSec: avgDecodeTps ?? lastStreamTps ?? avgE2eTps,
       lastDecodeTps: lastStreamTps,
       avgDecodeTps,
+      decodeTokensSum: streamTokensSum,
+      decodeSecSum: streamSecSum,
       e2eTokPerSec: avgE2eTps,
       durationSec: lastStreamSec ?? (e2eSecSum > 0 ? e2eSecSum : null),
     };
@@ -770,6 +842,8 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     tokPerSec: avgDecodeTps ?? lastDecodeTps ?? avgE2eTps,
     lastDecodeTps,
     avgDecodeTps,
+    decodeTokensSum,
+    decodeSecSum,
     e2eTokPerSec: avgE2eTps,
     durationSec: decodeSecSum > 0 ? decodeSecSum : e2eSecSum > 0 ? e2eSecSum : null,
   };
@@ -816,7 +890,7 @@ function extractThreadId(hint) {
 function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackProvider) {
   const pThreadRows = db
     .prepare(
-      "SELECT driver, payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ? ORDER BY rowid ASC"
+      "SELECT driver, updated_at, payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ? ORDER BY rowid ASC"
     )
     .all(threadId);
 
@@ -910,6 +984,9 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 
   if (nativeParts.length > 0) {
     nativeParts.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const coveredDrivers = new Set(nativeParts.map((p) => p.driver));
+    // statev2 model selection, captured before native parts overwrite latestModel.
+    const statev2Model = latestModel;
     let uncached = 0;
     let cached = 0;
     let cacheWrite = 0;
@@ -918,6 +995,13 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     let usd = 0;
     let savedUsd = 0;
     let stepCount = 0;
+    let totalDecodeTok = 0;
+    let totalDecodeSec = 0;
+    let uncoveredOut = 0;
+    let uncoveredNetSec = 0;
+    let latestUncoveredTurnMs = 0;
+    let latestUncoveredDriver = null;
+    let latestUncoveredModel = null;
 
     for (const part of nativeParts) {
       uncached += part.uncached;
@@ -928,18 +1012,117 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       usd += part.usd;
       savedUsd += part.savedUsd;
       stepCount += part.stepCount;
+      totalDecodeTok += part.decodeTokensSum || 0;
+      totalDecodeSec += part.decodeSecSum || 0;
       if (part.model) latestModel = part.model;
       if (part.driver) latestDriver = part.driver;
     }
 
+    // Mixed-provider threads: scan turns whose driver is not covered by native parts
+    // so zero turns are ever dropped (e.g., thread with both claudeAgent and muse turns).
+    for (const tr of turnRows) {
+      const p = safeJsonParse(tr.payload_json);
+      const d = p?.nativeTurnRef?.driver;
+      if (!d || coveredDrivers.has(d)) continue;
+      const u = p?.turnTokenUsage;
+      if (!u || typeof u.inputTokens !== "number") continue;
+      let inp = Math.max(0, u.inputTokens || 0);
+      const cr = Math.max(0, u.cachedInputTokens || 0);
+      const cw = Math.max(0, u.cacheCreationTokens || 0);
+      if (d === "antigravity" && inp >= cr * 2) inp = inp - cr;
+      const unc = Math.max(0, inp - cr - cw);
+      const out = Math.max(0, u.outputTokens || 0);
+      const reas = Math.min(out, Math.max(0, u.reasoningTokens || 0));
+      uncached += unc;
+      cached += cr;
+      cacheWrite += cw;
+      output += out;
+      reasoning += reas;
+      const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, latestModel, d);
+      usd += priced.usd;
+      savedUsd += priced.savedUsd;
+      const uS = Date.parse(tr.started_at || p?.startedAt || "");
+      const uE = Date.parse(tr.completed_at || p?.completedAt || "");
+      if (Number.isFinite(uE) && Number.isFinite(uS) && uE > uS + 50 && out > 0) {
+        uncoveredOut += out;
+        uncoveredNetSec += (uE - uS) / 1000;
+      }
+      const turnMs = Number.isFinite(uE) ? uE : Number.isFinite(uS) ? uS : NaN;
+      if (Number.isFinite(turnMs) && turnMs >= latestUncoveredTurnMs) {
+        latestUncoveredTurnMs = turnMs;
+        latestUncoveredDriver = d;
+        latestUncoveredModel =
+          Array.isArray(u.models) && typeof u.models[0] === "string" && u.models[0]
+            ? u.models[0]
+            : typeof p?.model === "string" && p.model
+              ? p.model
+              : null;
+      }
+    }
+
+    // Pure decode speed from native logs when available; only fall back to timed turn rate when no native decode sample exists
+    const sessionAvgTps =
+      totalDecodeSec > 0.1
+        ? totalDecodeTok / totalDecodeSec
+        : uncoveredNetSec > 0.2
+          ? uncoveredOut / uncoveredNetSec
+          : null;
+
     const lastPart = nativeParts[nativeParts.length - 1];
+
+    // Mixed-provider freshness: if an uncovered provider ran after the newest
+    // native part, its statev2 metadata wins over stale native metadata.
+    const lastPThread = pThreadRows[pThreadRows.length - 1];
+    const lastPThreadDriver = lastPThread?.driver || null;
+    const lastPThreadMs = lastPThread?.updated_at ? Date.parse(lastPThread.updated_at) : NaN;
+    let overrideDriver = null;
+    let overrideModel = null;
+    let overrideMs = 0;
+    if (latestUncoveredDriver) {
+      overrideDriver = latestUncoveredDriver;
+      overrideModel = latestUncoveredModel || null;
+      overrideMs = latestUncoveredTurnMs;
+    }
+    if (
+      lastPThreadDriver &&
+      !coveredDrivers.has(lastPThreadDriver) &&
+      Number.isFinite(lastPThreadMs) &&
+      lastPThreadMs > overrideMs
+    ) {
+      if (lastPThreadDriver !== latestUncoveredDriver) {
+        overrideDriver = lastPThreadDriver;
+        overrideModel = statev2Model;
+      }
+      overrideMs = lastPThreadMs;
+    }
+    const useOverride = Boolean(overrideDriver) && overrideMs > (lastPart.mtimeMs || 0);
+    const effDriver = useOverride ? overrideDriver : lastPart.driver || latestDriver;
+    const effModel = useOverride ? overrideModel || statev2Model : lastPart.model || latestModel;
     const promptTotal = uncached + cached + cacheWrite;
     const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
 
+    // True contextMax: prefer native part max, then statev2 maxTokens,
+    // then Antigravity fallback (Gemini 1048576 / Claude 1000000), then catalog, then null.
+    let resolvedContextMax = useOverride ? contextMax ?? null : lastPart.contextMax ?? contextMax ?? null;
+    if (resolvedContextMax == null) {
+      const drv = effDriver || latestDriver;
+      const mdl = effModel || latestModel;
+      if (drv === "antigravity") {
+        const model = (mdl || "").toLowerCase();
+        const isClaude = /opus|sonnet|haiku|claude/.test(model);
+        const catalog = lookupCatalogContextMax(mdl, drv);
+        resolvedContextMax = catalog ?? (isClaude ? 1000000 : 1048576);
+      } else if (drv === "muse") {
+        resolvedContextMax = lookupCatalogContextMax(mdl, drv) ?? 1007997;
+      } else if (drv === "codex") {
+        resolvedContextMax = lookupCatalogContextMax(mdl, drv) ?? contextMax ?? null;
+      }
+    }
+
     return {
       source: "native",
-      provider: lastPart.driver || latestDriver,
-      model: lastPart.model || latestModel,
+      provider: effDriver,
+      model: effModel,
       isRunning,
       turnCount: turnRows.length || stepCount,
       stepCount,
@@ -953,12 +1136,12 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       savedUsd,
       sessionCacheRate,
       lastTurnCacheRate: lastPart.lastStepCacheRate ?? sessionCacheRate,
-      tokPerSec: lastPart.tokPerSec,
+      tokPerSec: sessionAvgTps ?? lastPart.tokPerSec,
       lastDecodeTps: lastPart.lastDecodeTps,
       e2eTokPerSec: lastPart.e2eTokPerSec,
       durationSec: lastPart.durationSec,
-      contextUsed: lastPart.lastContextPrompt ?? contextUsed,
-      contextMax: lastPart.contextMax ?? contextMax,
+      contextUsed: useOverride ? contextUsed : lastPart.lastContextPrompt ?? contextUsed,
+      contextMax: resolvedContextMax,
     };
   }
 
@@ -1024,8 +1207,15 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   const netGenSec = Math.max(0.2, turnDurSum - totalToolWaitSec);
   const promptTotal = uncached + cached + cacheWrite;
   const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
-  const effectiveMax =
-    latestDriver === "antigravity" ? Math.max(300000, contextUsed || 0) : contextMax;
+  let effectiveMax = contextMax ?? lookupCatalogContextMax(latestModel, latestDriver) ?? null;
+  if (effectiveMax == null && latestDriver === "antigravity") {
+    const model = (latestModel || "").toLowerCase();
+    const isClaude = /opus|sonnet|haiku|claude/.test(model);
+    effectiveMax = isClaude ? 1000000 : 1048576;
+  }
+  if (effectiveMax == null && latestDriver === "muse") {
+    effectiveMax = 1007997;
+  }
 
   return {
     source: "sqlite-fallback",
@@ -1062,7 +1252,18 @@ function getCachedChildTelemetry(db, childThreadId, fallbackModel, fallbackProvi
       "SELECT default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?"
     )
     .get(childThreadId);
-  const sig = cRow ? `${cRow.updated_at || ""}` : "";
+  let turnSig = "";
+  try {
+    const tRow = db
+      .prepare(
+        "SELECT COUNT(*) AS cnt, MAX(ordinal) AS max_ord, MAX(completed_at) AS max_done FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?"
+      )
+      .get(childThreadId);
+    turnSig = tRow ? `|${tRow.cnt || 0}:${tRow.max_ord ?? ""}:${tRow.max_done || ""}` : "";
+  } catch {
+    turnSig = "";
+  }
+  const sig = cRow ? `${cRow.updated_at || ""}${turnSig}` : "";
   const hit = childSubagentCache.get(childThreadId);
   if (hit && sig && hit.sig === sig && !hit.data.isRunning) {
     return hit.data;
@@ -1213,17 +1414,29 @@ function getThreadStats(threadHint) {
       combinedInput > 0 ? combinedCached / combinedInput : mainTel.sessionCacheRate;
 
     const resolvedProvider = mainTel.provider || baseProvider;
-    const fallbackMax = resolvedProvider === "antigravity" ? 300000 : 1000000;
+    const resolvedModel = mainTel.model || baseModel;
+    let resolvedContextMax = mainTel.contextMax ?? null;
+    if (resolvedContextMax == null) {
+      resolvedContextMax =
+        lookupCatalogContextMax(resolvedModel, resolvedProvider) ?? null;
+      if (resolvedContextMax == null && resolvedProvider === "antigravity") {
+        const m = (resolvedModel || "").toLowerCase();
+        resolvedContextMax = /opus|sonnet|haiku|claude/.test(m) ? 1000000 : 1048576;
+      }
+      if (resolvedContextMax == null && resolvedProvider === "muse") {
+        resolvedContextMax = 1007997;
+      }
+    }
 
     return {
       ok: true,
       threadId,
-      title: threadRow.title || "未命名会话",
+      title: threadRow.title || "Untitled",
       projectTitle: projectRow?.title || (repoPath ? path.basename(repoPath) : ""),
       repoPath,
       branch: branchName,
       provider: resolvedProvider,
-      model: mainTel.model || baseModel,
+      model: resolvedModel,
       telemetrySource: mainTel.source,
       isRunning: mainTel.isRunning || psRow?.status === "running",
       turnCount: mainTel.turnCount,
@@ -1237,7 +1450,7 @@ function getThreadStats(threadHint) {
         subagentTokens,
         total: mainTotal + subagentTokens,
         contextUsed: mainTel.contextUsed,
-        contextMax: mainTel.contextMax || fallbackMax,
+        contextMax: resolvedContextMax,
       },
       cache: {
         cachedTokens: combinedCached,
@@ -1571,8 +1784,67 @@ async function getCommitDetail(threadHint, commitHash) {
   }
 }
 
+// ============================================================================
+// 5. Language Config Persistence (~/.t3/hud-plugin/config.json)
+// ============================================================================
+function getConfig() {
+  try {
+    const raw = fs.readFileSync(HUD_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const defaultLang = parsed.defaultLang === "en" ? "en" : parsed.defaultLang === "zh" ? "zh" : "zh";
+    const userLang =
+      parsed.userLang === "en" || parsed.userLang === "zh" || parsed.userLang === "auto"
+        ? parsed.userLang
+        : undefined;
+    const out = { defaultLang };
+    if (userLang) out.userLang = userLang;
+    else if (parsed && Object.prototype.hasOwnProperty.call(parsed, "userLang") && parsed.userLang === null) {
+      out.userLang = null;
+    }
+    const langUpdatedAt = Number(parsed?.langUpdatedAt);
+    if (Number.isFinite(langUpdatedAt) && langUpdatedAt > 0) out.langUpdatedAt = Math.round(langUpdatedAt);
+    return { ok: true, ...out };
+  } catch {
+    return { ok: true, defaultLang: "zh" };
+  }
+}
+
+function setConfig(patch) {
+  const p = patch && typeof patch === "object" ? patch : {};
+  let current = { defaultLang: "zh" };
+  try {
+    const raw = fs.readFileSync(HUD_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") current = { ...current, ...parsed };
+  } catch {}
+  if (p.defaultLang === "zh" || p.defaultLang === "en") current.defaultLang = p.defaultLang;
+  if (p.userLang === "zh" || p.userLang === "en" || p.userLang === "auto" || p.userLang === null) current.userLang = p.userLang;
+  if (Number.isFinite(Number(p.langUpdatedAt)) && Number(p.langUpdatedAt) > 0) {
+    current.langUpdatedAt = Math.round(Number(p.langUpdatedAt));
+  }
+  try {
+    const dir = path.dirname(HUD_CONFIG_PATH);
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch {}
+    try {
+      const st = fs.statSync(dir);
+      if (st.isSymbolicLink()) {
+        fs.unlinkSync(dir);
+      }
+    } catch {}
+    fs.writeFileSync(HUD_CONFIG_PATH, JSON.stringify(current, null, 2) + "\n", { mode: 0o600 });
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+  return getConfig();
+}
+
 module.exports = {
   getThreadStats,
   getGitGraph,
   getCommitDetail,
+  getConfig,
+  setConfig,
+  lookupCatalogContextMax,
 };

@@ -4,9 +4,11 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 PLUGIN_DIR="${T3_HUD_DIR:-$HOME/.t3/hud-plugin}"
+RUN_DIR="$PLUGIN_DIR/run"
 BOOTSTRAP_PATH="$PLUGIN_DIR/bootstrap.cjs"
-MARKER_FILE="/tmp/t3-hud-active.pid"
-RPC_FILE="/tmp/t3-hud-rpc.json"
+MARKER_FILE="$RUN_DIR/active.pid"
+RPC_FILE="$RUN_DIR/rpc.json"
+CONFIG_FILE="$PLUGIN_DIR/config.json"
 
 resolve_t3_app() {
   local candidates=(
@@ -71,6 +73,48 @@ launch_enhanced() {
   activate_t3
 }
 
+do_reload() {
+  if [[ ! -f "$RPC_FILE" ]]; then
+    echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
+    exit 1
+  fi
+  # Single-quoted EJS passes the RPC path / token slot verbatim to Node; the shell
+  # never interpolates them, so an unexpected RPC_FILE cannot break out of the argv.
+  ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
+    const fs = require("node:fs");
+    const rpcFile = process.argv[2];
+    const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
+    fetch(cfg.url + "/admin/reload-ui", {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": cfg.adminToken || cfg.token }
+    }).then(r => r.json()).then(j => console.log("[t3-hud] 热重载完成:", JSON.stringify(j)));
+  ' "node" "$RPC_FILE"
+}
+
+do_lang() {
+  local lang_arg="${1:-}"
+  if [[ "$lang_arg" != "zh" && "$lang_arg" != "en" && "$lang_arg" != "auto" ]]; then
+    echo "Usage: t3-hud lang <zh|en|auto>" >&2
+    exit 1
+  fi
+  mkdir -p "$PLUGIN_DIR"
+  ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
+    const fs = require("node:fs"), path = require("node:path");
+    const cfgFile = process.argv[1], arg = process.argv[2];
+    let d = { defaultLang: "zh" };
+    try { d = { ...d, ...JSON.parse(fs.readFileSync(cfgFile, "utf8")) }; } catch {}
+    d.userLang = arg === "auto" ? null : arg;
+    d.langUpdatedAt = Date.now();
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(cfgFile, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+  ' "$CONFIG_FILE" "$lang_arg"
+  echo "[t3-hud] Language set to: $lang_arg (config: $CONFIG_FILE)"
+  # Reload UI if running
+  if [[ -f "$RPC_FILE" ]]; then
+    do_reload || true
+  fi
+}
+
 case "$cmd" in
   launch|start)
     MAIN_PID="$(get_main_pid)"
@@ -96,18 +140,10 @@ case "$cmd" in
     echo "[t3-hud] 重启并挂载完成！"
     ;;
   reload)
-    if [[ ! -f "$RPC_FILE" ]]; then
-      echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
-      exit 1
-    fi
-    ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
-      const fs = require("node:fs");
-      const cfg = JSON.parse(fs.readFileSync("/tmp/t3-hud-rpc.json", "utf8"));
-      fetch(cfg.url + "/admin/reload-ui", {
-        method: "POST",
-        headers: { "X-T3-Hud-Token": cfg.token }
-      }).then(r => r.json()).then(j => console.log("[t3-hud] 热重载完成:", JSON.stringify(j)));
-    '
+    do_reload
+    ;;
+  lang)
+    do_lang "${2:-}"
     ;;
   status)
     MAIN_PID="$(get_main_pid)"
@@ -122,9 +158,12 @@ case "$cmd" in
     else
       echo "运行状态: 未运行"
     fi
+    if [[ -f "$CONFIG_FILE" ]]; then
+      echo "语言配置: $(cat "$CONFIG_FILE" 2>/dev/null || echo '{}')"
+    fi
     ;;
   *)
-    echo "用法: t3-hud [start|restart|reload|status]"
+    echo "用法: t3-hud [start|restart|reload|status|lang zh|en|auto]"
     exit 1
     ;;
 esac

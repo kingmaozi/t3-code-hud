@@ -1,0 +1,11 @@
+name: Feature Request / 功能建议
+description: Suggest an enhancement for T3 Code HUD / 提出新功能或交互改进建议
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposal / 建议内容
+      placeholder: What would you like to see in T3 Code HUD? / 希望新增或改进什么特性？
+    validations:
+      required: true

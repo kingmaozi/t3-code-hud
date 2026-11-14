@@ -44,7 +44,8 @@ if (!resolved) {
 }
 
 const HOOK_PATH = path.join(__dirname, "main-hook.cjs");
-const MARKER_FILE = "/tmp/t3-hud-active.pid";
+const RUN_DIR = path.join(os.homedir(), ".t3", "hud-plugin", "run");
+const MARKER_FILE = path.join(RUN_DIR, "active.pid");
 
 const childEnv = { ...process.env };
 delete childEnv.ELECTRON_RUN_AS_NODE;
@@ -62,7 +63,28 @@ const child = spawn(resolved.binPath, ["--inspect=127.0.0.1:0", ...extraArgs], {
 });
 
 try {
-  fs.writeFileSync(MARKER_FILE, String(child.pid), "utf8");
+  fs.mkdirSync(RUN_DIR, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(RUN_DIR, 0o700);
+  } catch {}
+  let st = null;
+  try {
+    st = fs.lstatSync(RUN_DIR);
+  } catch {}
+  if (st && st.isSymbolicLink()) {
+    try {
+      fs.unlinkSync(RUN_DIR);
+    } catch {}
+    fs.mkdirSync(RUN_DIR, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(RUN_DIR, 0o700);
+    } catch {}
+  }
+  try {
+    const mst = fs.lstatSync(MARKER_FILE);
+    if (mst.isSymbolicLink()) fs.unlinkSync(MARKER_FILE);
+  } catch {}
+  fs.writeFileSync(MARKER_FILE, String(child.pid), { flag: "w", mode: 0o600 });
 } catch {}
 
 let injected = false;
@@ -123,11 +145,37 @@ child.stderr.on("data", (chunk) => {
       })
     );
   };
-  ws.onmessage = () => {
+  ws.onmessage = (event) => {
     try {
-      ws.close();
-    } catch {}
-    finish(0);
+      let msg = null;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        console.error("[t3-hud] WebSocket message is not JSON");
+        finish(1);
+        return;
+      }
+      if (msg && msg.id === 1) {
+        const val = msg.result?.result?.value;
+        const hasException = Boolean(msg.result?.exceptionDetails);
+        if (!msg.error && !hasException && val === "OK") {
+          try {
+            ws.close();
+          } catch {}
+          finish(0);
+        } else {
+          const detail = msg.error?.message || JSON.stringify(msg.result?.exceptionDetails || msg.result?.result || msg);
+          console.error("[t3-hud] HUD injection failed:", detail);
+          try {
+            ws.close();
+          } catch {}
+          finish(1);
+        }
+      }
+    } catch (err) {
+      console.error("[t3-hud] WebSocket handling failed:", err.message);
+      finish(1);
+    }
   };
   ws.onerror = () => {
     finish(1);

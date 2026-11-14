@@ -1,38 +1,61 @@
 # T3 Code HUD (`t3-code-hud`)
 
-为 **T3 Code / T3 Code (Beta)** 打造的**零侵入式（不改 `app.asar`、不破坏签名、跟随官方自动更新不失效）**增强悬浮胶囊与可拖拽 Git 拓扑图插件。
+![License](https://img.shields.io/badge/license-MIT-green.svg) ![Platform](https://img.shields.io/badge/platform-macOS-informational.svg) ![Electron](https://img.shields.io/badge/electron-injected-blue.svg) ![Non-invasive](https://img.shields.io/badge/non--invasive-✅-brightgreen.svg)
 
-精准修复并补齐了原版 T3 Code 在多引擎（**Antigravity / Muse / Codex / Claude**）下的速度、缓存命中率、上下文容量虚标及子代理十亿级 Token 漏算问题。
+**English** | [简体中文](docs/README.zh-CN.md) | [日本語](docs/README.ja.md) | [한국어](docs/README.ko.md)
 
----
+Non-invasive real-time telemetry HUD, billion-token subagent & cost tracker, true context ring, quota monitor, and interactive Git Graph floating window for **T3 Code / T3 Code (Beta)**.
 
-## ✨ 核心特性
-
-- **聊天输入框正上方极简胶囊悬浮窗**（自动预留原生弹性间距，绝不遮挡消息流，完美适配亮/暗主题）：
-  - **⚡ 实时动态流式速度 (`tok/s`)**：流式输出期间每 `260ms` 动态跳动显示实时生成速率；单步完成后精准锁定纯解码速度（自动剥离工具执行等待与首字预填充耗时，支持同一会话内切换引擎自动同步最新速度）。
-  - **♻️ 真实累计缓存命中率 (`累计缓存 XX%`)**：直读 Muse `session.jsonl`、Antigravity `conversations/*.db` Protobuf 与 Codex `sessions/*.jsonl`，彻底绕开原版 `geminiPromptUsage` 将缓存 Token 重复计入分母导致上限卡死 50% 的缺陷。
-  - **🧮 单会话全树 Token 总量（含递归子代理，支持 `B` 十亿级显示）**：递归汇总当前会话下所有 `delegate_task` 子代理、孙代理及原生子代理 Token（如 `2.34B tok`），内置 `O(1)` 缓存索引，400+ 子代理热查询仅需 `< 8ms`。
-  - **💰 官方费率等效费用 (`$XX.XX (+N子)`)**：复用 T3 官方 `usage-model-rates.json` 5,900+ 模型阶梯定价（含超长上下文阶梯价与缓存节省金额）。
-  - **🔋 智能周额度剩余 (`周余 XX%`)**：
-    - **Antigravity (AGY)**：默认显示 `Gemini · Weekly`；当在输入框切换为 **Opus / Sonnet / Claude / GPT** 模型时，**无需发消息即刻自动切换**显示 `Claude & GPT · Weekly` 周余（低额度自动橙/红预警）。
-    - **Muse / Codex**：自动匹配当前引擎的 `Weekly` 剩余额度；鼠标悬停可一览**所有引擎的 `5-hour / Session / Weekly` 额度条与重置倒计时**。
-  - **◔ 圆环上下文占比（紧邻图谱按钮前）**：
-    - 彻底修复 Antigravity 下原版双倍计入缓存（500k+）及分母虚标 `1M` 的问题，按真实滑动窗口上限（如 AGY `30万`、Codex `47.5万/25.8万`、Muse `101万`）显示真实占比；
-    - 鼠标移上圆环弹出极简卡片：**`上下文容量 XX万/XX万 (XX.X%)` + 圆角进度条 + `平均缓存命中率`**。
-  - **🧹 自动精简右侧边栏**：通过纯 CSS 隐藏右侧边栏底部冗余的原生「额度」与「上下文」区块，保留干净的分支 / PR / 提交面板，同时保持底层额度状态实时在线。
-  - **🌿 可拖拽 Git 分支拓扑图悬浮窗 (`Option + G`)**：多泳道 SVG 分支曲线、工作区脏文件数角标、搜索过滤、点击任意 Commit 查看改动文件列表与语法高亮 Diff（自动过滤 T3 内部 `refs/t3/*` 快照噪音）。
+> Zero modification to `app.asar`, no signature breakage, survives T3 auto-updates. Precise fixes for stock T3 telemetry bugs across **Antigravity / Muse / Codex / Claude** engines: speed misreporting, cache double-counting, context-capacity inflation, and billion-token subagent undercounting.
 
 ---
 
-## 📦 一键安装（任何装有 T3 Code 的 Mac）
+## Why this exists (root-cause fixes)
 
-### 方式一：一行命令安装（推荐）
+Stock T3 misreports telemetry in four ways. `t3-code-hud` corrects each at the source:
+
+| Bug | Stock T3 | HUD fix |
+|-----|----------|---------|
+| **Cache hit rate capped at 50%** | `geminiPromptUsage` adds `cachedInputTokens` twice (both to numerator and denominator) on Antigravity SQLite fallback. | Read native protobuf / JSONL directly (`conversations/*.db`, `session.jsonl`, `sessions/*.jsonl`); dedupe to `uncached + cacheRead + cacheWrite`. |
+| **Context ring shows 100% red on `0 tok`** | On `/new` / non-thread routes the UI reuses the previous thread's `live.contextWindow.usedTokens`. | When `!stats.ok`, force `ctxUsed = 0`, `ctxPct = 0`. Never read stale live state. |
+| **Artificial `300k` floor** | Antigravity context max was clamped to `Math.max(300000, …)`, inflating usage % and hiding the true `1M / 1,048,576` window. | Removed all `300000` floors. `readAntigravityConvDb` sets `contextMax: null` and inherits the true `statev2 contextUsage.maxTokens` (`1048576` Gemini / `1000000` Claude) with catalog fallback via `lookupCatalogContextMax`. |
+| **Billion-token subagent loss** | Recursive `delegate_task` children were undercounted; stale cache keyed only by `updated_at` dropped late WAL turns. | Recursive BFS over `orchestration_v2_projection_subagents` + turn-count/invalidation guard (`SELECT COUNT(*), MAX(updated_at)` per child) + file-parse cache. Mixed-provider threads merge uncovered drivers so zero turns are dropped. |
+
+Additional telemetry correctness:
+
+- **True context window** — `contextUsed` is the last per-call prompt (`promptTotal + output`, deduplicated). Muse inherits `1007997` from `statev2`; Codex reads `model_context_window` from `token_count` events; Antigravity falls back to `1048576` (Gemini) / `1000000` (Claude).
+- **Streaming speed** — pure decode window (`response_created → completed` for Muse, `t6 → t7` for Antigravity, `reasoning → token_usage` for Codex), stripping tool-wait and prefill time. Live 260 ms sampler shows real-time `tok/s`.
+- **OAuth pricing** — reuses T3's official `usage-model-rates.json` (5,900+ models + tiered rates) via `resolveModelRate`.
+
+---
+
+## Features
+
+- **Minimal hover capsule above the composer** (auto-spaced, never blocks the message stream, Light/Dark aware):
+  - ⚡ Session average decode speed (`Avg XX.X tok/s`) at rest; live `tok/s` with a pulsing blue dot while text streams. Hover shows **Avg Decode Speed** and **Last Turn Speed** separately.
+  - ♻️ Real session cache hit rate.
+  - 🧮 Full-tree token total including recursive subagents (supports `B` billions, e.g. `2.34B tok`, warm query `< 8 ms`).
+  - 💰 Official-rate equivalent cost with subagent breakdown (`$XX.XX (+N sub)`).
+  - 🔋 Weekly quota remaining (`Wk 67%`) — auto-switches Gemini ↔ Claude/GPT when you switch models *without sending a message*; hover to see all engines' `5-hour / Session / Weekly` bars.
+  - ◔ Context ring — true usage % with hover card (`Context Capacity`, progress bar, `Avg Cache Hit Rate`).
+- **Zero-overlap layout** — `isChatComposerVisibleAndUncovered()` hides the HUD on Settings, `/usage`, `/pair`, dialogs/modals, and occluded composers; topbar `z-index: 30` stays below native modals (`50`).
+- **Draggable Git Graph floating window** (`Option+G` / `Esc`) — centered 920 × 600 maximum, monochrome vector icon, compact search and repo/status pill. A sticky five-column table shows **Graph / Description / Date / Author / Commit** with orange HEAD rings, separate HEAD/branch pills and `MM/DD HH:mm` timestamps. Click a commit for a bottom split pane with file `+added / -deleted` stats and highlighted unified diff. Below 680px the author column is hidden and date/hash columns compact; narrow capsules keep token/quota details in the hover card. Settings closes the window; native dialogs temporarily hide it. Automatically filters T3-internal `refs/t3/*` snapshot noise.
+- **Bilingual auto-detected UI** (`中文` / `English`) with one-click switch — see [i18n guide](#i18n-guide).
+- **Hardened local RPC** — private `~/.t3/hud-plugin/run/rpc.json` (`0700` dir, `0600` file, `wx` + symlink guard), split `rpcToken` (read-only) and `adminToken` (CLI), no `/admin/eval`, strict `t3code://` origin allowlist.
+
+---
+
+## Install
+
+### One-line install (recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/install.sh | bash
 ```
 
-### 方式二：克隆仓库安装
+> Installs to `~/.t3/hud-plugin`, symlinks `t3-hud` into your `PATH`, and creates `~/Applications/T3 Code HUD.app` (drag to Dock or launch via Spotlight).
+
+Or clone and install:
 
 ```bash
 git clone https://github.com/kingmaozi/t3-code-hud.git
@@ -40,41 +63,97 @@ cd t3-code-hud
 ./install.sh
 ```
 
-安装完成后，执行以下命令重启一次 T3 Code 即可生效：
+Then enable (one graceful restart):
 
 ```bash
 t3-hud restart
 ```
 
-> 💡 安装脚本同时会在 `~/Applications/T3 Code HUD.app` 生成带官方图标的启动器，可直接拖到 **macOS Dock 栏** 或通过 **Spotlight / Raycast** 一键启动。
+> The script never modifies `/Applications/T3 Code.app` internals. Uninstall = remove `~/.t3/hud-plugin` and restart.
 
 ---
 
-## 🛠️ 常用命令
+## CLI commands
 
 ```bash
-t3-hud start     # 启动挂载了 HUD 的 T3 Code（若已运行原版则自动无缝切换）
-t3-hud restart   # 优雅重启 T3 Code 并重新挂载 HUD
-t3-hud reload    # 零重启热更新 UI 与后端统计逻辑（修改代码后秒级生效）
-t3-hud status    # 查看当前挂载状态与进程 PID
+t3-hud start     # Launch T3 with HUD (gracefully restarts stock T3 if needed)
+t3-hud restart   # Graceful restart + remount HUD
+t3-hud reload    # Zero-restart hot-reload UI + backend logic (after editing sources)
+t3-hud status    # Show PID + mount state + language config
+t3-hud lang zh   # Set HUD language to Chinese (persists userLang)
+t3-hud lang en   # Set HUD language to English
+t3-hud lang auto # Clear explicit choice (auto-detect from T3 UI language)
 ```
 
-### 快捷键
+### Shortcuts
 
-- `Option + G`：打开 / 关闭右侧可拖拽 Git 分支拓扑图抽屉
-- `Esc`：关闭 Git 图谱抽屉
+- `Option + G`: toggle Git Graph floating window
+- `Esc`: close Git Graph floating window
 
 ---
 
-## 🗑️ 一键卸载
+## i18n guide
+
+HUD language resolves in this order:
+
+1. **Explicit toggle** — `localStorage["t3-hud-lang"]` or `config.userLang` (`zh` / `en` / `auto`) from the `EN` / `中文` switch in the stats popover header or the Git Graph floating window toolbar, or `t3-hud lang`.
+2. **DOM auto-detection** — inspects `document.documentElement.lang` and UI strings (`想问什么` / `本地工作副本` / `新会话` / `设置` → `zh`; `Ask anything` / `Local working copy` / `New thread` / `Settings` → `en`).
+3. **Install-time default** — `config.defaultLang` written by `install.sh` from `--lang` / `T3_HUD_LANG` / system locale (`LC_ALL` / `LC_MESSAGES` / `LANG` / AppleLanguages) → fallback `zh`.
+
+Language switch is instant and persists across restarts:
+
+```bash
+# Install-time
+./install.sh --lang en
+T3_HUD_LANG=zh ./install.sh
+
+# Runtime
+t3-hud lang en
+t3-hud lang zh
+t3-hud lang auto
+# Or click EN / 中文 in the HUD popover header or Git window toolbar
+```
+
+Config: `~/.t3/hud-plugin/config.json` (`{ "defaultLang": "zh"|"en", "userLang": "zh"|"en"|"auto" }`).
+
+---
+
+## Architecture
+
+```
+T3 Code.app (Electron, main "browser")
+  └─ bootstrap.cjs     spawn --inspect=127.0.0.1:0 → CDP Runtime.evaluate → require(main-hook.cjs) → verify "OK"
+       └─ main-hook.cjs
+            ├─ Loopback HTTP server (127.0.0.1:0) — rpcToken (GET /rpc) + adminToken (CLI only)
+            │    writes ~/.t3/hud-plugin/run/rpc.json (0600, wx, symlink-guarded)
+            ├─ IPC: t3hud:get-thread-stats / get-git-graph / get-commit-detail / get-config / set-config
+            │    (senderFrame-allowlisted to captured T3 origin)
+            └─ injectHudIntoWindow() → window.__t3HudHttpConfig = { url, token: rpcToken } + renderer-ui.js
+                 └─ preload-bridge.cjs → window.__t3HudBridge (contextBridge)
+                      └─ renderer-ui.js → topbar + popover + Git window (bilingual, zero-overlap)
+                           └─ backend.cjs → statev2.sqlite + provider-native files + usage-model-rates.json
+```
+
+---
+
+## Uninstall
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/uninstall.sh | bash
+# or
+./uninstall.sh
 ```
-（本插件**零修改** `/Applications/T3 Code.app` 内部文件，卸载后重启 T3 Code 即 100% 恢复原厂状态。）
+
+Uninstall removes `~/.t3/hud-plugin`, the `t3-hud` symlink, `~/Applications/T3 Code HUD.app`, and legacy `/tmp/t3-hud-*.pid/json`. Restart T3 to return to 100% stock.
 
 ---
 
-## 📄 License
+## Security
 
-[MIT](./LICENSE)
+See [`src/main-hook.cjs`](src/main-hook.cjs), [`src/bootstrap.cjs`](src/bootstrap.cjs), and [`src/backend.cjs`](src/backend.cjs) `getConfig`/`setConfig`. Runtime state lives under `~/.t3/hud-plugin/run/` with `0o700` / `0o600` and `wx` create-or-fail semantics. `/admin/eval` has been removed entirely.
+
+---
+
+## License
+
+[MIT](LICENSE)

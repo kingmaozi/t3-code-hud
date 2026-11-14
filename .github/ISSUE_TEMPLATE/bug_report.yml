@@ -1,0 +1,16 @@
+name: Bug Report / 问题反馈
+description: Report a bug or telemetry discrepancy / 反馈功能异常或统计偏差
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened? / 问题描述
+      placeholder: Describe the issue and attach a screenshot if possible / 请描述遇到的问题（建议附上截图）
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Provider & Model / 使用的引擎与模型
+      placeholder: e.g. Antigravity (gemini-4-hydrogen) / Codex (gpt-6.1-terra) / Muse (muse-ember-1.0)

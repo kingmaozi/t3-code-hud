@@ -15,6 +15,7 @@ globalThis.__t3HudMainHookLoaded = true;
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
 const path = require("node:path");
 const electron = require("electron");
 const BACKEND_PATH = path.join(__dirname, "backend.cjs");
@@ -22,21 +23,137 @@ let backend = require(BACKEND_PATH);
 
 const PRELOAD_BRIDGE_PATH = path.join(__dirname, "preload-bridge.cjs");
 const RENDERER_UI_PATH = path.join(__dirname, "renderer-ui.js");
-const RPC_INFO_FILE = "/tmp/t3-hud-rpc.json";
+const HUD_RUN_DIR = path.join(os.homedir(), ".t3", "hud-plugin", "run");
+const RPC_INFO_FILE = path.join(HUD_RUN_DIR, "rpc.json");
 
 let httpFallbackConfig = null;
 let lastInjectError = null;
+let capturedT3Origin = null;
+let rpcToken = null;
+let adminToken = null;
+
+function ensureRunDir() {
+  try {
+    let st = null;
+    try {
+      st = fs.lstatSync(HUD_RUN_DIR);
+    } catch {
+      st = null;
+    }
+    if (st && st.isSymbolicLink()) {
+      try {
+        fs.unlinkSync(HUD_RUN_DIR);
+      } catch {}
+      st = null;
+    }
+    if (st && !st.isDirectory()) {
+      try {
+        fs.unlinkSync(HUD_RUN_DIR);
+      } catch {}
+      st = null;
+    }
+    fs.mkdirSync(HUD_RUN_DIR, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(HUD_RUN_DIR, 0o700);
+    } catch {}
+  } catch {}
+}
+
+function writeRpcInfo() {
+  ensureRunDir();
+  try {
+    const st = fs.lstatSync(RPC_INFO_FILE);
+    if (st.isSymbolicLink()) {
+      try {
+        fs.unlinkSync(RPC_INFO_FILE);
+      } catch {}
+    } else {
+      try {
+        fs.unlinkSync(RPC_INFO_FILE);
+      } catch {}
+    }
+  } catch {}
+  try {
+    fs.writeFileSync(
+      RPC_INFO_FILE,
+      JSON.stringify({
+        ...httpFallbackConfig,
+        adminToken,
+        rpcToken,
+        pid: process.pid,
+      }),
+      { flag: "wx", mode: 0o600 }
+    );
+  } catch {
+    try {
+      fs.rmSync(RPC_INFO_FILE, { force: true });
+    } catch {}
+    try {
+      fs.writeFileSync(
+        RPC_INFO_FILE,
+        JSON.stringify({
+          ...httpFallbackConfig,
+          adminToken,
+          rpcToken,
+          pid: process.pid,
+        }),
+        { flag: "wx", mode: 0o600 }
+      );
+    } catch {}
+  }
+}
+
+function captureT3Origin() {
+  if (capturedT3Origin) return capturedT3Origin;
+  try {
+    for (const win of electron.BrowserWindow.getAllWindows()) {
+      if (!win || win.isDestroyed() || isHelperWindow(win)) continue;
+      const wc = win.webContents;
+      if (!wc || wc.isDestroyed()) continue;
+      const url = wc.getURL();
+      if (!url) continue;
+      const title = win.getTitle() || "";
+      const isT3Title = title === "T3 Code" || title === "T3 Code (Beta)";
+      const urlHasT3 = url.includes("t3code");
+      if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) {
+        try {
+          capturedT3Origin = new URL(url).origin;
+        } catch {
+          capturedT3Origin = url.split("/").slice(0, 3).join("/");
+        }
+        return capturedT3Origin;
+      }
+      if (isT3Title || urlHasT3) {
+        if (url.match(/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/)) {
+          try {
+            capturedT3Origin = new URL(url).origin;
+          } catch {}
+          if (capturedT3Origin) return capturedT3Origin;
+        }
+      }
+    }
+  } catch {}
+  return capturedT3Origin;
+}
 
 function isMainT3Url(url) {
   if (!url || typeof url !== "string") return false;
-  return (
-    url.startsWith("t3code://") ||
-    url.startsWith("t3code-dev://") ||
-    url.startsWith("http://127.0.0.1:") ||
-    url.startsWith("http://localhost:") ||
-    url.startsWith("https://127.0.0.1:") ||
-    url.startsWith("https://localhost:")
-  );
+  if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) return true;
+  // For http(s) loopback URLs, strictly require match to captured origin or t3code marker,
+  // and reject arbitrary localhost preview windows.
+  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) {
+    if (capturedT3Origin) {
+      try {
+        const u = new URL(url);
+        return u.origin === capturedT3Origin;
+      } catch {
+        return false;
+      }
+    }
+    // No capture yet: only accept if URL itself mentions t3code (heuristic upgrade path).
+    return url.includes("t3code");
+  }
+  return false;
 }
 
 function isHelperWindow(win) {
@@ -51,6 +168,7 @@ function isHelperWindow(win) {
 }
 
 function getMainWindows() {
+  captureT3Origin();
   return electron.BrowserWindow.getAllWindows().filter((win) => {
     if (!win || win.isDestroyed() || isHelperWindow(win)) return false;
     const wc = win.webContents;
@@ -78,7 +196,7 @@ async function injectHudIntoWindow(win, forceReload = false) {
 
     const uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
     const bootstrapCfg = httpFallbackConfig
-      ? `window.__t3HudHttpConfig = ${JSON.stringify(httpFallbackConfig)};\n`
+      ? `window.__t3HudHttpConfig = ${JSON.stringify({ url: httpFallbackConfig.url, token: rpcToken })};\n`
       : "";
     await wc.executeJavaScript(bootstrapCfg + uiCode, true);
     lastInjectError = null;
@@ -89,16 +207,27 @@ async function injectHudIntoWindow(win, forceReload = false) {
   }
 }
 
+function allowedOrigin(origin) {
+  if (!origin || origin === "null") return null;
+  if (origin.startsWith("t3code://") || origin.startsWith("t3code-dev://")) return origin;
+  if (capturedT3Origin && origin === capturedT3Origin) return origin;
+  return null;
+}
+
 function startLoopbackFallbackServer() {
   return new Promise((resolve) => {
     try {
-      const token = crypto.randomBytes(24).toString("hex");
+      rpcToken = crypto.randomBytes(32).toString("hex");
+      adminToken = crypto.randomBytes(32).toString("hex");
       const server = http.createServer(async (req, res) => {
-        const origin = req.headers.origin || "*";
-        res.setHeader("Access-Control-Allow-Origin", origin);
-        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
-        res.setHeader("Access-Control-Allow-Private-Network", "true");
+        const reqOrigin = req.headers.origin || "";
+        const corsOrigin = allowedOrigin(reqOrigin);
+        if (corsOrigin) {
+          res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+          res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+          res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
+          res.setHeader("Access-Control-Allow-Private-Network", "true");
+        }
 
         if (req.method === "OPTIONS") {
           res.writeHead(204);
@@ -106,13 +235,26 @@ function startLoopbackFallbackServer() {
           return;
         }
 
-        if (req.headers["x-t3-hud-token"] !== token) {
-          res.writeHead(403, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
-          return;
-        }
+        const token = req.headers["x-t3-hud-token"];
+        const isRpcToken = token === rpcToken;
+        const isAdminToken = token === adminToken;
+
+        // RPC: allowed for both tokens (rpcToken is read/write to local config via RPC only)
+        const bodyReader = (cb) => {
+          let body = "";
+          req.on("data", (chunk) => {
+            body += chunk;
+            if (body.length > 1e6) req.destroy();
+          });
+          req.on("end", () => cb(body));
+        };
 
         if (req.method === "GET" && req.url === "/admin/status") {
+          if (!isAdminToken) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
+            return;
+          }
           const wins = electron.BrowserWindow.getAllWindows().map((w) => ({
             id: w.id,
             title: w.getTitle(),
@@ -124,14 +266,14 @@ function startLoopbackFallbackServer() {
           return;
         }
 
-        let body = "";
-        req.on("data", (chunk) => {
-          body += chunk;
-          if (body.length > 1e6) req.destroy();
-        });
-        req.on("end", async () => {
+        bodyReader(async (body) => {
           try {
             if (req.method === "POST" && req.url === "/admin/reload-ui") {
+              if (!isAdminToken) {
+                res.writeHead(403, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
+                return;
+              }
               try {
                 delete require.cache[require.resolve(BACKEND_PATH)];
                 backend = require(BACKEND_PATH);
@@ -145,21 +287,12 @@ function startLoopbackFallbackServer() {
               return;
             }
 
-            if (req.method === "POST" && req.url === "/admin/eval") {
-              const { code } = JSON.parse(body || "{}");
-              const win = getMainWindows()[0];
-              if (!win) {
-                res.writeHead(404, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ ok: false, error: "No main T3 window found" }));
+            if (req.method === "POST" && req.url === "/rpc") {
+              if (!isRpcToken && !isAdminToken) {
+                res.writeHead(403, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
                 return;
               }
-              const val = await win.webContents.executeJavaScript(code, true);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ ok: true, result: val }));
-              return;
-            }
-
-            if (req.method === "POST" && req.url === "/rpc") {
               const { method, args = [] } = JSON.parse(body || "{}");
               let out;
               if (method === "getThreadStats") {
@@ -168,6 +301,10 @@ function startLoopbackFallbackServer() {
                 out = await backend.getGitGraph(args[0], args[1]);
               } else if (method === "getCommitDetail") {
                 out = await backend.getCommitDetail(args[0], args[1]);
+              } else if (method === "getConfig") {
+                out = backend.getConfig();
+              } else if (method === "setConfig") {
+                out = backend.setConfig(args[0]);
               } else {
                 out = { ok: false, error: "Unknown method" };
               }
@@ -188,14 +325,9 @@ function startLoopbackFallbackServer() {
       server.listen(0, "127.0.0.1", () => {
         const addr = server.address();
         if (addr && typeof addr === "object") {
-          httpFallbackConfig = { url: `http://127.0.0.1:${addr.port}`, token };
-          try {
-            fs.writeFileSync(
-              RPC_INFO_FILE,
-              JSON.stringify({ ...httpFallbackConfig, pid: process.pid }),
-              { mode: 0o600 }
-            );
-          } catch {}
+          httpFallbackConfig = { url: `http://127.0.0.1:${addr.port}`, token: rpcToken };
+          captureT3Origin();
+          writeRpcInfo();
         }
         resolve();
       });
@@ -211,13 +343,36 @@ function registerIpcAndPreload() {
   const { ipcMain, session } = electron;
 
   try {
-    ipcMain.handle("t3hud:get-thread-stats", (_evt, threadHint) => backend.getThreadStats(threadHint));
-    ipcMain.handle("t3hud:get-git-graph", (_evt, threadHint, maxCommits) =>
-      backend.getGitGraph(threadHint, maxCommits)
-    );
-    ipcMain.handle("t3hud:get-commit-detail", (_evt, threadHint, commitHash) =>
-      backend.getCommitDetail(threadHint, commitHash)
-    );
+    const guard = (evt) => {
+      try {
+        const url = evt?.senderFrame?.url;
+        if (!url) return false;
+        captureT3Origin();
+        return isMainT3Url(url);
+      } catch {
+        return false;
+      }
+    };
+    ipcMain.handle("t3hud:get-thread-stats", (evt, threadHint) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getThreadStats(threadHint);
+    });
+    ipcMain.handle("t3hud:get-git-graph", (evt, threadHint, maxCommits) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getGitGraph(threadHint, maxCommits);
+    });
+    ipcMain.handle("t3hud:get-commit-detail", (evt, threadHint, commitHash) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getCommitDetail(threadHint, commitHash);
+    });
+    ipcMain.handle("t3hud:get-config", (evt) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getConfig();
+    });
+    ipcMain.handle("t3hud:set-config", (evt, patch) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.setConfig(patch);
+    });
   } catch {
     // Ignore duplicate registration
   }
@@ -249,7 +404,10 @@ function attachWindowHooks(win) {
   const wc = win.webContents;
   if (!wc) return;
 
-  wc.on("did-finish-load", () => injectHudIntoWindow(win));
+  wc.on("did-finish-load", () => {
+    captureT3Origin();
+    injectHudIntoWindow(win);
+  });
   wc.on("did-navigate", () => setTimeout(() => injectHudIntoWindow(win), 150));
   wc.on("dom-ready", () => setTimeout(() => injectHudIntoWindow(win), 150));
 

@@ -8,6 +8,8 @@ const bridge = {
     ipcRenderer.invoke("t3hud:get-git-graph", threadHint, maxCommits),
   getCommitDetail: (threadHint, commitHash) =>
     ipcRenderer.invoke("t3hud:get-commit-detail", threadHint, commitHash),
+  getConfig: () => ipcRenderer.invoke("t3hud:get-config"),
+  setConfig: (patch) => ipcRenderer.invoke("t3hud:set-config", patch),
 };
 
 try {
