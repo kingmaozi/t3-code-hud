@@ -1689,10 +1689,10 @@
   function resolveModelAvgSpeed(stats, activeModelRaw) {
     if (!stats || !stats.speed) return null;
     const bm = stats.speed.byModel;
-    const m = (activeModelRaw || stats.model || "").toLowerCase().trim();
+    const m = (activeModelRaw || stats.model || "").toLowerCase().trim().replace(/\s+/g, "-");
     if (bm && m) {
       if (bm[m] != null) return bm[m];
-      const hit = Object.keys(bm).find((k) => k === m || k.startsWith(m + "-") || m.startsWith(k + "-"));
+      const hit = Object.keys(bm).find((k) => k === m || k.startsWith(m + "-") || m.startsWith(k + "-") || k.includes(m) || m.includes(k));
       if (hit) return bm[hit];
     }
     return stats.speed.tokPerSec ?? stats.speed.lastDecodeTps ?? null;
@@ -1762,7 +1762,7 @@
         </span>
       </div>
       <div class="t3-pop-row"><span>${escapeHtml(t("engineModel"))}</span><span>${escapeHtml(providerBadge)}</span></div>
-      <div class="t3-pop-row"><span>${escapeHtml(t("avgDecodeSpeed"))}</span><span>${formatSpeed(s.speed.tokPerSec)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("avgDecodeSpeed"))}</span><span>${formatSpeed(resolveModelAvgSpeed(s, qInfo.activeModelRaw))}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("lastTurnSpeed"))}</span><span>${formatSpeed(s.speed.lastDecodeTps)}</span></div>
       ${liveSpeedLine}
       ${e2eLine}
@@ -1861,7 +1861,7 @@
     } else {
       const activelyStreaming = liveStreamTps != null;
       nextDotClass = "t3-hud-dot " + (activelyStreaming ? "running" : "ready");
-      const primarySpd = liveStreamTps ?? stats.speed.tokPerSec ?? stats.speed.lastDecodeTps;
+      const primarySpd = liveStreamTps ?? resolveModelAvgSpeed(stats, qInfo.activeModelRaw);
       if (primarySpd != null) {
         nextSpeed = `${activelyStreaming ? "" : t("avgSpeed") + " "}${primarySpd.toFixed(1)} tok/s`;
       } else if (stats.isRunning) {
