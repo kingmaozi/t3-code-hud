@@ -319,6 +319,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
   let decodeSecSum = 0;
   let e2eTokensSum = 0;
   let e2eSecSum = 0;
+  const byModelDecode = {};
 
   let lastDecodeTps = null;
   let lastDecodeSec = null;
@@ -387,6 +388,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
         if (decSec >= 0.12 && output / decSec <= 1200) {
           decodeTokensSum += output;
           decodeSecSum += decSec;
+          if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += output; bm.sec += decSec; }
           lastDecodeTps = output / decSec;
           lastDecodeSec = decSec;
         }
@@ -420,6 +422,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     avgDecodeTps,
     decodeTokensSum,
     decodeSecSum,
+    byModelDecode,
     e2eTokPerSec: avgE2eTps,
     durationSec: lastDecodeSec ?? (decodeSecSum > 0 ? decodeSecSum : null),
   };
@@ -551,6 +554,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
 
     let streamTokensSum = 0;
     let streamSecSum = 0;
+    const byModelDecode = {};
     let e2eTokensSum = 0;
     let e2eSecSum = 0;
 
@@ -635,6 +639,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
         if (sTps <= 900) {
           streamTokensSum += streamTok;
           streamSecSum += sDur;
+          if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += streamTok; bm.sec += sDur; }
           lastStreamTps = sTps;
           lastStreamSec = sDur;
         }
@@ -662,6 +667,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       avgDecodeTps,
       decodeTokensSum: streamTokensSum,
       decodeSecSum: streamSecSum,
+      byModelDecode,
       e2eTokPerSec: avgE2eTps,
       durationSec: lastStreamSec ?? (e2eSecSum > 0 ? e2eSecSum : null),
     };
@@ -737,6 +743,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
 
   let decodeTokensSum = 0;
   let decodeSecSum = 0;
+  const byModelDecode = {};
   let e2eTokensSum = 0;
   let e2eSecSum = 0;
   let lastDecodeTps = null;
@@ -815,6 +822,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
         if (visOut / dSec <= 1500) {
           decodeTokensSum += visOut;
           decodeSecSum += dSec;
+          if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += visOut; bm.sec += dSec; }
           lastDecodeTps = visOut / dSec;
         }
       }
@@ -997,6 +1005,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     let stepCount = 0;
     let totalDecodeTok = 0;
     let totalDecodeSec = 0;
+    const mergedByModel = {};
     let uncoveredOut = 0;
     let uncoveredNetSec = 0;
     let latestUncoveredTurnMs = 0;
@@ -1014,6 +1023,13 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       stepCount += part.stepCount;
       totalDecodeTok += part.decodeTokensSum || 0;
       totalDecodeSec += part.decodeSecSum || 0;
+      if (part.byModelDecode) {
+        for (const [mk, mv] of Object.entries(part.byModelDecode)) {
+          const cur = (mergedByModel[mk] ||= { tok: 0, sec: 0 });
+          cur.tok += mv.tok;
+          cur.sec += mv.sec;
+        }
+      }
       if (part.model) latestModel = part.model;
       if (part.driver) latestDriver = part.driver;
     }
@@ -1137,6 +1153,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       sessionCacheRate,
       lastTurnCacheRate: lastPart.lastStepCacheRate ?? sessionCacheRate,
       tokPerSec: sessionAvgTps ?? lastPart.tokPerSec,
+      byModelSpeed: Object.fromEntries(Object.entries(mergedByModel).filter(([, v]) => v.sec > 0.1).map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])),
       lastDecodeTps: lastPart.lastDecodeTps,
       e2eTokPerSec: lastPart.e2eTokPerSec,
       durationSec: lastPart.durationSec,
@@ -1462,6 +1479,7 @@ function getThreadStats(threadHint) {
       },
       speed: {
         tokPerSec: mainTel.tokPerSec != null ? Math.round(mainTel.tokPerSec * 10) / 10 : null,
+        byModel: mainTel.byModelSpeed || {},
         lastDecodeTps:
           mainTel.lastDecodeTps != null ? Math.round(mainTel.lastDecodeTps * 10) / 10 : null,
         e2eTokPerSec:

@@ -1686,6 +1686,18 @@
     });
   }
 
+  function resolveModelAvgSpeed(stats, activeModelRaw) {
+    if (!stats || !stats.speed) return null;
+    const bm = stats.speed.byModel;
+    const m = (activeModelRaw || stats.model || "").toLowerCase().trim();
+    if (bm && m) {
+      if (bm[m] != null) return bm[m];
+      const hit = Object.keys(bm).find((k) => k === m || k.startsWith(m + "-") || m.startsWith(k + "-"));
+      if (hit) return bm[hit];
+    }
+    return stats.speed.tokPerSec ?? stats.speed.lastDecodeTps ?? null;
+  }
+
   function renderStatsPopover() {
     popover.style.width = "324px";
     const qInfo = computeQuotaAndContext(latestStats);
