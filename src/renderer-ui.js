@@ -369,6 +369,18 @@
       --hud-border: var(--border, rgba(0, 0, 0, 0.1));
       --hud-hover: color-mix(in srgb, var(--foreground, #262626) 7%, transparent);
       --hud-shadow: 0 8px 30px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
+      --hud-emerald: #059669;
+      --hud-emerald-fill: linear-gradient(90deg, #10b981, #34d399);
+      --hud-blue: #2563eb;
+      --hud-blue-fill: linear-gradient(90deg, #3b82f6, #06b6d4);
+      --hud-cyan: #0284c7;
+      --hud-amber: #d97706;
+      --hud-amber-fill: linear-gradient(90deg, #f59e0b, #fbbf24);
+      --hud-orange: #ea580c;
+      --hud-orange-fill: linear-gradient(90deg, #f97316, #ef4444);
+      --hud-red: #dc2626;
+      --hud-red-fill: linear-gradient(90deg, #ef4444, #dc2626);
+      --hud-violet: #7c3aed;
       font-family: -apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", system-ui, sans-serif;
       color: var(--hud-fg);
       pointer-events: none;
@@ -376,7 +388,7 @@
       inset: 0;
       z-index: 9990;
     }
-    html.dark #t3-hud-root {
+    :is(.dark, [data-theme="dark"]) #t3-hud-root {
       --hud-bg: color-mix(in srgb, var(--popover, #141414) 94%, transparent);
       --hud-bg-solid: var(--popover, #141414);
       --hud-fg: var(--foreground, #f5f5f5);
@@ -385,6 +397,13 @@
       --hud-border: var(--border, rgba(255, 255, 255, 0.12));
       --hud-hover: color-mix(in srgb, var(--foreground, #f5f5f5) 9%, transparent);
       --hud-shadow: 0 14px 40px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.35);
+      --hud-emerald: #34d399;
+      --hud-blue: #60a5fa;
+      --hud-cyan: #38bdf8;
+      --hud-amber: #fbbf24;
+      --hud-orange: #fb923c;
+      --hud-red: #f87171;
+      --hud-violet: #a78bfa;
     }
 
     #t3-hud-topbar {
@@ -434,7 +453,7 @@
       transform: rotate(-90deg);
     }
     .t3-ctx-bar-track {
-      height: 7px;
+      height: 6px;
       border-radius: 999px;
       background: color-mix(in srgb, var(--hud-fg) 10%, transparent);
       overflow: hidden;
@@ -443,11 +462,52 @@
     .t3-ctx-bar-fill {
       height: 100%;
       border-radius: 999px;
-      background: var(--hud-fg);
-      transition: width 0.2s ease;
+      background: var(--hud-blue-fill);
+      transition: width 0.25s ease, background 0.2s ease;
     }
-    .t3-ctx-bar-fill.warn { background: #f59e0b; }
-    .t3-ctx-bar-fill.err { background: #ef4444; }
+    .t3-ctx-bar-fill.mid { background: var(--hud-amber-fill); }
+    .t3-ctx-bar-fill.warn { background: var(--hud-orange-fill); }
+    .t3-ctx-bar-fill.err { background: var(--hud-red-fill); }
+    .t3-cache-bar-fill { background: var(--hud-emerald-fill); }
+    .t3-cache-bar-fill.mid { background: var(--hud-cyan); }
+    .t3-cache-bar-fill.low { background: var(--hud-amber-fill); }
+    #t3-hud-ring-arc {
+      transition: stroke-dashoffset 0.25s ease, stroke 0.2s ease;
+    }
+    .t3-ctx-heading, .t3-ctx-summary {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-variant-numeric: tabular-nums;
+    }
+    .t3-ctx-heading { font-size: 12px; }
+    .t3-ctx-heading > span { color: var(--hud-muted); }
+    .t3-ctx-summary { margin-top: 7px; font-size: 11.5px; }
+    .t3-ctx-summary > span:first-child { color: var(--hud-muted); }
+    .t3-ctx-summary > span:last-child { font-weight: 600; }
+    .t3-cache-bar-track { margin-bottom: 0; }
+    #t3-hud-cost {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .t3-hud-sub-badge {
+      color: var(--hud-violet);
+      background: color-mix(in srgb, var(--hud-violet) 11%, transparent);
+      padding: 0 5px;
+      border-radius: 999px;
+      font-size: 11px;
+      line-height: 17px;
+    }
+    .t3-hud-quota-track {
+      width: 26px;
+      height: 4.5px;
+      flex: none;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--hud-fg) 11%, transparent);
+      overflow: hidden;
+    }
     .t3-hud-metric:hover {
       background: var(--hud-hover);
     }
@@ -474,12 +534,12 @@
       flex: none;
     }
     .t3-hud-dot.running {
-      background: #3b82f6;
-      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+      background: var(--hud-blue);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--hud-blue) 16%, transparent);
       animation: t3HudPulse 1.2s ease-in-out infinite;
     }
     .t3-hud-dot.ready {
-      background: #3b82f6;
+      background: var(--hud-blue);
     }
     @keyframes t3HudPulse {
       0%, 100% { opacity: 1; transform: scale(1); }
@@ -507,12 +567,12 @@
       background: var(--hud-hover);
     }
     #t3-hud-git-btn.active {
-      background: color-mix(in srgb, #3b82f6 15%, transparent);
-      color: #3b82f6;
+      background: color-mix(in srgb, var(--hud-blue) 11%, transparent);
+      color: var(--hud-blue);
     }
-    html.dark #t3-hud-git-btn.active {
-      background: color-mix(in srgb, #60a5fa 18%, transparent);
-      color: #60a5fa;
+    #t3-hud-git-btn:hover .t3-git-symbol,
+    #t3-hud-git-btn.active .t3-git-symbol {
+      color: var(--hud-blue);
     }
     .t3-hud-branch-text {
       max-width: 110px;
@@ -524,19 +584,18 @@
       font-size: 10px;
       padding: 1px 4px;
       border-radius: 4px;
-      background: color-mix(in srgb, #f59e0b 18%, transparent);
-      color: #d97706;
+      background: color-mix(in srgb, var(--hud-amber) 12%, transparent);
+      color: var(--hud-amber);
       font-variant-numeric: tabular-nums;
-    }
-    html.dark .t3-hud-dirty-dot {
-      color: #fbbf24;
     }
 
     /* Hover breakdown card above bottom HUD capsule */
     #t3-hud-popover {
+      box-sizing: border-box;
       pointer-events: none;
       position: fixed;
       width: 324px;
+      max-width: calc(100vw - 24px);
       padding: 10px 12px;
       border-radius: 10px;
       background: var(--hud-bg-solid);
@@ -582,27 +641,30 @@
       font-size: 11px;
     }
     .t3-quota-track {
-      height: 4px;
+      height: 6px;
       border-radius: 999px;
       background: color-mix(in srgb, var(--hud-fg) 12%, transparent);
       overflow: hidden;
     }
-    .t3-quota-fill {
+    .t3-quota-fill, #t3-hud-quota-bar {
       height: 100%;
       border-radius: 999px;
-      background: var(--hud-fg);
+      background: var(--hud-emerald-fill);
+      transition: width 0.25s ease, background 0.2s ease;
     }
-    .t3-quota-fill.warn { background: #f59e0b; }
-    .t3-quota-fill.err { background: #ef4444; }
+    .t3-quota-fill.mid, #t3-hud-quota-bar.mid { background: var(--hud-amber-fill); }
+    .t3-quota-fill.warn, #t3-hud-quota-bar.warn { background: var(--hud-orange-fill); }
+    .t3-quota-fill.err, #t3-hud-quota-bar.err { background: var(--hud-red-fill); }
     .t3-quota-val {
       font-weight: 500;
       font-size: 11px;
       text-align: right;
       min-width: 32px;
     }
-    .t3-quota-val.warn { color: #d97706; }
-    html.dark .t3-quota-val.warn { color: #fbbf24; }
-    .t3-quota-val.err { color: #ef4444; }
+    .t3-quota-val, #t3-hud-quota { color: var(--hud-emerald); }
+    .t3-quota-val.mid, #t3-hud-quota.mid { color: var(--hud-amber); }
+    .t3-quota-val.warn, #t3-hud-quota.warn { color: var(--hud-orange); }
+    .t3-quota-val.err, #t3-hud-quota.err { color: var(--hud-red); }
     .t3-pop-title {
       font-weight: 600;
       font-size: 12px;
@@ -1092,6 +1154,7 @@
       <span id="t3-hud-quota-sep" class="t3-hud-sep" style="display:none"></span>
       <div id="t3-hud-quota-item" class="t3-hud-metric" data-hud-hover="stats" style="display:none">
         <span class="lbl" id="t3-hud-week-lbl">周余</span>
+        <span class="t3-hud-quota-track" aria-hidden="true"><span id="t3-hud-quota-bar" style="display:block;width:0%"></span></span>
         <span id="t3-hud-quota" class="val">--%</span>
       </div>
       <span class="t3-hud-sep"></span>
@@ -1158,6 +1221,7 @@
   const quotaSepEl = document.getElementById("t3-hud-quota-sep");
   const quotaItemEl = document.getElementById("t3-hud-quota-item");
   const quotaEl = document.getElementById("t3-hud-quota");
+  const quotaBarEl = document.getElementById("t3-hud-quota-bar");
   const ringArcEl = document.getElementById("t3-hud-ring-arc");
   const ctxPctEl = document.getElementById("t3-hud-ctx-pct");
   const branchBtnText = document.getElementById("t3-hud-branch");
@@ -1477,6 +1541,20 @@
     return `${(ms / 86400000).toFixed(1)}d`;
   }
 
+  function contextTone(pct) {
+    return pct >= 90 ? "err" : pct >= 75 ? "warn" : pct >= 50 ? "mid" : "ok";
+  }
+
+  function contextColor(pct) {
+    const tone = contextTone(pct);
+    return tone === "err" ? "var(--hud-red)" : tone === "warn" ? "var(--hud-orange)" : tone === "mid" ? "var(--hud-amber)" : "var(--hud-blue)";
+  }
+
+  function cacheColor(rate) {
+    if (rate == null || !Number.isFinite(rate)) return "var(--hud-fg)";
+    return rate >= 0.75 ? "var(--hud-emerald)" : rate >= 0.45 ? "var(--hud-cyan)" : "var(--hud-amber)";
+  }
+
   function computeQuotaAndContext(stats) {
     const { usage: live, selectedModel, selectedProvider } = readLiveT3State();
     const activeProviderRaw = (
@@ -1526,7 +1604,7 @@
 
     const toWinItem = (w, prefix = "") => {
       const rem = Math.max(0, Math.min(100, Math.round(100 - (Number(w.usedPercent) || 0))));
-      const tone = rem <= 10 ? "err" : rem <= 25 ? "warn" : "";
+      const tone = rem > 50 ? "ok" : rem > 25 ? "mid" : rem > 10 ? "warn" : "err";
       const reset = formatResetShort(w.resetsAt);
       const rawLbl = String(w.label || w.id || "Quota").replace(" (shared)", "");
       return {
@@ -1653,7 +1731,10 @@
     const usedTxt = qInfo.ctxUsed != null ? formatContextPair(qInfo.ctxUsed, qInfo.ctxMax) : "0";
     const pctNum = qInfo.ctxPct != null ? qInfo.ctxPct : 0;
     const pctTxt = qInfo.ctxPct != null ? `${qInfo.ctxPct.toFixed(1)}%` : "0.0%";
-    const barTone = pctNum >= 90 ? "err" : pctNum >= 75 ? "warn" : "";
+    const barTone = contextTone(pctNum);
+    const avgCacheRate = s?.cache.sessionRate;
+    const cachePct = Number.isFinite(avgCacheRate) ? Math.min(100, Math.max(0, avgCacheRate * 100)) : 0;
+    const cacheTone = avgCacheRate >= 0.75 ? "" : avgCacheRate >= 0.45 ? "mid" : "low";
     const avgCacheTxt =
       s && s.cache.sessionRate != null ? `${(s.cache.sessionRate * 100).toFixed(1)}%` : "--";
     const showAgyNote =
@@ -1663,21 +1744,24 @@
 
     popover.style.width = "268px";
     popover.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-variant-numeric:tabular-nums">
+      <div class="t3-ctx-heading">
         <span style="font-weight:600;font-size:13px;color:var(--hud-fg)">${escapeHtml(t("contextCapacity"))}</span>
-        <span style="display:flex;align-items:center;gap:6px">
-          <span style="font-size:12px;color:var(--hud-muted)">${escapeHtml(usedTxt)} (${escapeHtml(pctTxt)})</span>
-          <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
-        </span>
+        <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
+      </div>
+      <div class="t3-ctx-summary">
+        <span>${escapeHtml(usedTxt)}</span>
+        <span style="color:${contextColor(pctNum)}">${escapeHtml(pctTxt)}</span>
       </div>
       <div class="t3-ctx-bar-track">
         <div class="t3-ctx-bar-fill ${barTone}" style="width:${Math.min(100, Math.max(0, pctNum)).toFixed(1)}%"></div>
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;font-variant-numeric:tabular-nums;font-size:12px">
-        <span style="color:var(--hud-muted)">${escapeHtml(t("avgCacheHitRate"))}</span>
-        <span style="font-weight:600;color:var(--hud-fg)">${escapeHtml(avgCacheTxt)}</span>
+      <div class="t3-ctx-heading">
+        <span>${escapeHtml(t("avgCacheHitRate"))}</span>
+        <span style="font-weight:600;color:${cacheColor(avgCacheRate)}">${escapeHtml(avgCacheTxt)}</span>
       </div>
-      <div style="margin-top:4px;font-size:10.5px;color:var(--hud-muted)">${escapeHtml(t("cache"))} ${escapeHtml(avgCacheTxt)}</div>
+      <div class="t3-ctx-bar-track t3-cache-bar-track">
+        <div class="t3-ctx-bar-fill t3-cache-bar-fill ${cacheTone}" style="width:${cachePct.toFixed(1)}%"></div>
+      </div>
       ${showAgyNote ? `<div style="margin-top:6px;font-size:10.5px;color:var(--hud-muted)">${escapeHtml(t("agyNote"))}</div>` : ""}
     `;
     popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
@@ -1740,9 +1824,11 @@
 
     const lastCache = s.cache.lastTurnRate != null ? (s.cache.lastTurnRate * 100).toFixed(1) + "%" : "--";
     const sessCache = s.cache.sessionRate != null ? (s.cache.sessionRate * 100).toFixed(1) + "%" : "--";
+    const avgSpeed = resolveModelAvgSpeed(s, qInfo.activeModelRaw);
+    const speedColor = (value) => value >= 150 ? "var(--hud-cyan)" : "var(--hud-fg)";
     const formatSpeed = (value) => value != null ? `${value.toFixed(1)} tok/s` : "--";
     const liveSpeedLine = liveStreamTps != null
-      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span>${formatSpeed(liveStreamTps)}</span></div>`
+      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span style="color:var(--hud-blue)">${formatSpeed(liveStreamTps)}</span></div>`
       : "";
     const e2eLine =
       s.speed.e2eTokPerSec != null
@@ -1762,13 +1848,13 @@
         </span>
       </div>
       <div class="t3-pop-row"><span>${escapeHtml(t("engineModel"))}</span><span>${escapeHtml(providerBadge)}</span></div>
-      <div class="t3-pop-row"><span>${escapeHtml(t("avgDecodeSpeed"))}</span><span>${formatSpeed(resolveModelAvgSpeed(s, qInfo.activeModelRaw))}</span></div>
-      <div class="t3-pop-row"><span>${escapeHtml(t("lastTurnSpeed"))}</span><span>${formatSpeed(s.speed.lastDecodeTps)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("avgDecodeSpeed"))}</span><span style="color:${speedColor(avgSpeed)}">${formatSpeed(avgSpeed)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("lastTurnSpeed"))}</span><span style="color:${speedColor(s.speed.lastDecodeTps)}">${formatSpeed(s.speed.lastDecodeTps)}</span></div>
       ${liveSpeedLine}
       ${e2eLine}
-      <div class="t3-pop-row"><span>${escapeHtml(t("cumCacheRound"))}</span><span>${sessCache} / ${lastCache}</span></div>
-      <div class="t3-pop-row"><span>${escapeHtml(t("cacheSaved"))}</span><span style="color:#10b981">${formatUsd(s.cache.savedUsd)}</span></div>
-      <div class="t3-pop-row"><span>${escapeHtml(t("contextRatio"))}</span><span>${ctxLine}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("cumCacheRound"))}</span><span><span style="color:${cacheColor(s.cache.sessionRate)}">${sessCache}</span> / <span style="color:${cacheColor(s.cache.lastTurnRate)}">${lastCache}</span></span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("cacheSaved"))}</span><span style="color:var(--hud-emerald)">${formatUsd(s.cache.savedUsd)}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("contextRatio"))}</span><span style="color:${contextColor(qInfo.ctxPct)}">${ctxLine}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("totalTokensWithSub"))}</span><span style="font-weight:600">${formatCompactTokens(s.tokens.total)} tok</span></div>
       ${subTokLine}
       <div class="t3-pop-row"><span>${escapeHtml(t("inpCacheRead"))}</span><span>${formatCompactTokens(s.tokens.input)} / ${formatCompactTokens(s.cache.cachedTokens)}</span></div>
@@ -1778,7 +1864,7 @@
       </div>
       ${
         s.cost.subagentCount > 0
-          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${s.cost.subagentCount})</span><span>+${formatUsd(s.cost.subagentUsd)}</span></div>
+          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${s.cost.subagentCount})</span><span style="color:var(--hud-violet)">+${formatUsd(s.cost.subagentUsd)}</span></div>
              <div class="t3-pop-row"><span>${escapeHtml(t("totalCost"))}</span><span style="font-weight:700">${formatUsd(s.cost.withSubagentsUsd)}</span></div>`
           : ""
       }
@@ -1839,6 +1925,7 @@
     let nextDotClass;
     let nextSpeed;
     let nextCache;
+    let nextCacheColor = "var(--hud-fg)";
     let nextTokens;
     let nextCost;
     let nextQuota = wk ? `${wk.remainingPct}%` : "";
@@ -1846,8 +1933,7 @@
     const ctxPctNum = qInfo.ctxPct != null ? Math.round(qInfo.ctxPct) : 0;
     const nextCtxTxt = qInfo.ctxPct != null ? `${ctxPctNum}%` : "0%";
     const nextRingOffset = (RING_CIRC * (1 - Math.max(0, Math.min(100, qInfo.ctxPct || 0)) / 100)).toFixed(2);
-    const nextRingColor =
-      ctxPctNum >= 90 ? "#ef4444" : ctxPctNum >= 75 ? "#f59e0b" : "var(--hud-fg)";
+    const nextRingColor = contextColor(qInfo.ctxPct);
     let nextBranch = t(window.innerWidth < 640 ? "graph" : "gitGraph");
     let hideDirty = false;
 
@@ -1871,31 +1957,36 @@
       }
       const rate = stats.cache.sessionRate ?? stats.cache.displayRate;
       nextCache = rate != null ? `${Math.round(rate * 100)}%` : "--%";
+      nextCacheColor = cacheColor(rate);
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
       const totalUsd = stats.cost.withSubagentsUsd;
-      const subSuffix = stats.cost.subagentCount > 0 ? ` (+${stats.cost.subagentCount}${t("sub")})` : "";
+      const subSuffix = stats.cost.subagentCount > 0 ? `<span class="t3-hud-sub-badge">(+${escapeHtml(stats.cost.subagentCount)}${escapeHtml(t("sub"))})</span>` : "";
       nextCost = `${formatUsd(totalUsd)}${subSuffix}`;
     }
 
-    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextBranch}|${hideDirty}|${hudLang}`;
+    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
     if (sig !== lastTopbarSig) {
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
       speedEl.textContent = nextSpeed;
+      speedEl.style.color = liveStreamTps != null && stats?.ok ? "var(--hud-blue)" : "var(--hud-fg)";
       cacheEl.textContent = nextCache;
+      cacheEl.style.color = nextCacheColor;
       tokensEl.textContent = nextTokens;
-      costEl.textContent = nextCost;
+      costEl.innerHTML = nextCost;
       if (nextQuota) {
         quotaSepEl.style.display = "inline-block";
         quotaItemEl.style.display = "inline-flex";
         quotaEl.textContent = nextQuota;
-        quotaEl.style.color =
-          nextQuotaTone === "err" ? "#ef4444" : nextQuotaTone === "warn" ? "#f59e0b" : "";
+        quotaEl.className = `val ${nextQuotaTone}`;
+        quotaBarEl.className = nextQuotaTone;
+        quotaBarEl.style.width = `${wk.remainingPct}%`;
       } else {
         quotaSepEl.style.display = "none";
         quotaItemEl.style.display = "none";
       }
       ctxPctEl.textContent = nextCtxTxt;
+      ctxPctEl.style.color = nextRingColor;
       ringArcEl.setAttribute("stroke-dashoffset", nextRingOffset);
       ringArcEl.style.stroke = nextRingColor;
       branchBtnText.textContent = nextBranch;
