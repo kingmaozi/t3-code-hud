@@ -422,11 +422,11 @@ describe("embed-manager", () => {
     fs.mkdirSync(path.join(cache, "models--mlx-community--embeddinggemma-2-8bit", "blobs"), { recursive: true });
     fs.writeFileSync(path.join(cache, "models--mlx-community--embeddinggemma-2-8bit", "blobs", "x"), "1234");
     fs.mkdirSync(mgrHome, { recursive: true });
-    const mgr = createEmbedManager({ homeDir: mgrHome, hubDir: hub, cacheDir: cache, port: 18099 });
+    const mgr = createEmbedManager({ homeDir: mgrHome, hubDir: hub, cacheDir: cache, port: 18099, launchAgentPlistPath: null });
     const st = mgr.getStatus();
     assert.equal(st.ok, true);
     assert.equal(st.port, 18099);
-    assert.equal(st.presets.length, 4);
+    assert.equal(st.presets.length, 11);
     const eg = st.presets.find((x) => x.id === "mlx-community/embeddinggemma-2-8bit");
     const qwen = st.presets.find((x) => x.id === "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ");
     assert.equal(eg.downloaded, true);

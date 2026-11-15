@@ -881,9 +881,7 @@
     function curatedModels() {
       const models = items(cache.embed, ["models", "presets", "availableModels"]);
       const defaults = [
-        { id: "mlx-community/embeddinggemma-2-8bit", name: "EmbeddingGemma-2-8bit" },
-        { id: "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ", name: "Qwen3-Embedding-0.6B-4bit" },
-        { id: "mlx-community/bge-small-zh-v1.5-4bit", name: "BGE-Small-ZH-4bit" },
+        { id: "mlx-community/Qwen3-Embedding-0.6B-8bit", name: "Qwen3 Embedding 0.6B · 8-bit", label: "Qwen3 Embedding 0.6B · 8-bit", sizeMb: 604, estRamMb: 680, dim: 1024 }, { id: "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ", name: "Qwen3 Embedding 0.6B · 4-bit DWQ", label: "Qwen3 Embedding 0.6B · 4-bit DWQ", sizeMb: 320, estRamMb: 380, dim: 1024 }, { id: "mlx-community/bge-m3-mlx-8bit", name: "BGE-M3 · 8-bit", label: "BGE-M3 · 8-bit", sizeMb: 576, estRamMb: 650, dim: 1024 }, { id: "mlx-community/bge-m3-mlx-4bit", name: "BGE-M3 · 4-bit", label: "BGE-M3 · 4-bit", sizeMb: 305, estRamMb: 360, dim: 1024 }, { id: "mlx-community/embeddinggemma-300m-8bit", name: "EmbeddingGemma 300M · 8-bit", label: "EmbeddingGemma 300M · 8-bit", sizeMb: 312, estRamMb: 370, dim: 768 }, { id: "mlx-community/embeddinggemma-300m-4bit", name: "EmbeddingGemma 300M · 4-bit", label: "EmbeddingGemma 300M · 4-bit", sizeMb: 165, estRamMb: 220, dim: 768 }, { id: "mlx-community/snowflake-arctic-embed-l-v2.0-8bit", name: "Arctic Embed L v2 · 8-bit", label: "Arctic Embed L v2 · 8-bit", sizeMb: 576, estRamMb: 650, dim: 1024 }, { id: "mlx-community/LFM2.5-Embedding-350M-4bit", name: "LFM2.5 Embedding 350M · 4-bit", label: "LFM2.5 Embedding 350M · 4-bit", sizeMb: 190, estRamMb: 250, dim: 1024 }, { id: "mlx-community/nomicai-modernbert-embed-base-bf16", name: "Nomic ModernBERT · BF16", label: "Nomic ModernBERT · BF16", sizeMb: 284, estRamMb: 340, dim: 768 }, { id: "mlx-community/embeddinggemma-2-8bit", name: "EmbeddingGemma 2 · 8-bit", label: "EmbeddingGemma 2 · 8-bit", sizeMb: 1177, estRamMb: 1635, dim: 768 },
       ];
       return (models.length ? models : defaults).map((model) => typeof model === "string" ? { id: model, name: model.split("/").pop() } : { ...model, id: model.id || model.modelId, name: model.name || model.label || (model.id || model.modelId || "").split("/").pop() }).filter((model) => model.id && !/^(keyword|fts5-zero-ram)$/.test(model.id) && !/keyword|fts/.test(model.mode || ""));
     }
@@ -908,7 +906,14 @@
       const status = keyword ? tr("纯关键词零内存模式 · 0 MB", "Keyword-only · 0 MB") : ready === true ? tr(`本地向量运行中${mb == null ? "" : ` · ${Math.round(mb)} MB`}`, `Local vectors running${mb == null ? "" : ` · ${Math.round(mb)} MB`}`) : active ? tr("正在准备本地向量模型", "Preparing local vector model") : tr("本地向量引擎 · 待就绪", "Local vector engine · Not ready");
       const selected = known.find((model) => model.id === state.modelChoice);
       const switchOnly = state.modelChoice === "keyword" || selected?.downloaded || selected?.installed || selected?.cached;
-      node.innerHTML = `<div class="hub-card hub-engine"><div class="hub-row"><span class="hub-engine-label">VECTOR ENGINE</span><span class="hub-grow"></span><span class="hub-badge hub-green">${icon("bolt", 10)}${esc(tr("轻量记忆", "Lightweight"))}</span></div><div id="t3-hub-engine-status" class="hub-engine-status">${icon(keyword ? "bolt" : "memory", 13)}<span>${esc(status)}</span></div><div class="hub-engine-model">${esc(keyword ? tr("不加载模型，全文检索依然可用。", "No model loaded. Full-text search stays available.") : modelId || tr("选择一个适合你的本地模型", "Choose your local model"))}</div><div class="hub-engine-controls"><select class="hub-select" name="embed-model" aria-label="${esc(tr("向量模型", "Embedding model"))}" ${active ? "disabled" : ""}>${known.map((model) => `<option value="${esc(model.id)}" ${state.modelChoice === model.id ? "selected" : ""}>${esc(model.name)}${model.downloaded || model.installed || model.cached ? ` [${esc(tr("已下载", "Downloaded"))}]` : ""}</option>`).join("")}<option value="keyword" ${state.modelChoice === "keyword" ? "selected" : ""}>${esc(tr("纯关键词零内存模式 0MB", "Keyword-only · 0 MB"))}</option><option value="custom" ${state.modelChoice === "custom" ? "selected" : ""}>${esc(tr("自定义模型…", "Custom model…"))}</option></select>${button("switch-embed", active ? tr("下载中", "Loading") : switchOnly ? tr("切换", "Switch") : tr("下载并启用", "Download & use"), { primary: true, icon: active ? undefined : switchOnly ? "bolt" : "download", disabled: active })}</div>${state.modelChoice === "custom" ? `<input class="hub-input" style="margin-top:8px" name="customModel" value="${esc(state.customModel)}" placeholder="HuggingFace ID / ${esc(tr("本地路径", "local path"))}" aria-label="${esc(tr("自定义模型地址", "Custom model ID or path"))}" spellcheck="false">` : ""}<label class="hub-checkbox"><input type="checkbox" name="useMirror" ${state.useMirror ? "checked" : ""} ${active ? "disabled" : ""}>${esc(tr("国内镜像加速 (hf-mirror)", "Use hf-mirror download accelerator"))}</label><div id="t3-hub-download-progress"></div>${data.downloadJob?.error ? `<div class="hub-hint" style="color:var(--hud-red);margin-top:9px">${esc(errorText(data.downloadJob.error))}</div>` : ""}</div>`;
+      const hw = data.hardware || null;
+      const vs = data.vectorStats || null;
+      const syncText = vs && (vs.totalMemories > 0 || vs.syncedVectors > 0) ? (vs.reindexing ? `正在重算向量索引 ${vs.syncedVectors}/${vs.totalMemories}…` : `向量索引 ${vs.syncedVectors}/${vs.totalMemories} 已同步`) : "";
+      const hwBanner = hw && hw.chipModel && hw.totalRamGb != null ? `<div class="hub-hint" id="t3-hub-engine-hardware" title="${esc(hw.recommendReason || "")}" style="margin-bottom:8px">🖥 ${esc(hw.chipModel)} · ${esc(hw.totalRamGb)} GB 内存 · 单实例共享支撑 10+ 项目并发</div>` : "";
+      const tierLabel = (model) => ({ compact: "省内存档", standard: "标准档", workstation: "工作站档", any: "任意档" }[model?.idealRamTier] || model?.idealRamTier || "");
+      const detailText = state.modelChoice === "keyword" ? tr("0 MB 常驻 · SQLite FTS5 内置检索", "0 MB resident · SQLite FTS5 内置检索") : selected ? `${selected.desc || selected.description || ""}${selected.estRamMb != null ? ` · 常驻约 ${selected.estRamMb} MB` : ""}${tierLabel(selected) ? ` · ${tierLabel(selected)}` : ""}${selected.dim ? ` · ${selected.dim}d` : ""}` : "";
+      const statusWithSync = syncText ? `${status} · ${syncText}` : status;
+      node.innerHTML = `<div class="hub-card hub-engine">${hwBanner}<div class="hub-row"><span class="hub-engine-label">VECTOR ENGINE</span><span class="hub-grow"></span><span class="hub-badge hub-green">${icon("bolt", 10)}${esc(tr("轻量记忆", "Lightweight"))}</span></div><div id="t3-hub-engine-status" class="hub-engine-status">${icon(keyword ? "bolt" : "memory", 13)}<span>${esc(statusWithSync)}</span></div><div class="hub-engine-model">${esc(keyword ? tr("不加载模型，全文检索依然可用。", "No model loaded. Full-text search stays available.") : modelId || tr("选择一个适合你的本地模型", "Choose your local model"))}</div><div class="hub-engine-controls"><select class="hub-select" name="embed-model" aria-label="${esc(tr("向量模型", "Embedding model"))}" ${active ? "disabled" : ""}>${known.map((model) => { const badge = model.recommendBadge || (model.recommended ? "★ 本机首选" : ""); const label = `${badge ? badge + " " : ""}${model.name}${model.sizeMb != null && model.dim ? ` (~${model.sizeMb} MB · ${model.dim}d)` : ""}${model.downloaded || model.installed || model.cached ? ` [${esc(tr("已下载", "Downloaded"))}]` : ""}`; return `<option value="${esc(model.id)}" ${state.modelChoice === model.id ? "selected" : ""}>${esc(label)}</option>`; }).join("")}<option value="keyword" ${state.modelChoice === "keyword" ? "selected" : ""}>${esc(tr("纯关键词零内存模式 0MB", "Keyword-only · 0 MB"))}</option><option value="custom" ${state.modelChoice === "custom" ? "selected" : ""}>${esc(tr("自定义模型…", "Custom model…"))}</option></select>${button("switch-embed", active ? tr("下载中", "Loading") : switchOnly ? tr("切换", "Switch") : tr("下载并启用", "Download & use"), { primary: true, icon: active ? undefined : switchOnly ? "bolt" : "download", disabled: active })}</div>${detailText ? `<div class="hub-hint" id="t3-hub-engine-detail" style="margin-top:8px">${esc(detailText)}</div>` : ""}${state.modelChoice === "custom" ? `<input class="hub-input" style="margin-top:8px" name="customModel" value="${esc(state.customModel)}" placeholder="HuggingFace ID / ${esc(tr("本地路径", "local path"))}" aria-label="${esc(tr("自定义模型地址", "Custom model ID or path"))}" spellcheck="false">` : ""}<label class="hub-checkbox"><input type="checkbox" name="useMirror" ${state.useMirror ? "checked" : ""} ${active ? "disabled" : ""}>${esc(tr("国内镜像加速 (hf-mirror)", "Use hf-mirror download accelerator"))}</label><div id="t3-hub-download-progress"></div>${data.downloadJob?.error ? `<div class="hub-hint" style="color:var(--hud-red);margin-top:9px">${esc(errorText(data.downloadJob.error))}</div>` : ""}</div>`;
       renderDownloadProgress();
     }
     function renderDownloadProgress() {
@@ -1504,22 +1509,26 @@
       }
     }
     async function refreshEmbed(render = true, force = false) {
-      if (cache.embed && !force && !cache.embed.downloadJob?.active) return;
+      if (cache.embed && !force && !cache.embed.downloadJob?.active && !cache.embed.vectorStats?.reindexing) return;
       const version = ++embedVersion;
       try {
         const data = await request("embed:status", {});
         if (disposed || version !== embedVersion) return;
         const wasActive = cache.embed?.downloadJob?.active;
+        const prevVs = cache.embed?.vectorStats;
+        const prevSig = prevVs ? `${prevVs.syncedVectors}/${prevVs.totalMemories}:${prevVs.reindexing}` : "";
+        const nextSig = data.vectorStats ? `${data.vectorStats.syncedVectors}/${data.vectorStats.totalMemories}:${data.vectorStats.reindexing}` : "";
         const wasWaiting = state.embedReadyDeadline > 0;
         cache.embed = data;
         if (!state.embedInitialized) { state.useMirror = !!data.useMirror; state.embedInitialized = true; }
         if (data.downloadJob?.active) state.embedReadyDeadline = Date.now() + 60000;
+        if (data.vectorStats?.reindexing) state.embedReadyDeadline = Date.now() + 300000;
         const ready = data.ready ?? data.running ?? data.engine?.ready;
         const keyword = /keyword|fts|none/.test(data.mode || data.engine?.mode || "");
-        if (ready === true || keyword) state.embedReadyDeadline = 0;
+        if ((ready === true || keyword) && !data.vectorStats?.reindexing) state.embedReadyDeadline = 0;
         delete errors.embed;
         if (render && state.tab === "memory") {
-          if (!!wasActive !== !!data.downloadJob?.active || wasWaiting && ready === true) renderEngine();
+          if (!!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || wasWaiting && ready === true) renderEngine();
           else renderDownloadProgress();
         }
         if ((wasActive || wasWaiting) && ready === true && !data.downloadJob?.active && !data.downloadJob?.error) {
@@ -1538,7 +1547,7 @@
     function scheduleEmbedPoll() {
       cancelTimer(embedTimer);
       embedTimer = null;
-      if (!disposed && state.open && state.tab === "memory" && (cache.embed?.downloadJob?.active || state.embedReadyDeadline)) embedTimer = later(pollEmbed, 1000);
+      if (!disposed && state.open && state.tab === "memory" && (cache.embed?.downloadJob?.active || state.embedReadyDeadline || cache.embed?.vectorStats?.reindexing)) embedTimer = later(pollEmbed, 1000);
     }
     async function pollEmbed() {
       if (disposed || !state.open || state.tab !== "memory" || document.hidden) return;

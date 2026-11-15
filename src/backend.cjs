@@ -2051,8 +2051,32 @@ async function hubCall(action, payload = {}) {
       case "memory:delete": return memoryVault.deleteMemory(payload);
       case "memory:pinToAgentsMd": return memoryVault.pinToAgentsMd(payload);
       case "memory:migratePowerContext": return await memoryVault.migrateFromPowerContext(payload);
-      case "embed:status": return await embedManager.getStatus();
-      case "embed:switch": return await embedManager.switchModel(payload);
+      case "memory:stats": return memoryVault.getStats(payload || {});
+      case "embed:status": {
+        const status = await embedManager.getStatus();
+        try {
+          const stats = memoryVault.getStats({});
+          if (stats && stats.vectorStats) status.vectorStats = stats.vectorStats;
+        } catch {}
+        return status;
+      }
+      case "embed:switch": {
+        try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
+        const switchResult = await embedManager.switchModel({
+          ...(payload || {}),
+          onReadyReindex: () => {
+            try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
+            return memoryVault.reindexVectors({ forceModelSync: true });
+          },
+        });
+        try {
+          if (switchResult && switchResult.ok && switchResult.mode === "mlx") {
+            try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
+            memoryVault.reindexVectors({ forceModelSync: true });
+          }
+        } catch {}
+        return switchResult;
+      }
       case "subagents:list": return hubSubagents.listSubagents(payload);
       case "subagents:resolveRoute":
       case "subagents:resolve": return hubSubagents.resolveSubagentRoute(payload);

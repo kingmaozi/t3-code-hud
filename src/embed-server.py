@@ -18,8 +18,8 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-MODEL_ID = os.environ.get("EMBED_MODEL", "mlx-community/embeddinggemma-2-8bit")
-SERVED_NAME = os.environ.get("EMBED_NAME", "EmbeddingGemma-2-768")
+MODEL_ID = os.environ.get("EMBED_MODEL", "mlx-community/Qwen3-Embedding-0.6B-8bit")
+SERVED_NAME = os.environ.get("EMBED_NAME", "Qwen3-Embedding-0.6B-8bit")
 MAX_LEN = int(os.environ.get("EMBED_MAX_LEN", "8192"))
 PREFIX = os.environ.get("EMBED_PREFIX", "")
 CACHE_LIMIT_MB = int(os.environ.get("EMBED_CACHE_LIMIT_MB", "256"))
@@ -38,8 +38,8 @@ def _reclaim_cache():
         pass
 
 
-def _get_rss_mb():
-    # Prefer rusage; on macOS ru_maxrss is bytes, on Linux it is KiB.
+def _get_peak_rss_mb():
+    # Historical peak RSS (ru_maxrss never decreases).
     try:
         ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         import sys
@@ -48,12 +48,80 @@ def _get_rss_mb():
             return round(float(ru) / (1024 * 1024), 1)
         return round(float(ru) / 1024, 1)
     except Exception:
-        pass
+        return 0.0
+
+
+def _get_rss_mb():
+    # Prefer current live RSS via ps (ru_maxrss only reports the peak).
     try:
         out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())], text=True, timeout=1).strip()
-        return round(float(out) / 1024, 1)
+        if out:
+            return round(float(out) / 1024, 1)
     except Exception:
-        return 0.0
+        pass
+    return _get_peak_rss_mb()
+
+
+def _format_inputs_for_model(texts: list[str], model_id: str, input_type: str | None) -> list[str]:
+    if PREFIX:
+        return [PREFIX + t for t in texts]
+    if input_type is None:
+        return list(texts)
+    mid = (model_id or "").lower()
+    out: list[str] = []
+    if input_type == "query":
+        for t in texts:
+            if "qwen3-embedding" in mid or (mid.endswith("qwen3") or "qwen3" in mid):
+                if t.startswith("Instruct:"):
+                    out.append(t)
+                else:
+                    out.append(
+                        f"Instruct: Given a software engineering search query, retrieve relevant project memories, architecture rules, and debugging pitfalls\nQuery:{t}"
+                    )
+            elif "embeddinggemma" in mid:
+                if t.startswith("task: search result"):
+                    out.append(t)
+                else:
+                    out.append(f"task: search result | query: {t}")
+            elif "modernbert-embed" in mid:
+                if t.startswith("search_query:"):
+                    out.append(t)
+                else:
+                    out.append(f"search_query: {t}")
+            elif "snowflake-arctic-embed" in mid:
+                if t.startswith("query:"):
+                    out.append(t)
+                else:
+                    out.append(f"query: {t}")
+            elif "multilingual-e5" in mid:
+                if t.startswith("query:"):
+                    out.append(t)
+                else:
+                    out.append(f"query: {t}")
+            else:
+                out.append(t)
+        return out
+    if input_type == "document":
+        for t in texts:
+            if "embeddinggemma" in mid:
+                if t.startswith("title: none"):
+                    out.append(t)
+                else:
+                    out.append(f"title: none | text: {t}")
+            elif "modernbert-embed" in mid:
+                if t.startswith("search_document:"):
+                    out.append(t)
+                else:
+                    out.append(f"search_document: {t}")
+            elif "multilingual-e5" in mid:
+                if t.startswith("passage:"):
+                    out.append(t)
+                else:
+                    out.append(f"passage: {t}")
+            else:
+                out.append(t)
+        return out
+    return list(texts)
 
 
 def _load_model_sync(model_id):
@@ -101,14 +169,15 @@ class EmbeddingRequest(BaseModel):
     model: str | None = None
     dimensions: int | None = None
     encoding_format: str | None = None
+    input_type: str | None = None
 
 
-def embed_texts(texts, dimensions=None):
+def embed_texts(texts, dimensions=None, input_type=None):
     tokenizer = state["tokenizer"]
     model = state["model"]
     if tokenizer is None or model is None:
         raise RuntimeError("embedding model is not loaded")
-    prepared = [PREFIX + t for t in texts]
+    prepared = _format_inputs_for_model(list(texts), state.get("model_id", ""), input_type)
     chunks = []
     tokens = 0
     elapsed = 0.0
@@ -141,6 +210,7 @@ async def health():
     except Exception:
         cache_mb = 0.0
     rss_mb = _get_rss_mb()
+    peak_rss_mb = _get_peak_rss_mb()
     return {
         "ok": True,
         "status": "ok",
@@ -150,6 +220,8 @@ async def health():
         "model_id": state["model_id"],
         "dim": state["native_dim"],
         "rssMb": rss_mb,
+        "peakRssMb": peak_rss_mb,
+        "peak_rss_mb": peak_rss_mb,
         "rss_mb": rss_mb,
         "active_mb": active_mb,
         "cache_mb": cache_mb,
@@ -170,7 +242,7 @@ async def embeddings(req: EmbeddingRequest):
         return {"error": {"message": "input must be a string or a list of strings", "type": "invalid_request_error"}}
     texts = [t if t else " " for t in texts]
     async with lock:
-        arr, tokens, elapsed = await asyncio.to_thread(embed_texts, texts, req.dimensions)
+        arr, tokens, elapsed = await asyncio.to_thread(embed_texts, texts, req.dimensions, req.input_type)
     data = [{"object": "embedding", "index": i, "embedding": vec.tolist()} for i, vec in enumerate(arr)]
     return {
         "object": "list",

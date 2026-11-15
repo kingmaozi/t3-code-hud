@@ -296,6 +296,10 @@ function createMemoryVault(opts = {}) {
   const embedUrl = opts.embeddingUrl || process.env.T3_EMBED_URL || DEFAULT_EMBED_URL;
   const embedTimeoutMs = opts.embeddingTimeoutMs || EMBED_TIMEOUT_MS;
   const embedFn = opts._embedFn || opts.embedFn || null;
+  const healthFn = opts._healthFn || opts.healthFn || null;
+  const embedHealthUrl = opts.embeddingHealthUrl || embedUrl.replace(/\/v1\/embeddings\/?$/, "/health");
+  let _healthCache = { modelId: null, dim: null, at: 0 };
+  let _reindexing = false;
 
   function projectsDir() {
     return path.join(vaultDir, "projects");
@@ -470,6 +474,51 @@ function createMemoryVault(opts = {}) {
     if (dirExists(path.join(vaultDir, "global"))) set.add(GLOBAL_SLUG);
     return [...set];
   }
+  function invalidateEmbedHealthCache() {
+    _healthCache = { modelId: null, dim: null, at: 0 };
+  }
+  function getEmbedHealthSync() {
+    const now = Date.now();
+    if (_healthCache.modelId && now - _healthCache.at < 5000) return _healthCache;
+    if (healthFn) {
+      try {
+        const h = healthFn();
+        if (h && (h.modelId || h.model_id)) {
+          _healthCache = { modelId: String(h.modelId || h.model_id), dim: h.dim != null ? Number(h.dim) : null, at: now };
+        } else if (h && h.dim != null) {
+          _healthCache = { modelId: h.modelId || h.model_id || null, dim: Number(h.dim), at: now };
+        } else if (h == null) {
+          _healthCache = { modelId: null, dim: null, at: now };
+        }
+        return _healthCache;
+      } catch {
+        _healthCache = { modelId: null, dim: null, at: now };
+        return _healthCache;
+      }
+    }
+    try {
+      const res = spawnSync(
+        "curl",
+        ["-s", "-m", "0.8", "--connect-timeout", "0.8", embedHealthUrl],
+        { encoding: "utf8", timeout: 1200 }
+      );
+      if (!res.error && res.status === 0 && res.stdout) {
+        const j = JSON.parse(res.stdout);
+        const mid = j && (j.modelId || j.model_id || j.model);
+        const dim = j && (j.dim != null ? Number(j.dim) : null);
+        if (mid) _healthCache = { modelId: String(mid), dim: Number.isFinite(dim) ? dim : null, at: now };
+        else _healthCache = { modelId: null, dim: null, at: now };
+      } else {
+        _healthCache = { modelId: null, dim: null, at: now };
+      }
+    } catch {
+      _healthCache = { modelId: null, dim: null, at: now };
+    }
+    return _healthCache;
+  }
+  function activeEmbedModelId() {
+    return getEmbedHealthSync().modelId || "local";
+  }
   function syncOneFile(db, slug, module) {
     const f = moduleFileFor(slug, module);
     if (!fileExists(f)) return { changed: false, upserted: 0, deleted: 0 };
@@ -628,17 +677,21 @@ function createMemoryVault(opts = {}) {
       db.close();
     }
   }
-  function embedTextsSync(texts) {
+  function embedTextsSync(texts, embedOpts = {}) {
+    const inputType = embedOpts.inputType ?? embedOpts.input_type ?? null;
     if (embedFn) {
       try {
-        const out = embedFn(texts);
+        const active = getEmbedHealthSync();
+        const fnOpts = { inputType, input_type: inputType, modelId: active.modelId || "local", dim: active.dim || null };
+        const out = embedFn(texts, fnOpts);
         return out || null;
       } catch {
         return null;
       }
     }
     try {
-      const payload = JSON.stringify({ input: texts });
+      const payloadObj = inputType ? { input: texts, input_type: inputType } : { input: texts };
+      const payload = JSON.stringify(payloadObj);
       const res = spawnSync(
         "curl",
         ["-s", "-m", String(embedTimeoutMs / 1000), "--connect-timeout", String(embedTimeoutMs / 1000), "-X", "POST", embedUrl, "-H", "Content-Type: application/json", "-d", payload],
@@ -652,10 +705,13 @@ function createMemoryVault(opts = {}) {
       return null;
     }
   }
-  async function embedTextsAsync(texts) {
+  async function embedTextsAsync(texts, embedOpts = {}) {
+    const inputType = embedOpts.inputType ?? embedOpts.input_type ?? null;
     if (embedFn) {
       try {
-        return await Promise.resolve(embedFn(texts));
+        const active = getEmbedHealthSync();
+        const fnOpts = { inputType, input_type: inputType, modelId: active.modelId || "local", dim: active.dim || null };
+        return await Promise.resolve(embedFn(texts, fnOpts));
       } catch {
         return null;
       }
@@ -666,7 +722,7 @@ function createMemoryVault(opts = {}) {
       const res = await fetch(embedUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: texts }),
+        body: JSON.stringify(inputType ? { input: texts, input_type: inputType } : { input: texts }),
         signal: ctrl.signal,
       });
       clearTimeout(t);
@@ -701,35 +757,61 @@ function createMemoryVault(opts = {}) {
   }
   function triggerBackgroundEmbedding(id, title, content) {
     const combined = embeddingText({ title, content });
+    const targetModelId = activeEmbedModelId();
     setImmediate(() => {
-      embedTextsAsync([combined]).then((vecs) => {
+      embedTextsAsync([combined], { inputType: "document" }).then((vecs) => {
         if (!vecs || !vecs[0]) return;
-        storeVector(id, "local", vecs[0], combined);
+        storeVector(id, targetModelId, vecs[0], combined);
       }).catch(() => {});
     });
   }
-  function triggerBatchEmbedding() {
-    setImmediate(async () => {
+  function needsReindexRow(row, activeId, activeDim) {
+    if (row.v_model == null) return true;
+    if (activeId === "mlx-community/embeddinggemma-2-8bit") {
+      return !((row.v_model === "mlx-community/embeddinggemma-2-8bit" || row.v_model === "local" || row.v_model === "powercontext-legacy") && Number(row.v_dim) === 768);
+    }
+    if (row.v_model !== activeId) return true;
+    if (activeDim != null && activeDim > 0 && Number(row.v_dim) !== Number(activeDim)) return true;
+    return false;
+  }
+  async function performBatchEmbedding({ targetModelId } = {}) {
+    if (_reindexing) return { ok: true, queued: 0, alreadyReindexing: true };
+    _reindexing = true;
+    try {
+      const health = getEmbedHealthSync();
+      const activeId = targetModelId || health.modelId || "local";
+      const activeDim = health.dim || null;
+      const db = openDb();
+      let rows = [];
       try {
-        const db = openDb();
-        let rows = [];
-        try {
-          rows = db.prepare("SELECT m.id, m.title, m.content FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id WHERE v.id IS NULL").all();
-        } finally {
-          db.close();
+        const all = db.prepare("SELECT m.id, m.title, m.content, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id").all();
+        rows = all.filter((r) => needsReindexRow(r, activeId, activeDim));
+      } finally {
+        db.close();
+      }
+      const total = rows.length;
+      const B = 32;
+      for (let i = 0; i < rows.length; i += B) {
+        const chunk = rows.slice(i, i + B);
+        const texts = chunk.map((r) => (String(r.title || "") + "\n" + String(r.content || "")).slice(0, 8000));
+        const vecs = await embedTextsAsync(texts, { inputType: "document" });
+        if (!vecs) break;
+        for (let k = 0; k < chunk.length; k += 1) {
+          if (vecs[k]) storeVector(chunk[k].id, activeId, vecs[k], texts[k]);
         }
-        const B = 32;
-        for (let i = 0; i < rows.length; i += B) {
-          const chunk = rows.slice(i, i + B);
-          const texts = chunk.map((r) => (String(r.title || "") + "\n" + String(r.content || "")).slice(0, 8000));
-          const vecs = await embedTextsAsync(texts);
-          if (!vecs) return;
-          for (let k = 0; k < chunk.length; k += 1) {
-            if (vecs[k]) storeVector(chunk[k].id, "local", vecs[k], texts[k]);
-          }
-        }
-      } catch {}
-    });
+      }
+      return { ok: true, queued: total };
+    } catch {
+      return { ok: true, queued: 0 };
+    } finally {
+      _reindexing = false;
+    }
+  }
+  function triggerBatchEmbedding(opts = {}) {
+    const targetModelId = opts && typeof opts === "object" ? (opts.targetModelId || null) : null;
+    const promise = performBatchEmbedding({ targetModelId });
+    promise.catch(() => {});
+    return promise;
   }
   function resolveVaultSlug(projectRoot) {
     const raw = String(projectRoot);
@@ -756,18 +838,39 @@ function createMemoryVault(opts = {}) {
   function vectorsFor(db, items) {
     const vectors = new Map();
     const missing = [];
+    const health = getEmbedHealthSync();
+    const activeId = health.modelId || "local";
+    const activeDim = health.dim || null;
+    const isLegacy = activeId === "mlx-community/embeddinggemma-2-8bit";
     for (const item of items) {
-      const stored = db.prepare("SELECT * FROM memory_vectors WHERE id=? AND model_id='local'").get(item.id);
+      let stored = null;
+      try {
+        if (isLegacy) {
+          stored = db.prepare("SELECT * FROM memory_vectors WHERE id=? AND model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND dim=768").get(item.id);
+        } else if (activeDim) {
+          stored = db.prepare("SELECT * FROM memory_vectors WHERE id=? AND model_id=? AND dim=?").get(item.id, activeId, activeDim);
+        } else {
+          stored = db.prepare("SELECT * FROM memory_vectors WHERE id=? AND model_id=?").get(item.id, activeId);
+        }
+      } catch { stored = null; }
       let vec = null;
-      if (stored && stored.vec_f32.byteLength === stored.dim * 4) {
-        const bytes = Uint8Array.from(stored.vec_f32);
-        vec = new Float32Array(bytes.buffer);
+      if (stored) {
+        try {
+          const raw = stored.vec_f32;
+          const byteLength = raw && raw.byteLength != null ? raw.byteLength : (raw && raw.length != null ? raw.length : 0);
+          if (byteLength === stored.dim * 4) {
+            const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+            vec = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 4));
+            vec = new Float32Array(vec);
+          }
+        } catch { vec = null; }
       }
-      if (validVector(vec)) vectors.set(item.id, vec);
+      const dimOk = !activeDim || !vec || vec.length === activeDim || (isLegacy && vec.length === 768);
+      if (validVector(vec) && dimOk) vectors.set(item.id, vec);
       else missing.push(item);
     }
     if (missing.length) {
-      const result = embedTextsSync(missing.map(embeddingText));
+      const result = embedTextsSync(missing.map(embeddingText), { inputType: "document" });
       for (let i = 0; i < missing.length; i++) {
         if (result && validVector(result[i])) vectors.set(missing[i].id, result[i]);
       }
@@ -883,8 +986,8 @@ function createMemoryVault(opts = {}) {
         } catch (e) { db.exec("ROLLBACK"); throw e; }
         if (textChanged) {
           const vec = embeddingText(item) === embeddingText(incoming) ? vectors.get(incoming.id) : null;
-          const embedded = vec || embedTextsSync([embeddingText(item)])?.[0];
-          if (validVector(embedded)) putVector(db, item.id, embedded);
+          const embedded = vec || embedTextsSync([embeddingText(item)], { inputType: "document" })?.[0];
+          if (validVector(embedded)) putVector(db, item.id, embedded, activeEmbedModelId());
         }
         rewriteModules(db, slug, [mod, ...(existing ? [existing.module] : [])]);
         touchProject(slug, item.updatedAt);
@@ -1134,13 +1237,17 @@ function createMemoryVault(opts = {}) {
         const vecMap = new Map();
         const vecOrder = [];
         try {
-          const vecs = embedTextsSync([q]);
+          const vecs = embedTextsSync([q], { inputType: "query" });
           if (vecs && vecs[0]) {
             const qv = vecs[0];
             const dim = qv.length;
+            const health = getEmbedHealthSync();
+            const activeId = health.modelId || "local";
+            const isLegacy = activeId === "mlx-community/embeddinggemma-2-8bit";
             let vrows = [];
             try {
-              vrows = db.prepare("SELECT * FROM memory_vectors WHERE dim = ?").all(dim);
+              if (isLegacy) vrows = db.prepare("SELECT * FROM memory_vectors WHERE model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND dim = ?").all(dim);
+              else vrows = db.prepare("SELECT * FROM memory_vectors WHERE model_id = ? AND dim = ?").all(activeId, dim);
             } catch {
               vrows = [];
             }
@@ -1274,7 +1381,7 @@ function createMemoryVault(opts = {}) {
             // matches), rather than falling back mid-consolidation.
             if (sourceVector) {
               vectors.set(keep.id, sourceVector);
-              putVector(db, keep.id, sourceVector);
+              putVector(db, keep.id, sourceVector, activeEmbedModelId());
             }
             active.set(keep.id, merged);
             active.delete(remove.id);
@@ -1632,19 +1739,52 @@ function createMemoryVault(opts = {}) {
       return { ok: false, error: e.message || String(e) };
     }
   }
-  function reindexVectors() {
-    triggerBatchEmbedding();
-    let count = 0;
+  function reindexVectors(opts = {}) {
+    const targetModelId = opts && typeof opts === "object" ? (opts.targetModelId || null) : null;
+    let queued = 0;
     try {
+      const health = getEmbedHealthSync();
+      const activeId = targetModelId || health.modelId || "local";
+      const activeDim = health.dim || null;
       const db = openDb();
       try {
-        const r = db.prepare("SELECT COUNT(*) AS c FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id WHERE v.id IS NULL").get();
-        count = r ? Number(r.c) : 0;
+        const all = db.prepare("SELECT m.id, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id").all();
+        queued = all.filter((r) => needsReindexRow(r, activeId, activeDim)).length;
       } finally {
         db.close();
       }
     } catch {}
-    return { ok: true, queued: count };
+    const promise = triggerBatchEmbedding({ targetModelId });
+    return { ok: true, queued, promise };
+  }
+  function getStats() {
+    let totalMemories = 0;
+    let syncedVectors = 0;
+    let activeModelId = "local";
+    try {
+      const health = getEmbedHealthSync();
+      activeModelId = health.modelId || "local";
+      const activeDim = health.dim || null;
+      const isLegacy = activeModelId === "mlx-community/embeddinggemma-2-8bit";
+      const db = openDb();
+      try {
+        const t = db.prepare("SELECT COUNT(*) AS c FROM memories").get();
+        totalMemories = t ? Number(t.c) : 0;
+        if (isLegacy) {
+          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND dim=768").get();
+          syncedVectors = s ? Number(s.c) : 0;
+        } else if (activeDim) {
+          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id=? AND dim=?").get(activeModelId, activeDim);
+          syncedVectors = s ? Number(s.c) : 0;
+        } else {
+          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id=?").get(activeModelId);
+          syncedVectors = s ? Number(s.c) : 0;
+        }
+      } finally {
+        db.close();
+      }
+    } catch {}
+    return { ok: true, vectorStats: { totalMemories, syncedVectors, activeModelId, reindexing: _reindexing } };
   }
   return {
     vaultDir,
@@ -1661,7 +1801,10 @@ function createMemoryVault(opts = {}) {
     syncFromMarkdownIfChanged,
     ensureProject,
     resolveProjectSlug: resolveVaultSlug,
+    getStats,
     reindexVectors,
+    triggerBatchEmbedding,
+    invalidateEmbedHealthCache,
     _ensureProjectVault: ensureProjectVault,
   };
 }
@@ -1697,6 +1840,15 @@ function migrateFromPowerContext(a) {
 function syncFromMarkdownIfChanged(a) {
   return getDefaultMemoryVault().syncFromMarkdownIfChanged(a);
 }
+function getStats(a) {
+  return getDefaultMemoryVault().getStats(a || {});
+}
+function reindexVectors(a) {
+  return getDefaultMemoryVault().reindexVectors(a || {});
+}
+function invalidateEmbedHealthCache() {
+  return getDefaultMemoryVault().invalidateEmbedHealthCache();
+}
 module.exports = {
   createMemoryVault,
   getDefaultMemoryVault,
@@ -1709,6 +1861,9 @@ module.exports = {
   pinToAgentsMd,
   migrateFromPowerContext,
   syncFromMarkdownIfChanged,
+  getStats,
+  reindexVectors,
+  invalidateEmbedHealthCache,
   slugify,
   slugFromProjectRoot,
   scopeHashFor,
