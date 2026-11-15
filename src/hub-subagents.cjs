@@ -492,9 +492,12 @@ function createSubagentsManager(opts = {}) {
     let next = "";
     if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
       const before = existing.slice(0, sIdx);
-      const after = existing.slice(eIdx + endMarker.length);
+      let after = existing.slice(eIdx + endMarker.length);
+      // The block already ends with a trailing "\n"; consume the one
+      // newline it contributed so repeated saves stay byte-identical.
+      if (after.startsWith("\r\n")) after = after.slice(2);
+      else if (after.startsWith("\n")) after = after.slice(1);
       next = before + block + after;
-      // Ensure no extra blank-line collapse issues: keep deterministic
     } else {
       next = (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + block;
     }

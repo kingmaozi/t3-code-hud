@@ -2043,7 +2043,8 @@ async function hubCall(action, payload = {}) {
       case "hooks:remove": return hubHooks.deleteCustomHook(payload);
       case "hooks:setPlugin": return hubHooks.setPluginHooks(payload);
       case "memory:overview": return memoryVault.getOverview(payload);
-      case "memory:list": return await memoryVault.listMemories(payload);
+      case "memory:list":
+      case "memory:search": return await memoryVault.listMemories(payload);
       case "memory:save": return await memoryVault.saveMemory(payload);
       case "memory:consolidate": return await memoryVault.consolidateMemories(payload);
       case "memory:rollback": return await memoryVault.rollbackMemory(payload);
@@ -2056,6 +2057,39 @@ async function hubCall(action, payload = {}) {
       case "subagents:resolveRoute":
       case "subagents:resolve": return hubSubagents.resolveSubagentRoute(payload);
       case "subagents:save": return hubSubagents.saveSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      case "subagents:update": {
+        const p = payload || {};
+        if (p.item && typeof p.item === "object") {
+          return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+        }
+        if (p.id || p.name) {
+          const { id, item: _item, scope, projectRoot, extraSyncPaths, ...patch } = p;
+          const targetId = id || patch.name;
+          const targetScope = scope || (projectRoot ? "project" : "global");
+          let existing;
+          try {
+            const listed = hubSubagents.listSubagents({ projectRoot: targetScope === "project" ? (projectRoot || null) : null });
+            const findIn = (arr) => (arr || []).find((x) => x.id === targetId)
+              || (arr || []).find((x) => x.name === (patch.name || targetId));
+            existing = targetScope === "project"
+              ? (findIn(listed.projectItems) || findIn(listed.globalItems))
+              : findIn(listed.globalItems);
+          } catch {}
+          const mergedItem = {
+            ...existing, ...patch,
+            id: existing ? existing.id : targetId,
+            name: patch.name !== undefined ? patch.name : (existing ? existing.name : targetId),
+          };
+          return hubSubagents.saveSubagent({
+            ...p,
+            scope: targetScope,
+            projectRoot: targetScope === "project" ? projectRoot : null,
+            extraSyncPaths: discoverAntigravityRulesPaths(extraSyncPaths),
+            item: mergedItem,
+          });
+        }
+        return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+      }
       case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
       default: return { ok: false, error: "unknown action: " + action };
     }

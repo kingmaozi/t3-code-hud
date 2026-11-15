@@ -126,6 +126,180 @@ const BUILTIN_UPSTREAM_MCPS = [
   { name: "github", url: "https://api.githubcopilot.com/mcp/" },
 ];
 
+function stripTomlCommentOutsideQuotes(line) {
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inDouble) {
+      if (c === "\\") { i++; continue; }
+      if (c === '"') inDouble = false;
+      continue;
+    }
+    if (inSingle) {
+      if (c === "'") inSingle = false;
+      continue;
+    }
+    if (c === '"') { inDouble = true; continue; }
+    if (c === "'") { inSingle = true; continue; }
+    if (c === "#") return line.slice(0, i);
+  }
+  return line;
+}
+
+function parseTomlDottedPath(text) {
+  if (typeof text !== "string") return null;
+  let i = 0;
+  const n = text.length;
+  const parts = [];
+  const skipWs = () => { while (i < n && (text[i] === " " || text[i] === "\t")) i++; };
+  skipWs();
+  if (i >= n) return null;
+  while (true) {
+    skipWs();
+    if (i >= n) return null;
+    const c = text[i];
+    let seg = null;
+    if (c === '"') {
+      i++;
+      let out = "";
+      let closed = false;
+      while (i < n) {
+        const ch = text[i];
+        if (ch === '"') { i++; closed = true; break; }
+        if (ch === "\\") {
+          if (i + 1 >= n) return null;
+          const esc = text[i + 1];
+          if (esc === "b") out += "\b", i += 2;
+          else if (esc === "t") out += "\t", i += 2;
+          else if (esc === "n") out += "\n", i += 2;
+          else if (esc === "f") out += "\f", i += 2;
+          else if (esc === "r") out += "\r", i += 2;
+          else if (esc === '"') out += '"', i += 2;
+          else if (esc === "\\") out += "\\", i += 2;
+          else if (esc === "u") {
+            if (i + 5 >= n) return null;
+            const hex = text.slice(i + 2, i + 6);
+            if (!/^[0-9A-Fa-f]{4}$/.test(hex)) return null;
+            out += String.fromCodePoint(parseInt(hex, 16));
+            i += 6;
+          } else if (esc === "U") {
+            if (i + 9 >= n) return null;
+            const hex = text.slice(i + 2, i + 10);
+            if (!/^[0-9A-Fa-f]{8}$/.test(hex)) return null;
+            const cp = parseInt(hex, 16);
+            if (!Number.isFinite(cp) || cp < 0 || cp > 0x10FFFF) return null;
+            out += String.fromCodePoint(cp);
+            i += 10;
+          } else {
+            return null;
+          }
+          continue;
+        }
+        out += ch;
+        i++;
+      }
+      if (!closed) return null;
+      seg = out;
+    } else if (c === "'") {
+      const start = i + 1;
+      let j = start;
+      while (j < n && text[j] !== "'") j++;
+      if (j >= n) return null;
+      seg = text.slice(start, j);
+      i = j + 1;
+    } else if (/[A-Za-z0-9_-]/.test(c)) {
+      let j = i;
+      while (j < n && /[A-Za-z0-9_-]/.test(text[j])) j++;
+      seg = text.slice(i, j);
+      i = j;
+    } else {
+      return null;
+    }
+    parts.push(seg);
+    skipWs();
+    if (i >= n) break;
+    if (text[i] === ".") {
+      i++;
+      skipWs();
+      if (i >= n) return null;
+      continue;
+    }
+    return null;
+  }
+  return parts;
+}
+
+function parseTomlTableHeader(line) {
+  if (typeof line !== "string") return null;
+  let start = 0;
+  while (start < line.length && (line[start] === " " || line[start] === "\t")) start++;
+  if (start >= line.length || line[start] !== "[") return null;
+  const noComment = stripTomlCommentOutsideQuotes(line);
+  const trimmed = noComment.trim();
+  let isArrayTable = false;
+  let inner = null;
+  if (trimmed.startsWith("[[")) {
+    if (!trimmed.endsWith("]]")) return null;
+    isArrayTable = true;
+    inner = trimmed.slice(2, trimmed.length - 2);
+  } else {
+    if (!trimmed.endsWith("]")) return null;
+    inner = trimmed.slice(1, trimmed.length - 1);
+  }
+  const parsed = parseTomlDottedPath(inner);
+  if (!parsed || parsed.length === 0) return null;
+  return { isArrayTable, path: parsed };
+}
+
+function parseTomlKeyValue(line) {
+  if (typeof line !== "string") return null;
+  let inDouble = false;
+  let inSingle = false;
+  let eqIdx = -1;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inDouble) {
+      if (c === "\\") { i++; continue; }
+      if (c === '"') inDouble = false;
+      continue;
+    }
+    if (inSingle) {
+      if (c === "'") inSingle = false;
+      continue;
+    }
+    if (c === "#") break;
+    if (c === "=") { eqIdx = i; break; }
+    if (c === '"') { inDouble = true; continue; }
+    if (c === "'") { inSingle = true; continue; }
+  }
+  if (eqIdx < 0 || inDouble || inSingle) return null;
+  const lhs = line.slice(0, eqIdx);
+  const rhs = line.slice(eqIdx + 1);
+  if (!lhs.trim()) return null;
+  const parsed = parseTomlDottedPath(lhs);
+  if (!parsed || parsed.length === 0) return null;
+  const rhsTrimmed = rhs.replace(/^\s+/, "");
+  return { isInlineTable: rhsTrimmed.startsWith("{"), path: parsed, valueStart: eqIdx + 1 };
+}
+
+const isTomlHubKey = (k) => k === "t3_hub" || k === "t3-hub";
+
+function isHubMcpPath(p) {
+  return Array.isArray(p) && p.length >= 2 && p[0] === "mcp_servers" && isTomlHubKey(p[1]);
+}
+
+function isUnsupportedMcpDefinition(currentPath, kv) {
+  if (!kv || !Array.isArray(kv.path)) return false;
+  if (currentPath.length === 0) {
+    if (kv.path.length === 1 && kv.path[0] === "mcp_servers" && kv.isInlineTable) return true;
+    if (kv.path.length >= 2 && kv.path[0] === "mcp_servers" && isTomlHubKey(kv.path[1])) return true;
+  } else if (currentPath.length === 1 && currentPath[0] === "mcp_servers") {
+    if (kv.path.length >= 1 && isTomlHubKey(kv.path[0])) return true;
+  }
+  return false;
+}
+
 function createMcpRouter(opts = {}) {
   const homeDir = opts.homeDir || process.env.HOME || os.homedir();
   const hubDir = opts.hubDir || process.env.T3_HUB_DIR || path.join(homeDir, ".t3", "hub");
@@ -434,47 +608,76 @@ function createMcpRouter(opts = {}) {
       const lines = raw.split(/\r?\n/);
       const kept = [];
       let inHub = false;
-      let multiDelim = null; // '"""' or "'''"
+      let stringMode = null; // Single-line or multiline basic/literal strings.
+      let arrayDepth = 0, braceDepth = 0;
+      const valueDelimiters = [];
+      let currentPath = [];
       for (const line of lines) {
-        const lineStartInMulti = Boolean(multiDelim);
+        // A header/key can only begin between complete statements. In particular,
+        // ["x"] inside an array is a value, even when it occupies a whole line.
+        const atStatementStart = stringMode === null && arrayDepth === 0 && braceDepth === 0;
         let i = 0;
-        let singleDelim = null;
+        if (atStatementStart) {
+          if (/^\s*(?:#|$)/.test(line)) {
+            if (!inHub) kept.push(line);
+            continue;
+          }
+          if (/^\s*\[/.test(line)) {
+            const header = parseTomlTableHeader(line);
+            if (!header) return null;
+            if (header.isArrayTable && ((header.path.length === 1 && header.path[0] === "mcp_servers") || isHubMcpPath(header.path))) return null;
+            currentPath = header.path;
+            inHub = isHubMcpPath(currentPath);
+            if (!inHub) kept.push(line);
+            continue; // Header brackets are never value delimiters.
+          }
+          const kv = parseTomlKeyValue(line);
+          if (!kv || !line.slice(kv.valueStart).trim() || /^\s*#/.test(line.slice(kv.valueStart))) return null;
+          if (!inHub && isUnsupportedMcpDefinition(currentPath, kv)) return null;
+          i = kv.valueStart;
+        }
         while (i < line.length) {
-          if (multiDelim) {
-            if (line.startsWith(multiDelim, i)) {
-              if (multiDelim === '"""') {
-                let bs = 0, k = i - 1;
-                while (k >= 0 && line[k] === "\\") { bs++; k--; }
-                if (bs % 2 === 1) { i++; continue; }
+          const c = line[i];
+          if (stringMode) {
+            const basic = stringMode[0] === '"';
+            if (basic && c === "\\") { i += 2; continue; }
+            if (stringMode.length === 3 && c === stringMode[0]) {
+              let end = i;
+              while (line[end] === c) end++;
+              const count = end - i;
+              if (count >= 3) {
+                // TOML permits one or two content quotes beside the terminator.
+                if (count > 5) return null;
+                stringMode = null;
               }
-              i += 3;
-              while (line[i] === multiDelim[0]) i++;
-              multiDelim = null;
+              i = end;
               continue;
             }
+            if (stringMode.length === 1 && c === stringMode) stringMode = null;
             i++;
             continue;
           }
-          if (singleDelim) {
-            if (singleDelim === '"' && line[i] === "\\") { i += 2; continue; }
-            if (line[i] === singleDelim) { singleDelim = null; i++; continue; }
-            i++;
+          if (c === "#") break;
+          if (c === '"' || c === "'") {
+            stringMode = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+            i += stringMode.length;
             continue;
           }
-          if (line[i] === "#") break;
-          if (line.startsWith('"""', i)) { multiDelim = '"""'; i += 3; continue; }
-          if (line.startsWith("'''", i)) { multiDelim = "'''"; i += 3; continue; }
-          if (line[i] === '"' || line[i] === "'") { singleDelim = line[i]; i++; continue; }
+          if (c === "[" || c === "{") {
+            valueDelimiters.push(c);
+            if (c === "[") arrayDepth++; else braceDepth++;
+          } else if (c === "]" || c === "}") {
+            const opening = c === "]" ? "[" : "{";
+            if (valueDelimiters.pop() !== opening) return null;
+            if (c === "]") arrayDepth--; else braceDepth--;
+          }
           i++;
         }
-        if (singleDelim) return null; // Malformed single-line string in TOML
-        if (!lineStartInMulti && /^\s*\[/.test(line)) {
-          if (!/^\s*\[\[?[^\]\r\n]+\]?\]\s*(?:#.*)?$/.test(line)) return null;
-          inHub = /^\s*\[mcp_servers\.(?:t3[_-]hub|"t3[_-]hub"|'t3[_-]hub')(?:\.[^\]]+)?\]\s*(?:#.*)?$/.test(line);
-        }
+        // Only multiline strings may span physical lines.
+        if (stringMode && stringMode.length === 1) return null;
         if (!inHub) kept.push(line);
       }
-      if (multiDelim) return null; // Unclosed multiline string in TOML
+      if (stringMode !== null || arrayDepth !== 0 || braceDepth !== 0) return null;
       const section = `[mcp_servers.t3_hub]\ncommand = ${JSON.stringify(routerBin)}\nargs = []\n`;
       const prefix = kept.join("\n").trimEnd();
       return (prefix ? prefix + "\n\n" : "") + section;
@@ -802,5 +1005,5 @@ function discoverServerDefinitions(opts) { return getDefaultMcpRouter().discover
 module.exports = {
   createMcpRouter, redactSummary, redactArgs, redactUrl, ALLOWED_MODES, BUILTIN_UPSTREAM_MCPS, probeMcpServers, autoSyncHosts,
   listMcpServers, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis,
-  discoverServerDefinitions, getDefaultMcpRouter,
+  discoverServerDefinitions, getDefaultMcpRouter, parseTomlTableHeader,
 };

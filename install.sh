@@ -46,6 +46,21 @@ for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skil
   if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
 done
 
+# CSP-free embedded bundle: base + drawer in the same executeJavaScript payload,
+# so renderer-ui never needs (0, eval) which script-src blocks in t3code://app.
+if [[ -f "$DEST_DIR/renderer-ui.js" && -f "$DEST_DIR/hub-drawer-ui.js" ]]; then
+  cp "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js"
+  {
+    printf 'window.__t3HubDrawerEmbedded = true;\n'
+    cat "$DEST_DIR/renderer-base.js"
+    printf '\n'
+    printf ';/* __T3_HUB_DRAWER_EMBED_START__ */\n'
+    cat "$DEST_DIR/hub-drawer-ui.js"
+    printf '\n/* __T3_HUB_DRAWER_EMBED_END__ */\n'
+  } > "$DEST_DIR/renderer-ui.js"
+  chmod 0600 "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js" 2>/dev/null || true
+fi
+
 cp "$SCRIPT_DIR/bin/t3-hud" "$BIN_DIR/t3-hud"
 chmod +x "$BIN_DIR/t3-hud"
 if [[ -f "$SCRIPT_DIR/bin/t3-mcp-router" ]]; then cp "$SCRIPT_DIR/bin/t3-mcp-router" "$BIN_DIR/t3-mcp-router"; chmod +x "$BIN_DIR/t3-mcp-router"; fi
@@ -261,6 +276,14 @@ if [[ -L "$RUN_DIR" ]]; then
 fi
 mkdir -p "$RUN_DIR"
 chmod 0700 "$RUN_DIR" 2>/dev/null || true
+
+# Hot-reload a live T3 Code window automatically when re-running install.sh.
+if [[ -f "$RUN_DIR/rpc.json" ]]; then
+  RPC_PID="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$RUN_DIR/rpc.json" 2>/dev/null | grep -o '[0-9]\+' | head -n 1 || true)"
+  if [[ -n "${RPC_PID:-}" ]] && kill -0 "$RPC_PID" 2>/dev/null; then
+    "$BIN_DIR/t3-hud" reload >/dev/null 2>&1 || true
+  fi
+fi
 
 echo ""
 if [[ "$INSTALL_LANG" == "zh" ]]; then

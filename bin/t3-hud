@@ -84,41 +84,54 @@ do_reload() {
     (async () => {
       const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
       const admTok = cfg.adminToken || cfg.token;
-      const rpcTok = cfg.rpcToken || cfg.token || admTok;
-      await fetch(cfg.url + "/admin/reload-ui", { method: "POST", headers: { "X-T3-Hud-Token": admTok } });
-      const probe = await fetch(cfg.url + "/rpc", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-T3-Hud-Token": rpcTok },
-        body: JSON.stringify({ method: "getGitGraph", args: ["__HUB_RPC__", "hub:getContext", {}] }),
-      }).then(r => r.json()).catch(() => ({ ok: false, error: "Git" }));
-      if (!probe.ok && /Git|Unknown method/i.test(String(probe.error || ""))) {
-        const bridgeFile = path.join(pluginDir, "run", "hub-bridge.json");
-        let bridge = null;
+      // Always ensure hub-bridge is running and hot-reloaded, regardless of probe.
+      const bridgeFile = path.join(pluginDir, "run", "hub-bridge.json");
+      let bridge = null;
+      try {
+        const b = JSON.parse(fs.readFileSync(bridgeFile, "utf8"));
+        process.kill(b.pid, 0);
+        if (Number(cfg.pid || 0) > 0 && Number(b.watchPid || 0) !== Number(cfg.pid || 0)) {
+          try { process.kill(b.pid, "SIGTERM"); } catch {}
+          throw new Error("bridge watchPid mismatch");
+        }
+        const r = await fetch(b.url + "/reload", { method: "POST", headers: { "X-T3-Hud-Token": b.token } });
+        const rj = await r.json();
+        if (!r.ok || !rj || rj.ok !== true) throw new Error("bridge reload failed");
+        bridge = b;
+      } catch { bridge = null; }
+      if (!bridge) {
+        try { fs.unlinkSync(bridgeFile); } catch {}
         try {
-          const b = JSON.parse(fs.readFileSync(bridgeFile, "utf8"));
-          process.kill(b.pid, 0);
-          await fetch(b.url + "/reload", { method: "POST", headers: { "X-T3-Hud-Token": b.token } });
-          bridge = b;
-        } catch { bridge = null; }
-        if (!bridge) {
-          try { fs.unlinkSync(bridgeFile); } catch {}
           const child = spawn(process.execPath, [path.join(pluginDir, "hub-bridge.cjs")], {
             env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: pluginDir, T3_WATCH_PID: String(cfg.pid || 0) },
             detached: true,
             stdio: "ignore",
           });
           child.unref();
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < 40; i++) {
             await new Promise(r => setTimeout(r, 80));
-            if (fs.existsSync(bridgeFile)) { bridge = JSON.parse(fs.readFileSync(bridgeFile, "utf8")); break; }
+            if (fs.existsSync(bridgeFile)) { try { bridge = JSON.parse(fs.readFileSync(bridgeFile, "utf8")); break; } catch {} }
           }
+        } catch {}
+      }
+      if (bridge) {
+        const ruiPath = path.join(pluginDir, "renderer-ui.js");
+        const basePath = path.join(pluginDir, "renderer-base.js");
+        let base;
+        if (fs.existsSync(basePath)) {
+          base = fs.readFileSync(basePath, "utf8");
+        } else {
+          let raw = fs.readFileSync(ruiPath, "utf8");
+          raw = raw.replace(/^window\.__t3HubSidecarBridge = [^\n]+\n/, "");
+          raw = raw.replace(/^window\.__t3HubDrawerEmbedded = [^\n]+\n/, "");
+          raw = raw.replace(/;\/\* __T3_HUB_DRAWER_EMBED_START__ \*\/[\s\S]*?\/\* __T3_HUB_DRAWER_EMBED_END__ \*\/\s*$/, "");
+          base = raw;
         }
-        if (bridge) {
-          const ruiPath = path.join(pluginDir, "renderer-ui.js");
-          const raw = fs.readFileSync(ruiPath, "utf8").replace(/^window\.__t3HubSidecarBridge = [^\n]+\n/, "");
-          const header = "window.__t3HubSidecarBridge = " + JSON.stringify({ url: bridge.url, token: bridge.token }) + ";\n";
-          fs.writeFileSync(ruiPath, header + raw, { encoding: "utf8", mode: 0o600 }); try { fs.chmodSync(ruiPath, 0o600); } catch {}
-        }
+        const bridgeHeader = "window.__t3HubSidecarBridge = " + JSON.stringify({ url: bridge.url, token: bridge.token }) + ";\nwindow.__t3HubDrawerEmbedded = true;\n";
+        let drawerCode = "";
+        try { drawerCode = fs.readFileSync(path.join(pluginDir, "hub-drawer-ui.js"), "utf8"); } catch {}
+        const assembled = bridgeHeader + base + (base.endsWith("\n") ? "" : "\n") + ";/* __T3_HUB_DRAWER_EMBED_START__ */\n" + drawerCode + "\n/* __T3_HUB_DRAWER_EMBED_END__ */\n";
+        fs.writeFileSync(ruiPath, assembled, { encoding: "utf8", mode: 0o600 }); try { fs.chmodSync(ruiPath, 0o600); } catch {}
       }
       const j = await fetch(cfg.url + "/admin/reload-ui", {
         method: "POST",

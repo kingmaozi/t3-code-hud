@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { execFileSync } = require("node:child_process");
+const vm = require("node:vm");
+const http = require("node:http");
 
 const REPO = path.resolve(__dirname, "..");
 
@@ -402,5 +404,260 @@ describe("install.sh sidecar copies", () => {
     assert.ok(src.includes('hub-plugins.cjs'));
     assert.ok(src.includes('hub-hooks.cjs'));
     assert.ok(src.includes('chmod +x'));
+  });
+  it("install.sh builds CSP-free embedded renderer bundle + auto-reloads live window", () => {
+    const src = fs.readFileSync(path.join(REPO, "install.sh"), "utf8");
+    assert.ok(src.includes("renderer-base.js"));
+    assert.ok(src.includes("__t3HubDrawerEmbedded = true"));
+    assert.ok(src.includes("__T3_HUB_DRAWER_EMBED_START__"));
+    assert.ok(src.includes("__T3_HUB_DRAWER_EMBED_END__"));
+    assert.ok(src.includes("chmod 0600"));
+    assert.ok(src.includes('t3-hud" reload'));
+    assert.ok(src.includes("kill -0"));
+  });
+});
+
+function extractHubRpc(rendererSrc) {
+  const start = rendererSrc.indexOf("window.__t3HubRpc = async");
+  assert.ok(start !== -1, "window.__t3HubRpc definition found");
+  const endMarker = "\n  };";
+  const end = rendererSrc.indexOf(endMarker, start);
+  assert.ok(end !== -1, "window.__t3HubRpc end found");
+  return rendererSrc.slice(start, end + endMarker.length);
+}
+
+describe("CSP-free embedded bundle + bridge-first RPC", () => {
+  it("(a) embedded bundle mounts 7-tab v2 Hub and replaces pre-existing Hub without eval", async () => {
+    const rendererSrc = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const drawerSrc = fs.readFileSync(path.join(REPO, "src", "hub-drawer-ui.js"), "utf8");
+    // Embedded guard: no fetch/eval when __t3HubDrawerEmbedded is truthy.
+    const guardIdx = rendererSrc.indexOf("__t3HubDrawerEmbedded");
+    const drawerFetchIdx = rendererSrc.indexOf("hub:getDrawerScript");
+    const evalIdx = rendererSrc.indexOf("(0, eval)");
+    assert.ok(guardIdx !== -1 && drawerFetchIdx !== -1 && evalIdx !== -1);
+    assert.ok(guardIdx < drawerFetchIdx, "embedded guard precedes drawer fetch");
+    assert.ok(guardIdx < evalIdx, "embedded guard precedes eval");
+    // Backward compat: eval branch still exists for non-embedded path.
+    assert.ok(rendererSrc.includes("if (!window.__t3HubDrawerEmbedded)"));
+    // 7-tab v2 Hub tabs.
+    for (const tab of ["plugins", "mcp", "skills", "hooks", "subagents", "memory", "agents"]) {
+      assert.ok(drawerSrc.includes(`"${tab}"`), `drawer defines tab ${tab}`);
+    }
+    assert.ok(drawerSrc.includes('["plugins", "mcp", "skills", "hooks", "subagents", "memory", "agents"]'));
+    // Assembled bundle matches install.sh / bin/t3-hud format.
+    const bundle =
+      "window.__t3HubDrawerEmbedded = true;\n" + rendererSrc +
+      ";/* __T3_HUB_DRAWER_EMBED_START__ */\n" + drawerSrc +
+      "\n/* __T3_HUB_DRAWER_EMBED_END__ */\n";
+    assert.ok(bundle.includes("window.__t3HubDrawerEmbedded = true;"));
+    assert.ok(bundle.includes("__T3_HUB_DRAWER_EMBED_START__"));
+    assert.ok(bundle.includes("__T3_HUB_DRAWER_EMBED_END__"));
+    assert.ok(!drawerSrc.includes("(0, eval)"), "drawer itself never evals");
+
+    // Behavioral: drawer mount replaces a pre-existing Hub (old 5-tab) without eval.
+    // document.body is null so build() is deferred (no DOM needed for mount proof).
+    let oldDestroyed = false;
+    const oldHub = {
+      snapshot: () => ({ open: false, tab: "plugins" }),
+      destroy() { oldDestroyed = true; },
+      options: {},
+    };
+    const sandbox = {
+      console,
+      setTimeout, clearTimeout, setInterval, clearInterval,
+      localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+      document: {
+        body: null,
+        documentElement: { lang: "en", dataset: {}, classList: { contains: () => false } },
+        getElementById: () => null,
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        createElement: () => ({ style: {}, classList: { add() {}, contains: () => false }, addEventListener() {} }),
+        addEventListener() {}, removeEventListener() {},
+      },
+      window: {},
+      fetch: async () => ({ ok: true, json: async () => ({ ok: true }) }),
+      getComputedStyle: () => ({ backgroundColor: "rgb(255, 255, 255)" }),
+    };
+    sandbox.window.__t3SidecarHub = oldHub;
+    sandbox.window.__t3HubRpc = async () => ({ ok: true });
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(drawerSrc, sandbox);
+    assert.ok(oldDestroyed, "pre-existing Hub destroyed");
+    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 7-tab Hub mounted");
+    assert.equal(typeof sandbox.window.__t3SidecarHub.snapshot, "function");
+    assert.equal(typeof sandbox.window.__t3SidecarHub.destroy, "function");
+    assert.equal(typeof sandbox.window.__t3MountSidecarHub, "function");
+  });
+
+  it("(b) window.__t3HubRpc uses in-process IPC and delegates unknown actions / legacy Git errors to sidecar bridge", async () => {
+    const rendererSrc = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const snippet = extractHubRpc(rendererSrc);
+    assert.ok(snippet.includes("unknown action:"));
+    assert.ok(snippet.includes('bridge.url + "/hub-rpc"'));
+
+    function loadRpc(win, callRpcMock) {
+      const factory = new Function("window", "fetch", "callRpc", snippet + "\nreturn window.__t3HubRpc;");
+      return factory(win, fetch, callRpcMock);
+    }
+
+    const server = http.createServer((req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ ok: true, via: "bridge" }));
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const { port } = server.address();
+      const winLive = { __t3HubSidecarBridge: { url: `http://127.0.0.1:${port}`, token: "tok" } };
+
+      const rpcNewMain = loadRpc(winLive, async () => ({ ok: true, via: "in-process" }));
+      assert.equal((await rpcNewMain("memory:save", {})).via, "in-process", "modern main-hook handles writes directly without bridge");
+
+      const rpcOldV1Main = loadRpc(winLive, async () => ({ ok: false, error: "unknown action: plugins:list" }));
+      assert.equal((await rpcOldV1Main("plugins:list", {})).via, "bridge", "stale v1 main-hook delegates new v2 actions to hot-reloaded bridge");
+
+      const rpcOldV0Main = loadRpc(winLive, async () => ({ ok: false, error: "当前会话未绑定本地 Git 仓库目录" }));
+      assert.equal((await rpcOldV0Main("hub:getContext", {})).via, "bridge", "legacy v0 main-hook delegates to sidecar bridge");
+
+      const winDead = { __t3HubSidecarBridge: { url: "http://127.0.0.1:1", token: "tok" } };
+      const rpcDead = loadRpc(winDead, async () => ({ ok: false, error: "unknown action: plugins:list" }));
+      assert.equal((await rpcDead("plugins:list", {})).ok, false, "dead bridge returns original in-process error cleanly without double execution");
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
+describe("backend aliases + idempotent subagent sync", () => {
+  it("subagents:update preserves canonical id and custom name for flat partial updates", async () => {
+    const id = "alias-identity-check";
+    const name = "custom-display-name";
+    // Put a conflicting display name before the target: exact id must win.
+    const otherId = "alias-identity-other";
+    const seed = { role: "general", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "orig", systemPrompt: "identity prompt", enabled: true };
+    try {
+      for (const item of [{ ...seed, id: otherId, name: id }, { ...seed, id, name }]) {
+        const saved = await backend.hubCall("subagents:save", { scope: "global", item });
+        assert.equal(saved.ok, true, JSON.stringify(saved));
+      }
+      for (const patch of [{ description: "by-id" }, { effort: "high" }, { name: undefined, description: "undefined-name" }]) {
+        const updated = await backend.hubCall("subagents:update", { id, ...patch });
+        assert.equal(updated.ok, true, JSON.stringify(updated));
+        assert.equal(updated.item.id, id);
+        assert.equal(updated.item.name, name, "omitted name preserves the display name");
+        assert.equal(updated.item.model, seed.model);
+        assert.equal(updated.item.systemPrompt, seed.systemPrompt);
+      }
+      for (const lookup of [{ name }, { id: name }, { id: "missing-id", name }]) {
+        const updated = await backend.hubCall("subagents:update", { ...lookup, description: "by-name" });
+        assert.equal(updated.ok, true, JSON.stringify(updated));
+        assert.equal(updated.item.id, id, "display-name lookup preserves canonical id");
+        assert.equal(updated.item.name, name);
+        assert.equal(updated.item.description, "by-name");
+      }
+      const renamed = await backend.hubCall("subagents:update", { id, name: "Renamed display", description: "explicit-rename" });
+      assert.equal(renamed.ok, true, JSON.stringify(renamed));
+      assert.equal(renamed.item.id, id);
+      assert.equal(renamed.item.name, "Renamed display");
+      const listed = await backend.hubCall("subagents:list", {});
+      assert.equal(listed.globalItems.filter(i => [id, otherId, name, "missing-id"].includes(i.id)).length, 2, "no duplicate records created");
+      assert.equal(listed.globalItems.find(i => i.id === otherId).description, "orig", "exact-id lookup did not update conflicting display name");
+    } finally {
+      for (const cleanupId of [id, otherId, name, "missing-id"]) {
+        await backend.hubCall("subagents:delete", { scope: "global", id: cleanupId });
+      }
+    }
+  });
+
+  it("subagents:update by name preserves project scope and forwards sync paths", async () => {
+    const id = "alias-project-identity";
+    const name = "project-custom-name";
+    const globalId = "alias-global-sync-path";
+    const extraSyncPath = path.join(tmpRoot, "alias-sync", "rules.md");
+    try {
+      const saved = await backend.hubCall("subagents:save", { scope: "project", projectRoot: PROJECT_ROOT, item: { id, name, role: "general", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "project-original" } });
+      assert.equal(saved.ok, true, JSON.stringify(saved));
+      const updated = await backend.hubCall("subagents:update", { name, projectRoot: PROJECT_ROOT, effort: "high", extraSyncPaths: [extraSyncPath] });
+      assert.equal(updated.ok, true, JSON.stringify(updated));
+      assert.equal(updated.scope, "project");
+      assert.equal(updated.projectRoot, PROJECT_ROOT);
+      assert.equal(updated.item.id, id);
+      assert.equal(updated.item.name, name);
+      assert.equal(updated.item.effort, "high");
+      const listed = await backend.hubCall("subagents:list", { projectRoot: PROJECT_ROOT });
+      assert.equal(listed.projectItems.filter(i => i.id === id || i.id === name).length, 1);
+      assert.equal(listed.globalItems.some(i => i.id === id || i.id === name), false);
+      const globalSaved = await backend.hubCall("subagents:save", { scope: "global", item: { ...saved.item, id: globalId } });
+      assert.equal(globalSaved.ok, true, JSON.stringify(globalSaved));
+      await backend.hubCall("subagents:save", {
+        scope: "project", projectRoot: PROJECT_ROOT,
+        item: { id: globalId, name: globalId, role: "general", providerInstanceId: "codex", model: "gpt-6.1-sol", effort: "xhigh", description: "proj-override", systemPrompt: "proj-prompt", enabled: true },
+      });
+      const globalUpdated = await backend.hubCall("subagents:update", { scope: "global", projectRoot: PROJECT_ROOT, id: globalId, description: "sync-path-forwarded", extraSyncPaths: [extraSyncPath] });
+      assert.equal(globalUpdated.item.model, "muse-ember-1.0", "global update must not copy project override model into global");
+      assert.equal(globalUpdated.item.systemPrompt, "", "global update must not copy project override prompt into global");
+      assert.equal(globalUpdated.ok, true, JSON.stringify(globalUpdated));
+      assert.ok(fs.readFileSync(extraSyncPath, "utf8").includes("sync-path-forwarded"));
+    } finally {
+      for (const cleanupId of [id, name]) await backend.hubCall("subagents:delete", { scope: "project", projectRoot: PROJECT_ROOT, id: cleanupId });
+      await backend.hubCall("subagents:delete", { scope: "project", projectRoot: PROJECT_ROOT, id: globalId });
+      await backend.hubCall("subagents:delete", { scope: "global", id: globalId });
+    }
+  });
+
+  it("(c) subagents:update and memory:search aliases work in backend.hubCall", async () => {
+    const aliasId = "sidecar-alias-check-" + Date.now().toString(36);
+    try {
+      const saved = await backend.hubCall("subagents:save", {
+        scope: "global",
+        item: { id: aliasId, role: "general", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "orig", systemPrompt: "alias prompt", enabled: true },
+      });
+      assert.equal(saved.ok, true, JSON.stringify(saved));
+      // Flat { id, ...patch } update merges onto existing effective item.
+      const upd = await backend.hubCall("subagents:update", { id: aliasId, description: "updated-flat" });
+      assert.equal(upd.ok, true, JSON.stringify(upd));
+      assert.equal(upd.item.description, "updated-flat");
+      assert.equal(upd.item.model, "muse-ember-1.0");
+      // Wrapped { item } update delegates to save.
+      const upd2 = await backend.hubCall("subagents:update", {
+        scope: "global",
+        item: { id: aliasId, role: "general", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "updated-wrapped", systemPrompt: "alias prompt", enabled: true },
+      });
+      assert.equal(upd2.ok, true, JSON.stringify(upd2));
+      assert.equal(upd2.item.description, "updated-wrapped");
+
+      const memSaved = await backend.hubCall("memory:save", {
+        projectRoot: PROJECT_ROOT, module: "constraints", kind: "constraint",
+        title: "alias-search-" + Date.now().toString(36), content: "alias searchable content " + Math.random(),
+      });
+      assert.equal(memSaved.ok, true, JSON.stringify(memSaved));
+      const searched = await backend.hubCall("memory:search", { projectRoot: PROJECT_ROOT, module: "constraints" });
+      assert.equal(searched.ok, true, JSON.stringify(searched));
+      assert.ok(searched.items.some((i) => i.id === memSaved.item.id), "memory:search finds saved memory");
+      await backend.hubCall("memory:delete", { projectRoot: PROJECT_ROOT, id: memSaved.item.id });
+    } finally {
+      await backend.hubCall("subagents:delete", { scope: "global", id: aliasId });
+    }
+  });
+
+  it("(d) repeated saveSubagent keeps AGENTS.md byte-for-byte identical", async () => {
+    const mgr = createSubagentsManager({ homeDir: tmpHome, hubDir: tmpHub });
+    const id = "idem-check-" + Date.now().toString(36);
+    const item = { id, role: "general", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "idem", systemPrompt: "idem prompt", enabled: true };
+    try {
+      mgr.saveSubagent({ scope: "global", item });
+      const globalMd = path.join(tmpHub, "global-AGENTS.md");
+      const buf1 = fs.readFileSync(globalMd);
+      mgr.saveSubagent({ scope: "global", item });
+      const buf2 = fs.readFileSync(globalMd);
+      mgr.saveSubagent({ scope: "global", item });
+      const buf3 = fs.readFileSync(globalMd);
+      assert.ok(buf1.equals(buf2), "2nd save byte-identical");
+      assert.ok(buf2.equals(buf3), "3rd save byte-identical");
+      assert.ok(buf1.toString("utf8").includes(id));
+    } finally {
+      try { mgr.deleteSubagent({ scope: "global", id }); } catch {}
+    }
   });
 });

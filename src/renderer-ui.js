@@ -662,15 +662,17 @@
   const callRpc = (method, ...args) => callBackend(method, ...args);
   window.__t3HubRpc = async (action, payload) => {
     const res = await callRpc("getGitGraph", "__HUB_RPC__", action, payload || {});
-    if (res && (res.ok || !/Git|Unknown method/i.test(String(res.error || "")))) return res;
+    if (res && (res.ok || !/Git|Unknown method|unknown action:/i.test(String(res.error || "")))) return res;
     const bridge = window.__t3HubSidecarBridge;
     if (bridge && bridge.url && bridge.token) {
-      const r = await fetch(bridge.url + "/hub-rpc", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
-        body: JSON.stringify({ action, payload: payload || {} }),
-      });
-      return r.json();
+      try {
+        const r = await fetch(bridge.url + "/hub-rpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+          body: JSON.stringify({ action, payload: payload || {} }),
+        });
+        if (r.ok) return await r.json();
+      } catch {}
     }
     return res;
   };
@@ -3272,12 +3274,16 @@
     // Keep telemetry boot independent if an older Hub backend is slow or missing.
     void (async () => {
       try {
-        const res = await window.__t3HubRpc("hub:getDrawerScript", {});
-        if (disposed) return;
-        if (res?.ok && res.code) {
-          window.__t3HubDrawerLoading = true;
-          try { (0, eval)(res.code); }
-          finally { delete window.__t3HubDrawerLoading; }
+        // Embedded drawer (same executeJavaScript payload) mounts directly
+        // without eval, which is blocked by script-src CSP in t3code://app.
+        if (!window.__t3HubDrawerEmbedded) {
+          const res = await window.__t3HubRpc("hub:getDrawerScript", {});
+          if (disposed) return;
+          if (res?.ok && res.code) {
+            window.__t3HubDrawerLoading = true;
+            try { (0, eval)(res.code); }
+            finally { delete window.__t3HubDrawerLoading; }
+          }
         }
         window.__t3MountSidecarHub?.({ hubRpc: window.__t3HubRpc });
       } catch (error) {

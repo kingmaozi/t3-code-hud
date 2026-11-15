@@ -207,10 +207,19 @@ async function injectHudIntoWindow(win, forceReload = false) {
       if (alreadyMounted) return true;
     }
 
-    const uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
+    let uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
     const bootstrapCfg = httpFallbackConfig
       ? `window.__t3HudHttpConfig = ${JSON.stringify({ url: httpFallbackConfig.url, token: rpcToken })};\n`
       : "";
+    // CSP-free path: append the drawer in the same payload instead of
+    // relying on a later (0, eval), which script-src blocks in t3code://app.
+    if (!uiCode.includes("__T3_HUB_DRAWER_EMBED_START__")) {
+      const drawerPath = path.join(__dirname, "hub-drawer-ui.js");
+      if (fs.existsSync(drawerPath)) {
+        const drawerCode = fs.readFileSync(drawerPath, "utf8");
+        uiCode += ";\nwindow.__t3HubDrawerEmbedded = true;\n" + drawerCode;
+      }
+    }
     await wc.executeJavaScript(bootstrapCfg + uiCode, true);
     lastInjectError = null;
     return true;

@@ -312,7 +312,7 @@ test("HTTP/SSE probes require valid MCP initialize handshake and reject plain 20
 test("autoSyncHosts idempotently updates existing hosts, preserves other settings and secures backups", t => {
   const f = fixture(t), router = createMcpRouter(f);
   const codex = path.join(f.homeDir, ".codex", "config.toml");
-  write(codex, '# keep\n[mcp_servers.t3-hub]\ncommand = "old"\n[mcp_servers.t3-hub.env]\nTOKEN = "private"\n[other]\nvalue = "keep"\n');
+  write(codex, '# keep\n[mcp_servers.t3_hub]\ncommand = "old"\n[mcp_servers.t3_hub.env]\nTOKEN = "private"\n[other]\nvalue = "keep"\n');
   const files = [path.join(f.homeDir, ".pi", "agent", "mcp.json"), path.join(f.homeDir, ".config", "muse", "settings.json"), path.join(f.homeDir, ".claude", "mcp.json"), path.join(f.homeDir, ".zcode", "cli", "mcp.json"), path.join(f.homeDir, ".t3", "userdata", "providers", "antigravity", "one", "config", "mcp_config.json")];
   for (const file of files) write(file, { other: true, mcpServers: { keep: { command: "keep" }, "t3-hub": { command: "old" } } });
   const first = router.autoSyncHosts(); assert.equal(first.syncedTargets.length, 6);
@@ -590,7 +590,7 @@ test("autoSyncHosts preserves [mcp_servers.t3_hub] lines inside multiline TOML s
     '[mcp_servers.t3_hub]',
     'command = "keep-inside-string"',
     '"""',
-    '[mcp_servers.t3-hub]',
+    '[mcp_servers.t3_hub]',
     'command = "stale-real-section"',
     '[model_providers.custom]',
     'name = "keep-provider"',
@@ -609,4 +609,224 @@ test("autoSyncHosts preserves [mcp_servers.t3_hub] lines inside multiline TOML s
   const resBroken = router.autoSyncHosts();
   assert.ok(resBroken.skippedTargets.includes(codex));
   assert.equal(fs.readFileSync(codex, "utf8"), broken);
+});
+
+test("autoSyncHosts replaces spaced TOML hub header without duplicate table", t => {
+  const f = fixture(t), router = createMcpRouter(f);
+  const codex = path.join(f.homeDir, ".codex", "config.toml");
+  const original = [
+    "[ mcp_servers . t3_hub ]",
+    'command = "old-spaced"',
+    '[other]',
+    'value = "keep"',
+    '',
+  ].join("\n");
+  write(codex, original);
+  const res = router.autoSyncHosts();
+  assert.ok(res.syncedTargets.includes(codex));
+  const out = fs.readFileSync(codex, "utf8");
+  assert.equal((out.match(/\[mcp_servers\.t3_hub\]/g) || []).length, 1);
+  assert.ok(!out.includes("old-spaced"));
+  assert.ok(out.includes('[other]\nvalue = "keep"'));
+  assert.ok(!out.includes("[ mcp_servers . t3_hub ]"));
+});
+
+test("autoSyncHosts replaces quoted TOML hub headers without duplicate table", t => {
+  for (const variant of ['["mcp_servers"."t3_hub"]', "['mcp_servers'.'t3_hub'] # trailing comment"]) {
+    const f = fixture(t), router = createMcpRouter(f);
+    const codex = path.join(f.homeDir, ".codex", "config.toml");
+    const original = [
+      variant,
+      'command = "old-quoted"',
+      '[other]',
+      'value = "keep"',
+      '',
+    ].join("\n");
+    write(codex, original);
+    const res = router.autoSyncHosts();
+    assert.ok(res.syncedTargets.includes(codex), variant);
+    const out = fs.readFileSync(codex, "utf8");
+    assert.equal((out.match(/\[mcp_servers\.t3_hub\]/g) || []).length, 1, variant);
+    assert.ok(!out.includes("old-quoted"), variant);
+    assert.ok(out.includes('[other]\nvalue = "keep"'), variant);
+    assert.ok(!out.includes(variant.split("#")[0].trim()), variant);
+  }
+});
+
+test("autoSyncHosts preserves hub header text inside multiline TOML strings", t => {
+  const f = fixture(t), router = createMcpRouter(f);
+  const codex = path.join(f.homeDir, ".codex", "config.toml");
+  const original = [
+    'a = """',
+    '[mcp_servers.t3_hub]',
+    'command = "keep-basic"',
+    '"""',
+    "b = '''",
+    '[mcp_servers.t3_hub]',
+    'command = "keep-literal"',
+    "'''",
+    '[mcp_servers.t3_hub]',
+    'command = "stale-real-section"',
+    '[other]',
+    'value = "keep"',
+    '',
+  ].join("\n");
+  write(codex, original);
+  const res = router.autoSyncHosts();
+  assert.ok(res.syncedTargets.includes(codex));
+  const out = fs.readFileSync(codex, "utf8");
+  assert.ok(out.includes('a = """\n[mcp_servers.t3_hub]\ncommand = "keep-basic"\n"""'));
+  assert.ok(out.includes("b = '''\n[mcp_servers.t3_hub]\ncommand = \"keep-literal\"\n'''"));
+  assert.ok(out.includes('[other]\nvalue = "keep"'));
+  assert.ok(!out.includes("stale-real-section"));
+  assert.equal((out.match(/\[mcp_servers\.t3_hub\]/g) || []).length, 3);
+});
+
+test("autoSyncHosts does not append conflicting table for inline/dotted mcp definitions", t => {
+  for (const original of [
+    'mcp_servers = { t3_hub = { command = "node" } }\n',
+    '[mcp_servers]\nt3_hub = { command = "node" }\n',
+    'mcp_servers.t3_hub.command = "node"\n',
+    '[mcp_servers]\nt3_hub.command = "node"\n',
+  ]) {
+    const f = fixture(t), router = createMcpRouter(f);
+    const codex = path.join(f.homeDir, ".codex", "config.toml");
+    write(codex, original);
+    const res = router.autoSyncHosts();
+    const out = fs.readFileSync(codex, "utf8");
+    assert.equal(out, original, original);
+    assert.ok(res.skippedTargets.includes(codex), original);
+    assert.ok(!out.includes("[mcp_servers.t3_hub]") || original.includes("[mcp_servers.t3_hub]"), original);
+  }
+});
+
+test("autoSyncHosts preserves case/underscore variants of the hub TOML table and skips array tables", t => {
+  const f = fixture(t), router = createMcpRouter(f);
+  const codex = path.join(f.homeDir, ".codex", "config.toml");
+  const original = [
+    "[mcp_servers.T3_HUB]",
+    'command = "keep-uppercase"',
+    "[mcp-servers.t3-hub]",
+    'command = "keep-hyphen-servers"',
+    "[mcp_servers.t3-hub]",
+    'command = "legacy-hyphen-hub"',
+    "[mcp_servers.t3_hub]",
+    'command = "stale-exact-hub"',
+    "[mcp_servers.t3_hub.env]",
+    'TOKEN = "stale-exact-secret"',
+    "[other]",
+    'value = "keep"',
+    "",
+  ].join("\n");
+  write(codex, original);
+  const res = router.autoSyncHosts();
+  assert.ok(res.syncedTargets.includes(codex));
+  const out = fs.readFileSync(codex, "utf8");
+  assert.ok(out.includes('[mcp_servers.T3_HUB]\ncommand = "keep-uppercase"'));
+  assert.ok(out.includes('[mcp-servers.t3-hub]\ncommand = "keep-hyphen-servers"'));
+  assert.ok(!out.includes("legacy-hyphen-hub"), "legacy lowercase [mcp_servers.t3-hub] migrated to canonical t3_hub");
+  assert.ok(!out.includes("stale-exact-hub"));
+  assert.ok(!out.includes("stale-exact-secret"));
+  assert.ok(out.includes('[other]\nvalue = "keep"'));
+  assert.equal((out.match(/\[mcp_servers\.t3_hub\]/g) || []).length, 1);
+  for (const originalArray of ["[[mcp_servers]]\ncommand = \"keep-array\"\n", "[[mcp_servers.t3_hub]]\ncommand = \"keep-array-hub\"\n"]) {
+    const f2 = fixture(t), router2 = createMcpRouter(f2);
+    const codex2 = path.join(f2.homeDir, ".codex", "config.toml");
+    write(codex2, originalArray);
+    const res2 = router2.autoSyncHosts();
+    assert.ok(res2.skippedTargets.includes(codex2), originalArray);
+    assert.equal(fs.readFileSync(codex2, "utf8"), originalArray, originalArray);
+  }
+});
+
+test("autoSyncHosts skips unmanaged MCP definitions after multiline values without touching TOML", t => {
+  for (const original of [
+    'arr = [\n  ["x"]\n]\nmcp_servers.t3_hub.command = "old"\n',
+    'arr = [\n  ["x"]\n]\nmcp_servers = { t3_hub = { command = "old" } }\n',
+    '[mcp_servers]\narr = [\n  ["x"]\n]\nt3_hub.command = "old"\n',
+    'config = { nested = [\n  ["x"]\n] }\nmcp_servers.t3_hub.command = "old"\n',
+  ]) {
+    const f = fixture(t), router = createMcpRouter(f);
+    const codex = path.join(f.homeDir, ".codex", "config.toml");
+    write(codex, original);
+    const result = router.autoSyncHosts();
+    assert.ok(result.skippedTargets.includes(codex), original);
+    assert.ok(!result.syncedTargets.includes(codex), original);
+    assert.equal(fs.readFileSync(codex, "utf8"), original);
+    assert.ok(!fs.existsSync(codex + ".bak-t3hub"), "skip creates no backup");
+  }
+});
+
+test("autoSyncHosts replaces complete hub multiline values and preserves other nested values", t => {
+  const prefix = [
+    'arr = [ # unmatched delimiters in comments do not count: [ {',
+    '  ["x"],',
+    '  { value = "# ] } [", nested = ["y"] },',
+    '  """multiline basic',
+    '[mcp_servers.t3_hub]',
+    'brackets ] } and an escaped quote: \\"',
+    '""",',
+    "  '''multiline literal",
+    '[mcp_servers.t3_hub.env]',
+    "brackets [ { and backslash \\",
+    "''',",
+    ']',
+    '',
+  ].join("\n");
+  const suffix = '[other]\nargs = [\n  ["keep"]\n]\n';
+  const hub = [
+    '[mcp_servers.t3_hub]',
+    'command = "old"',
+    'args = [',
+    '  "--foo",',
+    '  ["--flag"]',
+    ']',
+    '[mcp_servers.t3_hub.env]',
+    'config = { nested = [',
+    '  ["stale"]',
+    '] }',
+    'text = """',
+    '[other]',
+    '"""',
+    '',
+  ].join("\n");
+  for (const beforeHub of ["", prefix]) {
+    const f = fixture(t), router = createMcpRouter(f);
+    const codex = path.join(f.homeDir, ".codex", "config.toml");
+    write(codex, beforeHub + hub + suffix);
+    const result = router.autoSyncHosts();
+    assert.ok(result.syncedTargets.includes(codex));
+    const expected = beforeHub + suffix.trimEnd() + '\n\n[mcp_servers.t3_hub]\ncommand = ' + JSON.stringify(path.join(__dirname, "..", "bin", "t3-mcp-router")) + '\nargs = []\n';
+    assert.equal(fs.readFileSync(codex, "utf8"), expected, "no removed array/table/string fragments survive");
+    router.autoSyncHosts();
+    assert.equal(fs.readFileSync(codex, "utf8"), expected, "sync is idempotent");
+  }
+});
+
+test("autoSyncHosts skips unbalanced TOML values and malformed headers even inside replaced sections", t => {
+  for (const broken of [
+    'arr = [\n  ["x"]\n',
+    'config = { nested = ["x"]\n',
+    'arr = [\n  { key = "x" ]\n}\n',
+    'arr = ["x"] ]\n',
+    'config = { key = "x" } }\n',
+    'text = "unclosed\n',
+    "text = 'unclosed\n",
+    'text = """unclosed\n',
+    "text = '''unclosed\n",
+    '[broken\n',
+    '["unclosed]\n',
+    '[valid] trailing garbage\n',
+  ]) {
+    for (const prefix of ["", '[mcp_servers.t3_hub]\ncommand = "old"\n']) {
+      const f = fixture(t), router = createMcpRouter(f);
+      const codex = path.join(f.homeDir, ".codex", "config.toml");
+      const original = prefix + broken;
+      write(codex, original);
+      const result = router.autoSyncHosts();
+      assert.ok(result.skippedTargets.includes(codex), original);
+      assert.equal(fs.readFileSync(codex, "utf8"), original);
+      assert.ok(!fs.existsSync(codex + ".bak-t3hub"), "skip creates no backup");
+    }
+  }
 });
