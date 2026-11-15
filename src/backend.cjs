@@ -1848,6 +1848,12 @@ function parseRefs(decorateStr) {
 }
 
 async function getGitGraph(threadHint, maxCommits = 90, fallbackCwd = null) {
+  const selectedEnvironment = typeof fallbackCwd === "object" && typeof fallbackCwd?.environmentId === "string" ? fallbackCwd.environmentId.trim() : "";
+  if (selectedEnvironment) {
+    let localEnvironment = "";
+    try { localEnvironment = fs.readFileSync(path.join(T3_USERDATA, "environment-id"), "utf8").trim(); } catch {}
+    if (selectedEnvironment !== localEnvironment) return { ok: false, remoteOnly: true, remoteCwd: fallbackCwd.cwd || "(remote)", error: "Remote workspace" };
+  }
   const stats = getThreadStats(threadHint);
   let repoPath = stats?.repoPath || null;
 
@@ -2159,13 +2165,14 @@ function parseHeadLog(headLogText) {
 }
 
 function normalizeBranchCommits(branchCommits) {
+  if (!Array.isArray(branchCommits)) branchCommits = branchCommits?.commits;
   if (!Array.isArray(branchCommits)) return [];
   const out = [];
   for (const c of branchCommits) {
     if (!c || typeof c !== "object") continue;
     const hash = String(c.hash || c.sha || c.id || "").toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(hash)) continue;
-    const ts = c.timestamp || c.time || (c.date ? Math.floor(Date.parse(c.date) / 1000) : 0) || 0;
+    const ts = c.timestamp || c.time || ((c.date || c.committedAt) ? Math.floor(Date.parse(c.date || c.committedAt) / 1000) : 0) || 0;
     const parents = Array.isArray(c.parents)
       ? c.parents.map((p) => String(p?.sha || p?.hash || p || "").toLowerCase()).filter((p) => /^[0-9a-f]{40}$/.test(p))
       : [];
@@ -2183,6 +2190,7 @@ function normalizeBranchCommits(branchCommits) {
 }
 
 function normalizeVcsRefs(vcsRefs) {
+  if (!Array.isArray(vcsRefs)) vcsRefs = vcsRefs?.refs;
   if (!Array.isArray(vcsRefs)) return [];
   const out = [];
   for (const r of vcsRefs) {
@@ -2232,7 +2240,7 @@ function buildBadgeMapFromRefs(refsList, headSha, headBranch) {
 }
 
 function parseDirtyCount(vcsStatus) {
-  if (vcsStatus == null) return 0;
+  if (vcsStatus == null) return null;
   if (typeof vcsStatus === "number" && Number.isFinite(vcsStatus)) return Math.max(0, Math.floor(vcsStatus));
   if (typeof vcsStatus === "string") {
     return vcsStatus.split("\n").filter((l) => l.trim()).length;
@@ -2243,6 +2251,7 @@ function parseDirtyCount(vcsStatus) {
     if (typeof vcsStatus.changed === "number") return Math.max(0, Math.floor(vcsStatus.changed));
     if (Array.isArray(vcsStatus.files)) return vcsStatus.files.length;
     if (Array.isArray(vcsStatus.entries)) return vcsStatus.entries.length;
+    if (Array.isArray(vcsStatus.workingTree?.files)) return vcsStatus.workingTree.files.length;
   }
   return 0;
 }
@@ -2285,7 +2294,7 @@ function buildRemoteGraphResult({ cwd, branch, headSha, dirtyCount, commits, rem
     currentBranch: branch || "HEAD",
     projectTitle: repoName,
     dirtyCount,
-    workingTree: {
+    workingTree: dirtyCount == null ? null : {
       clean: dirtyCount === 0,
       total: dirtyCount,
       staged: 0,
@@ -2306,7 +2315,7 @@ async function getRemoteGitGraph(bundle) {
 
   const { githubRepo } = parseRemoteGitConfig(b.gitConfig);
   const head = parseGitHead(b.gitHead);
-  const branch = (typeof b.branch === "string" && b.branch.trim()) || head.branch || null;
+  const branch = head.branch || b.vcsStatus?.refName || b.vcsRefs?.refs?.find(ref => ref.current)?.name || (typeof b.branch === "string" && b.branch.trim()) || null;
   const headSha = head.headSha || null;
   const headLogEntries = parseHeadLog(b.headLog);
   const packedRefs = parsePackedRefs(b.packedRefs);
@@ -2314,11 +2323,23 @@ async function getRemoteGitGraph(bundle) {
   const branchCommits = normalizeBranchCommits(b.branchCommits);
   const dirtyCount = parseDirtyCount(b.vcsStatus);
 
+  const nativeCommits = normalizeBranchCommits(b.nativeCommits);
+  if (nativeCommits.length) {
+    const known = new Map([...branchCommits, ...headLogEntries.map(entry => ({ hash: entry.newSha, ...entry }))].map(commit => [commit.hash, commit]));
+    const badges = buildBadgeMapFromRefs([...packedRefs, ...vcsRefsList], nativeCommits[0].hash, branch);
+    for (const commit of nativeCommits) {
+      const meta = known.get(commit.hash);
+      if (meta) { commit.author = meta.author || commit.author; commit.timestamp = meta.timestamp || commit.timestamp; commit.relTime = meta.relTime || commit.relTime; }
+      commit.refs = badges.get(commit.hash) || [];
+    }
+    return { ...buildRemoteGraphResult({ cwd, branch, headSha: nativeCommits[0].hash, dirtyCount, commits: nativeCommits, remoteSource: "t3-connect", githubRepo }), partialHistory: !!b.nativeHistoryTruncated, firstParentOnly: true, parentsUnavailable: false };
+  }
+
   // Local tip commits from the remote reflog (never in GitHub's set while unpushed).
   const localCommits = headLogEntries.map((e) => ({
     hash: e.newSha,
     shortHash: e.newSha.slice(0, 7),
-    parents: e.oldSha === ZERO_SHA ? [] : [e.oldSha],
+    parents: [], // Reflog records the previous HEAD, not necessarily a parent.
     author: e.author,
     relTime: e.relTime,
     timestamp: e.timestamp,
@@ -2380,7 +2401,7 @@ async function getRemoteGitGraph(bundle) {
             }
           }
         }
-        return buildRemoteGraphResult({
+        return { ...buildRemoteGraphResult({
           cwd,
           branch,
           headSha,
@@ -2388,7 +2409,7 @@ async function getRemoteGitGraph(bundle) {
           commits: merged,
           remoteSource: "t3-connect+github",
           githubRepo,
-        });
+        }), partialHistory: true, parentsUnavailable: unpushed.length > 0 };
       }
     } catch {}
   }
@@ -2396,11 +2417,12 @@ async function getRemoteGitGraph(bundle) {
   // Pure local repo on the remote (no GitHub remote, or API unreachable): the
   // reflog + refs are the history.
   const commits = localCommits.length ? localCommits : branchCommits;
+  if (!commits.length) return { ok: false, error: "Remote Git history unavailable through the authorized connection" };
   const badgeBySha = buildBadgeMapFromRefs([...packedRefs, ...vcsRefsList], commits[0]?.hash || headSha, branch);
   for (const c of commits) {
     c.refs = badgeBySha.get(c.hash) || (c.hash === (commits[0]?.hash || "") ? [{ kind: "head", label: "HEAD", isHead: true }] : []);
   }
-  return buildRemoteGraphResult({
+  return { ...buildRemoteGraphResult({
     cwd,
     branch,
     headSha,
@@ -2408,7 +2430,7 @@ async function getRemoteGitGraph(bundle) {
     commits,
     remoteSource: "t3-connect",
     githubRepo: githubRepo || null,
-  });
+  }), partialHistory: true, parentsUnavailable: true };
 }
 
 async function getRemoteCommitDetail(req) {

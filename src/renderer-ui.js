@@ -1,3 +1,134 @@
+// Install in the main world on every UI injection, including hot reloads of
+// windows whose preload was created by an older HUD version.
+(function installT3HudWsRpc() {
+  "use strict";
+  if (window.__t3HudWsRpcState?.version === 3) return;
+  let NativeWS = window.WebSocket;
+  while (typeof NativeWS === "function" && Object.prototype.hasOwnProperty.call(NativeWS, "__t3HudTracked")) {
+    NativeWS = NativeWS.__t3HudOriginal || Object.getPrototypeOf(NativeWS);
+  }
+  if (typeof NativeWS !== "function" || typeof NativeWS.prototype?.send !== "function") return;
+  const sockets = new Set();
+  const tracked = new WeakSet();
+  const byEnvironment = new Map();
+  const pending = new Map();
+  const socketWaiters = new Set();
+  const frameParts = new WeakMap();
+  const originalSend = NativeWS.prototype.send;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let sequence = 0;
+  let discovery = null;
+
+  function unwrap(exit) {
+    const value = exit?.value;
+    return value?._tag === "Success" && "value" in value ? value.value : value;
+  }
+  function failureMessage(node, depth = 0) {
+    if (!node || depth > 5) return "RPC failure";
+    if (typeof node === "string") return node.slice(0, 400);
+    if (typeof node.message === "string") return node.message.slice(0, 400);
+    for (const key of ["error", "cause", "failure", "reasons", "errors"]) {
+      const child = node[key];
+      if (child) return failureMessage(Array.isArray(child) ? child[0] : child, depth + 1);
+    }
+    return "RPC failure";
+  }
+  function receive(socket, text) {
+    // T3 splitSocketFrame prefixes every non-final part with ASCII RS.
+    // Buffer per socket: server.getConfig and patches often exceed 48 KiB.
+    const previous = frameParts.get(socket) || "";
+    if (text.charCodeAt(0) === 30) {
+      const combined = previous + text.slice(1);
+      if (combined.length <= 16 * 1024 * 1024) frameParts.set(socket, combined);
+      else frameParts.delete(socket);
+      return;
+    }
+    if (previous) { text = previous + text; frameParts.delete(socket); }
+    let frames;
+    try { const parsed = JSON.parse(text); frames = Array.isArray(parsed) ? parsed : [parsed]; }
+    catch { return; }
+    for (const frame of frames) {
+      if (frame?._tag !== "Exit") continue;
+      const id = String(frame.requestId);
+      const entry = pending.get(id);
+      if (!entry || entry.socket !== socket) continue;
+      pending.delete(id);
+      clearTimeout(entry.timer);
+      if (frame.exit?._tag === "Success") {
+        const value = unwrap(frame.exit);
+        const environmentId = value?.environment?.environmentId;
+        if (entry.tag === "server.getConfig" && uuid.test(environmentId || "")) byEnvironment.set(environmentId, socket);
+        entry.resolve({ ok: true, value });
+      } else entry.resolve({ ok: false, error: failureMessage(frame.exit) });
+    }
+  }
+  function track(socket) {
+    if (!socket || tracked.has(socket)) return;
+    tracked.add(socket);
+    sockets.add(socket);
+    const notify = () => { if (socket.readyState === 1) for (const fn of socketWaiters) fn(); };
+    socket.addEventListener("open", notify, { once: true });
+    socket.addEventListener("close", () => {
+      sockets.delete(socket);
+      frameParts.delete(socket);
+      for (const [id, value] of byEnvironment) if (value === socket) byEnvironment.delete(id);
+      for (const [id, entry] of pending) if (entry.socket === socket) {
+        pending.delete(id); clearTimeout(entry.timer); entry.resolve({ ok: false, error: "socket closed" });
+      }
+    }, { once: true });
+    socket.addEventListener("message", event => {
+      const data = event?.data;
+      if (typeof data === "string") receive(socket, data);
+      else if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) receive(socket, new TextDecoder().decode(data));
+      else if (typeof data?.arrayBuffer === "function") data.arrayBuffer().then(buf => receive(socket, new TextDecoder().decode(buf))).catch(() => {});
+    });
+    notify();
+  }
+  NativeWS.prototype.send = function () {
+    track(this);
+    return originalSend.apply(this, arguments);
+  };
+  class T3HudTrackedWebSocket extends NativeWS {
+    constructor(url, protocols) { super(url, protocols); track(this); }
+  }
+  T3HudTrackedWebSocket.__t3HudTracked = true;
+  T3HudTrackedWebSocket.__t3HudOriginal = NativeWS;
+  window.WebSocket = T3HudTrackedWebSocket;
+
+  function request(socket, tag, payload, timeoutMs) {
+    return new Promise(resolve => {
+      const id = String(1000000000000 + Math.floor(Math.random() * 8000000000000) + (++sequence));
+      const timer = setTimeout(() => { pending.delete(id); resolve({ ok: false, error: "RPC timeout" }); }, timeoutMs);
+      pending.set(id, { socket, tag, resolve, timer });
+      try { socket.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] })); }
+      catch (error) { pending.delete(id); clearTimeout(timer); resolve({ ok: false, error: error?.message || String(error) }); }
+    });
+  }
+  window.__t3HudRemoteRpc = async (environmentId, tag, payload, timeoutMs = 4500) => {
+    const env = String(environmentId || "");
+    if (!uuid.test(env)) return { ok: false, error: "environment id missing or invalid" };
+    let socket = byEnvironment.get(env);
+    if (socket?.readyState === 1) return request(socket, tag, payload, timeoutMs);
+    if (![...sockets].some(value => value.readyState === 1)) await new Promise(resolve => {
+      const finish = () => { clearTimeout(timer); socketWaiters.delete(finish); resolve(); };
+      const timer = setTimeout(finish, Math.min(timeoutMs, 1800));
+      socketWaiters.add(finish);
+    });
+    const open = [...sockets].filter(value => value.readyState === 1);
+    if (!open.length) return { ok: false, error: "waiting for an active T3 Connect WebSocket" };
+    if (!discovery) discovery = Promise.all(open.map(value => request(value, "server.getConfig", {}, timeoutMs))).finally(() => { discovery = null; });
+    await discovery;
+    socket = byEnvironment.get(env);
+    if (socket?.readyState === 1) return request(socket, tag, payload, timeoutMs);
+    return { ok: false, error: "requested environment is not connected" };
+  };
+  window.__t3HudWsRpcInstalled = true;
+  window.__t3HudWsRpcState = {
+    version: 3,
+    snapshot: () => ({ version: 3, openSockets: [...sockets].filter(value => value.readyState === 1).length, environments: [...byEnvironment.keys()] }),
+  };
+})();
+
 (() => {
   "use strict";
 
@@ -2749,9 +2880,13 @@
       statusBadgeEl.title = `${t("uncommitted")}: ${wt.total} (${wt.modified} ${t("modified")} / ${wt.untracked} ${t("newFiles")})`;
       dirtyBadge.textContent = `*${wt.total}`;
       dirtyBadge.style.display = "inline-block";
-    } else {
+    } else if (wt) {
       statusBadgeEl.textContent = t("cleanStatus");
       statusBadgeEl.title = t("workingClean");
+      dirtyBadge.style.display = "none";
+    } else {
+      statusBadgeEl.textContent = "--";
+      statusBadgeEl.title = "";
       dirtyBadge.style.display = "none";
     }
     scheduleLayoutSync();
@@ -2768,7 +2903,11 @@
       return;
     }
 
-    gitListEl.innerHTML = header + commits.map((c) => {
+    const historyText = latestGraph.partialHistory
+      ? (hudLang === "en" ? "Partial remote history; merge connections may be incomplete." : "仅显示部分远端历史；合并分支的连线可能不完整。")
+      : latestGraph.firstParentOnly ? (hudLang === "en" ? "Remote history follows first parents; merge connections may be incomplete." : "远端提交历史；合并分支的连线可能不完整。") : "";
+    const historyNotice = historyText ? `<div class="t3-empty-msg">${escapeHtml(historyText)}</div>` : "";
+    gitListEl.innerHTML = header + historyNotice + commits.map((c) => {
       const refs = displayCommitRefs(c.refs);
       const refsHtml = refs.length ? `<span class="t3-git-refs">${refs.map((r) =>
         `<span class="t3-git-ref ${r.kind}${r.label.length <= 18 ? " short" : ""}" title="${escapeHtml(r.label)}">${GIT_BRANCH_ICON}<span class="t3-git-ref-label">${escapeHtml(r.label)}</span></span>`
@@ -2839,7 +2978,7 @@
       rpc("projects.readFile", { cwd, relativePath, allowMissing: true });
     const toText = (v) => {
       if (typeof v === "string") return v;
-      if (v && typeof v === "object") return v.content ?? v.text ?? v.fileContent ?? null;
+      if (v && typeof v === "object" && !v.truncated && v.exists !== false) return v.contents ?? v.content ?? v.text ?? v.fileContent ?? null;
       return null;
     };
     const [gitConfigRaw, gitHeadRaw, packedRefsRaw, headLogRaw, vcsRefs, vcsStatus, branchCommits] =
@@ -2852,20 +2991,52 @@
         rpc("vcs.refreshStatus", { cwd }),
         rpc("review.getBranchCommits", { cwd }),
       ]);
+    // Review ranges exclude their base. Without an upstream, ask for the
+    // latest commit relative to its first parent and clearly mark it partial.
+    let reviewCommits = branchCommits;
+    if (!toText(headLogRaw) && (!branchCommits || !branchCommits.commits?.length)) {
+      const range = await rpc("review.getBranchCommits", { cwd, baseRef: "HEAD~1" });
+      if (range?.commits?.length) reviewCommits = range;
+    }
+    const gitHead = toText(gitHeadRaw);
+    const headRef = gitHead?.trim().match(/^ref: (refs\/[A-Za-z0-9_./-]+)$/)?.[1];
+    const looseHead = headRef ? toText(await readFile(`.git/${headRef}`))?.trim() : gitHead?.trim();
+    const packedHead = headRef ? toText(packedRefsRaw)?.split("\n").find(line => line.endsWith(` ${headRef}`))?.split(" ")[0] : null;
+    const headLog = toText(headLogRaw);
+    const logTip = headLog?.trim().split("\n").at(-1)?.split(" ")[1];
+    let nextSha = [looseHead, packedHead, logTip, reviewCommits?.commits?.[0]?.sha].find(value => /^[a-f0-9]{40}$/i.test(value || ""));
+    const nativeCommits = [];
+    const visited = new Set();
+    let nativeHistoryTruncated = true;
+    // The native preview resolves a full SHA and its first parent, including
+    // the root commit excluded from review ranges. Never invent reflog edges.
+    while (nextSha && nativeCommits.length < 80 && !visited.has(nextSha)) {
+      visited.add(nextSha);
+      const preview = await rpc("review.getDiffPreview", { cwd, commitSha: nextSha, metadataOnly: true });
+      const source = preview?.sources?.find(value => value.kind === "commit" && value.headRef?.toLowerCase() === nextSha.toLowerCase());
+      if (!source) break;
+      const parent = source.baseRef;
+      const isRoot = parent === "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+      nativeCommits.push({ hash: nextSha.toLowerCase(), subject: source.commitSubject || "(no message)", parents: !isRoot && /^[a-f0-9]{40}$/i.test(parent || "") ? [parent.toLowerCase()] : [] });
+      if (isRoot) { nativeHistoryTruncated = false; break; }
+      nextSha = /^[a-f0-9]{40}$/i.test(parent || "") ? parent.toLowerCase() : null;
+    }
     const bundle = {
       environmentId: envId,
       cwd,
       branch: branch || null,
       gitConfig: toText(gitConfigRaw),
-      gitHead: toText(gitHeadRaw),
+      gitHead,
       packedRefs: toText(packedRefsRaw),
-      headLog: toText(headLogRaw),
+      headLog,
       vcsRefs: vcsRefs ?? null,
       vcsStatus: vcsStatus ?? null,
-      branchCommits: branchCommits ?? null,
+      branchCommits: reviewCommits ?? null,
+      nativeCommits,
+      nativeHistoryTruncated,
     };
     const res = await callBackend("getRemoteGitGraph", bundle);
-    return res && res.ok ? res : null;
+    return res || null;
   }
 
   async function openCommitDetail(hash) {
@@ -2888,7 +3059,13 @@
       const cwd = fb?.cwd || latestGraph.repoPath || "";
       const envId = fb?.environmentId || lastRemotePayload?.environmentId || "";
       const entry = (latestGraph.commits || []).find((c) => c.hash === hash) || {};
-      res = await callBackend("getRemoteCommitDetail", {
+      const previewResult = envId && cwd && typeof window.__t3HudRemoteRpc === "function"
+        ? await window.__t3HudRemoteRpc(envId, "review.getDiffPreview", { cwd, commitSha: hash }, 4500).catch(() => null)
+        : null;
+      const source = previewResult?.ok && previewResult.value?.sources?.find((item) => item.kind === "commit");
+      if (source) {
+        res = { ok: true, hash, authorName: entry.author || "", authorEmail: "", message: source.commitSubject || entry.subject || "", files: (source.files || []).map((f) => ({ path: f.path, added: f.additions, deleted: f.deletions })), patch: source.diff || "", diffUnavailable: !!(source.truncated || source.patchesDeferred || previewResult.value.incomplete) };
+      } else res = await callBackend("getRemoteCommitDetail", {
         githubRepo: latestGraph.githubRepo || null,
         hash,
         cwd,
@@ -2938,7 +3115,8 @@
       ? `<div class="t3-patch-box">${formatColoredPatch(res.patch)}</div>`
       : "";
 
-    commitBodyEl.innerHTML = filesHtml + patchHtml;
+    const notice = res.diffUnavailable ? `<div class="t3-empty-msg">${escapeHtml(hudLang === "en" ? "Diff unavailable or incomplete." : "变更详情不可用或不完整。")}</div>` : "";
+    commitBodyEl.innerHTML = notice + filesHtml + patchHtml;
   }
 
   gitListEl.addEventListener("click", (e) => {
@@ -2982,7 +3160,7 @@
       if (envId && cwd) {
         try {
           const remote = await fetchRemoteGitBundle(envId, cwd, branchSnap);
-          if (remote && remote.ok) {
+          if (remote) {
             if (!remote.threadId && threadSnap) remote.threadId = threadSnap;
             graph = remote;
           }
