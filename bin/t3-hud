@@ -78,17 +78,55 @@ do_reload() {
     echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
     exit 1
   fi
-  # Single-quoted EJS passes the RPC path / token slot verbatim to Node; the shell
-  # never interpolates them, so an unexpected RPC_FILE cannot break out of the argv.
   ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
-    const fs = require("node:fs");
-    const rpcFile = process.argv[2];
-    const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
-    fetch(cfg.url + "/admin/reload-ui", {
-      method: "POST",
-      headers: { "X-T3-Hud-Token": cfg.adminToken || cfg.token }
-    }).then(r => r.json()).then(j => console.log("[t3-hud] 热重载完成:", JSON.stringify(j)));
-  ' "node" "$RPC_FILE"
+    const fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process");
+    const [pluginDir, rpcFile] = process.argv.slice(1);
+    (async () => {
+      const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
+      const admTok = cfg.adminToken || cfg.token;
+      const rpcTok = cfg.rpcToken || cfg.token || admTok;
+      await fetch(cfg.url + "/admin/reload-ui", { method: "POST", headers: { "X-T3-Hud-Token": admTok } });
+      const probe = await fetch(cfg.url + "/rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-T3-Hud-Token": rpcTok },
+        body: JSON.stringify({ method: "getGitGraph", args: ["__HUB_RPC__", "hub:getContext", {}] }),
+      }).then(r => r.json()).catch(() => ({ ok: false, error: "Git" }));
+      if (!probe.ok && /Git|Unknown method/i.test(String(probe.error || ""))) {
+        const bridgeFile = path.join(pluginDir, "run", "hub-bridge.json");
+        let bridge = null;
+        try {
+          const b = JSON.parse(fs.readFileSync(bridgeFile, "utf8"));
+          process.kill(b.pid, 0);
+          await fetch(b.url + "/reload", { method: "POST", headers: { "X-T3-Hud-Token": b.token } });
+          bridge = b;
+        } catch { bridge = null; }
+        if (!bridge) {
+          try { fs.unlinkSync(bridgeFile); } catch {}
+          const child = spawn(process.execPath, [path.join(pluginDir, "hub-bridge.cjs")], {
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: pluginDir, T3_WATCH_PID: String(cfg.pid || 0) },
+            detached: true,
+            stdio: "ignore",
+          });
+          child.unref();
+          for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 80));
+            if (fs.existsSync(bridgeFile)) { bridge = JSON.parse(fs.readFileSync(bridgeFile, "utf8")); break; }
+          }
+        }
+        if (bridge) {
+          const ruiPath = path.join(pluginDir, "renderer-ui.js");
+          const raw = fs.readFileSync(ruiPath, "utf8").replace(/^window\.__t3HubSidecarBridge = [^\n]+\n/, "");
+          const header = "window.__t3HubSidecarBridge = " + JSON.stringify({ url: bridge.url, token: bridge.token }) + ";\n";
+          fs.writeFileSync(ruiPath, header + raw, { encoding: "utf8", mode: 0o600 }); try { fs.chmodSync(ruiPath, 0o600); } catch {}
+        }
+      }
+      const j = await fetch(cfg.url + "/admin/reload-ui", {
+        method: "POST",
+        headers: { "X-T3-Hud-Token": admTok },
+      }).then(r => r.json());
+      console.log("[t3-hud] 热重载完成:", JSON.stringify(j));
+    })().catch(e => { console.error(e); process.exit(1); });
+  ' "$PLUGIN_DIR" "$RPC_FILE"
 }
 
 do_lang() {

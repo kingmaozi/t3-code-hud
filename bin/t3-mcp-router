@@ -1,0 +1,463 @@
+#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const http = require("node:http");
+const https = require("node:https");
+
+const HOME_DIR = process.env.HOME || os.homedir();
+const HUB_DIR = process.env.T3_HUB_DIR || path.join(HOME_DIR, ".t3", "hub");
+const STATE_PATH = path.join(HUB_DIR, "state.json");
+const REGISTRY_PATH = path.join(HUB_DIR, "mcp-registry.json");
+const SCHEMA_CACHE_PATH = path.join(HUB_DIR, "mcp-schema-cache.json");
+const IDLE_MS = 3 * 60 * 1000;
+
+let memoryVault = null;
+for (const cand of [
+  process.env.T3_MEMORY_VAULT ? path.resolve(process.env.T3_MEMORY_VAULT) : null,
+  path.join(__dirname, "..", "src", "memory-vault.cjs"),
+  path.join(__dirname, "..", "hud-plugin", "memory-vault.cjs"),
+  path.join(HOME_DIR, ".t3", "hud-plugin", "memory-vault.cjs"),
+].filter(Boolean)) {
+  try { memoryVault = require(cand); if (memoryVault) break; } catch {}
+}
+
+function readJson(p, fb) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fb; } }
+function readState() { const s = readJson(STATE_PATH, {}); return s && typeof s === "object" ? s : {}; }
+function readRegistry() {
+  const r = readJson(REGISTRY_PATH, []);
+  if (Array.isArray(r)) return r;
+  if (r && typeof r === "object" && Array.isArray(r.servers)) return r.servers;
+  if (r && typeof r === "object" && r.mcpServers && typeof r.mcpServers === "object") return Object.entries(r.mcpServers).map(([name, v]) => ({ name, ...(v || {}) }));
+  if (r && typeof r === "object") return Object.entries(r).map(([name, v]) => ({ name, ...(v || {}) }));
+  return [];
+}
+function dirExistsBin(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+function listDirsBin(dir) {
+  try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => path.join(dir, e.name)); } catch { return []; }
+}
+function discoveredDefs() {
+  try {
+    const cands = [
+      process.env.T3_MCP_ROUTER ? path.resolve(process.env.T3_MCP_ROUTER) : null,
+      path.join(__dirname, "..", "src", "mcp-router.cjs"),
+      path.join(__dirname, "..", "hud-plugin", "mcp-router.cjs"),
+      path.join(HOME_DIR, ".t3", "hud-plugin", "mcp-router.cjs"),
+    ].filter(Boolean);
+    for (const c of cands) {
+      try {
+        const mod = require(c);
+        if (!mod) continue;
+        let m = null;
+        if (typeof mod.discoverServerDefinitions === "function") {
+          try { m = mod.discoverServerDefinitions({ homeDir: HOME_DIR, hubDir: HUB_DIR }); } catch {
+            try {
+              if (typeof mod.createMcpRouter === "function") {
+                const r = mod.createMcpRouter({ homeDir: HOME_DIR, hubDir: HUB_DIR });
+                if (r && typeof r.discoverServerDefinitions === "function") m = r.discoverServerDefinitions();
+              }
+            } catch {}
+          }
+        } else if (typeof mod.createMcpRouter === "function") {
+          try {
+            const r = mod.createMcpRouter({ homeDir: HOME_DIR, hubDir: HUB_DIR });
+            if (r && typeof r.discoverServerDefinitions === "function") m = r.discoverServerDefinitions();
+          } catch {}
+        }
+        if (m) {
+          const map = new Map();
+          if (m instanceof Map) { for (const [k, v] of m) map.set(k, v); }
+          else if (Array.isArray(m)) { for (const v of m) if (v && v.name) map.set(v.name, v); }
+          else if (m && typeof m === "object") { for (const [k, v] of Object.entries(m)) map.set(v && v.name ? v.name : k, v); }
+          if (map.size) return map;
+        }
+      } catch {}
+    }
+  } catch {}
+  const byName = new Map();
+  function add(s) { if (!s || !s.name || s.name === "t3_hub" || s.name === "t3-hub") return; if (!byName.has(s.name)) byName.set(s.name, s); }
+  try {
+    const magpie = readJson(path.join(HOME_DIR, ".config", "magpie", "library.json"), null);
+    if (magpie && Array.isArray(magpie.mcp)) {
+      for (const e of magpie.mcp) if (e && e.name) add({ name: e.name, transport: e.transport || (e.url ? "http" : "stdio"), command: e.command, args: e.args, env: e.env, url: e.url, agents: e.agents, __source: "magpie", __sourceLabel: "magpie" });
+    }
+    function collect(file, key) {
+      const raw = readJson(file, null);
+      if (!raw || !raw.mcpServers || typeof raw.mcpServers !== "object" || Array.isArray(raw.mcpServers)) return;
+      for (const [name, v] of Object.entries(raw.mcpServers)) { if (name === "t3_hub" || name === "t3-hub") continue; add({ name, ...(v || {}), __source: key, __sourceLabel: key }); }
+    }
+    collect(path.join(HOME_DIR, ".pi", "agent", "mcp.json"), "pi");
+    collect(path.join(HOME_DIR, ".config", "muse", "settings.json"), "muse");
+    collect(path.join(HOME_DIR, ".claude", "mcp.json"), "claude");
+    const agyRoot = path.join(HOME_DIR, ".t3", "userdata", "providers", "antigravity");
+    if (dirExistsBin(agyRoot)) for (const inst of listDirsBin(agyRoot)) collect(path.join(inst, "config", "mcp_config.json"), "agy");
+  } catch {}
+  return byName;
+}
+function resolveProjectRoot() {
+  let cur = path.resolve(process.cwd());
+  const state = readState();
+  const registered = new Set(Object.keys(state.mcpModes?.projects || {}));
+  let fallback = cur;
+  while (true) {
+    try {
+      const st = fs.statSync(path.join(cur, ".git"));
+      if (st.isDirectory() || st.isFile()) return cur;
+    } catch {}
+    if (registered.has(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return fallback;
+    cur = parent;
+    if (cur === path.parse(cur).root) break;
+  }
+  return fallback;
+}
+function enabledServers() {
+  const registry = readRegistry();
+  const state = readState();
+  const projectRoot = resolveProjectRoot();
+  const globalModes = state.mcpModes?.global || {};
+  const projModes = state.mcpModes?.projects?.[projectRoot] || {};
+  const discovered = discoveredDefs();
+  const merged = new Map();
+  for (const [k, v] of discovered) merged.set(k, v);
+  for (const s of registry) { if (s && s.name) merged.set(s.name, s); }
+  const out = [];
+  for (const s of merged.values()) {
+    if (!s || !s.name) continue;
+    const mode = projModes[s.name] || globalModes[s.name] || "off";
+    if (mode === "off") continue;
+    out.push({ def: s, mode });
+  }
+  return { servers: out, projectRoot };
+}
+function vaultFn(...names) {
+  if (!memoryVault) return null;
+  for (const n of names) if (typeof memoryVault[n] === "function") return (...a) => memoryVault[n](...a);
+  return null;
+}
+const vaultSearch = memoizeVault(["search", "memorySearch", "memory_search", "recall", "listMemories"]);
+const vaultRead = (...args) => {
+  const fn = vaultFn("read", "memoryRead", "memory_read");
+  if (fn) return fn(...args);
+  if (memoryVault && typeof memoryVault.listMemories === "function") {
+    const a = args[0] || {};
+    const res = memoryVault.listMemories({ projectRoot: a.projectRoot, module: a.module || "all", includeGlobal: true, limit: 200 });
+    if (a.id && res && Array.isArray(res.items)) {
+      const found = res.items.find((it) => it.id === a.id);
+      return { ok: Boolean(found), item: found || null };
+    }
+    return res;
+  }
+  throw new Error("memory-vault function not found: read");
+};
+const vaultWrite = memoizeVault(["write", "memoryWrite", "memory_write", "saveMemory"]);
+function memoizeVault(names) {
+  let cached;
+  let tried = false;
+  return (...args) => {
+    if (!tried) { tried = true; cached = vaultFn(...names); }
+    if (!cached) throw new Error("memory-vault function not found: " + names[0]);
+    return cached(...args);
+  };
+}
+function memoryTools() {
+  if (!memoryVault) return [];
+  return [
+    { name: "memory_search", description: "Search shared project memory (rules, pitfalls, decisions).", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, includeGlobal: { type: "boolean" }, limit: { type: "number" } }, required: ["query"] } },
+    { name: "memory_read", description: "Read a memory module entry.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" } } } },
+    { name: "memory_write", description: "Write a verified non-obvious pitfall or durable constraint.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" } }, required: ["module", "title", "content"] } },
+  ];
+}
+const HUB_LIST_DEF = { name: "hub_list_mcp_tools", description: "List tools from lazy upstream MCP servers (connects on demand).", inputSchema: { type: "object", properties: { server: { type: "string" } } } };
+const HUB_CALL_DEF = { name: "hub_call_mcp_tool", description: "Invoke a tool on an upstream MCP server.", inputSchema: { type: "object", properties: { server: { type: "string" }, tool: { type: "string" }, arguments: { type: "object" } }, required: ["server", "tool"] } };
+
+const stdioPool = new Map();
+function childKey(def) {
+  return def.name + "|" + (def.command || "") + "|" + JSON.stringify(def.args || []) + "|" + (def.url || "");
+}
+function killPoolEntry(key) {
+  const e = stdioPool.get(key);
+  if (!e) return;
+  clearTimeout(e.idleTimer);
+  try { e.proc.kill("SIGTERM"); } catch {}
+  stdioPool.delete(key);
+}
+function scheduleIdle(key) {
+  const e = stdioPool.get(key);
+  if (!e) return;
+  clearTimeout(e.idleTimer);
+  e.idleTimer = setTimeout(() => killPoolEntry(key), IDLE_MS);
+  if (e.idleTimer.unref) e.idleTimer.unref();
+}
+function withTimeout(p, ms, label) {
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("timeout: " + label)), ms); });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(t));
+}
+function spawnStdioUpstream(def) {
+  const key = childKey(def);
+  let entry = stdioPool.get(key);
+  if (entry && !entry.proc.killed) return entry;
+  const cmd = def.command;
+  if (!cmd) throw new Error("missing command for " + def.name);
+  const args = Array.isArray(def.args) ? def.args : [];
+  const env = { ...process.env, ...(def.env && typeof def.env === "object" ? def.env : {}) };
+  const proc = spawn(cmd, args, { env, stdio: ["pipe", "pipe", "pipe"] });
+  let buffer = "";
+  const waiters = new Map(); // id -> {resolve, reject}
+  let nextId = 1;
+  let initialized = false;
+  proc.stdout.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg && msg.id !== undefined && waiters.has(msg.id)) {
+        const w = waiters.get(msg.id);
+        waiters.delete(msg.id);
+        if (msg.error) w.reject(new Error(JSON.stringify(msg.error)));
+        else w.resolve(msg.result);
+      }
+    }
+  });
+  proc.on("error", () => {});
+  proc.on("exit", () => { for (const k of [...waiters.keys()]) { const w = waiters.get(k); waiters.delete(k); w.reject(new Error("upstream exited")); } stdioPool.delete(key); });
+  entry = { key, proc, waiters, nextId: () => nextId++, initialized: false, idleTimer: null, def };
+  stdioPool.set(key, entry);
+  return entry;
+}
+function sendToStdio(entry, method, params) {
+  return new Promise((resolve, reject) => {
+    const id = entry.nextId();
+    entry.waiters.set(id, { resolve, reject });
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} });
+    entry.proc.stdin.write(msg + "\n");
+    scheduleIdle(entry.key);
+  });
+}
+async function ensureInitialized(entry) {
+  if (entry.initialized) return;
+  entry.initialized = true;
+  try {
+    await withTimeout(sendToStdio(entry, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t3-mcp-router", version: "1.0.0" } }), 8000, "initialize " + entry.def.name);
+    entry.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  } catch (e) { entry.initialized = false; throw e; }
+}
+async function stdioToolsList(def) {
+  const entry = spawnStdioUpstream(def);
+  await ensureInitialized(entry);
+  const res = await withTimeout(sendToStdio(entry, "tools/list", {}), 10000, "tools/list " + def.name);
+  if (!res || !Array.isArray(res.tools)) throw new Error("invalid tools/list from " + def.name);
+  return res.tools;
+}
+async function stdioToolsCall(def, tool, args) {
+  const entry = spawnStdioUpstream(def);
+  await ensureInitialized(entry);
+  const res = await withTimeout(sendToStdio(entry, "tools/call", { name: tool, arguments: args || {} }), 15000, "tools/call " + def.name + "/" + tool);
+  if (!res || !Array.isArray(res.content)) return { content: [{ type: "text", text: JSON.stringify(res) }] };
+  return res;
+}
+function httpPostJson(urlStr, payload, env) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { reject(e); return; }
+    const body = JSON.stringify(payload);
+    const headers = { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), Accept: "application/json, text/event-stream" };
+    if (env && typeof env === "object") for (const [k, v] of Object.entries(env)) { if (typeof v === "string" && /^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(k)) headers[k] = v; }
+    const lib = u.protocol === "https:" ? https : http;
+    const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: "POST", headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        const ct = String(res.headers["content-type"] || "");
+        if (ct.includes("text/event-stream")) {
+          let found = null;
+          for (const line of text.split(/\r?\n/)) {
+            const t = line.trim();
+            if (t.startsWith("data:")) {
+              const d = t.slice(5).trim();
+              if (d && d !== "[DONE]") { try { const j = JSON.parse(d); if (j && (j.result !== undefined || j.error !== undefined)) found = j; } catch {} }
+            }
+          }
+          if (found) { if (found.error) reject(new Error(JSON.stringify(found.error))); else resolve(found.result); return; }
+        }
+        try {
+          const j = JSON.parse(text);
+          if (j && j.error) reject(new Error(JSON.stringify(j.error)));
+          else resolve(j.result !== undefined ? j.result : j);
+        } catch (e) { reject(new Error("invalid HTTP JSON-RPC response: " + text.slice(0, 200))); }
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+async function upstreamToolsList(def) {
+  if (def.url) {
+    const res = await withTimeout(httpPostJson(def.url, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, def.env), 10000, "http tools/list " + def.name);
+    if (!res || !Array.isArray(res.tools)) throw new Error("invalid tools/list from " + def.name);
+    return res.tools;
+  }
+  return stdioToolsList(def);
+}
+async function upstreamToolsCall(def, tool, args) {
+  if (def.url) {
+    const res = await withTimeout(httpPostJson(def.url, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args || {} } }, def.env), 15000, "http tools/call " + def.name + "/" + tool);
+    if (!res || !Array.isArray(res.content)) return { content: [{ type: "text", text: JSON.stringify(res) }] };
+    return res;
+  }
+  return stdioToolsCall(def, tool, args);
+}
+function readSchemaCache() { const c = readJson(SCHEMA_CACHE_PATH, {}); return c && typeof c === "object" ? c : {}; }
+function writeSchemaCache(c) { try { fs.mkdirSync(HUB_DIR, { recursive: true }); const tmp = SCHEMA_CACHE_PATH + ".tmp-" + process.pid; fs.writeFileSync(tmp, JSON.stringify(c, null, 2), "utf8"); fs.renameSync(tmp, SCHEMA_CACHE_PATH); } catch {} }
+async function getToolsCachedLive(def, forceLive = false) {
+  const cache = readSchemaCache();
+  if (!forceLive && cache[def.name] && Array.isArray(cache[def.name].tools)) return cache[def.name].tools;
+  const tools = await upstreamToolsList(def);
+  cache[def.name] = { tools, fetchedAt: new Date().toISOString() };
+  writeSchemaCache(cache);
+  return tools;
+}
+
+function writeResponse(res, framed) {
+  const body = JSON.stringify(res);
+  if (framed) {
+    process.stdout.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  } else {
+    process.stdout.write(body + "\n");
+  }
+}
+async function handleToolsList() {
+  const { servers } = enabledServers();
+  const tools = [];
+  for (const t of memoryTools()) tools.push(t);
+  const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
+  const direct = servers.filter((s) => s.mode === "project-direct" || s.mode === "global-direct");
+  if (lazy.length) { tools.push(HUB_LIST_DEF, HUB_CALL_DEF); }
+  for (const { def } of direct) {
+    try {
+      const upstream = await getToolsCachedLive(def, false);
+      for (const t of upstream) tools.push({ name: `${def.name}__${t.name}`, description: t.description || `${def.name} ${t.name}`, inputSchema: t.inputSchema || { type: "object", properties: {} } });
+    } catch {}
+  }
+  return { tools };
+}
+async function handleToolsCall(params) {
+  const name = params?.name;
+  const args = params?.arguments || {};
+  if (name === "memory_search") {
+    if (!memoryVault) throw new Error("memory-vault not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = await vaultSearch({ projectRoot, query: args.query, module: args.module, includeGlobal: args.includeGlobal !== false, limit: args.limit });
+    if (res && Array.isArray(res.content)) return res;
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
+  }
+  if (name === "memory_read") {
+    if (!memoryVault) throw new Error("memory-vault not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = await vaultRead({ projectRoot, module: args.module, id: args.id });
+    if (res && Array.isArray(res.content)) return res;
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
+  }
+  if (name === "memory_write") {
+    if (!memoryVault) throw new Error("memory-vault not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent });
+    if (res && Array.isArray(res.content)) return res;
+    return { content: [{ type: "text", text: JSON.stringify(res ?? true) }] };
+  }
+  if (name === "hub_list_mcp_tools") {
+    const { servers } = enabledServers();
+    const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
+    const target = args.server ? lazy.find((s) => s.def.name === args.server) : null;
+    if (args.server && !target) throw new Error("server not enabled as lazy: " + args.server);
+    const list = target ? [target] : lazy;
+    const serversObj = {};
+    for (const { def } of list) {
+      try {
+        const tools = await getToolsCachedLive(def, true);
+        serversObj[def.name] = { tools: tools.map((t) => ({ name: t.name, description: t.description || "", inputSchema: t.inputSchema || { type: "object", properties: {} } })) };
+      } catch (e) { serversObj[def.name] = { tools: [], error: String(e && e.message || e) }; }
+    }
+    const payload = target ? { server: target.def.name, tools: serversObj[target.def.name]?.tools || [] } : { servers: serversObj };
+    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+  }
+  if (name === "hub_call_mcp_tool") {
+    const { servers } = enabledServers();
+    const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
+    const entry = lazy.find((s) => s.def.name === args.server);
+    if (!entry) throw new Error("server not enabled as lazy: " + (args.server || ""));
+    if (!args.tool) throw new Error("tool required");
+    return upstreamToolsCall(entry.def, args.tool, args.arguments || {});
+  }
+  if (name && name.includes("__")) {
+    const idx = name.indexOf("__");
+    const srv = name.slice(0, idx), tool = name.slice(idx + 2);
+    const { servers } = enabledServers();
+    const direct = servers.filter((s) => s.mode === "project-direct" || s.mode === "global-direct");
+    const entry = direct.find((s) => s.def.name === srv);
+    if (!entry) throw new Error("server not enabled as direct: " + srv);
+    return upstreamToolsCall(entry.def, tool, args);
+  }
+  throw new Error("unknown tool: " + name);
+}
+async function handleMessage(msg, framed) {
+  const isNotification = msg.id === undefined || msg.id === null;
+  if (String(msg.method || "").startsWith("notifications/")) return;
+  const reply = (result) => { if (!isNotification) writeResponse({ jsonrpc: "2.0", id: msg.id, result }, framed); };
+  const fail = (code, message) => { if (!isNotification) writeResponse({ jsonrpc: "2.0", id: msg.id, error: { code, message } }, framed); };
+  try {
+    if (msg.method === "initialize") {
+      const ver = msg.params?.protocolVersion || "2024-11-05";
+      reply({ protocolVersion: ver, capabilities: { tools: {} }, serverInfo: { name: "t3-mcp-router", version: "1.0.0" } });
+    } else if (msg.method === "ping") { reply({}); }
+    else if (msg.method === "tools/list") { reply(await handleToolsList()); }
+    else if (msg.method === "tools/call") { reply(await handleToolsCall(msg.params || {})); }
+    else if (isNotification) return;
+    else fail(-32601, "method not found: " + msg.method);
+  } catch (e) { fail(-32603, String((e && e.message) || e)); }
+}
+let inBuffer = "";
+process.stdin.on("data", (chunk) => {
+  inBuffer += chunk.toString("utf8");
+  while (true) {
+    const trimmedStart = inBuffer.replace(/^\s+/, "");
+    const isFramed = /^content-length:/i.test(trimmedStart);
+    if (isFramed) {
+      const headerEnd = trimmedStart.search(/\r?\n\r?\n/);
+      if (headerEnd === -1) { inBuffer = trimmedStart; break; }
+      const headerBlock = trimmedStart.slice(0, headerEnd);
+      const after = trimmedStart.slice(headerEnd).replace(/^\r?\n\r?\n/, "");
+      const m = headerBlock.match(/content-length:\s*(\d+)/i);
+      if (!m) { inBuffer = after; continue; }
+      const len = parseInt(m[1], 10);
+      if (after.length < len) { inBuffer = trimmedStart; break; }
+      const body = after.slice(0, len);
+      inBuffer = after.slice(len);
+      let msg;
+      try { msg = JSON.parse(body); } catch { continue; }
+      handleMessage(msg, true).catch(() => {});
+    } else {
+      const nl = inBuffer.indexOf("\n");
+      if (nl === -1) break;
+      const line = inBuffer.slice(0, nl).trim();
+      inBuffer = inBuffer.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      handleMessage(msg, false).catch(() => {});
+    }
+  }
+});
+process.stdin.on("end", () => { for (const k of [...stdioPool.keys()]) killPoolEntry(k); });
+
+

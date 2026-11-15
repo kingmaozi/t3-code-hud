@@ -105,8 +105,12 @@
     const parts = rawHint.split(/[/?#]/).filter(Boolean);
     for (let i = parts.length - 1; i >= 0; i--) {
       let seg = parts[i];
-      try { seg = decodeURIComponent(seg); } catch {}
+      // Delegated subagent ids are literally `thread:delegated-task:command%3A...`:
+      // decoding them would turn the inner `%3A` into `:` and break every match.
       if (seg.startsWith("thread:")) return seg;
+      if (seg.toLowerCase().startsWith("thread%3a")) {
+        try { return decodeURIComponent(seg); } catch { return seg; }
+      }
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return seg;
     }
     return null;
@@ -124,22 +128,107 @@
       if (activeDriver && drv === activeDriver) driverUsage = pt.contextUsage;
     }
     const contextUsage = driverUsage ?? lastUsage;
+    // Everything that is not conversational content counts as tool wait
+    // (file_search / web_search / mcp / dynamic tools included).
+    const CONTENT_EXCLUDE = new Set(["root_turn", "assistant_message", "user_message", "checkpoint", "notification"]);
+    const itemKind = (it) => String(it?.kind ?? it?.type ?? "");
+    const itemTurnId = (it) => it?.providerTurnId ?? it?.turnId ?? it?.providerTurn?.id ?? null;
+    const itemStartedMs = (it) => toEpochMs(it?.startedAt ?? it?.startedMs);
+    const itemCompletedMs = (it) => toEpochMs(it?.completedAt ?? it?.completedMs);
+    const weightTextTokens = (raw) => {
+      if (!raw) return 0;
+      const str = typeof raw === "string" ? raw : JSON.stringify(raw);
+      let cjk = 0;
+      let ascii = 0;
+      let other = 0;
+      for (let i = 0; i < str.length; i++) {
+        const cp = str.charCodeAt(i);
+        if (cp >= 0x4e00 && cp <= 0x9fff) cjk++;
+        else if (cp <= 0x7f) ascii++;
+        else other++;
+      }
+      return Math.round(cjk * 0.88 + ascii * 0.33 + other * 0.75);
+    };
     const toolIntervals = [];
     for (const n of p.nodes || []) {
       if (!n) continue;
-      if (n.kind === "tool_call" || n.kind === "subagent" || n.kind === "command_execution") {
-        const s = toEpochMs(n.startedAt);
-        const e = toEpochMs(n.completedAt);
+      if (!CONTENT_EXCLUDE.has(itemKind(n))) {
+        const s = itemStartedMs(n);
+        const e = itemCompletedMs(n);
         if (s != null && e != null && e > s) toolIntervals.push([s, e]);
       }
     }
-    const turns = (p.providerTurns || []).map((pt) => ({
-      status: pt?.status || null,
-      driver: pt?.nativeTurnRef?.driver || null,
-      startedMs: toEpochMs(pt?.startedAt),
-      completedMs: toEpochMs(pt?.completedAt),
-      usage: pt?.turnTokenUsage || null,
-    }));
+    const rawItems = (Array.isArray(p.turnItems) && p.turnItems) || (Array.isArray(p.items) && p.items) || null;
+    const turns = (p.providerTurns || []).map((pt) => {
+      const ptId = pt?.id ?? pt?.providerTurnId ?? null;
+      const turnId = ptId == null ? null : String(ptId);
+      // Pure streaming decode window: final assistant_message span after last tool end.
+      let streamDecode = null;
+      if (turnId) {
+        const items = rawItems || p.nodes || [];
+        let lastToolEndMs = -Infinity;
+        let toolsInTurn = 0;
+        let asstCount = 0;
+        const assts = [];
+        for (const it of items) {
+          if (!it) continue;
+          const itTurnId = itemTurnId(it);
+          if (itTurnId != null && String(itTurnId) !== turnId) continue;
+          const k = itemKind(it);
+          if (k === "assistant_message") {
+            asstCount++;
+            const s = itemStartedMs(it);
+            const e = itemCompletedMs(it);
+            if (s != null && e != null) assts.push({ s, e, it });
+          } else if (!CONTENT_EXCLUDE.has(k)) {
+            toolsInTurn++;
+            const e = itemCompletedMs(it);
+            if (e != null && e > lastToolEndMs) lastToolEndMs = e;
+          }
+        }
+        if (assts.length) {
+          const floor = lastToolEndMs === -Infinity ? -Infinity : lastToolEndMs - 50;
+          const cands = assts.filter((a) => a.s >= floor && a.e > a.s + 180);
+          if (cands.length) {
+            cands.sort((a, b) => a.e - b.e || a.s - b.s);
+            const last = cands[cands.length - 1];
+            const streamSec = (last.e - last.s) / 1000;
+            if (streamSec >= 0.18) {
+              let visFraction = null;
+              const turnHasText = assts.some((a) => a.it?.text != null);
+              if (turnHasText) {
+                const lastWeight = weightTextTokens(last.it?.text);
+                let allWeight = 0;
+                for (const a of assts) allWeight += weightTextTokens(a.it?.text);
+                let toolArgWeight = 0;
+                for (const it of items) {
+                  if (!it) continue;
+                  const itTurnId = itemTurnId(it);
+                  if (itTurnId != null && String(itTurnId) !== turnId) continue;
+                  if (!CONTENT_EXCLUDE.has(itemKind(it)) && itemKind(it) !== "assistant_message") {
+                    toolArgWeight += weightTextTokens(it.input || it.pattern || it.arguments || "") + 18;
+                  }
+                }
+                if (toolsInTurn === 0) visFraction = 1;
+                else if (allWeight + toolArgWeight > 0) visFraction = lastWeight / (allWeight + toolArgWeight);
+              } else if (toolsInTurn === 0 && asstCount === 1) {
+                visFraction = 1;
+              }
+              streamDecode = { streamSec, visFraction };
+            }
+          }
+        }
+      }
+      return {
+        id: turnId,
+        status: pt?.status || null,
+        driver: pt?.nativeTurnRef?.driver || null,
+        startedMs: toEpochMs(pt?.startedAt),
+        completedMs: toEpochMs(pt?.completedAt),
+        usage: pt?.turnTokenUsage || null,
+        streamDecode,
+      };
+    });
     const tid = String(p.thread?.id || "");
     const uhMatches = uhProps && (!tid || !uhProps.threadId || String(uhProps.threadId) === tid);
     return {
@@ -164,9 +253,53 @@
 
   function readFiberThreadProjection(expectedThreadId) {
     const expected = extractLastThreadIdFromHint(expectedThreadId);
+    const fullyDecode = (v) => {
+      let cur = String(v || "");
+      for (let k = 0; k < 4; k++) {
+        try {
+          const next = decodeURIComponent(cur);
+          if (next === cur) break;
+          cur = next;
+        } catch {
+          break;
+        }
+      }
+      return cur;
+    };
+    const safeDecodeOnce = (v) => {
+      try {
+        return decodeURIComponent(String(v || ""));
+      } catch {
+        return String(v || "");
+      }
+    };
+    // Delegated ids mix raw `%3A`, single- and double-encoded forms; all must match.
+    const sameThreadId = (a, b) => {
+      const x = String(a || "");
+      const y = String(b || "");
+      if (x === y) return true;
+      if (safeDecodeOnce(x) === safeDecodeOnce(y)) return true;
+      return fullyDecode(x) === fullyDecode(y);
+    };
+    const fiberItemsOf = (st) => {
+      if (Array.isArray(st?.turnItems) && st.turnItems.length) return st.turnItems;
+      if (Array.isArray(st?.projection?.turnItems) && st.projection.turnItems.length) return st.projection.turnItems;
+      if (Array.isArray(st?.items) && st.items.length) return st.items;
+      return null;
+    };
+    const withFiberItems = (proj, items) => {
+      if (!items) return proj;
+      if (proj && (proj.turnItems || proj.items)) return proj;
+      const shallow = {};
+      for (const k of Object.keys(proj || {})) shallow[k] = proj[k];
+      shallow.turnItems = items;
+      return shallow;
+    };
     let uhProps = null;
     let matchedSt = null;
+    let matchedItems = null;
     let fallbackSt = null;
+    let fallbackItems = null;
     try {
       const rootEl = document.getElementById("root");
       if (!rootEl) return null;
@@ -186,7 +319,7 @@
           const mp = f.memoizedProps;
           if (mp && typeof mp === "object" && "gitCwd" in mp && "isServerThread" in mp) {
             const candTid = String(mp.threadId || "");
-            if (!uhProps || (expected && candTid === expected)) {
+            if (!uhProps || (expected && sameThreadId(candTid, expected))) {
               uhProps = {
                 environmentId: mp.environmentId,
                 threadId: mp.threadId,
@@ -205,28 +338,32 @@
             const st = h.memoizedState;
             if (st && typeof st === "object" && st.projection && Array.isArray(st.projection.providerTurns)) {
               const pid = String(st.projection.thread?.id || "");
-              if (!fallbackSt) fallbackSt = st;
-              if (expected && pid === expected && !matchedSt) {
+              if (!fallbackSt) {
+                fallbackSt = st;
+                fallbackItems = fiberItemsOf(st);
+              }
+              if (expected && sameThreadId(pid, expected) && !matchedSt) {
                 matchedSt = st;
+                matchedItems = fiberItemsOf(st);
               }
             }
             h = h.next;
             d++;
           }
         } catch {}
-        if (matchedSt && uhProps && (!expected || String(uhProps.threadId || "") === expected)) break;
+        if (matchedSt && uhProps && (!expected || sameThreadId(String(uhProps.threadId || ""), expected))) break;
         if (f.child) stack.push(f.child);
         if (f.sibling) stack.push(f.sibling);
       }
     } catch {}
 
     if (matchedSt) {
-      return buildProjectionPayload(matchedSt.projection, matchedSt.environmentId, uhProps);
+      return buildProjectionPayload(withFiberItems(matchedSt.projection, matchedItems), matchedSt.environmentId, uhProps);
     }
     if (!expected && fallbackSt) {
-      return buildProjectionPayload(fallbackSt.projection, fallbackSt.environmentId, uhProps);
+      return buildProjectionPayload(withFiberItems(fallbackSt.projection, fallbackItems), fallbackSt.environmentId, uhProps);
     }
-    if (uhProps && (!expected || String(uhProps.threadId || "") === expected)) {
+    if (uhProps && (!expected || sameThreadId(String(uhProps.threadId || ""), expected))) {
       return {
         environmentId: String(uhProps.environmentId || ""),
         threadId: String(uhProps.threadId || ""),
@@ -300,11 +437,16 @@
     let wallSecSum = 0;
     let lastTurnTps = null;
     let lastTurnNetSec = null;
+    let decodeTokSum = 0;
+    let decodeSecSum = 0;
+    let lastTurnDecodeTps = null;
+    let lastStreamSec = null;
     let lastPromptTotal = null;
     let lastTurnCacheRate = null;
     let lastTurnDriver = null;
     let lastTurnModel = null;
     const byModel = {};
+    const decodeByModel = {};
     for (const t of turns) {
       const u = t?.usage;
       if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") continue;
@@ -334,6 +476,22 @@
         wallOutSum += out;
         wallSecSum += (t.completedMs - t.startedMs) / 1000;
       }
+      const visOut = Math.max(0, out - reas);
+      const sd = t?.streamDecode;
+      if (sd && Number.isFinite(sd.streamSec) && sd.streamSec >= 0.18 && Number.isFinite(sd.visFraction) && sd.visFraction > 0) {
+        const streamTok = Math.round(visOut * Math.min(1, sd.visFraction));
+        if (streamTok >= 12 && streamTok / sd.streamSec < 900) {
+          decodeTokSum += streamTok;
+          decodeSecSum += sd.streamSec;
+          lastTurnDecodeTps = streamTok / sd.streamSec;
+          lastStreamSec = sd.streamSec;
+          if (turnModel) {
+            const cur = (decodeByModel[turnModel] ||= { tok: 0, sec: 0 });
+            cur.tok += streamTok;
+            cur.sec += sd.streamSec;
+          }
+        }
+      }
       if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
         const netSec = subtractWait(t.startedMs, t.completedMs);
         if (netSec > 0.05) {
@@ -349,22 +507,47 @@
         }
       }
     }
-    const promptTotal = sumUncached + sumCached + sumCacheWrite;
+    let promptTotal = sumUncached + sumCached + sumCacheWrite;
+    let uncachedOut = sumUncached;
+    let outputOut = sumOutput;
+    let totalUsd = sumUsd;
+    let totalSavedUsd = sumSavedUsd;
+    let estimated = false;
     const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
     const effDriver = lastTurnDriver || payload.provider || "unknown";
     const effModel = lastTurnModel || payload.model || null;
     let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
-    if (effDriver === "antigravity" && payload.contextUsage?.usedTokens != null && lastPromptTotal != null && payload.contextUsage.usedTokens > lastPromptTotal * 1.6) {
-      contextUsed = lastPromptTotal;
+    if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
+      const agyCacheRatio = lastTurnCacheRate ?? sessionCacheRate ?? 0;
+      const deduped =
+        agyCacheRatio > 0.01
+          ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
+          : payload.contextUsage.usedTokens;
+      contextUsed = deduped;
+      if (lastPromptTotal != null && deduped > lastPromptTotal * 1.6) {
+        contextUsed = lastPromptTotal;
+      }
     }
     let contextMax = payload.contextUsage?.maxTokens || (effDriver === "antigravity" ? (/opus|sonnet|haiku|claude/i.test(String(effModel || "")) ? 1000000 : 1048576) : effDriver === "muse" ? 1007997 : null);
-    const tokPerSec = netSecSum > 0.2 ? netOutSum / netSecSum : null;
+    if (pricedTurns === 0 && Number.isFinite(contextUsed) && contextUsed > 0) {
+      promptTotal = contextUsed;
+      uncachedOut = contextUsed;
+      outputOut = 0;
+      const lr = fallbackModelRate(effModel || effDriver);
+      totalUsd = contextUsed * lr.input;
+      totalSavedUsd = 0;
+      estimated = true;
+    }
+    const hasDecode = decodeSecSum > 0;
+    const tokPerSec = hasDecode ? decodeTokSum / decodeSecSum : netSecSum > 0.2 ? netOutSum / netSecSum : null;
     const e2eTokPerSec = wallSecSum > 0.2 && wallOutSum > 0 ? wallOutSum / wallSecSum : tokPerSec;
     const byModelSpeed = Object.fromEntries(
-      Object.entries(byModel)
+      Object.entries(hasDecode ? decodeByModel : byModel)
         .filter(([, v]) => v.sec > 0.1)
         .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
     );
+    const lastDecodeTps = hasDecode ? lastTurnDecodeTps : lastTurnTps;
+    const lastDurationSec = hasDecode ? lastStreamSec : lastTurnNetSec;
     return {
       ok: true,
       telemetrySource: "remote-projection",
@@ -382,23 +565,23 @@
       speed: {
         tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
         byModel: byModelSpeed,
-        lastDecodeTps: lastTurnTps != null ? Math.round(lastTurnTps * 10) / 10 : null,
+        lastDecodeTps: lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
         e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
-        durationSec: lastTurnNetSec != null ? Math.round(lastTurnNetSec * 10) / 10 : null,
+        durationSec: lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
       },
       tokens: {
         input: promptTotal,
-        uncached: sumUncached,
-        uncachedInput: sumUncached,
+        uncached: uncachedOut,
+        uncachedInput: uncachedOut,
         cached: sumCached,
         cachedInput: sumCached,
         cacheWrite: sumCacheWrite,
         cacheWriteInput: sumCacheWrite,
-        output: sumOutput,
+        output: outputOut,
         reasoning: sumReasoning,
-        mainTotal: promptTotal + sumOutput,
+        mainTotal: promptTotal + outputOut,
         subagentTokens: 0,
-        total: promptTotal + sumOutput,
+        total: promptTotal + outputOut,
         contextUsed: contextUsed ?? null,
         contextMax: contextMax ?? null,
       },
@@ -408,14 +591,14 @@
         sessionRate: sessionCacheRate,
         lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
         displayRate: lastTurnCacheRate ?? sessionCacheRate,
-        savedUsd: sumSavedUsd,
+        savedUsd: totalSavedUsd,
       },
       cost: {
-        sessionUsd: sumUsd,
+        sessionUsd: totalUsd,
         subagentUsd: 0,
-        withSubagentsUsd: sumUsd,
+        withSubagentsUsd: totalUsd,
         subagentCount: Math.max(0, Number(payload.subagentCount) || 0),
-        estimated: false,
+        estimated,
       },
     };
   }
@@ -474,6 +657,23 @@
     }
     return { ok: false, error: "HUD bridge unavailable" };
   }
+
+  // Keep Sidecar Hub on the same authenticated transport as the resident HUD.
+  const callRpc = (method, ...args) => callBackend(method, ...args);
+  window.__t3HubRpc = async (action, payload) => {
+    const res = await callRpc("getGitGraph", "__HUB_RPC__", action, payload || {});
+    if (res && (res.ok || !/Git|Unknown method/i.test(String(res.error || "")))) return res;
+    const bridge = window.__t3HubSidecarBridge;
+    if (bridge && bridge.url && bridge.token) {
+      const r = await fetch(bridge.url + "/hub-rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+        body: JSON.stringify({ action, payload: payload || {} }),
+      });
+      return r.json();
+    }
+    return res;
+  };
 
   function formatCompactTokens(n) {
     if (n == null || !Number.isFinite(n)) return "--";
@@ -1976,12 +2176,20 @@
     // Prefer live composer-selected model so switching Gemini <-> Opus/Sonnet updates 周余 immediately!
     const activeModelRaw = (selectedModel || stats?.model || "").toLowerCase();
 
+    // Antigravity live contextWindow carries the same 1+cache double-count.
+    const dedupeLiveAgy = (usedTokens, displayRate) => {
+      const rate = Number(displayRate);
+      if (activeProviderRaw === "antigravity" && Number.isFinite(rate)) {
+        if (rate > 0.01) return Math.round(usedTokens / (1 + Math.min(1, rate)));
+      }
+      return usedTokens;
+    };
     let ctxUsed;
     let ctxMax;
     let ctxPct;
     if (!stats || !stats.ok) {
       if (!stats?.nonThreadRoute && stats?.tokens?.contextUsed == null && liveContext && liveContext.usedTokens > 0) {
-        ctxUsed = liveContext.usedTokens;
+        ctxUsed = dedupeLiveAgy(liveContext.usedTokens, stats?.cache?.displayRate);
         ctxMax = stats?.tokens?.contextMax ?? liveContext.maxTokens ?? null;
         ctxPct =
           ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
@@ -1991,7 +2199,10 @@
         ctxPct = 0;
       }
     } else {
-      ctxUsed = stats?.tokens?.contextUsed ?? liveContext?.usedTokens ?? null;
+      const rawUsed = stats?.tokens?.contextUsed ?? liveContext?.usedTokens ?? null;
+      ctxUsed = rawUsed != null && stats?.tokens?.contextUsed == null
+        ? dedupeLiveAgy(rawUsed, stats?.cache?.displayRate)
+        : rawUsed;
       ctxMax = stats?.tokens?.contextMax ?? liveContext?.maxTokens ?? null;
       ctxPct =
         ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
@@ -2613,6 +2824,48 @@
     return { cwd, environmentId };
   }
 
+  // Remote Git bundle over the T3 Connect WebSocket relay: pulls the raw git
+  // metadata files out of the remote repo and lets the backend assemble them.
+  async function fetchRemoteGitBundle(envId, cwd, branch) {
+    if (typeof window.__t3HudRemoteRpc !== "function") return null;
+    if (!envId || !cwd) return null;
+    const rpc = (tag, rpcPayload) =>
+      window.__t3HudRemoteRpc(envId, tag, rpcPayload, 4500)
+        .then((r) => (r && r.ok ? r.value : null))
+        .catch(() => null);
+    const readFile = (relativePath) =>
+      rpc("projects.readFile", { cwd, relativePath, allowMissing: true });
+    const toText = (v) => {
+      if (typeof v === "string") return v;
+      if (v && typeof v === "object") return v.content ?? v.text ?? v.fileContent ?? null;
+      return null;
+    };
+    const [gitConfigRaw, gitHeadRaw, packedRefsRaw, headLogRaw, vcsRefs, vcsStatus, branchCommits] =
+      await Promise.all([
+        readFile(".git/config"),
+        readFile(".git/HEAD"),
+        readFile(".git/packed-refs"),
+        readFile(".git/logs/HEAD"),
+        rpc("vcs.listRefs", { cwd, limit: 50 }),
+        rpc("vcs.refreshStatus", { cwd }),
+        rpc("review.getBranchCommits", { cwd }),
+      ]);
+    const bundle = {
+      environmentId: envId,
+      cwd,
+      branch: branch || null,
+      gitConfig: toText(gitConfigRaw),
+      gitHead: toText(gitHeadRaw),
+      packedRefs: toText(packedRefsRaw),
+      headLog: toText(headLogRaw),
+      vcsRefs: vcsRefs ?? null,
+      vcsStatus: vcsStatus ?? null,
+      branchCommits: branchCommits ?? null,
+    };
+    const res = await callBackend("getRemoteGitGraph", bundle);
+    return res && res.ok ? res : null;
+  }
+
   async function openCommitDetail(hash) {
     if (selectedCommitHash === hash && !commitPane.classList.contains("hidden")) {
       clearCommitPaneDom();
@@ -2627,7 +2880,22 @@
     commitMetaEl.textContent = hash.slice(0, 10);
     commitBodyEl.textContent = "";
 
-    const res = await callBackend("getCommitDetail", getRouteHint(), hash, getFallbackCwd());
+    let res;
+    if (latestGraph?.isRemoteGit) {
+      const fb = getFallbackCwd();
+      const cwd = fb?.cwd || latestGraph.repoPath || "";
+      const envId = fb?.environmentId || lastRemotePayload?.environmentId || "";
+      const entry = (latestGraph.commits || []).find((c) => c.hash === hash) || {};
+      res = await callBackend("getRemoteCommitDetail", {
+        githubRepo: latestGraph.githubRepo || null,
+        hash,
+        cwd,
+        environmentId: envId,
+        commitMeta: { author: entry.author || "", subject: entry.subject || "", relTime: entry.relTime || "" },
+      });
+    } else {
+      res = await callBackend("getCommitDetail", getRouteHint(), hash, getFallbackCwd());
+    }
     if (selectedCommitHash !== hash || !drawerOpen) return;
     if (!res || !res.ok) {
       commitMsgEl.textContent = res?.error || t("readFail");
@@ -2689,8 +2957,22 @@
   async function refreshGitGraph(force = false) {
     const hint = getRouteHint();
     if (!drawerOpen && !force) return;
-    const graph = await callBackend("getGitGraph", hint, 120, getFallbackCwd());
+    let graph = await callBackend("getGitGraph", hint, 120, getFallbackCwd());
     if (!drawerOpen) return;
+    if (graph && !graph.ok && graph.remoteOnly) {
+      const fb = getFallbackCwd();
+      const envId = fb?.environmentId || "";
+      const cwd = fb?.cwd || "";
+      if (envId && cwd) {
+        try {
+          const remote = await fetchRemoteGitBundle(envId, cwd, lastRemotePayload?.branch || null);
+          if (remote && remote.ok) graph = remote;
+        } catch {
+          // Keep the remoteOnly message when the relay bundle fails.
+        }
+        if (!drawerOpen) return;
+      }
+    }
     latestGraph = graph;
     lastLoadedGraphThreadId = graph?.threadId || null;
     renderGitGraphList();
@@ -2955,6 +3237,8 @@
 
   window.__t3HudCleanup = () => {
     disposed = true;
+    // Hub owns its lifecycle: the next drawer script snapshots drafts/open state.
+    // Leave window.__t3SidecarHub intact across /admin/reload-ui.
     try {
       if (typeof unsubscribeRouter === "function") unsubscribeRouter();
     } catch {}
@@ -2984,7 +3268,25 @@
 
   // Boot: load language config, resolve language, then start polling
   (async () => {
+    // Fetch on every injection, so reload-ui never reuses an embedded stale drawer.
+    // Keep telemetry boot independent if an older Hub backend is slow or missing.
+    void (async () => {
+      try {
+        const res = await window.__t3HubRpc("hub:getDrawerScript", {});
+        if (disposed) return;
+        if (res?.ok && res.code) {
+          window.__t3HubDrawerLoading = true;
+          try { (0, eval)(res.code); }
+          finally { delete window.__t3HubDrawerLoading; }
+        }
+        window.__t3MountSidecarHub?.({ hubRpc: window.__t3HubRpc });
+      } catch (error) {
+        if (!disposed) console.warn("[T3 HUD] Sidecar Hub could not be refreshed:", error?.message || error);
+      }
+    })();
+    if (disposed) return;
     await syncConfigLang();
+    if (disposed) return;
     hudLang = resolveLang();
     applyLangToDom();
     ensureRouterSubscription();

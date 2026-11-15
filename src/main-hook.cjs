@@ -22,7 +22,11 @@ const BACKEND_PATH = path.join(__dirname, "backend.cjs");
 let backend = require(BACKEND_PATH);
 function reloadBackend() {
   try {
-    delete require.cache[require.resolve(BACKEND_PATH)];
+    for (const k of Object.keys(require.cache)) {
+      if (k === BACKEND_PATH || k.startsWith(__dirname + path.sep)) {
+        delete require.cache[k];
+      }
+    }
     backend = require(BACKEND_PATH);
     return true;
   } catch {
@@ -309,10 +313,16 @@ function startLoopbackFallbackServer() {
                 out = await backend.getGitGraph(args[0], args[1], args[2]);
               } else if (method === "getCommitDetail") {
                 out = await backend.getCommitDetail(args[0], args[1], args[2]);
+              } else if (method === "getRemoteGitGraph") {
+                out = await backend.getRemoteGitGraph(args[0]);
+              } else if (method === "getRemoteCommitDetail") {
+                out = await backend.getRemoteCommitDetail(args[0]);
               } else if (method === "getConfig") {
                 out = backend.getConfig();
               } else if (method === "setConfig") {
                 out = backend.setConfig(args[0]);
+              } else if (method === "hubCall") {
+                out = await backend.hubCall(args[0], args[1]);
               } else {
                 out = { ok: false, error: "Unknown method" };
               }
@@ -377,6 +387,14 @@ function registerIpcAndPreload() {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.getCommitDetail(threadHint, commitHash, fallbackCwd);
     });
+    ipcMain.handle("t3hud:get-remote-git-graph", (evt, bundle) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getRemoteGitGraph(bundle);
+    });
+    ipcMain.handle("t3hud:get-remote-commit-detail", (evt, req) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getRemoteCommitDetail(req);
+    });
     ipcMain.handle("t3hud:get-config", (evt) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.getConfig();
@@ -384,6 +402,10 @@ function registerIpcAndPreload() {
     ipcMain.handle("t3hud:set-config", (evt, patch) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.setConfig(patch);
+    });
+    ipcMain.handle("t3hud:hub-call", (evt, action, payload) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.hubCall(action, payload || {});
     });
   } catch {
     // Ignore duplicate registration
