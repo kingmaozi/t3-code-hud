@@ -1558,6 +1558,12 @@ function priceRemoteProjection(payload) {
   let wallSecSum = 0;
   let lastTurnTps = null;
   let lastTurnNetSec = null;
+  // Pure streaming-decode sums (immune to tool wait + per-call TTFT/prefill gaps).
+  let decodeTokSum = 0;
+  let decodeSecSum = 0;
+  let lastTurnDecodeTps = null;
+  let lastStreamSec = null;
+  const decodeByModel = {};
   let lastPromptTotal = null;
   let lastTurnCacheRate = null;
   let lastTurnDriver = null;
@@ -1592,6 +1598,24 @@ function priceRemoteProjection(payload) {
       wallOutSum += out;
       wallSecSum += (t.completedMs - t.startedMs) / 1000;
     }
+    // Primary speed path: pure streaming decode window (final assistant_message span),
+    // pre-computed by the renderer Fiber walk. Skips tool wait AND per-call TTFT/prefill.
+    const visOut = Math.max(0, out - reas);
+    const sd = t?.streamDecode;
+    if (sd && Number.isFinite(sd.streamSec) && sd.streamSec >= 0.18 && Number.isFinite(sd.visFraction) && sd.visFraction > 0) {
+      const streamTok = Math.round(visOut * Math.min(1, sd.visFraction));
+      if (streamTok >= 12 && streamTok / sd.streamSec < 900) {
+        decodeTokSum += streamTok;
+        decodeSecSum += sd.streamSec;
+        lastTurnDecodeTps = streamTok / sd.streamSec;
+        lastStreamSec = sd.streamSec;
+        if (turnModel) {
+          const cur = (decodeByModel[turnModel] ||= { tok: 0, sec: 0 });
+          cur.tok += streamTok;
+          cur.sec += sd.streamSec;
+        }
+      }
+    }
     if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
       const netSec = subtractToolWait(t.startedMs, t.completedMs, mergedToolIntervals);
       if (netSec > 0.05) {
@@ -1607,13 +1631,28 @@ function priceRemoteProjection(payload) {
       }
     }
   }
-  const promptTotal = sumUncached + sumCached + sumCacheWrite;
+  let promptTotal = sumUncached + sumCached + sumCacheWrite;
+  let uncachedOut = sumUncached;
+  let outputOut = sumOutput;
+  let totalUsd = sumUsd;
+  let totalSavedUsd = sumSavedUsd;
+  let estimated = false;
   const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
   const effDriver = lastTurnDriver || payload.provider || "unknown";
   const effModel = lastTurnModel || payload.model || null;
   let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
-  if (effDriver === "antigravity" && payload.contextUsage?.usedTokens != null && lastPromptTotal != null && payload.contextUsage.usedTokens > lastPromptTotal * 1.6) {
-    contextUsed = lastPromptTotal;
+  if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
+    // T3's acpPerTurnPromptUsage counts promptTokenCount + cachedContentTokenCount,
+    // but Gemini's promptTokenCount already includes cachedContentTokenCount.
+    const agyCacheRatio = lastTurnCacheRate ?? sessionCacheRate ?? 0;
+    const deduped =
+      agyCacheRatio > 0.01
+        ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
+        : payload.contextUsage.usedTokens;
+    contextUsed = deduped;
+    if (!payload.isRunning && lastPromptTotal != null && deduped > lastPromptTotal * 2.5) {
+      contextUsed = lastPromptTotal;
+    }
   }
   let contextMax = payload.contextUsage?.maxTokens || lookupCatalogContextMax(effModel, effDriver) || null;
   if (contextMax == null && effDriver === "antigravity") {
@@ -1623,13 +1662,27 @@ function priceRemoteProjection(payload) {
   if (contextMax == null && effDriver === "muse") {
     contextMax = 1007997;
   }
-  const tokPerSec = netSecSum > 0.2 ? netOutSum / netSecSum : null;
+  // Live in-progress Turn 1: contextUsage.usedTokens is already live before the
+  // first turnTokenUsage lands, so surface it as current consumption + est. cost.
+  if (pricedTurns === 0 && Number.isFinite(contextUsed) && contextUsed > 0) {
+    promptTotal = contextUsed;
+    uncachedOut = contextUsed;
+    outputOut = 0;
+    const liveEst = priceStep({ uncached: contextUsed, cached: 0, cacheWrite: 0, output: 0 }, effModel, effDriver);
+    totalUsd = liveEst.usd;
+    totalSavedUsd = liveEst.savedUsd;
+    estimated = true;
+  }
+  const hasDecode = decodeSecSum > 0;
+  const tokPerSec = hasDecode ? decodeTokSum / decodeSecSum : netSecSum > 0.2 ? netOutSum / netSecSum : null;
   const e2eTokPerSec = wallSecSum > 0.2 && wallOutSum > 0 ? wallOutSum / wallSecSum : tokPerSec;
   const byModelSpeed = Object.fromEntries(
-    Object.entries(byModel)
+    Object.entries(hasDecode ? decodeByModel : byModel)
       .filter(([, v]) => v.sec > 0.1)
       .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
   );
+  const lastDecodeTps = hasDecode ? lastTurnDecodeTps : lastTurnTps;
+  const lastDurationSec = hasDecode ? lastStreamSec : lastTurnNetSec;
   const subagentCount = Math.max(0, Number(payload.subagentCount) || 0);
   return {
     ok: true,
@@ -1648,23 +1701,23 @@ function priceRemoteProjection(payload) {
     speed: {
       tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
       byModel: byModelSpeed,
-      lastDecodeTps: lastTurnTps != null ? Math.round(lastTurnTps * 10) / 10 : null,
+      lastDecodeTps: lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
       e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
-      durationSec: lastTurnNetSec != null ? Math.round(lastTurnNetSec * 10) / 10 : null,
+      durationSec: lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
     },
     tokens: {
       input: promptTotal,
-      uncached: sumUncached,
-      uncachedInput: sumUncached,
+      uncached: uncachedOut,
+      uncachedInput: uncachedOut,
       cached: sumCached,
       cachedInput: sumCached,
       cacheWrite: sumCacheWrite,
       cacheWriteInput: sumCacheWrite,
-      output: sumOutput,
+      output: outputOut,
       reasoning: sumReasoning,
-      mainTotal: promptTotal + sumOutput,
+      mainTotal: promptTotal + outputOut,
       subagentTokens: 0,
-      total: promptTotal + sumOutput,
+      total: promptTotal + outputOut,
       contextUsed: contextUsed ?? null,
       contextMax: contextMax ?? null,
     },
@@ -1674,14 +1727,14 @@ function priceRemoteProjection(payload) {
       sessionRate: sessionCacheRate,
       lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
       displayRate: lastTurnCacheRate ?? sessionCacheRate,
-      savedUsd: sumSavedUsd,
+      savedUsd: totalSavedUsd,
     },
     cost: {
-      sessionUsd: sumUsd,
+      sessionUsd: totalUsd,
       subagentUsd: 0,
-      withSubagentsUsd: sumUsd,
+      withSubagentsUsd: totalUsd,
       subagentCount,
-      estimated: false,
+      estimated,
     },
   };
 }
@@ -2006,6 +2059,407 @@ async function getCommitDetail(threadHint, commitHash, fallbackCwd = null) {
 }
 
 // ============================================================================
+// 4.5 Remote Git Bundle (T3 Connect WebSocket + GitHub API fallback)
+// ============================================================================
+const ZERO_SHA = "0".repeat(40);
+
+function formatRelTime(tsSec) {
+  const ts = Number(tsSec);
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (diff < 60) return "just now";
+  if (diff < 3600) {
+    const m = Math.floor(diff / 60);
+    return `${m} minute${m === 1 ? "" : "s"} ago`;
+  }
+  if (diff < 86400) {
+    const h = Math.floor(diff / 3600);
+    return `${h} hour${h === 1 ? "" : "s"} ago`;
+  }
+  if (diff < 30 * 86400) {
+    const d = Math.floor(diff / 86400);
+    return `${d} day${d === 1 ? "" : "s"} ago`;
+  }
+  try {
+    return new Date(ts * 1000).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+
+function parseRemoteGitConfig(configText) {
+  const text = typeof configText === "string" ? configText : "";
+  if (!text) return { githubRepo: null, remoteUrl: null };
+  // Note: JS has no \Z anchor (it matches a literal Z/z), so stop at the next
+  // section header or end of string instead.
+  const originMatch = text.match(/\[remote\s+"origin"\]\s*\n([\s\S]*?)(?:\n\s*\[[^\]\n]+\]\s*\n|$)/i);
+  let remoteUrl = null;
+  if (originMatch) {
+    const urlMatch = originMatch[1].match(/^\s*url\s*=\s*(.+?)\s*$/im);
+    if (urlMatch) remoteUrl = urlMatch[1].trim();
+  }
+  if (!remoteUrl) return { githubRepo: null, remoteUrl: null };
+  const m = remoteUrl.match(/github\.com[:/]([^/\s]+?)\/([^/\s]+?)(?:\.git)?$/);
+  return { githubRepo: m ? `${m[1]}/${m[2]}` : null, remoteUrl };
+}
+
+function parseGitHead(headText) {
+  const text = typeof headText === "string" ? headText.trim() : "";
+  if (!text) return { branch: null, headSha: null };
+  const refMatch = text.match(/^ref:\s*refs\/heads\/(.+)$/);
+  if (refMatch) return { branch: refMatch[1].trim() || null, headSha: null };
+  if (/^[0-9a-f]{40}$/i.test(text)) return { branch: null, headSha: text.toLowerCase() };
+  return { branch: null, headSha: null };
+}
+
+function parsePackedRefs(packedRefsText) {
+  const refs = [];
+  if (typeof packedRefsText !== "string") return refs;
+  for (const line of packedRefsText.split("\n")) {
+    const m = line.trim().match(/^([0-9a-f]{40})\s+(\S+)$/i);
+    if (m) refs.push({ sha: m[1].toLowerCase(), ref: m[2] });
+  }
+  return refs;
+}
+
+function parseHeadLog(headLogText) {
+  const entries = [];
+  if (typeof headLogText !== "string") return entries;
+  const seen = new Set();
+  const re = /^([0-9a-f]{40})\s+([0-9a-f]{40})\s+(.+?)\s+<([^>]*)>\s+(\d+)\s+[+-]\d{4}\t(.*)$/i;
+  for (const line of headLogText.split("\n")) {
+    if (!line.trim()) continue;
+    const m = line.match(re);
+    if (!m) continue;
+    const oldSha = m[1].toLowerCase();
+    const newSha = m[2].toLowerCase();
+    const author = (m[3] || "").trim();
+    const email = (m[4] || "").trim();
+    const ts = Number(m[5]) || 0;
+    let subject = (m[6] || "").trim();
+    const actionMatch = subject.match(/^commit(?:\s*\([^)]+\))?:\s*(.*)$/);
+    const isCommit = /^commit/.test(subject) || /^merge\b/.test(subject);
+    if (!isCommit) continue;
+    if (actionMatch) subject = actionMatch[1].trim();
+    if (!subject) continue;
+    if (seen.has(newSha)) continue;
+    seen.add(newSha);
+    entries.push({
+      oldSha,
+      newSha,
+      author,
+      email,
+      timestamp: ts,
+      relTime: formatRelTime(ts),
+      subject,
+    });
+  }
+  // Reflog is chronological; newest first for display.
+  return entries.reverse();
+}
+
+function normalizeBranchCommits(branchCommits) {
+  if (!Array.isArray(branchCommits)) return [];
+  const out = [];
+  for (const c of branchCommits) {
+    if (!c || typeof c !== "object") continue;
+    const hash = String(c.hash || c.sha || c.id || "").toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(hash)) continue;
+    const ts = c.timestamp || c.time || (c.date ? Math.floor(Date.parse(c.date) / 1000) : 0) || 0;
+    const parents = Array.isArray(c.parents)
+      ? c.parents.map((p) => String(p?.sha || p?.hash || p || "").toLowerCase()).filter((p) => /^[0-9a-f]{40}$/.test(p))
+      : [];
+    out.push({
+      hash,
+      shortHash: hash.slice(0, 7),
+      parents,
+      author: String(c.author || c.authorName || c.committer || ""),
+      relTime: String(c.relTime || (ts ? formatRelTime(ts) : "")),
+      timestamp: Number(ts) || 0,
+      subject: String(c.subject || c.message || c.title || "(no message)"),
+    });
+  }
+  return out;
+}
+
+function normalizeVcsRefs(vcsRefs) {
+  if (!Array.isArray(vcsRefs)) return [];
+  const out = [];
+  for (const r of vcsRefs) {
+    if (!r) continue;
+    if (typeof r === "string") {
+      const m = r.trim().match(/^([0-9a-f]{40})\s+(\S+)$/i);
+      if (m) out.push({ sha: m[1].toLowerCase(), ref: m[2] });
+      continue;
+    }
+    if (typeof r === "object") {
+      const sha = String(r.sha || r.hash || r.commit || r.target || "").toLowerCase();
+      const ref = String(r.ref || r.name || r.label || r.branch || "");
+      if (/^[0-9a-f]{40}$/.test(sha) || ref) {
+        out.push({ sha: /^[0-9a-f]{40}$/.test(sha) ? sha : null, ref });
+      }
+    }
+  }
+  return out;
+}
+
+function buildBadgeMapFromRefs(refsList, headSha, headBranch) {
+  const bySha = new Map();
+  const push = (sha, badge) => {
+    if (!sha || !/^[0-9a-f]{40}$/.test(sha)) return;
+    const cur = bySha.get(sha) || [];
+    if (!cur.some((b) => b.label === badge.label && b.kind === badge.kind)) cur.push(badge);
+    bySha.set(sha, cur);
+  };
+  for (const { sha, ref } of refsList) {
+    if (!sha || !ref) continue;
+    if (ref.startsWith("refs/heads/")) push(sha, { kind: "branch", label: ref.slice(11), isHead: false });
+    else if (ref.startsWith("refs/remotes/")) push(sha, { kind: "remote", label: ref.slice(13), isHead: false });
+    else if (ref.startsWith("refs/tags/")) push(sha, { kind: "tag", label: ref.slice(10), isHead: false });
+    else push(sha, { kind: "branch", label: ref, isHead: false });
+  }
+  if (headSha && /^[0-9a-f]{40}$/.test(headSha)) {
+    const cur = bySha.get(headSha) || [];
+    if (!cur.some((b) => b.isHead)) {
+      cur.unshift({ kind: "head", label: "HEAD", isHead: true });
+      if (headBranch && !cur.some((b) => b.label === headBranch)) {
+        cur.splice(1, 0, { kind: "branch", label: headBranch, isHead: false });
+      }
+    }
+    bySha.set(headSha, cur);
+  }
+  return bySha;
+}
+
+function parseDirtyCount(vcsStatus) {
+  if (vcsStatus == null) return 0;
+  if (typeof vcsStatus === "number" && Number.isFinite(vcsStatus)) return Math.max(0, Math.floor(vcsStatus));
+  if (typeof vcsStatus === "string") {
+    return vcsStatus.split("\n").filter((l) => l.trim()).length;
+  }
+  if (typeof vcsStatus === "object") {
+    if (typeof vcsStatus.total === "number") return Math.max(0, Math.floor(vcsStatus.total));
+    if (typeof vcsStatus.count === "number") return Math.max(0, Math.floor(vcsStatus.count));
+    if (typeof vcsStatus.changed === "number") return Math.max(0, Math.floor(vcsStatus.changed));
+    if (Array.isArray(vcsStatus.files)) return vcsStatus.files.length;
+    if (Array.isArray(vcsStatus.entries)) return vcsStatus.entries.length;
+  }
+  return 0;
+}
+
+async function fetchGitHubJson(endpoint) {
+  try {
+    const res = await execFileAsync("gh", ["api", endpoint], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
+    const text = (res.stdout || "").trim();
+    if (text) return JSON.parse(text);
+  } catch {}
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    try {
+      ctrl.abort();
+    } catch {}
+  }, 5000);
+  try {
+    const resp = await fetch(`https://api.github.com/${endpoint}`, {
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "t3-hud" },
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildRemoteGraphResult({ cwd, branch, headSha, dirtyCount, commits, remoteSource, githubRepo }) {
+  const { commits: fitted, maxLanes } = buildSwimlanes(commits);
+  const repoName = path.basename(cwd || ".") || cwd || "repo";
+  return {
+    ok: true,
+    isRemoteGit: true,
+    remoteSource,
+    githubRepo,
+    repoPath: cwd || null,
+    repoName,
+    branch,
+    currentBranch: branch || "HEAD",
+    projectTitle: repoName,
+    dirtyCount,
+    workingTree: {
+      clean: dirtyCount === 0,
+      total: dirtyCount,
+      staged: 0,
+      modified: dirtyCount,
+      untracked: 0,
+    },
+    maxLanes,
+    commits: fitted,
+  };
+}
+
+async function getRemoteGitGraph(bundle) {
+  const b = bundle && typeof bundle === "object" ? bundle : null;
+  const cwd = b && typeof b.cwd === "string" ? b.cwd.trim() : "";
+  if (!cwd) return { ok: false, error: "Remote repo path missing" };
+  const environmentId = b && typeof b.environmentId === "string" ? b.environmentId : "";
+  void environmentId;
+
+  const { githubRepo } = parseRemoteGitConfig(b.gitConfig);
+  const head = parseGitHead(b.gitHead);
+  const branch = (typeof b.branch === "string" && b.branch.trim()) || head.branch || null;
+  const headSha = head.headSha || null;
+  const headLogEntries = parseHeadLog(b.headLog);
+  const packedRefs = parsePackedRefs(b.packedRefs);
+  const vcsRefsList = normalizeVcsRefs(b.vcsRefs);
+  const branchCommits = normalizeBranchCommits(b.branchCommits);
+  const dirtyCount = parseDirtyCount(b.vcsStatus);
+
+  // Local tip commits from the remote reflog (never in GitHub's set while unpushed).
+  const localCommits = headLogEntries.map((e) => ({
+    hash: e.newSha,
+    shortHash: e.newSha.slice(0, 7),
+    parents: e.oldSha === ZERO_SHA ? [] : [e.oldSha],
+    author: e.author,
+    relTime: e.relTime,
+    timestamp: e.timestamp,
+    subject: e.subject,
+  }));
+
+  if (githubRepo) {
+    try {
+      const [ghCommits, ghBranches] = await Promise.all([
+        fetchGitHubJson(`repos/${githubRepo}/commits?sha=${encodeURIComponent(branch || "HEAD")}&per_page=80`),
+        fetchGitHubJson(`repos/${githubRepo}/branches?per_page=30`).catch(() => []),
+      ]);
+      const ghList = Array.isArray(ghCommits) ? ghCommits : Array.isArray(ghCommits?.commits) ? ghCommits.commits : [];
+      if (ghList.length) {
+        const ghShaSet = new Set(ghList.map((c) => String(c.sha || c.hash || "").toLowerCase()).filter(Boolean));
+        const badgeBySha = new Map();
+        const pushBadge = (sha, badge) => {
+          const k = String(sha || "").toLowerCase();
+          if (!k) return;
+          const cur = badgeBySha.get(k) || [];
+          if (!cur.some((x) => x.label === badge.label)) cur.push(badge);
+          badgeBySha.set(k, cur);
+        };
+        for (const br of Array.isArray(ghBranches) ? ghBranches : []) {
+          const sha = br?.commit?.sha || br?.sha;
+          if (br?.name && sha) pushBadge(sha, { kind: "branch", label: String(br.name), isHead: false });
+        }
+        const remoteCommits = ghList.map((c) => {
+          const sha = String(c.sha || c.hash || "").toLowerCase();
+          const msg = String(c.commit?.message || c.message || "(no message)");
+          const ts = c.commit?.author?.date || c.commit?.committer?.date || c.date;
+          const tsSec = ts ? Math.floor(Date.parse(ts) / 1000) : 0;
+          return {
+            hash: sha,
+            shortHash: sha.slice(0, 7),
+            parents: (Array.isArray(c.parents) ? c.parents : [])
+              .map((p) => String(p.sha || p.hash || "").toLowerCase())
+              .filter((p) => /^[0-9a-f]{40}$/.test(p)),
+            author: String(c.commit?.author?.name || c.author?.login || c.author || ""),
+            relTime: tsSec ? formatRelTime(tsSec) : String(c.relTime || ""),
+            timestamp: Number.isFinite(tsSec) ? tsSec : 0,
+            subject: msg.split("\n")[0] || "(no message)",
+            refs: badgeBySha.get(sha) || [],
+          };
+        });
+        // Merge unpushed local commits on top of the GitHub history.
+        const unpushed = localCommits
+          .filter((c) => !ghShaSet.has(c.hash))
+          .map((c) => ({ ...c, refs: Array.isArray(c.refs) ? c.refs : [] }));
+        const merged = [...unpushed, ...remoteCommits];
+        // Attach HEAD/badge refs for the tip.
+        if (merged.length) {
+          const tip = merged[0];
+          if (!Array.isArray(tip.refs)) tip.refs = [];
+          if (!tip.refs.some((r) => r.isHead)) {
+            tip.refs = [{ kind: "head", label: "HEAD", isHead: true }, ...(tip.refs || [])];
+            if (branch && !tip.refs.some((r) => r.label === branch)) {
+              tip.refs.splice(1, 0, { kind: "branch", label: branch, isHead: false });
+            }
+          }
+        }
+        return buildRemoteGraphResult({
+          cwd,
+          branch,
+          headSha,
+          dirtyCount,
+          commits: merged,
+          remoteSource: "t3-connect+github",
+          githubRepo,
+        });
+      }
+    } catch {}
+  }
+
+  // Pure local repo on the remote (no GitHub remote, or API unreachable): the
+  // reflog + refs are the history.
+  const commits = localCommits.length ? localCommits : branchCommits;
+  const badgeBySha = buildBadgeMapFromRefs([...packedRefs, ...vcsRefsList], commits[0]?.hash || headSha, branch);
+  for (const c of commits) {
+    c.refs = badgeBySha.get(c.hash) || (c.hash === (commits[0]?.hash || "") ? [{ kind: "head", label: "HEAD", isHead: true }] : []);
+  }
+  return buildRemoteGraphResult({
+    cwd,
+    branch,
+    headSha,
+    dirtyCount,
+    commits,
+    remoteSource: "t3-connect",
+    githubRepo: githubRepo || null,
+  });
+}
+
+async function getRemoteCommitDetail(req) {
+  const r = req && typeof req === "object" ? req : {};
+  const hash = typeof r.hash === "string" ? r.hash.trim() : "";
+  if (!/^[0-9a-f]{6,40}$/i.test(hash)) {
+    return { ok: false, error: "非法 Commit SHA" };
+  }
+  const meta = r.commitMeta && typeof r.commitMeta === "object" ? r.commitMeta : {};
+  const githubRepo =
+    typeof r.githubRepo === "string" && /^([^/\s]+)\/([^/\s]+)$/.test(r.githubRepo) ? r.githubRepo : null;
+  if (githubRepo) {
+    try {
+      const data = await fetchGitHubJson(`repos/${githubRepo}/commits/${encodeURIComponent(hash)}`);
+      if (data && data.sha) {
+        const rawFiles = Array.isArray(data.files) ? data.files : [];
+        const files = rawFiles.map((f) => ({ path: f.filename, added: f.additions, deleted: f.deletions }));
+        const patch = rawFiles
+          .map((f) => `--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch || ""}`)
+          .join("\n")
+          .slice(0, 120000);
+        return {
+          ok: true,
+          hash: data.sha,
+          authorName: data.commit?.author?.name || data.author?.login || "",
+          authorEmail: data.commit?.author?.email || "",
+          date: data.commit?.author?.date || data.commit?.committer?.date || "",
+          authorDate: data.commit?.author?.date || data.commit?.committer?.date || "",
+          message: data.commit?.message || "",
+          files,
+          patch,
+        };
+      }
+    } catch {}
+  }
+  // Pure unpushed local commit on the remote server: metadata-only summary.
+  return {
+    ok: true,
+    diffUnavailable: true,
+    hash,
+    authorName: meta.author || "",
+    authorEmail: "",
+    date: meta.relTime || "",
+    authorDate: meta.relTime || "",
+    message: meta.subject || "",
+    files: [],
+    patch: "",
+  };
+}
+
+// ============================================================================
 // 5. Language Config Persistence (~/.t3/hud-plugin/config.json)
 // ============================================================================
 function getConfig() {
@@ -2068,6 +2522,8 @@ module.exports = {
   subtractToolWait,
   getGitGraph,
   getCommitDetail,
+  getRemoteGitGraph,
+  getRemoteCommitDetail,
   getConfig,
   setConfig,
   lookupCatalogContextMax,
