@@ -470,6 +470,10 @@ function createSkillsManager(opts = {}) {
     const lockSkills = lock.skills || {};
     const disabled = disabledSkillIds();
     const byId = new Map();
+    const state = readHubState();
+    const { discoverPluginDirectories, pluginDetails } = require("./hub-plugins.cjs");
+    const pluginRoots = discoverPluginDirectories({ homeDir, hubDir }).filter(d => pluginDetails(d).composite);
+    const compositeRoots = new Set(pluginRoots.map(d => { try { return fs.realpathSync(d); } catch { return d; } }));
     function addItem(it) {
       if (!it || !it.id) return;
       const existing = byId.get(it.id);
@@ -477,11 +481,21 @@ function createSkillsManager(opts = {}) {
       const rank = (s) => (s === "project" ? 0 : s === "global" ? 1 : s === "claude" || s === "zcode" ? 2 : s === "codex-market" ? 3 : s === "agy" ? 4 : 5);
       if (rank(it.source) < rank(existing.source)) byId.set(it.id, it);
     }
+    function compositeRoot(dir) {
+      let real = dir;
+      try { real = fs.realpathSync(dir); } catch {}
+      let current = path.dirname(real);
+      for (let i = 0; i < 6 && current !== homeDir && current !== hubDir; i++, current = path.dirname(current)) {
+        if (compositeRoots.has(current) || [".codex-plugin", ".zcode-plugin", ".claude-plugin", ".mcp.json", "servers.mcp.json", "hooks"].some(f => fs.existsSync(path.join(current, f)))) return current;
+        if (current === path.dirname(current)) break;
+      }
+      return null;
+    }
     function mkItem(id, dir, source, sourceLabel) {
       const meta = parseSkillMd(path.join(dir, "SKILL.md"));
       const lockEntry = lockSkills[id] || {};
       return {
-        id, name: meta.name || id, description: meta.description || "",
+        id, name: meta.name || id, description: meta.description || "", fromCompositePlugin: !!compositeRoot(dir) || !!(state.skills?.[id]?.sourceDir && compositeRoot(state.skills[id].sourceDir)),
         source, sourceLabel: sourceLabel || source,
         repoUrl: lockEntry.repoUrl || lockEntry.repo || lockEntry.url || "",
         scope: "off", path: dir,
@@ -493,12 +507,15 @@ function createSkillsManager(opts = {}) {
       if (fileExists(path.join(pd, "SKILL.md"))) { const id = path.basename(pd); addItem(mkItem(id, pd, "github", path.basename(pd))); }
       for (const sd of findSkillDirsRecursive(pd, 4)) { const id = path.basename(sd); if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(id, sd, "github", path.basename(pd))); }
     }
+    for (const plugin of pluginRoots) for (const sd of listDirs(path.join(plugin, "skills"))) if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(path.basename(sd), sd, "github", path.basename(plugin)));
     if (dirExists(codexCacheDir)) {
       for (const mp of listDirs(codexCacheDir)) for (const pl of listDirs(mp)) {
         const plugId = path.basename(pl);
         if (fileExists(path.join(pl, "SKILL.md"))) addItem(mkItem(plugId, pl, "codex-market", `${path.basename(mp)}/${plugId}`));
-        const inner = path.join(pl, "skills");
-        if (dirExists(inner)) for (const sd of listDirs(inner)) if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(path.basename(sd), sd, "codex-market", `${path.basename(mp)}/${plugId}`));
+        for (const root of [pl, ...listDirs(pl)]) {
+          const inner = path.join(root, "skills");
+          if (dirExists(inner)) for (const sd of listDirs(inner)) if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(path.basename(sd), sd, "codex-market", `${path.basename(mp)}/${plugId}`));
+        }
       }
     }
     if (dirExists(agentsSkillsDir)) for (const d of listDirs(agentsSkillsDir)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "global", "global"));
@@ -523,7 +540,7 @@ function createSkillsManager(opts = {}) {
       if (isGlobalActive) scope = "global";
       else if (isProject) scope = "project";
       return { ...it, scope, updatable: !!(it.repoUrl || it.source === "codex-market" || it.source === "github") };
-    }).sort((a, b) => a.id.localeCompare(b.id));
+    }).filter(it => args.includePluginBundled === true || !it.fromCompositePlugin || it.scope !== "off").sort((a, b) => a.id.localeCompare(b.id));
     return { ok: true, projectRoot: projectRoot || null, items };
   }
 
@@ -548,6 +565,7 @@ function createSkillsManager(opts = {}) {
     assertSafeSkillId(id);
     if (scope === "project" && (!projectRoot || !path.isAbsolute(projectRoot))) throw new Error("projectRoot required for project scope");
     if (projectRoot && !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be absolute");
+    if (args.sourceDir && (!path.isAbsolute(args.sourceDir) || !fileExists(path.join(args.sourceDir, "SKILL.md")))) throw new Error("sourceDir must be an absolute skill directory");
     safeMkdir(hubSkillsDir);
     const globalLink = path.join(agentsSkillsDir, id);
     const claudeLink = path.join(claudeSkillsDir, id);
@@ -567,6 +585,10 @@ function createSkillsManager(opts = {}) {
     if (projLink) backupIfRealDir(projLink, id);
     const canonicalPath = path.join(hubSkillsDir, id);
     const hadCanonical = fileExists(path.join(canonicalPath, "SKILL.md"));
+    if (!hadCanonical && args.sourceDir) {
+      if (lstatSafe(canonicalPath)) clearIncompleteCanonical(canonicalPath, hubDir);
+      cpDirRecursive(fs.realpathSync(args.sourceDir), canonicalPath);
+    }
     const canonical = ensureCanonical(id);
     if (!hadCanonical && fileExists(path.join(canonical, "SKILL.md"))) {
       for (const candidate of [globalLink, claudeLink]) {
@@ -613,7 +635,7 @@ function createSkillsManager(opts = {}) {
     }
     const state = readHubState();
     state.skills = state.skills || {};
-    state.skills[id] = { scope, updatedAt: new Date().toISOString() };
+    state.skills[id] = { ...state.skills[id], scope, updatedAt: new Date().toISOString(), ...(args.sourceDir ? { sourceDir: args.sourceDir } : {}) };
     writeHubState(state);
     const listed = listAssets({ projectRoot });
     const item = listed.items.find((i) => i.id === id) || { id, name: id, description: "", source: "github", sourceLabel: "hub", repoUrl: "", scope, path: canonical, updatable: false };

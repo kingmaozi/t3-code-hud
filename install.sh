@@ -42,7 +42,7 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$DEST_DIR/"
 
 # Ensure sidecar modules present (explicit list for older clones)
-for f in hub-subagents.cjs hub-skills.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js; do
+for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js; do
   if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
 done
 
@@ -51,8 +51,15 @@ chmod +x "$BIN_DIR/t3-hud"
 if [[ -f "$SCRIPT_DIR/bin/t3-mcp-router" ]]; then cp "$SCRIPT_DIR/bin/t3-mcp-router" "$BIN_DIR/t3-mcp-router"; chmod +x "$BIN_DIR/t3-mcp-router"; fi
 if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$BIN_DIR/pc-lite.mjs"; chmod +x "$BIN_DIR/pc-lite.mjs"; fi
 if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then mkdir -p "$HOME/.t3/hub/bin"; cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$HOME/.t3/hub/bin/pc-lite.mjs"; chmod +x "$HOME/.t3/hub/bin/pc-lite.mjs"; fi
-# Legacy fallback: also copy pc-lite next to hub binary dir if present
-if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then mkdir -p "$DEST_DIR/scripts" 2>/dev/null || true; cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$DEST_DIR/scripts/pc-lite.mjs" 2>/dev/null || true; fi
+for hs in pc-lite.mjs memory-stop-hook.mjs subagent-route-guard.mjs; do
+  if [[ -f "$SCRIPT_DIR/scripts/$hs" ]]; then
+    mkdir -p "$BIN_DIR" "$HOME/.t3/hub/bin" "$DEST_DIR/scripts" 2>/dev/null || true
+    cp "$SCRIPT_DIR/scripts/$hs" "$BIN_DIR/$hs"
+    cp "$SCRIPT_DIR/scripts/$hs" "$HOME/.t3/hub/bin/$hs"
+    cp "$SCRIPT_DIR/scripts/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
+    chmod +x "$BIN_DIR/$hs" "$HOME/.t3/hub/bin/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
+  fi
+done
 
 if [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
   ln -sf "$BIN_DIR/t3-hud" "/opt/homebrew/bin/t3-hud"

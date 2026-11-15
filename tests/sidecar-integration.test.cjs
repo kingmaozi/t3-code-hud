@@ -293,6 +293,93 @@ describe("backend hubCall via getGitGraph __HUB_RPC__ bridge", () => {
     assert.ok(rem2.ok === true || rem2.ok === false);
   });
 
+  it("v2 hubCall endpoints: plugins, hooks, mcp:probe, memory:consolidate/rollback, subagents:resolveRoute & AGY sync", async () => {
+    const ctx = await backend.getGitGraph("__HUB_RPC__", "hub:getContext", { threadHint: THREAD_ID });
+    assert.equal(ctx.ok, true);
+    assert.equal(typeof ctx.counts.activePlugins, "number");
+    assert.equal(typeof ctx.counts.activeHooks, "number");
+
+    // Plugins list & scope toggle
+    const plist = await backend.getGitGraph("__HUB_RPC__", "plugins:list", { projectRoot: PROJECT_ROOT });
+    assert.equal(plist.ok, true);
+    assert.ok(plist.items.some((p) => p.id === "t3-memory-vault" && p.builtin));
+    const pset = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "project", projectRoot: PROJECT_ROOT });
+    assert.equal(pset.ok, true);
+    const pset2 = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "global", projectRoot: PROJECT_ROOT });
+    assert.equal(pset2.ok, true);
+
+    // MCP probe
+    const probe = await backend.getGitGraph("__HUB_RPC__", "mcp:probe", { name: "context7", timeoutMs: 400 });
+    assert.equal(probe.ok, true);
+    assert.ok(probe.results && typeof probe.results === "object");
+
+    // Hooks list / save / toggle / delete
+    const hlist = await backend.getGitGraph("__HUB_RPC__", "hooks:list", { projectRoot: PROJECT_ROOT });
+    assert.equal(hlist.ok, true);
+    assert.ok(hlist.items.some((h) => h.id === "memory-stop-guard"));
+    assert.ok(hlist.items.some((h) => h.id === "subagent-route-guard"));
+    const hsave = await backend.getGitGraph("__HUB_RPC__", "hooks:save", {
+      id: "custom-int-hook",
+      title: "Custom Integration Hook",
+      event: "Stop",
+      command: "echo ok",
+      scope: "project",
+      projectRoot: PROJECT_ROOT,
+    });
+    assert.equal(hsave.ok, true);
+    const htog = await backend.getGitGraph("__HUB_RPC__", "hooks:toggle", { id: "custom-int-hook", scope: "off", projectRoot: PROJECT_ROOT });
+    assert.equal(htog.ok, true);
+    const hdel = await backend.getGitGraph("__HUB_RPC__", "hooks:delete", { id: "custom-int-hook" });
+    assert.equal(hdel.ok, true);
+
+    // Memory evolution + consolidate + rollback via hubCall
+    const m1 = await backend.getGitGraph("__HUB_RPC__", "memory:save", {
+      projectRoot: PROJECT_ROOT,
+      module: "decisions",
+      kind: "decision",
+      title: "RPC 端口约定",
+      content: "使用 7001 端口作为测试服务端口",
+    });
+    assert.equal(m1.ok, true);
+    const m2 = await backend.getGitGraph("__HUB_RPC__", "memory:save", {
+      projectRoot: PROJECT_ROOT,
+      module: "decisions",
+      kind: "decision",
+      title: "RPC 端口约定",
+      content: "已从 7001 端口迁移到 8001 端口作为统一本地嵌入服务端口",
+      supersedesId: m1.item.id,
+    });
+    assert.equal(m2.ok, true);
+    assert.equal(m2.action, "superseded");
+    assert.equal(m2.evolvedFromVersion, 1);
+    assert.ok(m2.item.version >= 2);
+    const cons = await backend.getGitGraph("__HUB_RPC__", "memory:consolidate", { projectRoot: PROJECT_ROOT, dryRun: true });
+    assert.equal(cons.ok, true);
+    const rb = await backend.getGitGraph("__HUB_RPC__", "memory:rollback", { projectRoot: PROJECT_ROOT, id: m2.item.id, targetVersion: 1 });
+    assert.equal(rb.ok, true);
+    assert.ok(rb.item.content.includes("7001"));
+
+    // Subagent live route resolution + Antigravity rules sync
+    const agyRulesDir = path.join(tmpUserdata, "providers", "antigravity", "mock-agy-inst", "config", "rules");
+    fs.mkdirSync(agyRulesDir, { recursive: true });
+    const agyRulesFile = path.join(agyRulesDir, "AGENTS.md");
+    fs.writeFileSync(agyRulesFile, "# Existing AGY Rules\nKeep me safe\n", "utf8");
+    const ssave = await backend.getGitGraph("__HUB_RPC__", "subagents:save", {
+      scope: "global",
+      item: { id: "worker", role: "implementation", providerInstanceId: "codex", model: "gpt-6.1-terra", effort: "high", memoryPolicy: "readwrite", enabled: true },
+    });
+    assert.equal(ssave.ok, true);
+    const agyText = fs.readFileSync(agyRulesFile, "utf8");
+    assert.ok(agyText.includes("Keep me safe"));
+    assert.ok(agyText.includes("t3-hub-subagents:start"));
+    assert.ok(agyText.includes("gpt-6.1-terra"));
+    const resolved = await backend.getGitGraph("__HUB_RPC__", "subagents:resolveRoute", { idOrTitle: "worker", role: "implementation", projectRoot: PROJECT_ROOT });
+    assert.equal(resolved.matched, true);
+    assert.equal(resolved.target.providerInstanceId, "codex");
+    assert.equal(resolved.target.model, "gpt-6.1-terra");
+    assert.equal(resolved.target.options.reasoningEffort, "high");
+  });
+
   it("hubCall unknown action returns ok false", async () => {
     const res = await backend.getGitGraph("__HUB_RPC__", "unknown:action", {});
     assert.equal(res.ok, false);
@@ -310,6 +397,10 @@ describe("install.sh sidecar copies", () => {
     assert.ok(src.includes('src/*.cjs') || src.includes('src/"*.cjs"') || src.includes('*.cjs'));
     assert.ok(src.includes('t3-mcp-router'));
     assert.ok(src.includes('pc-lite.mjs'));
+    assert.ok(src.includes('memory-stop-hook.mjs'));
+    assert.ok(src.includes('subagent-route-guard.mjs'));
+    assert.ok(src.includes('hub-plugins.cjs'));
+    assert.ok(src.includes('hub-hooks.cjs'));
     assert.ok(src.includes('chmod +x'));
   });
 });

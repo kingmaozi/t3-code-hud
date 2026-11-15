@@ -271,8 +271,10 @@ describe("hybrid search (mock :8001 + offline fallback)", () => {
   });
   it("fuses semantic ranks with mock server (RRF)", async () => {
     const v = makeVault({ embeddingUrl: mockUrl });
-    const a = v.saveMemory({ projectRoot: projB, module: "topics", kind: "topic", title: "sem-a", content: "cache hit cache hit cache hit" });
-    const b = v.saveMemory({ projectRoot: projB, module: "topics", kind: "topic", title: "sem-b", content: "completely unrelated zebra content" });
+    // Ranking needs two independent fixtures. The mock's coarse token hashes
+    // can otherwise auto-merge sem-a with an earlier timestamped cache-topic.
+    const a = v.saveMemory({ projectRoot: projB, module: "topics", kind: "topic", title: "sem-a", content: "cache hit cache hit cache hit", autoEvolve: false });
+    const b = v.saveMemory({ projectRoot: projB, module: "topics", kind: "topic", title: "sem-b", content: "completely unrelated zebra content", autoEvolve: false });
     assert.equal(a.ok, true);
     assert.equal(b.ok, true);
     const ok = await waitForVectors(vaultDir, 2, 5000);

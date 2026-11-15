@@ -43,12 +43,17 @@
     let slashSession = null;
     const slashCache = new Map();
     const subagentSaves = new Map();
-    const cache = { skills: null, subagents: null, mcp: null, overview: null, memory: null, embed: null, agents: null };
+    const tabKeys = ["plugins", "mcp", "skills", "hooks", "subagents", "memory", "agents"];
+    const cache = { plugins: null, hooks: null, skills: null, subagents: null, mcp: null, overview: null, memory: null, embed: null, agents: null };
     const errors = {};
     const drafts = initial?.drafts || {};
     const state = {
       open: initial?.open ?? false,
-      tab: initial?.tab || storageGet("t3-hub-tab") || "skills",
+      tab: initial?.tab || storageGet("t3-hub-tab") || "plugins",
+      scope: initial?.scope || storageGet("t3-hub-scope") || "global",
+      pluginQuery: initial?.pluginQuery || "", pluginInput: initial?.pluginInput || "", pluginInstallOpen: false,
+      mcpQuery: "", hookDraft: null, historyExpanded: initial?.historyExpanded || {},
+      supersedeItems: [], supersedeLoading: false,
       lang: "zh", dark: false, context: null, connected: false,
       contextError: "", projectRoot: null, refreshing: false,
       skillQuery: initial?.skillQuery || "", skillFilter: initial?.skillFilter || "all",
@@ -63,7 +68,8 @@
       mcpAddOpen: false, mcpForm: { kind: "form", name: "", transport: "stdio", command: "", args: "", url: "", json: "" },
       freshModes: {}, syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
     };
-    if (!["skills", "subagents", "mcp", "memory", "agents"].includes(state.tab)) state.tab = "skills";
+    if (!tabKeys.includes(state.tab)) state.tab = "plugins";
+    if (!["global", "project"].includes(state.scope)) state.scope = "global";
 
     async function hubRpc(action, payload = {}) {
       let result;
@@ -71,7 +77,7 @@
       else if (typeof window.__t3HubRpc === "function") result = await window.__t3HubRpc(action, payload);
       else if (typeof window.__t3HudBridge?.getGitGraph === "function") result = await window.__t3HudBridge.getGitGraph("__HUB_RPC__", action, payload);
       else throw new Error(tr("Hub 连接暂不可用", "Hub connection is unavailable"));
-      if (result?.ok !== false && result?.success !== false && ["skills:setScope", "skills:importGitHub", "subagents:save", "subagents:delete"].includes(action)) invalidateSlashCache();
+      if (result?.ok !== false && result?.success !== false && ["skills:setScope", "skills:importGitHub", "skills:updatePackage", "skills:removePackage", "plugins:setScope", "plugins:installGitHub", "subagents:save", "subagents:delete"].includes(action)) invalidateSlashCache();
       return result;
     }
     async function request(action, payload = {}) {
@@ -112,6 +118,13 @@
         .replace(/(Bearer\s+)[^\s"']+/gi, "$1•••");
     }
     const paths = {
+      graph: '<path d="M7 6h10M6 7v10m12-10v10M7 18h10M8 8l8 8"/><circle cx="5" cy="5" r="3"/><circle cx="19" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/>',
+      crystal: '<path d="m12 2 9 6v8l-9 6-9-6V8l9-6Zm0 0v20M3 8l9 6 9-6M3 16l9-9 9 9"/>',
+      display: '<rect x="2" y="3" width="20" height="14" rx="3"/><path d="M8 22h8m-4-5v5"/>',
+      cloud: '<path d="M6 18h14a3 3 0 0 0 0-6h-1a6 6 0 0 0-12-2 4 4 0 0 0-1 8Z"/><path d="M3 21h18"/>',
+      masks: '<path d="m3 4 9 2-2 9a5 5 0 0 1-7-3L3 4Zm9 4 9-3v9a6 6 0 0 1-9 6"/><path d="M5 8h2m2 1h1M5 12l3 1m7-1h1m2-1h1m-5 5q2 3 5-1"/>',
+      bag: '<path d="M4 7h16l1 14H3L4 7Zm4 0V5a4 4 0 0 1 8 0v2"/>',
+      terminal: '<rect x="2" y="3" width="20" height="18" rx="4"/><path d="m6 8 4 4-4 4m7 0h5"/>',
       hub: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M17.5 14v7m-3.5-3.5h7"/>',
       close: '<path d="m6 6 12 12M18 6 6 18"/>',
       refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/>',
@@ -142,7 +155,7 @@
       return `<button type="button" class="hub-btn ${options.primary ? "hub-primary" : ""} ${options.small ? "hub-small" : ""} ${options.danger ? "hub-danger" : ""}" data-action="${esc(action)}" ${options.disabled ? "disabled" : ""} ${options.attrs || ""}>${options.icon ? icon(options.icon, 14) : ""}<span>${esc(label)}</span></button>`;
     }
     function projectDisabled() { return !state.projectRoot; }
-    function projectTitle() { return projectDisabled() ? tr("请先打开一个项目", "Open a project first") : ""; }
+    function projectTitle() { return projectDisabled() ? tr("请先打开一个项目", "Open a project first") : state.context?.projectTitle || state.context?.projectName || state.context?.project?.name || state.projectRoot.split(/[\\/]/).filter(Boolean).pop(); }
     function empty(title, detail = "", name = "search") {
       return `<div class="hub-empty">${icon(name, 27)}<strong>${esc(title)}</strong>${detail ? `<span>${esc(detail)}</span>` : ""}</div>`;
     }
@@ -201,7 +214,6 @@
         @media(prefers-reduced-motion:reduce){#t3-sidecar-hub *,#t3-sidecar-hub *:after{animation:none!important;transition:none!important}}
       `;
       style.textContent += `
-        #t3-sidecar-hub[data-tab=subagents] #t3-hub-drawer{width:min(760px,calc(100vw - 24px))}
         #t3-sidecar-hub .hub-subagent-scopes{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:4px;background:var(--hud-surface);border:1px solid var(--hud-border);border-radius:10px;margin:3px 0 17px}
         #t3-sidecar-hub .hub-subagent-scope{padding:9px 6px;border:0;border-radius:7px;background:transparent;color:var(--hud-muted);font-size:11px;line-height:1.5;text-align:center}
         #t3-sidecar-hub .hub-subagent-scope small{display:block;font-size:9px;opacity:.75;margin-top:1px}
@@ -262,6 +274,128 @@
         @media(max-width:460px){#t3-sidecar-hub .hub-tabs{grid-template-columns:1.3fr 1.05fr .65fr .88fr 1.12fr;gap:1px}#t3-sidecar-hub .hub-tab{font-size:9px!important;gap:3px}#t3-sidecar-hub .hub-tab svg{width:11px;height:11px}#t3-sidecar-hub .hub-subagent-controls{grid-column:1/-1;margin-left:0;gap:5px}#t3-sidecar-hub .hub-subagent-meta{margin-left:0}#t3-sidecar-hub .hub-subagent-custom{margin-left:0}#t3-sidecar-hub .hub-subagent-heading h3{font-size:11px}#t3-sidecar-hub .hub-subagent-heading .hub-btn{font-size:10px!important;padding-inline:7px}#t3-sidecar-hub .hub-subagent-fields{gap:8px}#t3-sidecar-hub .hub-subagent-editor .hub-editor-actions .hub-btn{font-size:10px!important}#t3-sidecar-hub .hub-subagent-scope{font-size:10px}.hub-subagent-name{font-size:12px}}
         @media(prefers-reduced-motion:reduce){#t3-sidecar-hub .hub-subagent-expand{transition:none}}
       `;
+      style.textContent += `
+        /* Sidecar Hub v2: ZCode's quiet grouped surfaces, sized for a 480px drawer. */
+        #t3-sidecar-hub #t3-hub-drawer{width:min(480px,calc(100vw - 24px));border-radius:18px}
+        #t3-sidecar-hub .hub-header{padding:20px 19px 13px}
+        #t3-sidecar-hub .hub-title{font-size:19px;letter-spacing:-.55px;display:flex;align-items:center;gap:8px}
+        #t3-sidecar-hub .hub-version{font-size:9px;letter-spacing:.03em;font-weight:550;color:var(--hud-muted);border:1px solid var(--hud-border);padding:1px 5px;border-radius:5px}
+        #t3-sidecar-hub .hub-kicker{font-size:11px;letter-spacing:0;margin-top:4px}
+        #t3-sidecar-hub .hub-brand{width:38px;height:38px;border-radius:12px}
+        #t3-sidecar-hub .hub-scope-bar{display:flex;align-items:center;gap:10px;margin-top:19px;min-width:0}
+        #t3-sidecar-hub .hub-scope-select{width:auto;max-width:calc(100% - 50px);border-radius:20px;padding:7px 27px 7px 11px;background:color-mix(in srgb,var(--hud-surface) 55%,var(--hud-bg-solid));font-size:11px!important;height:33px}
+        #t3-sidecar-hub .hub-context{margin-top:9px}
+        #t3-sidecar-hub .hub-context-status{display:flex;align-items:center;gap:6px;min-width:0;max-width:100%;font-size:10px;color:var(--hud-muted)}
+        #t3-sidecar-hub .hub-context-status>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #t3-sidecar-hub .hub-context-status.is-ready{color:var(--hud-emerald)}
+        #t3-sidecar-hub .hub-tabs{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));padding:4px;gap:3px;margin:0 16px 15px;border-color:color-mix(in srgb,var(--hud-border) 75%,transparent);border-radius:12px;background:color-mix(in srgb,var(--hud-surface) 70%,var(--hud-bg-solid))}
+        #t3-sidecar-hub .hub-tab{grid-column:span 3;font-size:11px!important;gap:5px;padding:7px 3px;min-height:31px;border-radius:8px}
+        #t3-sidecar-hub .hub-tab:nth-child(n+5){grid-column:span 4}
+        #t3-sidecar-hub .hub-tab-count{font-size:9px;line-height:16px;min-width:16px;padding:0 3px;border-radius:5px;background:var(--hud-hover);font-variant-numeric:tabular-nums;font-weight:450;color:var(--hud-muted)}
+        #t3-sidecar-hub .hub-tab[aria-selected=true]{box-shadow:0 1px 4px #0000000c}
+        #t3-sidecar-hub .hub-tab[aria-selected=true] .hub-tab-count{color:var(--hud-emerald);background:var(--hub-accent-bg)}
+        #t3-sidecar-hub .hub-content{padding:0 18px 22px;overflow-x:hidden}
+        #t3-sidecar-hub .hub-section-heading{font-size:13px;line-height:1.6;margin-top:3px;margin-bottom:5px}
+        #t3-sidecar-hub .hub-description{font-size:11px;margin-bottom:14px}
+        #t3-sidecar-hub .hub-search{margin:12px 0}
+        #t3-sidecar-hub .hub-search .hub-input{height:35px;background:var(--hud-bg-solid);border-radius:10px}
+        #t3-sidecar-hub .hub-btn{border-radius:8px}
+        #t3-sidecar-hub .hub-btn.hub-primary{background:var(--hud-fg);color:var(--hud-bg-solid)!important}
+        #t3-sidecar-hub .hub-btn.hub-primary:hover:not(:disabled){background:var(--hud-fg);filter:brightness(.9)}
+        #t3-sidecar-hub .hub-form-panel{margin-top:12px}
+        #t3-sidecar-hub .hub-card{border-radius:12px}
+        #t3-sidecar-hub .hub-card-name{font-size:12px;line-height:1.55}
+        #t3-sidecar-hub .hub-card-description{-webkit-line-clamp:3;line-height:1.65}
+        #t3-sidecar-hub .hub-domain-hint{margin:14px 0}
+        #t3-sidecar-hub #t3-hub-plugin-list{margin-top:16px}
+        #t3-sidecar-hub .hub-plugin-card{padding:15px;background:color-mix(in srgb,var(--hud-surface) 52%,var(--hud-bg-solid));border-color:transparent;margin-bottom:12px}
+        #t3-sidecar-hub .hub-plugin-card.is-core{background:linear-gradient(115deg,color-mix(in srgb,var(--hud-emerald) 8%,var(--hud-bg-solid)),color-mix(in srgb,var(--hud-violet) 4%,var(--hud-bg-solid)));border-color:color-mix(in srgb,var(--hud-emerald) 19%,var(--hud-border))}
+        #t3-sidecar-hub .hub-plugin-card .hub-card-top{align-items:center;gap:11px}
+        #t3-sidecar-hub .hub-capabilities{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0 13px}
+        #t3-sidecar-hub .hub-capability{border:1px solid var(--hud-border);border-radius:5px;padding:2px 6px;font-size:9px;color:var(--hud-muted);white-space:nowrap;background:color-mix(in srgb,var(--hud-bg-solid) 65%,transparent)}
+        #t3-sidecar-hub .hub-scope-control{border-color:var(--hud-border);padding:3px;background:color-mix(in srgb,var(--hud-bg-solid) 35%,transparent)}
+        #t3-sidecar-hub .hub-scope-control>button{padding-block:5px}
+        #t3-sidecar-hub .hub-brand-icon{width:38px;height:38px;position:relative;display:grid;place-items:center;flex:none;border-radius:11px;background:var(--hud-bg-solid);color:var(--hud-muted)}
+        #t3-sidecar-hub .hub-brand-icon>svg{width:25px;height:25px}
+        #t3-sidecar-hub .hub-brand-icon>img{position:absolute;inset:5px;width:28px;height:28px;object-fit:contain;border-radius:5px;background:var(--hud-bg-solid)}
+        #t3-sidecar-hub .hub-brand-crystal{color:var(--hud-violet);background:color-mix(in srgb,var(--hud-violet) 8%,var(--hud-bg-solid))}
+        #t3-sidecar-hub .hub-brand-globe{color:#3489a7}.is-dark .hub-brand-globe{color:#68c6e4}
+        #t3-sidecar-hub .hub-brand-bag{color:#b97b3c}.is-dark .hub-brand-bag{color:#e1b171}
+        #t3-sidecar-hub .hub-brand-graph{color:#7c6ad5}.is-dark .hub-brand-graph{color:#b2a1ff}
+        #t3-sidecar-hub .hub-brand-context{color:#1f8b66}.is-dark .hub-brand-context{color:#5dd1a8}
+        #t3-sidecar-hub .hub-brand-playwright{color:#2aab68}.is-dark .hub-brand-playwright{color:#6dd897}
+        #t3-sidecar-hub .hub-brand-cloud{color:#f49b35}.hub-brand-display{color:#5087c7}.hub-brand-sparkle{color:#b97ac9}
+        #t3-sidecar-hub .hub-connection-dot{position:absolute;bottom:-1px;right:-1px;width:11px;height:11px;border:2px solid var(--hud-bg-solid);border-radius:50%;background:#a3a7ae}
+        #t3-sidecar-hub .hub-connection-dot.is-connected{background:#10B981}
+        #t3-sidecar-hub .hub-switch{width:31px;height:18px;padding:2px;border:0;border-radius:12px;flex:none;background:#aaadb2;align-self:center;transition:background .18s}
+        #t3-sidecar-hub .hub-switch>span{display:block;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 2px #0002;transition:transform .18s}
+        #t3-sidecar-hub .hub-switch[aria-checked=true]{background:#10B981}
+        #t3-sidecar-hub .hub-switch[aria-checked=true]>span{transform:translateX(13px)}
+        #t3-sidecar-hub .hub-mcp-actions{display:flex;gap:5px;flex-wrap:wrap;margin:0 0 18px}
+        #t3-sidecar-hub .hub-mcp-actions .hub-btn{min-height:28px;padding-inline:7px;font-size:10px!important}
+        #t3-sidecar-hub .hub-mcp-group{background:#f3f4f5;border:1px solid transparent;border-radius:13px;overflow:hidden}
+        #t3-sidecar-hub.is-dark .hub-mcp-group{background:color-mix(in srgb,var(--hud-surface) 84%,var(--hud-bg-solid));border-color:color-mix(in srgb,var(--hud-border) 35%,transparent)}
+        #t3-sidecar-hub .hub-mcp-row{display:flex;gap:10px;align-items:flex-start;padding:13px 12px;border-bottom:1px solid var(--hud-border);min-width:0}
+        #t3-sidecar-hub .hub-mcp-row:last-child{border-bottom:0}
+        #t3-sidecar-hub .hub-mcp-name{font-size:12px;font-weight:550;line-height:1.6;overflow-wrap:anywhere}
+        #t3-sidecar-hub .hub-mcp-detail{font-size:10px;color:var(--hud-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;margin-top:2px}
+        #t3-sidecar-hub .hub-mcp-row-options{display:flex;gap:7px;align-items:center;min-width:0;margin-top:7px}
+        #t3-sidecar-hub .hub-mode-pill{width:113px;max-width:100%;padding:3px 21px 3px 6px;font-size:9px!important;line-height:1.5;border-color:color-mix(in srgb,var(--hud-border) 75%,transparent);border-radius:6px;background-color:color-mix(in srgb,var(--hud-bg-solid) 65%,transparent)}
+        #t3-sidecar-hub .hub-upstream-status{font-size:10px;display:flex;align-items:flex-start;gap:5px;color:var(--hud-muted);margin-top:3px;line-height:1.65}
+        #t3-sidecar-hub .hub-upstream-status>.hub-dot{margin-top:6px;background:#a3a7ae}
+        #t3-sidecar-hub .hub-upstream-status.is-available>.hub-dot{background:#10B981}
+        #t3-sidecar-hub .hub-mcp-remove{margin-left:auto;width:22px;height:22px}
+        #t3-sidecar-hub .hub-group-heading{margin-top:18px;margin-bottom:11px}
+        #t3-sidecar-hub .hub-catalog-heading{margin-top:26px;padding-top:17px;border-top:1px solid var(--hud-border);margin-bottom:15px}
+        #t3-sidecar-hub .hub-upstream-heading{font-size:11px;font-weight:550;margin:0 0 8px}.hub-upstream-heading>.hub-count{margin-left:5px}
+        #t3-sidecar-hub .hub-upstream-group{margin-top:17px}
+        #t3-sidecar-hub .hub-quiet-empty{font-size:11px;padding:15px;color:var(--hud-muted);border-radius:10px;background:var(--hud-surface)}
+        #t3-sidecar-hub .hub-hook-card{background:color-mix(in srgb,var(--hud-surface) 60%,var(--hud-bg-solid));border-color:transparent;padding:14px;margin-bottom:10px}
+        #t3-sidecar-hub .hub-hook-card .hub-card-name{font-size:12px}.hub-hook-card .hub-card-description{margin:9px 0 12px}
+        #t3-sidecar-hub .hub-hook-command{display:block;margin-bottom:11px;padding:7px 9px;font-size:10px;line-height:1.65;background:var(--hud-bg-solid);border-radius:6px;color:var(--hud-muted);overflow-wrap:anywhere;white-space:pre-wrap}
+        #t3-sidecar-hub .hub-subagent-scopes{display:flex;padding:3px;margin:0 0 17px;border:0;background:var(--hud-surface)}
+        #t3-sidecar-hub .hub-subagent-scope{flex:1;padding:6px;font-size:10px}.hub-subagent-scope small{display:none!important}
+        #t3-sidecar-hub .hub-subagent-list{border-color:transparent;background:#f3f4f5;border-radius:13px}
+        #t3-sidecar-hub.is-dark .hub-subagent-list{background:color-mix(in srgb,var(--hud-surface) 82%,var(--hud-bg-solid))}
+        #t3-sidecar-hub .hub-subagent-card{padding:15px 13px 13px}
+        #t3-sidecar-hub .hub-subagent-main{grid-template-columns:38px minmax(0,1fr);gap:9px 10px;align-items:center}
+        #t3-sidecar-hub .hub-subagent-controls{grid-column:1/-1;grid-template-columns:minmax(0,.85fr) minmax(0,1.35fr) minmax(0,.8fr);gap:6px;margin-top:1px}
+        #t3-sidecar-hub .hub-subagent-controls .hub-select{font-size:10px!important;padding-right:17px;height:31px}
+        #t3-sidecar-hub .hub-subagent-meta{margin:9px 0 0;display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start}
+        #t3-sidecar-hub .hub-subagent-edit{margin-left:auto;font-size:9px}
+        #t3-sidecar-hub .hub-subagent-custom{margin-left:0}
+        #t3-sidecar-hub .hub-subagent-desc{font-size:10.5px;line-height:1.65}
+        #t3-sidecar-hub .hub-subagent-name{font-size:12px;gap:6px}
+        #t3-sidecar-hub .hub-memory-policy{font-size:9px!important;line-height:1.5;width:174px;max-width:100%;min-height:24px;padding:3px 18px 3px 6px;border-radius:6px;border-color:color-mix(in srgb,var(--hud-emerald) 18%,var(--hud-border));color:var(--hud-emerald);background:color-mix(in srgb,var(--hud-emerald) 5%,var(--hud-bg-solid))}
+        #t3-sidecar-hub .hub-memory-policy.policy-readonly{color:var(--hud-blue);background:color-mix(in srgb,var(--hud-blue) 5%,var(--hud-bg-solid));border-color:color-mix(in srgb,var(--hud-blue) 16%,var(--hud-border))}
+        #t3-sidecar-hub .hub-memory-policy.policy-off{color:var(--hud-muted);background:var(--hud-bg-solid);border-color:var(--hud-border)}
+        #t3-sidecar-hub .hub-subagent-editor .hub-memory-policy{width:100%;font-size:11px!important;padding:7px}
+        #t3-sidecar-hub .hub-bot-avatar{width:38px;height:38px;display:grid;place-items:center;border-radius:11px;background:#F4F5F7;flex:none}
+        #t3-sidecar-hub.is-dark .hub-bot-avatar{background:rgba(255,255,255,.07)}
+        #t3-sidecar-hub .hub-bot-head{width:24px;height:24px;border-radius:8.5px;display:grid;place-items:center;background:var(--bot-color);transform-origin:50% 70%}
+        #t3-sidecar-hub .hub-bot-look{display:block;animation:t3BotLook 5.5s ease-in-out var(--bot-delay) infinite}
+        #t3-sidecar-hub .hub-bot-eyes{display:flex;gap:4px;transform:translateX(1px);animation:t3BotDoubleBlink 5.5s ease-in-out var(--bot-delay) infinite;transform-origin:center}
+        #t3-sidecar-hub .hub-bot-eyes>i{display:block;width:3.6px;height:6.4px;border-radius:1.8px;background:#fff}
+        @keyframes t3BotDoubleBlink{0%,88%,92%,96%,100%{transform:translateX(1px) scaleY(1)}90%,94%{transform:translateX(1px) scaleY(.18)}}
+        @keyframes t3BotLook{0%,66%,100%{transform:translate(0,0)}74%,80%{transform:translate(1.5px,-1px)}90%{transform:translate(0,1.5px)}}
+        @keyframes t3BotHello{0%,28%,56%,100%{transform:translateX(1px) scaleY(1)}14%,42%{transform:translateX(1px) scaleY(.18)}}
+        @keyframes t3BotTilt{0%,100%{transform:rotate(0) translateY(0)}25%,65%{transform:rotate(-2deg) translateY(-1.5px)}}
+        #t3-sidecar-hub .hub-subagent-card.is-playful .hub-bot-eyes{animation:t3BotHello .7s ease-in-out both}
+        #t3-sidecar-hub .hub-subagent-card.is-playful .hub-bot-head{animation:t3BotTilt .75s ease-in-out both}
+        #t3-sidecar-hub .hub-memory-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 15px}
+        #t3-sidecar-hub .hub-memory-toolbar>.hub-btn{color:var(--hud-emerald);border-color:color-mix(in srgb,var(--hud-emerald) 25%,var(--hud-border));background:var(--hub-accent-bg)}
+        #t3-sidecar-hub .hub-memory-hits{font-size:9px;color:var(--hud-muted)}
+        #t3-sidecar-hub .hub-memory-history{padding:0 12px 11px}
+        #t3-sidecar-hub .hub-history-toggle{display:flex;align-items:center;gap:5px;font-size:10px;border:0;padding:4px 0;background:transparent;color:var(--hud-muted)}
+        #t3-sidecar-hub .hub-history-toggle[aria-expanded=true]>svg{transform:rotate(90deg)}
+        #t3-sidecar-hub .hub-history-list{border-left:1px solid var(--hud-border);margin:7px 0 0 4px;padding-left:11px}
+        #t3-sidecar-hub .hub-history-entry{padding:9px 10px;margin-bottom:7px;background:var(--hud-surface);border-radius:7px;min-width:0}
+        #t3-sidecar-hub .hub-history-entry .hub-row{font-size:9px;color:var(--hud-muted);flex-wrap:wrap;gap:6px}.hub-history-entry strong{color:var(--hud-violet)}
+        #t3-sidecar-hub .hub-history-entry p{font-size:10px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--hud-muted);margin:7px 0 9px}
+        #t3-sidecar-hub .hub-history-agent{color:var(--hud-muted);font-size:9px;margin-top:3px}
+        @media(max-width:460px){#t3-sidecar-hub #t3-hub-drawer{right:8px;top:8px;bottom:8px;width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border-radius:16px}#t3-sidecar-hub .hub-header{padding:16px 15px 12px}#t3-sidecar-hub .hub-tabs{margin:0 11px 14px}#t3-sidecar-hub .hub-content{padding-inline:13px}#t3-sidecar-hub .hub-tab{font-size:10px!important;gap:4px}#t3-sidecar-hub .hub-mcp-actions .hub-btn{font-size:9px!important;padding-inline:6px}#t3-sidecar-hub .hub-mcp-actions{gap:4px}#t3-sidecar-hub .hub-subagent-card{padding:13px 11px}#t3-sidecar-hub .hub-subagent-controls{grid-template-columns:minmax(0,.8fr) minmax(0,1.25fr) minmax(0,.8fr)}#t3-sidecar-hub .hub-subagent-meta{gap:5px}#t3-sidecar-hub .hub-subagent-meta .hub-subagent-edit{font-size:8px}#t3-sidecar-hub .hub-memory-policy{width:169px}#t3-sidecar-hub .hub-project-picker{flex-wrap:wrap}#t3-sidecar-hub .hub-project-picker>.hub-select{flex-basis:100%}#t3-sidecar-hub .hub-subagent-heading h3{font-size:12px}#t3-sidecar-hub .hub-import-grid{grid-template-columns:minmax(0,1fr) 85px auto}}
+        @media(prefers-reduced-motion:reduce){#t3-sidecar-hub .hub-bot-avatar *,#t3-sidecar-hub .hub-switch>span{animation:none!important;transition:none!important}}
+      `;
       document.head.appendChild(style);
       root = document.createElement("div");
       root.id = "t3-sidecar-hub";
@@ -273,7 +407,7 @@
       palette = document.createElement("section");
       palette.id = "t3-hub-slash-palette";
       palette.hidden = true;
-      palette.setAttribute("aria-label", "项目 Skills 与子代理快捷指令");
+      palette.setAttribute("aria-label", "项目 Skills 与子智能体快捷指令");
       root.appendChild(palette);
       state.lang = detectLang();
       state.dark = isDark();
@@ -283,8 +417,13 @@
       listen(root, "click", onClick);
       listen(root, "input", onInput);
       listen(root, "change", onChange);
+      listen(root, "error", (event) => { if (event.target.matches?.(".hub-brand-icon>img")) event.target.remove(); }, true);
+      listen(root, "pointerover", (event) => { const card = event.target.closest("[data-subagent-card]"); if (card && !card.contains(event.relatedTarget)) greetBots(card.dataset.subagentCard); });
       listen(root, "keydown", onEditorKeydown);
-      listen(root, "submit", (event) => { if (event.target.dataset.form === "import") { event.preventDefault(); runImport(); } });
+      listen(root, "submit", (event) => {
+        const form = event.target.dataset.form;
+        if (["import", "plugin", "hook"].includes(form)) { event.preventDefault(); if (form === "import") runImport(); if (form === "plugin") installPlugin(); if (form === "hook") saveHook(); }
+      });
       listen(handle, "pointerdown", onDragStart);
       listen(handle, "pointermove", onDragMove);
       listen(handle, "pointerup", onDragEnd);
@@ -327,29 +466,136 @@
       if (!root || disposed) return;
       root.dataset.tab = state.tab;
       const context = state.context || {};
-      const projectName = context.projectName || context.project?.name || state.projectRoot?.split(/[\\/]/).filter(Boolean).pop() || tr("未绑定项目", "No project bound");
-      const rawCli = context.activeCli || context.cli || context.provider || context.providerInstanceId;
+      const projectName = projectTitle();
+      const rawCli = context.activeProvider || context.activeCli || context.cli || context.provider || context.providerInstanceId;
       const cli = typeof rawCli === "object" ? rawCli?.name || rawCli?.id : rawCli;
       const cliNames = { codex: "Codex", antigravity: "Antigravity", agy: "Antigravity", muse: "Muse", pi: "Pi", claude: "Claude" };
-      const cliName = cliNames[String(cli).toLowerCase()] || cli || tr("识别中", "Detecting");
+      const model = typeof context.activeModel === "object" ? context.activeModel?.name || context.activeModel?.id : context.activeModel;
+      const cliName = [cliNames[String(cli).toLowerCase()] || cli, model].filter(Boolean).join(" · ") || tr("本地工作区就绪", "Workspace Ready");
       const count = context.activeProjectCount ?? context.projectCount ?? (Array.isArray(context.projects) ? context.projects.length : null);
       const badge = root.querySelector(".hub-handle-count");
       badge.hidden = count == null;
       badge.textContent = String(count ?? "");
       handle.title = tr("工作台 Hub · 拖动可调整位置 · ⌘⇧K / Alt+H", "Sidecar Hub · Drag to reposition · ⌘⇧K / Alt+H");
       handle.setAttribute("aria-label", `${tr("打开工作台 Hub", "Open Sidecar Hub")}${count == null ? "" : ` · ${count}`}`);
-      root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 21)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Sidecar Hub</div><div class="hub-kicker">${esc(tr("你的 AI 工作空间，井然有序。", "A little order for your AI workspace."))}</div></div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" title="${esc(tr("关闭 (Esc)", "Close (Esc)"))}" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 17)}</button></div><div class="hub-context"><span class="hub-badge" title="${esc(projectName)}">${icon("folder", 12)}<span>${esc(projectName)}</span></span><span class="hub-badge hub-green"><i class="hub-dot"></i><span>${esc(cliName)}</span></span><span class="hub-shortcut">⌘ ⇧ K</span></div>`;
-      const tabs = [["skills", "skill", tr("插件/Skills", "Skills")], ["subagents", "robot", tr("子代理", "Agents")], ["mcp", "plug", "MCP"], ["memory", "memory", tr("记忆库", "Memory")], ["agents", "edit", "AGENTS.md"]];
-      root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, name, label]) => `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === state.tab}" tabindex="${key === state.tab ? 0 : -1}">${name === "robot" ? '<span class="hub-tab-emoji" aria-hidden="true">🤖</span>' : icon(name, 14)}<span>${esc(label)}</span></button>`).join("");
+      root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 21)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Sidecar Hub <span class="hub-version">v2</span></div><div class="hub-kicker">${esc(tr("你的 AI 工作空间，井然有序。", "A little order for your AI workspace."))}</div></div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 17)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("工作空间作用域", "Workspace scope"))}"><option value="global" ${state.scope === "global" ? "selected" : ""}>${esc(tr("🖥️ 本机 · 全局", "🖥️ Local · Global"))}</option><option value="project" ${state.scope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>📁 ${esc(tr("当前项目", "Project"))} · ${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status ${state.connected ? "is-ready" : ""}" title="${esc(cliName)}"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
+      const tabs = [["plugins", tr("插件", "Plugins")], ["mcp", "MCP"], ["skills", tr("技能", "Skills")], ["hooks", "Hooks"], ["subagents", tr("子智能体", "Sub-Agents")], ["memory", tr("记忆库", "Memory")], ["agents", "AGENTS.md"]];
+      root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, label]) => {
+        const count = tabCount(key);
+        return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === state.tab}" tabindex="${key === state.tab ? 0 : -1}"><span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
+      }).join("");
       content.setAttribute("aria-labelledby", `t3-hub-tab-${state.tab}`);
       root.querySelector(".hub-footer").innerHTML = `<span class="hub-footer-status ${state.connected ? "is-connected" : ""}"><i class="hub-dot"></i>${esc(state.connected ? tr("已连接 · 本地工作空间", "Connected · Local workspace") : tr("等待 Hub 连接", "Waiting for Hub"))}</span><span class="hub-footer-key">${esc(tr("按 Esc 收起", "Esc to close"))}</span>`;
     }
+    function tabCount(key) {
+      const counts = state.context?.counts || {};
+      if (key === "plugins") return cache.plugins ? pluginItems().length : counts.plugins ?? null;
+      if (key === "mcp") return cache.mcp ? mcpServers().length : counts.activeMcps ?? null;
+      if (key === "skills") return cache.skills ? items(cache.skills, ["items", "skills"]).length : counts.activeSkills ?? null;
+      if (key === "hooks") return cache.hooks ? hookItems().length : counts.hooks ?? null;
+      if (key === "subagents") return cache.subagents ? subagentItems().length : counts.subagents ?? null;
+      if (key === "memory") {
+        const project = items(cache.overview, ["projects", "items"]).find((entry) => state.memoryProject === "global" ? ["global", "_global"].includes(entry.slug) : entry.projectRoot === selectedMemoryRoot());
+        return project?.total ?? cache.overview?.total ?? counts.projectMemories ?? (cache.memory ? memoryRecords().length : null);
+      }
+      return null;
+    }
+    function defaultScope() { return state.scope === "project" && state.projectRoot ? "project" : "global"; }
+    function setScope(scope) {
+      if (scope === "project" && projectDisabled()) return;
+      state.scope = scope;
+      state.importScope = scope;
+      state.subagentScope = scope;
+      state.agentsTarget = scope;
+      state.memoryProject = scope === "project" ? "current" : "global";
+      state.selectedMemory = null;
+      state.supersedeItems = [];
+      state.supersedeLoading = false;
+      memoryVersion++;
+      cache.memory = null;
+      if (drafts.__new) drafts.__new.supersedes = "";
+      storageSet("t3-hub-scope", scope);
+      renderChrome(); renderTab();
+      loadTab().then(() => { if (!disposed && drafts.__new?.open && state.tab === "memory") openNewMemory(); });
+    }
+    function scopeControl(domain, item, disabled = false) {
+      return `<div class="hub-segments hub-scope-control" role="group" aria-label="${esc(item.title || item.name || item.id)} ${esc(tr("启用范围", "Activation scope"))}">${[["off", tr("关闭", "Off")], ["project", tr("仅本项目", "This project")], ["global", tr("全局", "Global")]].map(([scope, label]) => `<button type="button" data-action="${domain}-scope" data-id="${esc(item.id)}" data-scope="${scope}" class="${(item.scope || "off") === scope ? "is-active" : ""}" aria-pressed="${(item.scope || "off") === scope}" ${disabled || scope === "project" && projectDisabled() ? "disabled" : ""}>${esc(label)}</button>`).join("")}</div>`;
+    }
+    // Local vector marks keep upstream identity crisp at drawer scale.
+    function brandIcon(item, kind = "") {
+      const key = `${kind} ${item.id || ""} ${item.name || ""} ${item.title || ""}`.toLowerCase();
+      let mark, brand = "neutral";
+      if (/chrome/.test(key)) { brand = "chrome"; mark = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#EA4335" d="M12 2a10 10 0 0 1 8.66 5H12a5 5 0 0 0-4.33 7.5L3.34 7A10 10 0 0 1 12 2Z"/><path fill="#FBBC05" d="M20.66 7a10 10 0 0 1-8.66 15l4.33-7.5A5 5 0 0 0 12 7Z"/><path fill="#34A853" d="M12 22A10 10 0 0 1 3.34 7l4.33 7.5a5 5 0 0 0 8.66 0Z"/><circle cx="12" cy="12" r="4.55" fill="#4285F4" stroke="#fff" stroke-width="1.2"/></svg>`; }
+      else if (/codegraph/.test(key)) { brand = "graph"; mark = icon("graph", 25); }
+      else if (/context7/.test(key)) { brand = "context"; mark = icon("bolt", 24); }
+      else if (/playwright/.test(key)) { brand = "playwright"; mark = icon("masks", 25); }
+      else if (/github/.test(key)) mark = icon("github", 25);
+      else if (/cloudflare/.test(key)) { brand = "cloud"; mark = icon("cloud", 26); }
+      else if (/lcu|computer.use/.test(key)) { brand = "display"; mark = icon("display", 25); }
+      else if (/memory|vault|再记忆/.test(key)) { brand = "crystal"; mark = icon("crystal", 25); }
+      else if (/reach|globe/.test(key)) { brand = "globe"; mark = icon("globe", 25); }
+      else if (/product|library|产品/.test(key)) { brand = "bag"; mark = icon("bag", 25); }
+      else if (/image|spark/.test(key)) { brand = "sparkle"; mark = icon("spark", 25); }
+      else if (/terminal|ponytail/.test(key)) { brand = "terminal"; mark = icon("terminal", 25); }
+      else mark = icon("hub", 23);
+      const url = String(item.iconUrl || (typeof item.icon === "string" ? item.icon : item.icon?.url) || "");
+      const image = /^(?:https?:\/\/|data:image\/(?:png|jpeg|webp|svg\+xml)[;,]|\/(?!\/))/.test(url) ? `<img src="${esc(url)}" alt="" referrerpolicy="no-referrer">` : "";
+      return `<span class="hub-brand-icon hub-brand-${brand}">${mark}${image}${kind === "mcp" ? `<i class="hub-connection-dot ${item.connected === true ? "is-connected" : ""}" title="${esc(item.connected === true ? tr("已连接", "Connected") : item.connected === false ? tr("暂未连通", "Not connected") : tr("空闲 / 未检测", "Idle / untested"))}"></i>` : ""}</span>`;
+    }
+    function pluginItems() {
+      const list = items(cache.plugins, ["items", "plugins"]);
+      const core = list.find((item) => /(?:t3.*memory|memory.*vault)/i.test(`${item.id} ${item.name} ${item.title}`));
+      const builtIn = core || { id: "t3-memory-vault", title: "T3 Memory Vault · 智能再记忆", description: tr("让每位搭档记住项目经验。记忆、向量检索与收尾整理，在本机协同工作。", "Project memory, vector recall, and consolidation in one local core plugin."), builtin: true, scope: "off", unavailable: true, components: { skills: 3, mcp: 1, hooks: 2, commands: 1 } };
+      return [{ ...builtIn, title: "T3 Memory Vault · 智能再记忆", builtin: true }, ...list.filter((item) => item !== core)];
+    }
+    function capabilityPills(item) {
+      const parts = item.components || item.capabilities || item;
+      return [["skills", "⚡", tr("技能", "Skills")], ["mcp", "🔌", "MCP"], ["hooks", "🪝", "Hooks"], ["commands", "⌨️", tr("命令", "Commands")]].map(([key, glyph, label]) => {
+        const value = parts[key] ?? parts[`${key}Count`] ?? parts[key === "mcp" ? "mcps" : key.slice(0, -1) + "Count"] ?? item[`${key}Count`];
+        const count = Array.isArray(value) ? value.length : Number(value) || 0;
+        return count ? `<span class="hub-capability">${glyph} ${key === "commands" ? "" : `${count} `}${esc(label)}</span>` : "";
+      }).join("");
+    }
+    function renderPlugins() {
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("把能力装进工作流", "Capabilities, working together"))}</span><span class="hub-count">${cache.plugins ? pluginItems().length : ""}</span></div><p class="hub-description">${esc(tr("一个插件，连接技能、工具与自动化。", "Skills, tools, and automation in one bundle."))}</p><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="pluginQuery" value="${esc(state.pluginQuery)}" placeholder="${esc(tr("搜索插件…", "Search plugins…"))}" aria-label="${esc(tr("搜索插件", "Search plugins"))}"></div>${button("install-plugin-form", tr("从 GitHub / 市场安装插件", "Install from GitHub / marketplace"), { icon: "plus", attrs: `aria-expanded="${state.pluginInstallOpen}"` })}<form class="hub-form-panel" data-form="plugin" ${state.pluginInstallOpen ? "" : "hidden"}><label class="hub-field">${esc(tr("仓库地址或市场标识", "Repository or marketplace ID"))}<input class="hub-input" name="pluginInput" value="${esc(state.pluginInput)}" placeholder="owner/repo" autocomplete="off"></label>${button("install-plugin", tr("安装到当前作用域", "Install for this scope"), { primary: true, icon: "plus" })}</form><div id="t3-hub-plugin-list"></div>`;
+      renderPluginList();
+    }
+    function renderPluginList() {
+      const node = root.querySelector("#t3-hub-plugin-list");
+      if (!node) return;
+      if (!cache.plugins) { node.innerHTML = errors.plugins ? inlineError(errors.plugins) : loading(); return; }
+      const query = state.pluginQuery.trim().toLowerCase();
+      const list = pluginItems().filter((item) => !query || `${item.title} ${item.name} ${item.description} ${item.id}`.toLowerCase().includes(query));
+      node.innerHTML = `${cache.plugins.unavailable ? `<p class="hub-hint hub-domain-hint">${esc(tr("插件服务尚未接入。内置能力预览如下，安装与范围设置将在接入后可用。", "Plugin service is not connected yet. Core capabilities are shown as a preview."))}</p>` : ""}${list.map((item) => `<article class="hub-card hub-plugin-card ${item.builtin ? "is-core" : ""}"><div class="hub-card-top">${brandIcon(item)}<div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.name || item.id)}</div><div class="hub-card-meta">${item.builtin ? `<span class="hub-badge hub-green">${esc(tr("官方内置", "Built-in"))}</span>` : `<span class="hub-badge">${esc(item.marketplace || sourceLabel(item.source))}</span>`}${item.version ? `<span class="hub-badge">v${esc(String(item.version).replace(/^v/, ""))}</span>` : ""}</div></div></div><p class="hub-card-description">${esc(item.description || tr("复合能力插件", "Composite capability bundle"))}</p><div class="hub-capabilities">${capabilityPills(item)}</div>${scopeControl("plugin", item, !!item.unavailable)}</article>`).join("") || empty(tr("没有匹配的插件", "No matching plugins"))}`;
+    }
+    const builtinHooks = [
+      { id: "rememory-stop", title: "🧠 收尾再记忆守门员", event: "Stop / SubagentStop", description: "任务收尾时整理第一现场经验，保留经过验证的项目记忆。", builtin: true, scope: "off", unavailable: true },
+      { id: "secret-guard", title: "🛡️ 敏感密钥提交守卫", event: "PreToolUse", description: "提交前检查敏感密钥，避免凭据进入版本历史。", builtin: true, scope: "off", unavailable: true },
+      { id: "syntax-check", title: "✨ JS/CJS 语法快检", event: "PostToolUse", description: "修改 JavaScript 后执行语法检查，及时发现错误。", builtin: true, scope: "off", unavailable: true },
+    ];
+    function hookItems() {
+      const list = items(cache.hooks, ["items", "hooks"]);
+      if (cache.hooks?.unavailable) return builtinHooks;
+      const templates = { "memory-stop-guard": builtinHooks[0], "secret-commit-guard": builtinHooks[1], "js-syntax-postcheck": builtinHooks[2] };
+      return list.map((item) => ({ ...item, title: templates[item.id]?.title || item.title || item.id, description: item.description || templates[item.id]?.description || "", event: item.event || items(item, ["events"]).join(" / ") }));
+    }
+    function renderHooks() {
+      const list = hookItems();
+      const draft = state.hookDraft;
+      const group = (title, entries) => entries.length ? `<div class="hub-section-heading hub-group-heading"><span>${esc(title)}</span><span class="hub-count">${entries.length}</span></div><div class="hub-hook-group">${entries.map((item) => `<article class="hub-card hub-hook-card"><div class="hub-card-top"><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.id)}</div><div class="hub-card-meta"><span class="hub-badge hub-purple">${esc(item.event)}</span>${item.readonly ? `<span class="hub-badge">${esc(tr("外部 · 只读", "External · read-only"))}</span>` : ""}</div></div>${!item.builtin && !item.readonly ? button("delete-hook", tr("删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` }) : ""}</div><p class="hub-card-description">${esc(item.description || item.matcher || "")}</p>${item.command ? `<code class="hub-hook-command">${esc(redact(item.command))}</code>` : ""}${scopeControl("hook", item, !!(item.readonly || item.unavailable))}<div class="hub-confirm-delete" data-hook-confirm="${esc(item.id)}" hidden>${esc(tr("删除这个自定义 Hook？", "Delete this custom hook?"))}<div class="hub-row">${button("confirm-delete-hook", tr("确认删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-delete-hook", tr("取消", "Cancel"), { small: true })}</div></div></article>`).join("")}</div>` : "";
+      const external = new Map();
+      list.filter((item) => !item.builtin).forEach((item) => { const key = item.source || tr("自定义", "Custom"); if (!external.has(key)) external.set(key, []); external.get(key).push(item); });
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("让工作流自动收尾", "A little automation, at the right moment"))}</span></div><p class="hub-description">${esc(tr("在关键生命周期运行检查与记忆整理。", "Run checks and memory routines at lifecycle events."))}</p>${button("new-hook", tr("新建自定义 Hook", "New custom hook"), { icon: "plus", primary: true, attrs: `aria-expanded="${!!draft}"` })}${draft ? `<form class="hub-form-panel" data-form="hook"><label class="hub-field">${esc(tr("名称", "Name"))}<input class="hub-input" name="hook-title" value="${esc(draft.title)}" placeholder="My workflow hook"></label><div class="hub-form-grid"><label class="hub-field">${esc(tr("生命周期事件", "Event"))}<select class="hub-select" name="hook-event">${["Stop", "SubagentStop", "PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "PreCompact", "SessionEnd"].map((event) => `<option ${event === draft.event ? "selected" : ""}>${event}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("范围", "Scope"))}<select class="hub-select" name="hook-scope">${["off", "project", "global"].map((scope) => `<option value="${scope}" ${scope === draft.scope ? "selected" : ""} ${scope === "project" && projectDisabled() ? "disabled" : ""}>${esc(scope === "off" ? tr("关闭", "Off") : scope === "project" ? tr("本项目", "Project") : tr("全局", "Global"))}</option>`).join("")}</select></label></div><label class="hub-field">Matcher<input class="hub-input" name="hook-matcher" value="${esc(draft.matcher)}" placeholder="Bash|Edit|Write"></label><label class="hub-field">${esc(tr("执行命令", "Command"))}<textarea class="hub-input" name="hook-command" rows="3" spellcheck="false">${esc(draft.command)}</textarea></label><div class="hub-row">${button("save-hook", tr("保存 Hook", "Save hook"), { primary: true, icon: "save" })}${button("cancel-hook", tr("取消", "Cancel"))}</div></form>` : ""}${errors.hooks ? inlineError(errors.hooks) : !cache.hooks ? loading() : `${cache.hooks.unavailable ? `<p class="hub-hint hub-domain-hint">${esc(tr("Hooks 服务尚未接入，以下为内置模板预览。", "Hooks service is not connected. Built-in templates are previewed below."))}</p>` : ""}${group(tr("内置 Hooks", "Built-in hooks"), list.filter((item) => item.builtin))}${[...external].map(([name, entries]) => group(name, entries)).join("")}${!list.length ? empty(tr("还没有 Hook", "No hooks yet")) : ""}`}`;
+    }
+
     function sourceLabel(source, fallback) {
       const key = String(source || "").toLowerCase();
       return ({ "codex-market": tr("Codex 市场", "Codex market"), marketplace: tr("Codex 市场", "Codex market"), github: "GitHub", zcode: "ZCode", claude: "Claude", global: tr("全局", "Global"), archive: tr("归档", "Archived"), archived: tr("归档", "Archived"), magpie: "Magpie", custom: tr("自定义", "Custom"), hub: tr("自定义", "Custom"), cli: "CLI" })[key] || fallback || source || tr("本地", "Local");
     }
     function renderTab() {
       if (!content || disposed) return;
+      if (state.tab === "plugins") renderPlugins();
+      if (state.tab === "hooks") renderHooks();
       if (state.tab === "skills") renderSkills();
       if (state.tab === "subagents") renderSubagents();
       if (state.tab === "mcp") renderMcp();
@@ -357,7 +603,7 @@
       if (state.tab === "agents") renderAgents();
     }
     function renderSkills() {
-      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("为工作流添一份能力", "Make room for new abilities"))}</span><span class="hub-count" id="t3-hub-skills-count"></span></div><p class="hub-description">${esc(tr("让插件与技能，在合适的项目里发挥作用。", "Bring the right plugins and skills to each project."))}</p><form class="hub-card hub-import" data-form="import"><div class="hub-import-title">${icon("github", 14)}${esc(tr("从 GitHub 导入", "Import from GitHub"))}</div><div class="hub-import-grid"><input class="hub-input" name="repoInput" aria-label="${esc(tr("GitHub 仓库", "GitHub repository"))}" placeholder="owner/repo" value="${esc(state.importRepo)}" autocomplete="off" spellcheck="false"><select class="hub-select" name="importScope" aria-label="${esc(tr("导入范围", "Import scope"))}"><option value="project" ${state.importScope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("仅本项目", "Project"))}</option><option value="global" ${state.importScope === "global" ? "selected" : ""}>${esc(tr("全局", "Global"))}</option></select>${button("import-skill", tr("导入", "Import"), { icon: "plus", primary: true })}</div><div class="hub-hint">${esc(tr("支持 owner/repo 或 GitHub 链接，按范围启用。", "Paste owner/repo or a GitHub URL, then choose a scope."))}</div></form><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="skillQuery" aria-label="${esc(tr("搜索插件与 Skills", "Search plugins and skills"))}" placeholder="${esc(tr("搜索插件、Skills…", "Search plugins, skills…"))}" value="${esc(state.skillQuery)}"></div><div class="hub-filters" id="t3-hub-skill-filters"></div><div id="t3-hub-skill-list"></div>`;
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("为工作流添一份能力", "Make room for new abilities"))}</span><span class="hub-count" id="t3-hub-skills-count"></span></div><p class="hub-description">${esc(tr("独立 SKILL.md，按项目启用你需要的技能。", "Standalone SKILL.md skills, enabled where you need them."))}</p><form class="hub-card hub-import" data-form="import"><div class="hub-import-title">${icon("github", 14)}${esc(tr("从 GitHub 导入", "Import from GitHub"))}</div><div class="hub-import-grid"><input class="hub-input" name="repoInput" aria-label="${esc(tr("GitHub 仓库", "GitHub repository"))}" placeholder="owner/repo" value="${esc(state.importRepo)}" autocomplete="off" spellcheck="false"><select class="hub-select" name="importScope" aria-label="${esc(tr("导入范围", "Import scope"))}"><option value="project" ${state.importScope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("仅本项目", "Project"))}</option><option value="global" ${state.importScope === "global" ? "selected" : ""}>${esc(tr("全局", "Global"))}</option></select>${button("import-skill", tr("导入", "Import"), { icon: "plus", primary: true })}</div><div class="hub-hint">${esc(tr("支持 owner/repo 或 GitHub 链接，按范围启用。", "Paste owner/repo or a GitHub URL, then choose a scope."))}</div></form><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="skillQuery" aria-label="${esc(tr("搜索独立技能", "Search standalone skills"))}" placeholder="${esc(tr("搜索技能…", "Search skills…"))}" value="${esc(state.skillQuery)}"></div><div class="hub-filters" id="t3-hub-skill-filters"></div><div id="t3-hub-skill-list"></div>`;
       renderSkillList();
     }
     function renderSkillList() {
@@ -372,7 +618,7 @@
         return matches && (!query || `${item.name} ${item.description} ${item.id}`.toLowerCase().includes(query));
       });
       root.querySelector("#t3-hub-skills-count").textContent = tr(`${all.length} 项能力`, `${all.length} abilities`);
-      root.querySelector("#t3-hub-skill-list").innerHTML = errors.skills ? inlineError(errors.skills) : !cache.skills ? loading() : !filtered.length ? empty(tr("没有找到匹配的能力", "No matching abilities"), tr("试试其他关键词，或从 GitHub 导入一个技能。", "Try another search, or import a skill from GitHub."), "skill") : filtered.map((item) => `<article class="hub-card"><div class="hub-card-top"><span class="hub-asset-icon ${item.scope && item.scope !== "off" ? "accent" : ""}">${icon(item.source === "github" ? "github" : "skill", 16)}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.name || item.id)}</div><div class="hub-card-meta"><span class="hub-badge ${/codex|market/.test(item.source || "") ? "hub-purple" : ""}">${esc(sourceLabel(item.source, item.sourceLabel))}</span>${item.scope && item.scope !== "off" ? `<span class="hub-live"><i class="hub-dot"></i>${esc(tr("已启用", "Enabled"))}</span>` : ""}</div></div>${item.updatable ? `<button type="button" class="hub-icon-btn" data-action="update-skill" data-id="${esc(item.id)}" title="${esc(tr("检查并更新", "Check for updates"))}" aria-label="${esc(tr("更新", "Update"))} ${esc(item.name || item.id)}">${icon("refresh", 14)}</button>` : ""}</div><p class="hub-card-description">${esc(item.description || tr("暂无描述", "No description available"))}</p><div class="hub-segments" role="group" aria-label="${esc(tr("启用范围", "Activation scope"))}">${[["off", tr("关闭", "Off")], ["project", tr("仅本项目", "This project")], ["global", tr("全局", "Global")]].map(([scope, label]) => `<button type="button" class="${item.scope === scope || (!item.scope && scope === "off") ? "is-active" : ""}" data-action="skill-scope" data-id="${esc(item.id)}" data-scope="${scope}" aria-pressed="${item.scope === scope}" ${scope === "project" && projectDisabled() ? `disabled title="${esc(projectTitle())}"` : ""}>${esc(label)}</button>`).join("")}</div></article>`).join("");
+      root.querySelector("#t3-hub-skill-list").innerHTML = errors.skills ? inlineError(errors.skills) : !cache.skills ? loading() : !filtered.length ? empty(tr("没有找到匹配的能力", "No matching abilities"), tr("试试其他关键词，或从 GitHub 导入一个技能。", "Try another search, or import a skill from GitHub."), "skill") : filtered.map((item) => `<article class="hub-card"><div class="hub-card-top"><span class="hub-asset-icon ${item.scope && item.scope !== "off" ? "accent" : ""}">${icon(item.source === "github" ? "github" : "skill", 16)}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.name || item.id)}</div><div class="hub-card-meta"><span class="hub-badge ${/codex|market/.test(item.source || "") ? "hub-purple" : ""}">${esc(sourceLabel(item.source, item.sourceLabel))}</span>${item.scope && item.scope !== "off" ? `<span class="hub-live"><i class="hub-dot"></i>${esc(tr("已启用", "Enabled"))}</span>` : ""}</div></div>${item.updatable ? `<button type="button" class="hub-icon-btn" data-action="update-skill" data-id="${esc(item.id)}" title="${esc(tr("检查并更新", "Check for updates"))}" aria-label="${esc(tr("更新", "Update"))} ${esc(item.name || item.id)}">${icon("refresh", 14)}</button>` : ""}</div><p class="hub-card-description">${esc(item.description || tr("暂无描述", "No description available"))}</p><div class="hub-segments" role="group" aria-label="${esc(tr("启用范围", "Activation scope"))}">${[["off", tr("关闭", "Off")], ["project", tr("仅本项目", "This project")], ["global", tr("全局", "Global")]].map(([scope, label]) => `<button type="button" class="${item.scope === scope || (!item.scope && scope === "off") ? "is-active" : ""}" data-action="skill-scope" data-id="${esc(item.id)}" data-scope="${scope}" aria-pressed="${item.scope === scope}" ${scope === "project" && projectDisabled() ? `disabled title="${esc(projectTitle())}"` : ""}>${esc(label)}</button>`).join("")}</div>${item.updatable ? `<div class="hub-editor-actions">${button("remove-skill", tr("移除技能包", "Remove package"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` })}</div><div data-skill-confirm class="hub-confirm-delete" hidden>${esc(tr("移除整个来源技能包及其启用链接？", "Remove this source package and its activation links?"))}<div class="hub-row">${button("confirm-remove-skill", tr("确认移除", "Remove package"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-remove-skill", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}</article>`).join("");
     }
 
     const mcpModes = () => [["off", tr("关闭", "Off")], ["project-lazy", tr("本项目·懒加载 (省Token)", "Project · Lazy (saves tokens)")], ["project-direct", tr("本项目·直连", "Project · Direct")], ["global-lazy", tr("全局·懒加载", "Global · Lazy")], ["global-direct", tr("全局·直连", "Global · Direct")]];
@@ -415,6 +661,32 @@
     function canDeleteSubagent(item) {
       return state.subagentScope === "project" || !(item.builtin ?? item.builtIn ?? item.isBuiltin ?? builtinSubagents.has(subagentId(item)));
     }
+    function memoryPolicy(item) {
+      if (["readwrite", "readonly", "off"].includes(item.memoryPolicy)) return item.memoryPolicy;
+      return ["explorer", "code-review"].includes(subagentId(item)) || ["research", "review"].includes(item.role) ? "readonly" : "readwrite";
+    }
+    function memoryPolicyControl(item, id, disabled = false) {
+      const policy = memoryPolicy(item);
+      return `<select class="hub-select hub-memory-policy policy-${policy}" name="subagent-memoryPolicy" data-subagent-id="${esc(id)}" aria-label="${esc(tr("记忆权限", "Memory policy"))} · ${esc(id)}" ${disabled ? "disabled" : ""}>${[["readwrite", tr("🧠 第一现场读写记忆", "🧠 First-hand memory · read & write")], ["readonly", tr("👁️ 只读项目记忆", "👁️ Project memory · read only")], ["off", tr("🚫 不挂载记忆", "🚫 No memory")]].map(([value, label]) => `<option value="${value}" ${value === policy ? "selected" : ""}>${esc(label)}</option>`).join("")}</select>`;
+    }
+    function renderBotAvatar(item) {
+      const id = subagentId(item);
+      const colors = { worker: "#3B82F6", "general-purpose": "#3B82F6", default: "#3B82F6", explorer: "#55B399", "worker-pro": "#6366F1", frontend: "#EC4899", qa: "#F59E0B", "code-review": "#0EA5E9" };
+      const roles = { research: "#55B399", implementation: "#3B82F6", design: "#EC4899", test: "#F59E0B", review: "#0EA5E9" };
+      const color = /^#[0-9a-f]{6}$/i.test(item.avatarColor || "") ? item.avatarColor : colors[id] || roles[item.role] || "#3B82F6";
+      const stagger = [...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 40 / 10;
+      return `<span class="hub-bot-avatar" aria-hidden="true" style="--bot-color:${color};--bot-delay:-${stagger}s"><span class="hub-bot-head"><span class="hub-bot-look"><span class="hub-bot-eyes"><i></i><i></i></span></span></span></span>`;
+    }
+    function greetBots(id = null) {
+      if (!content || state.tab !== "subagents") return;
+      content.querySelectorAll("[data-subagent-card]").forEach((card) => {
+        if (id && card.dataset.subagentCard !== id) return;
+        card.classList.remove("is-playful");
+        void card.offsetWidth;
+        card.classList.add("is-playful");
+        later(() => card.classList.remove("is-playful"), 850);
+      });
+    }
     function subagentControls(item, cardId, disabled = false) {
       const providerId = item.providerInstanceId || "codex";
       const providers = subagentProviders();
@@ -429,13 +701,13 @@
       const key = subagentKey(cardId);
       const saving = subagentSaves.has(key);
       const field = (name, label, value, extra = "") => `<label class="hub-field"><span>${esc(label)}</span><input class="hub-input" name="subagent-${name}" data-subagent-id="${esc(cardId)}" value="${esc(value)}" ${extra}></label>`;
-      return `<div class="hub-subagent-editor" data-subagent-editor="${esc(cardId)}"><div class="hub-subagent-fields">${field("id", tr("名称 (id)", "Name (id)"), subagentId(item), `${isNew ? 'placeholder="my-worker" autocomplete="off"' : 'readonly aria-readonly="true"'}`)}<label class="hub-field"><span>${esc(tr("角色类型", "Role"))}</span><select class="hub-select" name="subagent-role" data-subagent-id="${esc(cardId)}">${Object.keys(subagentRoles).map((role) => `<option ${role === (item.role || "implementation") ? "selected" : ""}>${role}</option>`).join("")}</select></label>${field("toolBadge", tr("工具标签", "Tool badge"), item.toolBadge || "")}${field("description", tr("简介", "Description"), item.description || "")}</div><label class="hub-field"><span>${esc(tr("系统提示词", "System prompt"))}</span><textarea class="hub-input hub-editor" name="subagent-systemPrompt" data-subagent-id="${esc(cardId)}" spellcheck="false" placeholder="${esc(tr("说明任务边界、工具使用与交付要求…", "Define responsibilities, tools, and delivery requirements…"))}">${esc(item.systemPrompt || "")}</textarea></label><div class="hub-editor-actions"><label class="hub-checkbox"><input type="checkbox" name="subagent-enabled" data-subagent-id="${esc(cardId)}" ${item.enabled !== false ? "checked" : ""}>${esc(tr("启用", "Enabled"))}</label>${button("save-subagent", tr("保存并注入 AGENTS.md", "Save & inject AGENTS.md"), { primary: true, small: true, icon: "save", disabled: saving, attrs: `data-id="${esc(cardId)}"` })}${!isNew && state.subagentScope === "global" && state.projectRoot ? button("clone-subagent", tr("复制到当前项目定制", "Customize for this project"), { small: true, icon: "folder", attrs: `data-id="${esc(cardId)}"` }) : ""}${isNew ? button("cancel-new-subagent", tr("取消", "Cancel"), { small: true }) : canDeleteSubagent(item) ? button("delete-subagent", tr("删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(cardId)}"` }) : ""}</div>${!isNew && canDeleteSubagent(item) ? `<div class="hub-confirm-delete" data-subagent-delete-confirm hidden>${esc(tr("删除这项配置？项目配置删除后将恢复使用全局模板。", "Delete this configuration? Project overrides fall back to the global template."))}<div class="hub-row">${button("confirm-delete-subagent", tr("确认删除", "Delete configuration"), { small: true, danger: true, attrs: `data-id="${esc(cardId)}"` })}${button("cancel-delete-subagent", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}</div>`;
+      return `<div class="hub-subagent-editor" data-subagent-editor="${esc(cardId)}"><div class="hub-subagent-fields">${field("id", tr("名称 (id)", "Name (id)"), subagentId(item), `${isNew ? 'placeholder="my-worker" autocomplete="off"' : 'readonly aria-readonly="true"'}`)}<label class="hub-field"><span>${esc(tr("角色类型", "Role"))}</span><select class="hub-select" name="subagent-role" data-subagent-id="${esc(cardId)}">${Object.keys(subagentRoles).map((role) => `<option ${role === (item.role || "implementation") ? "selected" : ""}>${role}</option>`).join("")}</select></label>${field("toolBadge", tr("工具标签", "Tool badge"), item.toolBadge || "")}${field("description", tr("简介", "Description"), item.description || "")}</div><label class="hub-field"><span>${esc(tr("第一现场记忆权限 · 即时保存", "First-hand memory policy · saves instantly"))}</span>${memoryPolicyControl(item, cardId, saving)}</label><label class="hub-field"><span>${esc(tr("系统提示词", "System prompt"))}</span><textarea class="hub-input hub-editor" name="subagent-systemPrompt" data-subagent-id="${esc(cardId)}" spellcheck="false" placeholder="${esc(tr("说明任务边界、工具使用与交付要求…", "Define responsibilities, tools, and delivery requirements…"))}">${esc(item.systemPrompt || "")}</textarea></label><div class="hub-editor-actions"><label class="hub-checkbox"><input type="checkbox" name="subagent-enabled" data-subagent-id="${esc(cardId)}" ${item.enabled !== false ? "checked" : ""}>${esc(tr("启用", "Enabled"))}</label>${button("save-subagent", tr("保存并注入 AGENTS.md", "Save & inject AGENTS.md"), { primary: true, small: true, icon: "save", disabled: saving, attrs: `data-id="${esc(cardId)}"` })}${!isNew && state.subagentScope === "global" && state.projectRoot ? button("clone-subagent", tr("复制到当前项目定制", "Customize for this project"), { small: true, icon: "folder", attrs: `data-id="${esc(cardId)}"` }) : ""}${isNew ? button("cancel-new-subagent", tr("取消", "Cancel"), { small: true }) : canDeleteSubagent(item) ? button("delete-subagent", tr("删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(cardId)}"` }) : ""}</div>${!isNew && canDeleteSubagent(item) ? `<div class="hub-confirm-delete" data-subagent-delete-confirm hidden>${esc(tr("删除这项配置？项目配置删除后将恢复使用全局模板。", "Delete this configuration? Project overrides fall back to the global template."))}<div class="hub-row">${button("confirm-delete-subagent", tr("确认删除", "Delete configuration"), { small: true, danger: true, attrs: `data-id="${esc(cardId)}"` })}${button("cancel-delete-subagent", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}</div>`;
     }
     function renderSubagents() {
       const scope = state.subagentScope;
       const list = subagentItems();
       const newDraft = state.subagentDrafts[subagentKey("__new__")];
-      const label = scope === "global" ? tr("内置/全局子智能体", "Built-in / global agents") : tr("本项目专属子智能体", "Project agents");
+      const label = scope === "global" ? tr("内置子智能体", "Built-in sub-agents") : tr("本项目专属子智能体", "Project agents");
       const count = cache.subagents ? `${list.length} ${tr("项", "items")}` : "";
       const cards = list.map((item) => {
         const id = subagentId(item), key = subagentKey(id), expanded = !!state.subagentExpanded[key];
@@ -445,15 +717,16 @@
         const busy = subagentSaves.has(key);
         const custom = state.subagentCustom[key];
         const draft = expanded ? subagentDraft(id) : null;
-        return `<article class="hub-subagent-card" data-subagent-card="${esc(id)}"><div class="hub-subagent-main"><span class="hub-role-icon" style="--role-color:${role[1]}">${icon(role[0], 18)}</span><button type="button" class="hub-subagent-summary" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="t3-subagent-editor-${esc(id)}"><span class="hub-subagent-name">${esc(item.name || id)}<span class="hub-tool-badge">${esc(item.toolBadge || role[2])}</span></span><span class="hub-subagent-desc">${esc(item.description || tr("为这位子代理添加职责与交付说明。", "Add responsibilities and delivery guidelines."))}</span></button>${subagentControls(item, id, busy)}</div><div class="hub-subagent-meta"><span class="hub-badge ${scope === "project" ? "hub-cyan" : saved ? "hub-green" : ""}">${busy ? spinner() : icon(saved ? "check" : scope === "project" ? "folder" : "globe", 10)}${esc(busy ? tr("保存并注入中…", "Saving & injecting…") : status)}${item.enabled === false ? ` · ${esc(tr("已停用", "Disabled"))}` : ""}</span><button type="button" class="hub-subagent-edit" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}">${icon("edit", 11)}${esc(expanded ? tr("收起设置", "Close settings") : tr("编辑提示词 / 设置", "Prompt / settings"))}</button></div>${custom ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="${esc(id)}" value="${esc(custom.value || "")}" placeholder="group/1m-auto" autocomplete="off" spellcheck="false">${button("save-subagent-model", tr("保存", "Save"), { small: true, primary: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: `data-id="${esc(id)}"` })}</div></label></div>` : ""}<div id="t3-subagent-editor-${esc(id)}" class="hub-subagent-expand ${expanded ? "is-expanded" : ""}" ${expanded ? "" : "inert"}><div>${draft ? renderSubagentEditor(draft, id) : ""}</div></div></article>`;
+        return `<article class="hub-subagent-card" data-subagent-card="${esc(id)}"><div class="hub-subagent-main">${renderBotAvatar(item)}<button type="button" class="hub-subagent-summary" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="t3-subagent-editor-${esc(id)}"><span class="hub-subagent-name">${esc(item.name || id)}<span class="hub-tool-badge">${esc(item.toolBadge || role[2])}</span></span><span class="hub-subagent-desc">${esc(item.description || tr("为这位子智能体添加职责与交付说明。", "Add responsibilities and delivery guidelines."))}</span></button>${subagentControls(item, id, busy)}</div><div class="hub-subagent-meta"><span class="hub-badge ${scope === "project" ? "hub-cyan" : saved ? "hub-green" : ""}">${busy ? spinner() : icon(saved ? "check" : scope === "project" ? "folder" : "globe", 10)}${esc(busy ? tr("保存并注入中…", "Saving & injecting…") : status)}${item.enabled === false ? ` · ${esc(tr("已停用", "Disabled"))}` : ""}</span>${memoryPolicyControl(item, id, busy)}<button type="button" class="hub-subagent-edit" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}">${icon("edit", 11)}${esc(expanded ? tr("收起设置", "Close settings") : tr("编辑提示词 / 设置", "Prompt / settings"))}</button></div>${custom ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="${esc(id)}" value="${esc(custom.value || "")}" placeholder="group/1m-auto" autocomplete="off" spellcheck="false">${button("save-subagent-model", tr("保存", "Save"), { small: true, primary: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: `data-id="${esc(id)}"` })}</div></label></div>` : ""}<div id="t3-subagent-editor-${esc(id)}" class="hub-subagent-expand ${expanded ? "is-expanded" : ""}" ${expanded ? "" : "inert"}><div>${draft ? renderSubagentEditor(draft, id) : ""}</div></div></article>`;
       }).join("");
-      content.innerHTML = `<div class="hub-subagent-scopes" aria-label="${esc(tr("子代理作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}">🌐 ${esc(tr("全局子代理", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}">📁 ${esc(tr("项目子代理", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子代理", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子代理", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子代理。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子代理，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子代理。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后自动注入全局 AGENTS.md，并同步 5 个 CLI。", "Saving injects global AGENTS.md and synchronizes five CLIs.") : tr("保存后自动写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
+      content.innerHTML = `<div class="hub-subagent-scopes" aria-label="${esc(tr("子智能体作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}">🌐 ${esc(tr("全局子智能体", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}">📁 ${esc(tr("项目子智能体", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子智能体", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子智能体", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子智能体。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子智能体，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子智能体。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后自动注入全局 AGENTS.md，并同步 5 个 CLI。", "Saving injects global AGENTS.md and synchronizes five CLIs.") : tr("保存后自动写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
+      greetBots();
     }
     function newSubagent() {
       const provider = subagentProviders().find((entry) => entry.id === "codex") || subagentProviders()[0];
       const key = subagentKey("__new__");
       const efforts = providerEfforts(provider.id);
-      state.subagentDrafts[key] ||= { id: "", name: "", role: "implementation", toolBadge: "全部工具", description: "", systemPrompt: "", enabled: true, providerInstanceId: provider.id, model: providerModels(provider.id)[0]?.id || "", effort: efforts.includes("max") ? "max" : efforts.includes("high") ? "high" : efforts[0] };
+      state.subagentDrafts[key] ||= { id: "", name: "", role: "implementation", toolBadge: "全部工具", description: "", systemPrompt: "", enabled: true, memoryPolicy: "readwrite", providerInstanceId: provider.id, model: providerModels(provider.id)[0]?.id || "", effort: efforts.includes("max") ? "max" : efforts.includes("high") ? "high" : efforts[0] };
       renderSubagents();
       content.querySelector('[name="subagent-id"]')?.focus();
     }
@@ -466,6 +739,7 @@
       item.id = String(item.id || item.name || "").trim();
       item.name = item.name || item.id;
       item.scope = scope;
+      item.memoryPolicy = memoryPolicy(item);
       if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(item.id)) { toast(tr("名称请使用 1–80 位字母、数字、横线或下划线", "Use a 1–80 character ID with letters, numbers, dashes, or underscores"), true); return; }
       if (!item.model?.trim()) { toast(tr("请先选择或填写模型 ID", "Choose or enter a model ID first"), true); return; }
       if (id === "__new__" && subagentItems().some((entry) => subagentId(entry) === item.id)) { toast(tr("这个名称已经存在，请使用其他名称", "This ID already exists"), true); return; }
@@ -494,22 +768,22 @@
         }
         toast(tr(`已保存并自动注入${scope === "global" ? "全局" : "项目"} AGENTS.md`, `Saved and injected into ${scope} AGENTS.md`));
       } catch (error) { if (!disposed) toast(errorText(error), true); }
-      finally { subagentSaves.delete(key); if (!disposed && state.tab === "subagents" && projectRoot === state.projectRoot && scope === state.subagentScope) renderSubagents(); }
+      finally { subagentSaves.delete(key); if (!disposed && state.tab === "subagents" && projectRoot === state.projectRoot && scope === state.subagentScope) { renderSubagents(); renderChrome(); } }
     }
     async function cloneSubagent(id, element) {
       const item = subagentItems("global").find((entry) => subagentId(entry) === id);
       const projectRoot = state.projectRoot;
       if (!item || !projectRoot) return;
       const existing = subagentItems("project").find((entry) => subagentId(entry) === id);
-      if (existing) { state.subagentScope = "project"; state.subagentExpanded[subagentKey(id)] = true; renderSubagents(); toast(tr("已打开现有项目配置", "Opened the existing project override")); return; }
+      if (existing) { state.subagentScope = "project"; state.subagentExpanded[subagentKey(id)] = true; renderSubagents(); renderChrome(); toast(tr("已打开现有项目配置", "Opened the existing project override")); return; }
       await busy(`clone:${projectRoot}:${id}`, element, async () => {
-        const result = await request("subagents:save", { scope: "project", projectRoot, item: { ...item, id, scope: "project", projectRoot, builtin: false, builtIn: false, isBuiltin: false, overridesGlobal: true } });
+        const result = await request("subagents:save", { scope: "project", projectRoot, item: { ...item, memoryPolicy: memoryPolicy(item), id, scope: "project", projectRoot, builtin: false, builtIn: false, isBuiltin: false, overridesGlobal: true } });
         cache.agents = null;
         if (disposed || projectRoot !== state.projectRoot) return;
         if (cache.subagents) cache.subagents.projectItems = [...subagentItems("project"), { ...item, ...(result.item || {}), id, scope: "project", projectRoot, builtin: false, overridesGlobal: true, injected: true }];
         state.subagentScope = "project";
         state.subagentExpanded[subagentKey(id)] = true;
-        renderSubagents();
+        renderSubagents(); renderChrome();
         toast(tr("已克隆并自动注入项目 AGENTS.md，可直接定制", "Cloned and injected into project AGENTS.md"));
       });
     }
@@ -523,23 +797,28 @@
         if (disposed || projectRoot !== state.projectRoot) return;
         if (cache.subagents) cache.subagents[scope === "global" ? "globalItems" : "projectItems"] = subagentItems(scope).filter((entry) => subagentId(entry) !== id);
         delete state.subagentDrafts[key]; delete state.subagentExpanded[key]; delete state.subagentCustom[key];
-        if (state.tab === "subagents") renderSubagents();
+        if (state.tab === "subagents") { renderSubagents(); renderChrome(); }
         toast(tr("已删除配置并更新 AGENTS.md", "Configuration deleted and AGENTS.md updated"));
       });
     }
 
-    function renderMcp() {
+    function mcpServers() {
       const data = cache.mcp || {};
-      const magpie = data.magpie?.running ?? data.magpie?.ok ?? data.magpie?.connected ?? data.magpie?.online ?? data.magpieRunning ?? null;
-      const router = data.router?.running ?? data.router?.ok ?? data.router?.connected ?? null;
-      const status = (label, online) => {
-        const registered = label === "Multi-CLI Router" && online == null && data.routerRegistered === true;
-        return `<span class="hub-status-item ${online === true || registered ? "online" : ""}"><i class="hub-dot"></i>${esc(label)} · ${esc(online === true ? tr("已连接", "Online") : online === false ? tr("未连接", "Offline") : registered ? tr("已注册", "Registered") : tr("待检测", "Unknown"))}</span>`;
+      const byName = new Map();
+      const add = (entry, groupTitle = "") => {
+        if (entry?.items || entry?.servers) { items(entry, ["items", "servers"]).forEach((server) => add(server, entry.groupTitle || entry.title || entry.name || groupTitle)); return; }
+        if (!entry?.name && !entry?.id) return;
+        const name = String(entry.name || entry.id), previous = byName.get(name) || {};
+        byName.set(name, { ...entry, ...previous, groupTitle: previous.groupTitle || entry.groupTitle || groupTitle, name });
       };
-      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("工具互联，按需唤醒", "Tools, connected on demand"))}</span><span class="hub-count">${items(data, ["items", "servers"]).length} ${esc(tr("个服务", "servers"))}</span></div><p class="hub-description">${esc(tr("把常用工具接入所有 CLI，懒加载更省上下文。", "Connect your tools across CLIs. Load them only when needed."))}</p><div class="hub-status-strip"><div class="hub-status-items">${status("Magpie", magpie)}${status("Multi-CLI Router", router)}</div>${button("sync-mcp", tr("一键同步路由到全部 CLI", "Sync router to all CLIs"), { icon: "refresh", small: true })}</div>${button("toggle-mcp-add", tr("新增自定义 MCP", "Add a custom MCP"), { icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}<div id="t3-hub-mcp-form" class="hub-form-panel" ${state.mcpAddOpen ? "" : "hidden"}></div><div class="hub-mode-legend">${icon("bolt", 12)}${esc(tr("懒加载仅在调用时注入工具，适合日常使用。", "Lazy mode adds tools only when called. A lighter default."))}</div><div id="t3-hub-mcp-list"></div>`;
-      content.querySelector('[data-action="toggle-mcp-add"]').classList.add("hub-custom-toggle");
-      renderMcpForm();
-      renderMcpList();
+      items(data, ["items", "servers"]).forEach((entry) => add(entry));
+      for (const key of ["upstream", "upstreamCatalog", "catalog", "groups"]) items(data, [key]).forEach((entry) => add(entry));
+      return [...byName.values()];
+    }
+    function mcpMode(server) { return server.mode || (server.enabled ? `${defaultScope()}-lazy` : "off"); }
+    function renderMcp() {
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("工具互联，按需唤醒", "Tools, connected on demand"))}</span><span class="hub-count">${cache.mcp ? mcpServers().length : ""} ${esc(tr("个服务", "servers"))}</span></div><p class="hub-description">${esc(tr("直达内置与插件上游，按需启用。", "Enable tools straight from your upstream catalog."))}</p><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="mcpQuery" value="${esc(state.mcpQuery)}" aria-label="${esc(tr("搜索 MCP 服务器", "Search MCP servers"))}" placeholder="${esc(tr("搜索 MCP 服务器…", "Search MCP servers…"))}"></div><div class="hub-mcp-actions">${button("sync-mcp", tr("同步路由至全部 CLI", "Sync all CLIs"), { icon: "refresh", small: true })}${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "bolt" })}${button("toggle-mcp-add", tr("新建 MCP", "New MCP"), { icon: "plus", small: true, primary: true, attrs: `aria-expanded="${state.mcpAddOpen}"` })}</div><div id="t3-hub-mcp-form" class="hub-form-panel" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
+      renderMcpForm(); renderMcpList();
     }
     function renderMcpForm() {
       const node = root.querySelector("#t3-hub-mcp-form");
@@ -549,12 +828,26 @@
       node.innerHTML = `<div class="hub-segments" role="group" aria-label="${esc(tr("新增方式", "Configuration method"))}">${[["form", tr("命令 / URL", "Command / URL")], ["json", tr("粘贴 JSON", "Paste JSON")]].map(([kind, label]) => `<button type="button" data-action="mcp-form-kind" data-kind="${kind}" class="${form.kind === kind ? "is-active" : ""}" aria-pressed="${form.kind === kind}">${esc(label)}</button>`).join("")}</div>${form.kind === "json" ? `<label class="hub-field">mcpServers JSON<textarea class="hub-editor" name="mcp-json" spellcheck="false" placeholder='{"mcpServers":{"my-server":{"command":"npx","args":["-y","package"]}}}'>${esc(form.json)}</textarea></label>` : `<div class="hub-form-grid"><label class="hub-field">${esc(tr("服务名称", "Server name"))}<input class="hub-input" name="mcp-name" value="${esc(form.name)}" placeholder="my-server" autocomplete="off"></label><label class="hub-field">${esc(tr("传输", "Transport"))}<select class="hub-select" name="mcp-transport"><option value="stdio" ${form.transport === "stdio" ? "selected" : ""}>stdio</option><option value="http" ${form.transport === "http" ? "selected" : ""}>http</option></select></label></div>${form.transport === "http" ? `<label class="hub-field">URL<input class="hub-input" name="mcp-url" value="${esc(form.url)}" placeholder="https://example.com/mcp" spellcheck="false"></label>` : `<label class="hub-field">${esc(tr("启动命令", "Command"))}<input class="hub-input" name="mcp-command" value="${esc(form.command)}" placeholder="npx" spellcheck="false"></label><label class="hub-field">${esc(tr("参数（JSON 数组或每行一个）", "Arguments (JSON array or one per line)"))}<textarea class="hub-input" name="mcp-args" rows="2" placeholder='["-y", "@example/mcp"]' spellcheck="false">${esc(form.args)}</textarea></label>`}`}${button("save-mcp", tr("添加服务", "Add server"), { primary: true, icon: "plus" })}`;
     }
     function renderMcpList() {
-      if (state.tab !== "mcp" || disposed) return;
-      const servers = items(cache.mcp, ["items", "servers"]);
-      root.querySelector("#t3-hub-mcp-list").innerHTML = errors.mcp ? inlineError(errors.mcp) : !cache.mcp ? loading() : !servers.length ? empty(tr("还没有接入服务", "No services connected"), tr("添加自定义 MCP，或同步现有 CLI 路由。", "Add a custom MCP or sync your existing CLI router."), "plug") : servers.map((server) => {
-        const summary = redact(server.summary || server.url || [server.command, ...(server.args || [])].filter(Boolean).join(" "));
-        return `<article class="hub-card"><div class="hub-card-top"><span class="hub-asset-icon ${server.mode && server.mode !== "off" ? "accent" : ""}">${icon("plug", 16)}</span><div class="hub-grow"><div class="hub-card-name">${esc(server.name)}</div><div class="hub-card-meta"><span class="hub-badge">${esc(sourceLabel(server.source, server.sourceLabel))}</span><span class="hub-badge">${esc(server.transport || (server.url ? "http" : "stdio"))}</span></div></div></div><div class="hub-mcp-summary" title="${esc(summary)}">${esc(summary || tr("已隐藏连接信息", "Connection details hidden"))}</div><div class="hub-mode-row"><select class="hub-select" name="mcp-mode" data-name="${esc(server.name)}" aria-label="${esc(server.name)} ${esc(tr("连接模式", "connection mode"))}">${mcpModes().map(([mode, label]) => `<option value="${mode}" ${mode === (server.mode || "off") ? "selected" : ""} ${mode.startsWith("project-") && projectDisabled() ? `disabled title="${esc(projectTitle())}"` : ""}>${esc(label)}</option>`).join("")}</select>${state.freshModes[server.name] ? `<span class="hub-live">${icon("check", 11)}${esc(tr("免重启已生效", "Applied live"))}</span>` : ""}</div></article>`;
-      }).join("");
+      const node = root.querySelector("#t3-hub-mcp-list");
+      if (state.tab !== "mcp" || disposed || !node) return;
+      if (errors.mcp || !cache.mcp) { node.innerHTML = errors.mcp ? inlineError(errors.mcp) : loading(); return; }
+      const query = state.mcpQuery.trim().toLowerCase();
+      const servers = mcpServers().filter((server) => !query || `${server.name} ${server.groupTitle} ${server.description || ""}`.toLowerCase().includes(query));
+      const active = servers.filter((server) => mcpMode(server) !== "off");
+      const row = (server, upstream = false) => {
+        const mode = mcpMode(server), enabled = mode !== "off";
+        const summary = redact(server.summary || server.url || [server.command, ...items(server, ["args"])].filter(Boolean).join(" "));
+        const status = server.connected === true ? tr("该 MCP 服务器已连接并可用。", "This MCP server is connected and available.") : server.statusText || (server.connected === false ? tr("暂未连接，点击检测连通性。", "Not connected. Probe to check availability.") : tr("按需唤醒 · 点击检测连通性验证", "Wake on demand · Probe to verify connectivity"));
+        const removable = server.removable === true || !server.builtin && !server.readonly && ["custom", "hub"].includes(server.source);
+        return `<article class="hub-mcp-row" data-mcp-name="${esc(server.name)}">${brandIcon(server, "mcp")}<div class="hub-grow"><div class="hub-mcp-name" title="${esc(server.name)}">${esc(server.displayName || server.title || server.name)}</div>${upstream ? `<div class="hub-upstream-status ${server.connected === true ? "is-available" : ""}"><i class="hub-dot"></i><span>${esc(status)}</span></div>` : `<div class="hub-mcp-detail" title="${esc(summary)}">${esc(server.transport || (server.url ? "http" : "stdio"))} · ${esc(summary || tr("连接详情已隐藏", "Connection details hidden"))}</div>`}<div class="hub-mcp-row-options"><select class="hub-select hub-mode-pill" name="mcp-mode" data-name="${esc(server.name)}" aria-label="${esc(server.name)} ${esc(tr("连接模式", "connection mode"))}"><option value="off" ${!enabled ? "selected" : ""}>${esc(tr("关闭", "Off"))}</option>${mcpModes().filter(([value]) => value !== "off").map(([value]) => `<option value="${value}" ${mode === value ? "selected" : ""} ${value.startsWith("project-") && projectDisabled() ? "disabled" : ""}>${esc(`${value.startsWith("project-") ? tr("项目", "Project") : tr("全局", "Global")} · ${value.endsWith("lazy") ? tr("懒加载", "Lazy") : tr("直连", "Direct")}`)}</option>`).join("")}</select>${state.freshModes[server.name] ? `<span class="hub-live">${icon("check", 10)}${esc(tr("已生效", "Applied"))}</span>` : ""}${removable ? `<button type="button" class="hub-icon-btn hub-mcp-remove" data-action="remove-mcp" data-name="${esc(server.name)}" aria-label="${esc(tr("移除", "Remove"))} ${esc(server.name)}">${icon("trash", 12)}</button>` : ""}</div><div class="hub-confirm-delete" data-mcp-confirm hidden>${esc(tr("移除此自定义 MCP？", "Remove this custom MCP?"))}<div class="hub-row">${button("confirm-remove-mcp", tr("移除", "Remove"), { small: true, danger: true, attrs: `data-name="${esc(server.name)}"` })}${button("cancel-remove-mcp", tr("取消", "Cancel"), { small: true })}</div></div></div><button type="button" role="switch" aria-checked="${enabled}" class="hub-switch" data-action="toggle-mcp" data-name="${esc(server.name)}" data-mode="${esc(mode)}" aria-label="${esc(server.name)} ${esc(tr("启用", "enabled"))}"><span></span></button></article>`;
+      };
+      const groups = new Map();
+      servers.forEach((server) => { const name = server.groupTitle || server.pluginName || server.plugin?.name || mcpGroupTitle(server.name); if (!groups.has(name)) groups.set(name, []); groups.get(name).push(server); });
+      node.innerHTML = `<div class="hub-section-heading hub-group-heading"><span>${esc(tr("已启用", "Enabled"))} <span class="hub-count">${active.length}</span></span><span class="hub-hint">${esc(tr("按需加载 · 轻量连接", "On demand · Lightweight"))}</span></div>${active.length ? `<div class="hub-mcp-group">${active.map((server) => row(server)).join("")}</div>` : `<div class="hub-quiet-empty">${esc(tr("从下方上游库开启你的第一个 MCP。", "Enable your first MCP from the catalog below."))}</div>`}<div class="hub-section-heading hub-catalog-heading"><span>${esc(tr("内置与插件上游库", "Built-in & plugin upstream catalog"))}</span><span class="hub-count">${servers.length}</span></div>${[...groups].map(([title, entries]) => `<section class="hub-upstream-group"><div class="hub-upstream-heading">${esc(title)} <span class="hub-count">${entries.length}</span></div><div class="hub-mcp-group">${entries.map((server) => row(server, true)).join("")}</div></section>`).join("") || empty(tr("没有匹配的 MCP", "No matching MCP servers"))}`;
+    }
+    function mcpGroupTitle(name) {
+      const names = [[/chrome/i, "Chrome Devtools MCP"], [/codegraph/i, "Codegraph"], [/context7/i, "Context7 Docs"], [/playwright/i, "Playwright MCP"], [/lcu|computer.use/i, "LCU Computer Use"], [/reach/i, "Briking Agent Reach"], [/product|library/i, tr("产品库查询", "Product Library")], [/github/i, "GitHub"], [/cloudflare/i, "Cloudflare"]];
+      return names.find(([test]) => test.test(name))?.[1] || tr("其他上游", "Other upstream servers");
     }
 
     function selectedMemoryProject() {
@@ -643,7 +936,7 @@
         const count = project.count ?? project.total ?? project.memoryCount;
         return `<option value="${esc(key)}" ${state.memoryProject === key ? "selected" : ""}>📁 ${esc(name)}${count == null ? "" : ` · ${count}`}</option>`;
       }).join("");
-      node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("记忆所属项目", "Memory project"))}"><option value="current" ${state.memoryProject === "current" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>📁 ${esc(tr("当前项目", "Current project"))}</option><option value="global" ${state.memoryProject === "global" ? "selected" : ""}>🌐 ${esc(tr("全局通用记忆", "Global memories"))}</option>${projectOptions}</select>${button("new-memory", tr("新建记忆", "New memory"), { icon: "plus", small: true })}</div>`;
+      node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("记忆所属项目", "Memory project"))}"><option value="current" ${state.memoryProject === "current" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>📁 ${esc(tr("当前项目", "Current project"))}</option><option value="global" ${state.memoryProject === "global" ? "selected" : ""}>🌐 ${esc(tr("全局通用记忆", "Global memories"))}</option>${projectOptions}</select>${button("new-memory", tr("新建 / 演进记忆", "New / evolve memory"), { icon: "plus", small: true })}</div><div class="hub-memory-toolbar">${button("consolidate-memory", tr("🧹 一键再记忆整理", "🧹 Consolidate memories"), { small: true, disabled: !selectedMemoryRoot(), attrs: `title="${esc(!selectedMemoryRoot() ? tr("请选择项目记忆库", "Select a project vault") : tr("合并重复经验，整理过时记忆", "Merge duplicates and outdated memories"))}"` })}<span class="hub-hint">${esc(tr("去重 · 演进 · 保留历史", "Deduplicate · Evolve · Keep history"))}</span></div>`;
       if (errors.overview) node.insertAdjacentHTML("beforeend", inlineError(errors.overview));
     }
     function memoryRecords() { return items(cache.memory, ["items", "memories", "results"]); }
@@ -675,15 +968,50 @@
         const moduleLabel = moduleOptions().find(([key]) => key === module);
         const source = item.sourceAgent || item.agent || item.source || "migrated";
         const draft = drafts[memoryDraftKey(id)];
-        return `<article class="hub-card hub-memory-card ${selected ? "is-selected" : ""}" data-memory-id="${esc(id)}"><button type="button" class="hub-memory-open" data-action="open-memory" data-id="${esc(id)}" aria-expanded="${selected}"><div class="hub-card-top"><span class="hub-asset-icon ${module === "constraints" ? "accent" : ""}" style="width:27px;height:27px;font-size:13px">${esc(moduleLabel?.[2] || "📚")}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.name || memoryBody(item).split("\n")[0].replace(/^#+\s*/, "") || tr("未命名记忆", "Untitled memory"))}</div><div class="hub-card-meta"><span class="hub-badge">${esc(source)}</span><span class="hub-memory-date">${esc(dateLabel(item.updatedAt || item.updated_at || item.createdAt))}</span></div></div><span style="color:var(--hud-muted);transform:rotate(${selected ? 90 : 0}deg)">${icon("chevron", 12)}</span></div>${selected ? "" : `<p class="hub-card-description">${esc(item.summary || memoryBody(item).replace(/[#*`>]/g, "").slice(0, 210))}</p>`}</button>${selected ? `<div class="hub-memory-detail"><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="memory-title" data-id="${esc(id)}" value="${esc(draft?.title ?? item.title ?? item.name ?? "")}"></label><label class="hub-field">Markdown<textarea class="hub-editor" name="memory-content" data-id="${esc(id)}" spellcheck="false" aria-label="${esc(tr("记忆内容", "Memory content"))}">${esc(draft?.content ?? memoryBody(item))}</textarea></label><div class="hub-detail-meta"><span class="hub-badge">${esc(source)}</span><span>${esc(tr("更新于", "Updated"))} ${esc(item.updatedAt || item.updated_at || tr("未知", "Unknown"))}</span></div><div class="hub-editor-actions">${button("save-memory", tr("保存修改", "Save"), { primary: true, icon: "save", attrs: `data-id="${esc(id)}"` })}${button("pin-memory", tr("置顶到 AGENTS.md", "Pin to AGENTS.md"), { icon: "pin", disabled: !selectedMemoryRoot(), attrs: `data-id="${esc(id)}" title="${esc(!selectedMemoryRoot() ? tr("请选择要写入的项目", "Choose a project to pin into") : "")}"` })}${button("delete-memory", tr("删除", "Delete"), { icon: "trash", danger: true, attrs: `data-id="${esc(id)}"` })}</div><div data-delete-confirm hidden class="hub-confirm-delete">${esc(tr("确定删除这条记忆？此操作无法撤销。", "Delete this memory? This cannot be undone."))}<div class="hub-row">${button("confirm-delete-memory", tr("确认删除", "Delete memory"), { danger: true, small: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-delete-memory", tr("取消", "Cancel"), { small: true })}</div></div></div>` : ""}</article>`;
+        return `<article class="hub-card hub-memory-card ${selected ? "is-selected" : ""}" data-memory-id="${esc(id)}"><button type="button" class="hub-memory-open" data-action="open-memory" data-id="${esc(id)}" aria-expanded="${selected}"><div class="hub-card-top"><span class="hub-asset-icon ${module === "constraints" ? "accent" : ""}" style="width:27px;height:27px;font-size:13px">${esc(moduleLabel?.[2] || "📚")}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.name || memoryBody(item).split("\n")[0].replace(/^#+\s*/, "") || tr("未命名记忆", "Untitled memory"))}</div><div class="hub-card-meta"><span class="hub-badge">${esc(source)}</span>${Number(item.version) > 1 ? `<span class="hub-badge hub-purple">🔄 v${esc(item.version)}</span>` : ""}${Number(item.hitCount) > 0 ? `<span class="hub-memory-hits">🔥 ${esc(item.hitCount)}</span>` : ""}<span class="hub-memory-date">${esc(dateLabel(item.updatedAt || item.updated_at || item.createdAt))}</span></div></div><span style="color:var(--hud-muted);transform:rotate(${selected ? 90 : 0}deg)">${icon("chevron", 12)}</span></div>${selected ? "" : `<p class="hub-card-description">${esc(item.summary || memoryBody(item).replace(/[#*`>]/g, "").slice(0, 210))}</p>`}</button>${selected ? `<div class="hub-memory-detail"><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="memory-title" data-id="${esc(id)}" value="${esc(draft?.title ?? item.title ?? item.name ?? "")}"></label><label class="hub-field">Markdown<textarea class="hub-editor" name="memory-content" data-id="${esc(id)}" spellcheck="false" aria-label="${esc(tr("记忆内容", "Memory content"))}">${esc(draft?.content ?? memoryBody(item))}</textarea></label><div class="hub-detail-meta"><span class="hub-badge">${esc(source)}</span><span>${esc(tr("更新于", "Updated"))} ${esc(item.updatedAt || item.updated_at || tr("未知", "Unknown"))}</span></div><div class="hub-editor-actions">${button("save-memory", tr("保存修改", "Save"), { primary: true, icon: "save", attrs: `data-id="${esc(id)}"` })}${button("pin-memory", tr("置顶到 AGENTS.md", "Pin to AGENTS.md"), { icon: "pin", disabled: !selectedMemoryRoot(), attrs: `data-id="${esc(id)}" title="${esc(!selectedMemoryRoot() ? tr("请选择要写入的项目", "Choose a project to pin into") : "")}"` })}${button("delete-memory", tr("删除", "Delete"), { icon: "trash", danger: true, attrs: `data-id="${esc(id)}"` })}</div><div data-delete-confirm hidden class="hub-confirm-delete">${esc(tr("确定删除这条记忆？此操作无法撤销。", "Delete this memory? This cannot be undone."))}<div class="hub-row">${button("confirm-delete-memory", tr("确认删除", "Delete memory"), { danger: true, small: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-delete-memory", tr("取消", "Cancel"), { small: true })}</div></div></div>` : ""}${renderMemoryHistory(item)}</article>`;
       }).join("");
+    }
+    function renderMemoryHistory(item) {
+      const history = items(item, ["history"]);
+      if (!history.length) return "";
+      const id = memoryId(item), key = memoryDraftKey(id), open = !!state.historyExpanded[key];
+      return `<div class="hub-memory-history"><button type="button" class="hub-history-toggle" data-action="memory-history" data-id="${esc(id)}" aria-expanded="${open}">${icon("chevron", 11)}${esc(tr(`查看演进历史 (${history.length} 次修订)`, `Evolution history (${history.length} revisions)`))}</button><div class="hub-history-list" ${open ? "" : "hidden"}>${history.map((entry, index) => {
+        const version = entry.version ?? entry.targetVersion ?? index + 1;
+        return `<div class="hub-history-entry"><div class="hub-row"><strong>v${esc(version)}</strong><span>${esc(entry.timestamp || entry.updatedAt || entry.createdAt || "")}</span></div><div class="hub-history-agent">${esc(entry.agent || entry.sourceAgent || tr("未知来源", "Unknown agent"))}</div><p>${esc(entry.content || entry.text || entry.oldText || entry.body || "")}</p>${button("rollback-memory", tr("↩ 回滚到此版本", "↩ Restore this version"), { small: true, attrs: `data-id="${esc(id)}" data-version="${esc(version)}" data-revision-id="${esc(entry.revisionId || "")}"` })}</div>`;
+      }).join("")}</div></div>`;
+    }
+    async function openNewMemory() {
+      const payload = memoryPayload(), selection = JSON.stringify([payload.projectRoot, payload.projectSlug]);
+      drafts.__new = { ...(drafts.__new || { module: state.memoryModule === "all" ? "topics" : state.memoryModule }), open: true };
+      state.supersedeLoading = true;
+      state.supersedeItems = [];
+      renderNewMemory();
+      root.querySelector('[name="new-memory-title"]')?.focus();
+      try {
+        const data = await request("memory:list", { ...payload, module: undefined, query: "", limit: 500 });
+        const current = memoryPayload();
+        if (disposed || selection !== JSON.stringify([current.projectRoot, current.projectSlug])) return;
+        state.supersedeItems = items(data, ["items", "memories", "results"]);
+      } catch (error) { if (!disposed) toast(errorText(error), true); }
+      finally {
+        const current = memoryPayload();
+        if (!disposed && selection === JSON.stringify([current.projectRoot, current.projectSlug])) {
+          state.supersedeLoading = false;
+          // Preserve text and focus while the optional choices load.
+          const select = content.querySelector('[name="new-memory-supersedes"]');
+          if (select) { select.innerHTML = supersedeOptions(); select.disabled = false; }
+        }
+      }
+    }
+    function supersedeOptions() {
+      return `<option value="">${esc(tr("不覆盖 · 新建独立记忆", "New independent memory"))}</option>${state.supersedeItems.map((item) => `<option value="${esc(memoryId(item))}" ${drafts.__new?.supersedes === memoryId(item) ? "selected" : ""}>${esc(item.title || memoryBody(item).slice(0, 64))}${Number(item.version) > 1 ? ` · v${esc(item.version)}` : ""}</option>`).join("")}`;
     }
     function renderNewMemory() {
       const node = root.querySelector("#t3-hub-new-memory");
       if (!node) return;
       const draft = drafts.__new;
       if (!draft?.open) { node.innerHTML = ""; return; }
-      node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
+      node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("覆盖旧记忆 (Supersede) · 可选", "Supersede an existing memory · optional"))}<select class="hub-select" name="new-memory-supersedes" ${state.supersedeLoading ? "disabled" : ""}>${supersedeOptions()}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
     }
 
     function agentKey(target = state.agentsTarget) { return target === "global" ? "global" : `project:${state.projectRoot || ""}`; }
@@ -899,10 +1227,10 @@
       const session = slashSession;
       if (!session || !palette) return;
       const project = state.context?.projectName || state.projectRoot?.split(/[\\/]/).pop() || tr("全局", "Global");
-      palette.innerHTML = `<div class="hub-slash-header">${icon("bolt", 13)}${esc(tr("项目快捷指令", "Project shortcuts"))}<span class="hub-slash-project">${esc(project)}</span></div><div id="t3-hub-slash-list" class="hub-slash-list" role="listbox" aria-label="${esc(tr("Skills 与子代理", "Skills and agents"))}">${session.loading ? `<div class="hub-slash-empty">${spinner()} ${esc(tr("正在读取当前项目…", "Loading this project…"))}</div>` : session.error ? `<div class="hub-slash-empty" role="status">${esc(session.error)}</div>` : session.rows.length ? session.rows.map((item, index) => {
+      palette.innerHTML = `<div class="hub-slash-header">${icon("bolt", 13)}${esc(tr("项目快捷指令", "Project shortcuts"))}<span class="hub-slash-project">${esc(project)}</span></div><div id="t3-hub-slash-list" class="hub-slash-list" role="listbox" aria-label="${esc(tr("Skills 与子智能体", "Skills and agents"))}">${session.loading ? `<div class="hub-slash-empty">${spinner()} ${esc(tr("正在读取当前项目…", "Loading this project…"))}</div>` : session.error ? `<div class="hub-slash-empty" role="status">${esc(session.error)}</div>` : session.rows.length ? session.rows.map((item, index) => {
         const agent = item.type === "subagent";
-        const badge = agent ? `${tr("子代理", "Agent")} · ${item.providerInstanceId || "codex"}/${item.model || "default"}` : item.scope === "project" ? tr("仅本项目", "This project") : tr("全局", "Global");
-        return `<div class="hub-slash-row ${index === session.active ? "is-active" : ""}" data-slash-index="${index}" data-slash-id="${esc(item.id)}"><button type="button" id="t3-hub-slash-option-${index}" class="hub-slash-select" role="option" aria-selected="${index === session.active}" data-action="slash-select" data-index="${index}"><span class="hub-slash-type ${agent ? "is-agent" : ""}">${icon(agent ? "hub" : "skill", 14)}</span><span class="hub-grow"><span class="hub-slash-label">/${esc(item.id)}</span><span class="hub-slash-description">${esc(item.description || item.name || (agent ? tr("派发子代理", "Delegate to agent") : tr("启用技能", "Use skill")))}</span></span><span class="hub-badge hub-slash-badge ${agent ? "hub-purple" : item.scope === "project" ? "hub-cyan" : "hub-green"}" title="${esc(badge)}">${esc(badge)}</span></button>${agent ? `<button type="button" class="hub-slash-edit" data-action="slash-edit" data-index="${index}" title="${esc(tr("编辑此子代理", "Edit this agent"))}" aria-label="${esc(tr("编辑子代理", "Edit agent"))} ${esc(item.id)}">⚙️ ${esc(tr("编辑", "Edit"))}</button>` : ""}</div>`;
+        const badge = agent ? `${tr("子智能体", "Agent")} · ${item.providerInstanceId || "codex"}/${item.model || "default"}` : item.scope === "project" ? tr("仅本项目", "This project") : tr("全局", "Global");
+        return `<div class="hub-slash-row ${index === session.active ? "is-active" : ""}" data-slash-index="${index}" data-slash-id="${esc(item.id)}"><button type="button" id="t3-hub-slash-option-${index}" class="hub-slash-select" role="option" aria-selected="${index === session.active}" data-action="slash-select" data-index="${index}"><span class="hub-slash-type ${agent ? "is-agent" : ""}">${icon(agent ? "hub" : "skill", 14)}</span><span class="hub-grow"><span class="hub-slash-label">/${esc(item.id)}</span><span class="hub-slash-description">${esc(item.description || item.name || (agent ? tr("派发子智能体", "Delegate to agent") : tr("启用技能", "Use skill")))}</span></span><span class="hub-badge hub-slash-badge ${agent ? "hub-purple" : item.scope === "project" ? "hub-cyan" : "hub-green"}" title="${esc(badge)}">${esc(badge)}</span></button>${agent ? `<button type="button" class="hub-slash-edit" data-action="slash-edit" data-index="${index}" title="${esc(tr("编辑此子智能体", "Edit this agent"))}" aria-label="${esc(tr("编辑子智能体", "Edit agent"))} ${esc(item.id)}">⚙️ ${esc(tr("编辑", "Edit"))}</button>` : ""}</div>`;
       }).join("") : `<div class="hub-slash-empty" role="status">${esc(tr("当前项目没有匹配的快捷指令", "No matching shortcuts for this project"))}</div>`}</div><div class="hub-slash-footer"><span>Alt + ↑↓ · Alt + Enter ${esc(tr("插入", "insert"))}</span><span>Esc ${esc(tr("关闭", "close"))}</span></div>`;
       palette.hidden = false;
       // Preserve any native /plan combobox's accessibility relationship.
@@ -1074,12 +1402,21 @@
       if (before !== state.projectRoot) {
         requestVersion++;
         memoryVersion++;
-        for (const key of ["skills", "subagents", "mcp", "overview", "memory", "agents"]) { cache[key] = null; delete errors[key]; }
-        state.importScope = state.projectRoot ? "project" : "global";
+        for (const key of ["plugins", "hooks", "skills", "subagents", "mcp", "overview", "memory", "agents"]) { cache[key] = null; delete errors[key]; }
+        if (state.scope === "project" && !state.projectRoot) state.scope = "global";
+        state.importScope = defaultScope();
+        state.subagentScope = defaultScope();
+        state.agentsTarget = defaultScope();
+        state.memoryProject = defaultScope() === "project" ? "current" : "global";
+        state.hookDraft = null;
+        state.supersedeItems = [];
         state.selectedMemory = null;
         state.freshModes = {};
         if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
       } else if (!state.projectRoot) {
+        state.scope = "global";
+        state.subagentScope = "global";
+        state.agentsTarget = "global";
         state.importScope = "global";
         if (state.memoryProject === "current") state.memoryProject = "global";
       }
@@ -1087,8 +1424,31 @@
       if (document.activeElement) onComposerInput({ target: document.activeElement });
       if (state.open) {
         if (!state.connected) content.innerHTML = inlineError(state.contextError);
-        else { renderTab(); await loadTab(force); }
+        else { renderTab(); await loadTab(force); primeCatalogs(); }
       }
+    }
+    async function readCatalog(key, action, payload) {
+      try { return await request(action, payload); }
+      catch (error) {
+        if (["plugins", "hooks"].includes(key) && /unknown action|not (?:yet )?(?:wired|implemented|supported)|unsupported|not found|尚未接入/i.test(errorText(error))) return { items: [], unavailable: true };
+        throw error;
+      }
+    }
+    const catalogInflight = new Set();
+    async function primeCatalogs() {
+      const projectRoot = state.projectRoot, version = contextVersion;
+      const domains = [["plugins", "plugins:list"], ["mcp", "mcp:list"], ["skills", "skills:list"], ["hooks", "hooks:list"], ["subagents", "subagents:list"], ["overview", "memory:overview"]];
+      await Promise.all(domains.map(async ([key, action]) => {
+        const token = `${version}:${key}`;
+        if (cache[key] || catalogInflight.has(token)) return;
+        catalogInflight.add(token);
+        try {
+          const data = await readCatalog(key, action, { projectRoot });
+          if (disposed || version !== contextVersion || projectRoot !== state.projectRoot) return;
+          cache[key] = data; delete errors[key]; renderChrome();
+          if (state.open && state.tab === key) renderTab();
+        } catch {} finally { catalogInflight.delete(token); }
+      }));
     }
     async function loadTab(force = false) {
       if (disposed || !state.open) return;
@@ -1099,7 +1459,7 @@
         if (cache[key] && !force) return;
         delete errors[key];
         try {
-          const data = await request(action, payload);
+          const data = await readCatalog(key, action, payload);
           if (disposed || version !== requestVersion || projectRoot !== state.projectRoot) return;
           cache[key] = data;
           if (key === "agents") seedAgentDrafts(data, projectRoot);
@@ -1107,6 +1467,8 @@
           if (!disposed && version === requestVersion) errors[key] = error;
         }
       };
+      if (tab === "plugins") await load("plugins", "plugins:list", { projectRoot });
+      if (tab === "hooks") await load("hooks", "hooks:list", { projectRoot });
       if (tab === "skills") await load("skills", "skills:list", { projectRoot });
       if (tab === "subagents") await load("subagents", "subagents:list", { projectRoot });
       if (tab === "mcp") await load("mcp", "mcp:list", { projectRoot });
@@ -1117,6 +1479,7 @@
       }
       if (disposed || version !== requestVersion || state.tab !== tab) return;
       renderTab();
+      renderChrome();
       if (tab === "memory") scheduleEmbedPoll();
     }
     async function loadMemories(render = true) {
@@ -1129,7 +1492,7 @@
         if (disposed || version !== memoryVersion) return;
         cache.memory = data;
       } catch (error) { if (!disposed && version === memoryVersion) errors.memory = error; }
-      if (!disposed && render && state.tab === "memory") renderMemoryList();
+      if (!disposed && render && state.tab === "memory") { renderMemoryList(); renderChrome(); }
     }
     function seedAgentDrafts(data, projectRoot) {
       for (const target of ["global", "project"]) {
@@ -1199,7 +1562,7 @@
       drawer.inert = !state.open;
       if (state.open) {
         renderTab();
-        if (state.context) loadTab();
+        if (state.context) { loadTab(); primeCatalogs(); }
         else if (state.contextError) content.innerHTML = inlineError(state.contextError);
         if (focus) later(() => root.querySelector(`[data-tab="${state.tab}"]`)?.focus({ preventScroll: true }), 50);
       } else {
@@ -1208,7 +1571,7 @@
       }
     }
     function switchTab(tab, focus = false) {
-      if (!["skills", "subagents", "mcp", "memory", "agents"].includes(tab)) return;
+      if (!tabKeys.includes(tab)) return;
       state.tab = tab;
       requestVersion++;
       cancelTimer(embedTimer);
@@ -1272,11 +1635,32 @@
       if (action === "close") setOpen(false);
       else if (action === "tab") switchTab(target.dataset.tab);
       else if (action === "refresh") refresh();
+      else if (action === "install-plugin-form") { state.pluginInstallOpen = !state.pluginInstallOpen; renderPlugins(); content.querySelector('[name="pluginInput"]')?.focus(); }
+      else if (action === "install-plugin") installPlugin(target);
+      else if (action === "plugin-scope") setDomainScope("plugins", id, target.dataset.scope, target);
+      else if (action === "hook-scope") setDomainScope("hooks", id, target.dataset.scope, target);
+      else if (action === "new-hook") { state.hookDraft ||= { title: "", event: "Stop", matcher: "", command: "", scope: defaultScope() }; renderHooks(); content.querySelector('[name="hook-title"]')?.focus(); }
+      else if (action === "cancel-hook") { state.hookDraft = null; renderHooks(); }
+      else if (action === "save-hook") saveHook(target);
+      else if (action === "delete-hook") target.closest(".hub-hook-card").querySelector("[data-hook-confirm]").hidden = false;
+      else if (action === "cancel-delete-hook") target.closest("[data-hook-confirm]").hidden = true;
+      else if (action === "confirm-delete-hook") deleteHook(id, target);
+      else if (action === "remove-skill") target.closest(".hub-card").querySelector("[data-skill-confirm]").hidden = false;
+      else if (action === "cancel-remove-skill") target.closest("[data-skill-confirm]").hidden = true;
+      else if (action === "confirm-remove-skill") removeSkill(id, target);
+      else if (action === "toggle-mcp") setMcpMode(target.dataset.name, target.dataset.mode === "off" ? `${defaultScope()}-lazy` : "off", target);
+      else if (action === "probe-mcp") probeMcp(target);
+      else if (action === "remove-mcp") target.closest(".hub-mcp-row").querySelector("[data-mcp-confirm]").hidden = false;
+      else if (action === "cancel-remove-mcp") target.closest("[data-mcp-confirm]").hidden = true;
+      else if (action === "confirm-remove-mcp") removeMcp(target.dataset.name, target);
+      else if (action === "memory-history") { const key = memoryDraftKey(id); state.historyExpanded[key] = !state.historyExpanded[key]; renderMemoryList(); }
+      else if (action === "rollback-memory") rollbackMemory(id, Number(target.dataset.version), target.dataset.revisionId, target);
+      else if (action === "consolidate-memory") consolidateMemory(target);
       else if (action === "skill-filter") { state.skillFilter = target.dataset.filter; renderSkillList(); }
       else if (action === "import-skill") runImport(target);
       else if (action === "skill-scope") setSkillScope(id, target.dataset.scope, target);
       else if (action === "update-skill") updateSkill(id, target);
-      else if (action === "subagent-scope") { state.subagentScope = target.dataset.scope; renderSubagents(); }
+      else if (action === "subagent-scope") { state.subagentScope = target.dataset.scope; renderSubagents(); renderChrome(); }
       else if (action === "new-subagent") newSubagent();
       else if (action === "cancel-new-subagent") { delete state.subagentDrafts[subagentKey("__new__")]; renderSubagents(); }
       else if (action === "expand-subagent") {
@@ -1306,13 +1690,13 @@
       else if (action === "toggle-mcp-add") { state.mcpAddOpen = !state.mcpAddOpen; target.setAttribute("aria-expanded", String(state.mcpAddOpen)); renderMcpForm(); }
       else if (action === "mcp-form-kind") { state.mcpForm.kind = target.dataset.kind; renderMcpForm(); }
       else if (action === "save-mcp") saveMcp(target);
-      else if (action === "sync-mcp") busy("sync-mcp", target, async () => { const result = await request("mcp:syncClis", {}); if (!disposed) toast(tr(`路由已同步${result.syncedTargets?.length ? ` · ${result.syncedTargets.length} 端` : ""}`, "CLI router synchronized")); });
+      else if (action === "sync-mcp") busy("sync-mcp", target, async () => { const result = await request("mcp:syncClis", { projectRoot: state.projectRoot }); if (!disposed) toast(tr(`路由已同步${result.syncedTargets?.length ? ` · ${result.syncedTargets.length} 端` : ""}`, "CLI router synchronized")); });
       else if (action === "switch-embed") switchEmbed(target);
       else if (action === "refresh-embed") { refreshEmbed(true, true).then(() => { if (!disposed) renderEngine(); }); }
       else if (action === "memory-module") { state.memoryModule = target.dataset.module; state.selectedMemory = null; cache.memory = null; renderMemoryList(); loadMemories(); }
       else if (action === "refresh-memory") loadMemories();
       else if (action === "open-memory") { state.selectedMemory = state.selectedMemory === id ? null : id; renderMemoryList(); }
-      else if (action === "new-memory") { drafts.__new = { ...(drafts.__new || { module: state.memoryModule === "all" ? "topics" : state.memoryModule }), open: true }; renderNewMemory(); root.querySelector('[name="new-memory-title"]')?.focus(); }
+      else if (action === "new-memory") openNewMemory();
       else if (action === "cancel-new-memory") { if (drafts.__new) drafts.__new.open = false; renderNewMemory(); }
       else if (action === "create-memory") saveMemory(null, target);
       else if (action === "save-memory") saveMemory(id, target);
@@ -1333,7 +1717,11 @@
         else if (["id", "toolBadge", "description", "systemPrompt"].includes(field)) { const draft = subagentDraft(id); if (draft) { draft[field] = input.value; if (field === "id") draft.name = input.value; } }
         return;
       }
-      if (name === "skillQuery") { state.skillQuery = input.value; renderSkillList(); }
+      if (name === "pluginQuery") { state.pluginQuery = input.value; renderPluginList(); }
+      else if (name === "pluginInput") state.pluginInput = input.value;
+      else if (name === "mcpQuery") { state.mcpQuery = input.value; renderMcpList(); }
+      else if (name?.startsWith("hook-") && state.hookDraft) state.hookDraft[name.slice(5)] = input.value;
+      else if (name === "skillQuery") { state.skillQuery = input.value; renderSkillList(); }
       else if (name === "repoInput") state.importRepo = input.value;
       else if (name === "customModel") state.customModel = input.value;
       else if (name === "memoryQuery") {
@@ -1366,7 +1754,8 @@
           customInput?.focus(); customInput?.select();
           return;
         }
-        const patch = field === "provider" ? { providerInstanceId: input.value } : field === "model" ? { model: input.value } : field === "effort" ? { effort: input.value } : null;
+        greetBots(id);
+        const patch = field === "memoryPolicy" ? { memoryPolicy: input.value } : field === "provider" ? { providerInstanceId: input.value } : field === "model" ? { model: input.value } : field === "effort" ? { effort: input.value } : null;
         if (!patch) return;
         if (field === "provider") {
           const models = providerModels(input.value), efforts = providerEfforts(input.value);
@@ -1377,18 +1766,26 @@
         else persistSubagent(id, patch);
         return;
       }
-      if (name === "importScope") state.importScope = input.value;
+      if (name === "hub-scope") setScope(input.value);
+      else if (name?.startsWith("hook-") && state.hookDraft) state.hookDraft[name.slice(5)] = input.value;
+      else if (name === "new-memory-supersedes") { drafts.__new ||= {}; drafts.__new.supersedes = input.value; }
+      else if (name === "importScope") state.importScope = input.value;
       else if (name === "mcp-mode") setMcpMode(input.dataset.name, input.value, input);
       else if (name === "mcp-transport") { state.mcpForm.transport = input.value; renderMcpForm(); }
       else if (name === "embed-model") { state.modelChoice = input.value; renderEngine(); }
       else if (name === "useMirror") state.useMirror = input.checked;
       else if (name === "memoryProject") {
         state.memoryProject = input.value;
+        if (drafts.__new) drafts.__new.supersedes = "";
+        state.supersedeItems = [];
+        state.supersedeLoading = false;
+        renderNewMemory();
         state.selectedMemory = null;
         cache.memory = null;
         memoryVersion++;
         renderMemoryList();
         loadMemories();
+        if (drafts.__new?.open) openNewMemory();
       } else if (name === "new-memory-module") { drafts.__new ||= {}; drafts.__new.module = input.value; }
     }
     function onKeydown(event) {
@@ -1404,7 +1801,7 @@
       const input = event.target;
       if (input.getAttribute("role") === "tab" && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        const tabs = ["skills", "subagents", "mcp", "memory", "agents"];
+        const tabs = tabKeys;
         const index = tabs.indexOf(state.tab);
         const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
         switchTab(tabs[next], true);
@@ -1425,6 +1822,132 @@
         if (start === end) input.setSelectionRange(Math.max(lineStart, start + transformed.length - selected.length), Math.max(lineStart, start + transformed.length - selected.length));
       }
       input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    async function installPlugin(element = content.querySelector('[data-action="install-plugin"]')) {
+      const input = state.pluginInput.trim(), scope = defaultScope(), projectRoot = state.projectRoot;
+      if (!input) { toast(tr("请填写 GitHub 仓库或市场标识", "Enter a GitHub repository or marketplace ID"), true); return; }
+      await busy("install-plugin", element, async () => {
+        await request("plugins:installGitHub", { input, scope, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        state.pluginInput = ""; state.pluginInstallOpen = false;
+        for (const key of ["plugins", "skills", "mcp", "hooks"]) cache[key] = null;
+        if (state.tab === "plugins") await loadTab(true);
+        primeCatalogs();
+        toast(tr("插件已安装，组件能力已同步", "Plugin installed and capabilities synchronized"));
+      });
+    }
+    async function setDomainScope(domain, id, scope, element) {
+      const projectRoot = state.projectRoot;
+      const item = (domain === "plugins" ? pluginItems() : hookItems()).find((entry) => String(entry.id) === id);
+      if (!item || item.readonly || item.unavailable || scope === "project" && !projectRoot) return;
+      await busy(`${domain}-scope:${id}`, element, async () => {
+        const result = await request(domain === "plugins" ? "plugins:setScope" : "hooks:toggle", { id, scope, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        const list = items(cache[domain], ["items", domain]);
+        const original = list.find((entry) => String(entry.id) === id);
+        if (original) Object.assign(original, result.item || {}, { scope });
+        if (state.tab === domain) renderTab();
+        if (domain === "plugins") { for (const key of ["skills", "mcp", "hooks"]) cache[key] = null; primeCatalogs(); }
+        renderChrome();
+        toast(tr("启用范围已更新", "Activation scope updated"));
+      });
+    }
+    async function saveHook(element = content.querySelector('[data-action="save-hook"]')) {
+      if (state.hookDraft) state.hookDraft.id ||= `hook-${window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`}`;
+      const draft = { ...state.hookDraft }, projectRoot = state.projectRoot;
+      if (!draft.command?.trim() || !draft.title?.trim()) { toast(tr("请填写名称和执行命令", "Enter a name and command"), true); return; }
+      if (draft.scope === "project" && !projectRoot) return;
+      await busy("save-hook", element, async () => {
+        await request("hooks:save", { ...draft, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        state.hookDraft = null; cache.hooks = null;
+        if (state.tab === "hooks") await loadTab(true);
+        toast(tr("自定义 Hook 已保存", "Custom hook saved"));
+      });
+    }
+    async function deleteHook(id, element) {
+      const projectRoot = state.projectRoot, item = hookItems().find((entry) => String(entry.id) === id);
+      if (!item || item.builtin || item.readonly) return;
+      await busy(`delete-hook:${id}`, element, async () => {
+        await request("hooks:delete", { id, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        cache.hooks = null;
+        if (state.tab === "hooks") await loadTab(true);
+        toast(tr("自定义 Hook 已删除", "Custom hook deleted"));
+      });
+    }
+    function skillPackageId(id) {
+      const item = items(cache.skills, ["items", "skills"]).find((entry) => String(entry.id) === id);
+      const fromUrl = item?.repoUrl?.match(/github\.com[/:]([^/]+\/[^/#?]+)/i)?.[1]?.replace(/\.git$/, "");
+      return item?.packageId || item?.package || fromUrl || id;
+    }
+    async function removeSkill(id, element) {
+      const projectRoot = state.projectRoot;
+      await busy(`remove-skill:${id}`, element, async () => {
+        await request("skills:removePackage", { id: skillPackageId(id), projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        cache.skills = null;
+        if (state.tab === "skills") await loadTab(true);
+        toast(tr("技能包已移除", "Skill package removed"));
+      });
+    }
+    async function probeMcp(element) {
+      const projectRoot = state.projectRoot;
+      await busy("probe-mcp", element, async () => {
+        const result = await request("mcp:probe", { all: true, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        const results = items(result, ["items", "servers", "results"]);
+        if (!results.length && result.results && typeof result.results === "object" && !Array.isArray(result.results)) results.push(...Object.entries(result.results).map(([name, status]) => ({ name, ...status })));
+        if (results.length) cache.mcp = { ...cache.mcp, items: mcpServers().map((server) => ({ ...server, ...results.find((entry) => entry.name === server.name) })) };
+        else {
+          const data = await request("mcp:list", { projectRoot });
+          if (disposed || projectRoot !== state.projectRoot) return;
+          cache.mcp = data;
+        }
+        if (state.tab === "mcp") renderMcpList();
+        renderChrome();
+        toast(result.message || tr("连通性检测完成", "Connection probe complete"));
+      });
+    }
+    async function removeMcp(name, element) {
+      const projectRoot = state.projectRoot;
+      await busy(`remove-mcp:${name}`, element, async () => {
+        await request("mcp:remove", { name, projectRoot });
+        if (disposed || projectRoot !== state.projectRoot) return;
+        cache.mcp = null;
+        if (state.tab === "mcp") await loadTab(true);
+        toast(tr("自定义 MCP 已移除", "Custom MCP removed"));
+      });
+    }
+    function memorySelection() { const payload = memoryPayload(); return JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]); }
+    async function consolidateMemory(element) {
+      const projectRoot = selectedMemoryRoot(), selection = memorySelection();
+      if (!projectRoot) return;
+      await busy(`consolidate:${projectRoot}`, element, async () => {
+        const result = await request("memory:consolidate", { projectRoot, dryRun: false });
+        if (disposed || selection !== memorySelection()) return;
+        const stats = result.stats || result.summary || result;
+        const merged = stats.mergedCount ?? stats.merged ?? stats.duplicatesMerged ?? stats.duplicates;
+        const outdated = stats.outdatedCount ?? stats.outdated ?? stats.supersededCount;
+        const count = (value) => Array.isArray(value) ? value.length : typeof value === "number" ? value : null;
+        const detail = [count(merged) == null ? "" : tr(`合并重复 ${count(merged)} 条`, `${count(merged)} duplicates merged`), count(outdated) == null ? "" : tr(`整理过时 ${count(outdated)} 条`, `${count(outdated)} outdated memories updated`)].filter(Boolean).join(" · ");
+        if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); }
+        renderChrome();
+        toast(detail || result.message || tr("再记忆整理完成，历史版本已保留", "Consolidation complete; version history preserved"));
+      });
+    }
+    async function rollbackMemory(id, targetVersion, revisionId, element) {
+      if (!Number.isInteger(targetVersion) || targetVersion < 1) return;
+      const selection = memorySelection(), projectRoot = selectedMemoryRoot(), key = memoryDraftKey(id);
+      if (drafts[key]) { toast(tr("请先保存这条记忆的修改，再回滚", "Save your memory edits before restoring a version"), true); return; }
+      await busy(`rollback:${id}`, element, async () => {
+        await request("memory:rollback", { projectRoot, id, targetVersion, revisionId: revisionId || undefined });
+        if (disposed || selection !== memorySelection()) return;
+        if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); }
+        renderChrome();
+        toast(tr(`已回滚到 v${targetVersion}，演进历史已保留`, `Restored v${targetVersion}; history preserved`));
+      });
     }
 
     async function runImport(element = root?.querySelector('[data-action="import-skill"]')) {
@@ -1450,27 +1973,31 @@
         if (disposed || projectRoot !== state.projectRoot) return;
         const item = items(cache.skills, ["items", "skills", "plugins"]).find((entry) => String(entry.id) === id);
         if (item) Object.assign(item, result.item || {}, { scope });
-        renderSkillList();
+        renderSkillList(); renderChrome();
         toast(tr("启用范围已更新", "Activation scope updated"));
       });
     }
     async function updateSkill(id, element) {
       await busy(`update:${id}`, element, async () => {
-        await request("skills:update", { id, projectRoot: state.projectRoot });
+        await request("skills:updatePackage", { id: skillPackageId(id), projectRoot: state.projectRoot });
         if (!disposed) { toast(tr("已检查并更新技能", "Skill checked and updated")); cache.skills = null; if (state.tab === "skills") await loadTab(true); }
       });
     }
     async function setMcpMode(name, mode, element) {
       const projectRoot = state.projectRoot;
-      const old = items(cache.mcp, ["items", "servers"]).find((server) => server.name === name)?.mode || "off";
+      if (mode.startsWith("project-") && !projectRoot) return;
+      const old = mcpServers().find((server) => server.name === name)?.mode || "off";
       await busy(`mode:${name}`, element, async () => {
         try {
           await request("mcp:setMode", { name, mode, projectRoot });
           if (disposed || state.projectRoot !== projectRoot) return;
-          const server = items(cache.mcp, ["items", "servers"]).find((entry) => entry.name === name);
-          if (server) server.mode = mode;
+          const server = mcpServers().find((entry) => entry.name === name);
+          if (server) {
+            const all = mcpServers().map((entry) => entry.name === name ? { ...entry, mode } : entry);
+            cache.mcp = { ...cache.mcp, items: all };
+          }
           state.freshModes[name] = true;
-          renderMcpList();
+          renderMcpList(); renderChrome();
           toast(tr("免重启已生效", "Applied without restarting"));
         } catch (error) { if (element?.isConnected) element.value = old; throw error; }
       });
@@ -1523,7 +2050,7 @@
       if (!draft.title?.trim() || !draft.content?.trim()) { toast(tr("请填写标题和记忆内容", "Enter a title and memory content"), true); return; }
       const key = id == null ? null : memoryDraftKey(id);
       await busy(`memory-save:${id || "new"}`, element, async () => {
-        const result = await request("memory:save", { ...payload, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics" });
+        const result = await request("memory:save", { ...payload, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
         if (disposed) return;
         if (id == null) delete drafts.__new;
         else if (drafts[key]?.content === draft.content) delete drafts[key];
@@ -1591,7 +2118,7 @@
       close: () => setOpen(false),
       toggle: () => setOpen(!state.open),
       refresh,
-      snapshot: () => ({ open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
+      snapshot: () => ({ scope: state.scope, pluginQuery: state.pluginQuery, pluginInput: state.pluginInput, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
       destroy: () => {
         if (disposed) return;
         closeSlash();

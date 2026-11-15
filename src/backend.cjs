@@ -11,6 +11,8 @@ const mcpRouter = require("./mcp-router.cjs");
 const memoryVault = require("./memory-vault.cjs");
 const embedManager = require("./embed-manager.cjs");
 const hubSubagents = require("./hub-subagents.cjs");
+const hubPlugins = require("./hub-plugins.cjs");
+const hubHooks = require("./hub-hooks.cjs");
 
 const execFileAsync = promisify(execFile);
 
@@ -1855,7 +1857,27 @@ function parseRefs(decorateStr) {
 // ============================================================================
 // 3c. Hub Context & Unified RPC (zero-restart hot-reload via getGitGraph)
 // ============================================================================
+let didAutoSyncHosts = false;
+function discoverAntigravityRulesPaths(extra = []) {
+  const out = new Set(Array.isArray(extra) ? extra.filter(Boolean) : []);
+  try {
+    if (fs.existsSync(AGY_PROVIDERS_ROOT)) {
+      for (const entry of fs.readdirSync(AGY_PROVIDERS_ROOT, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const rulesDir = path.join(AGY_PROVIDERS_ROOT, entry.name, "config", "rules");
+        const rulesFile = path.join(rulesDir, "AGENTS.md");
+        if (fs.existsSync(rulesFile) || fs.existsSync(rulesDir)) out.add(rulesFile);
+      }
+    }
+  } catch {}
+  return [...out];
+}
+
 function resolveHubContext(args = {}) {
+  if (!didAutoSyncHosts) {
+    didAutoSyncHosts = true;
+    try { mcpRouter.autoSyncHosts(); } catch {}
+  }
   const threadHint = args.threadHint || args.threadId || "";
   const routeHint = args.routeHint || args.threadHint || args.threadId || "";
   const hint = routeHint || threadHint;
@@ -1908,10 +1930,20 @@ function resolveHubContext(args = {}) {
       } catch {}
       db.close();
       // Counts (best-effort, never throw)
+      let activePlugins = 0;
       let activeSkills = 0;
       let activeMcps = 0;
+      let activeHooks = 0;
       let projectMemories = 0;
       let subagents = 0;
+      try {
+        const pl = hubPlugins.listPlugins({ projectRoot });
+        activePlugins = (pl.items || []).filter((i) => projectRoot ? (i.scope === "global" || i.scope === "project") : i.scope === "global").length;
+      } catch {}
+      try {
+        const hk = hubHooks.listHooks({ projectRoot });
+        activeHooks = (hk.items || []).filter((h) => h.enabled !== false && h.scope !== "off").length;
+      } catch {}
       try {
         if (projectRoot) {
           const listed = hubSkills.listAssets({ projectRoot });
@@ -1939,7 +1971,7 @@ function resolveHubContext(args = {}) {
         const s = hubSubagents.listSubagents({ projectRoot });
         subagents = (s.effectiveItems || []).length;
       } catch {}
-      return { ok: true, threadId, projectId, projectRoot, projectSlug, projectTitle, activeProvider, activeModel, counts: { activeSkills, activeMcps, projectMemories, subagents } };
+      return { ok: true, threadId, projectId, projectRoot, projectSlug, projectTitle, activeProvider, activeModel, counts: { activePlugins, activeSkills, activeMcps, activeHooks, projectMemories, subagents } };
     } finally {
       try { db?.close(); } catch {}
     }
@@ -1985,18 +2017,46 @@ async function hubCall(action, payload = {}) {
       case "mcp:setMode": return mcpRouter.setMcpMode(payload);
       case "mcp:upsert": return mcpRouter.upsertMcpServer(payload);
       case "mcp:remove": return mcpRouter.removeMcpServer(payload);
+      case "plugins:list": return hubPlugins.listPlugins(payload);
+      case "plugins:setScope": {
+        const res = hubPlugins.setPluginScope(payload);
+        if (payload && payload.id === "t3-memory-vault" && payload.scope && payload.scope !== "off") {
+          try { mcpRouter.autoSyncHosts(); } catch {}
+        }
+        return res;
+      }
+      case "plugins:installGitHub":
+      case "plugins:importGitHub":
+        return await hubPlugins.installPluginFromGitHub({
+          ...(payload || {}),
+          input: payload?.input || payload?.repoInput || payload?.url || "",
+        });
+      case "mcp:probe": return await mcpRouter.probeMcpServers(payload);
+      case "mcp:autoSync": return mcpRouter.autoSyncHosts();
       case "mcp:syncClis": return mcpRouter.syncRouterToClis();
+      case "hooks:list": return hubHooks.listHooks(payload);
+      case "hooks:toggle":
+      case "hooks:setScope": return hubHooks.toggleHook(payload);
+      case "hooks:save":
+      case "hooks:upsert": return hubHooks.saveCustomHook(payload);
+      case "hooks:delete":
+      case "hooks:remove": return hubHooks.deleteCustomHook(payload);
+      case "hooks:setPlugin": return hubHooks.setPluginHooks(payload);
       case "memory:overview": return memoryVault.getOverview(payload);
       case "memory:list": return await memoryVault.listMemories(payload);
       case "memory:save": return await memoryVault.saveMemory(payload);
+      case "memory:consolidate": return await memoryVault.consolidateMemories(payload);
+      case "memory:rollback": return await memoryVault.rollbackMemory(payload);
       case "memory:delete": return memoryVault.deleteMemory(payload);
       case "memory:pinToAgentsMd": return memoryVault.pinToAgentsMd(payload);
       case "memory:migratePowerContext": return await memoryVault.migrateFromPowerContext(payload);
       case "embed:status": return await embedManager.getStatus();
       case "embed:switch": return await embedManager.switchModel(payload);
       case "subagents:list": return hubSubagents.listSubagents(payload);
-      case "subagents:save": return hubSubagents.saveSubagent(payload);
-      case "subagents:delete": return hubSubagents.deleteSubagent(payload);
+      case "subagents:resolveRoute":
+      case "subagents:resolve": return hubSubagents.resolveSubagentRoute(payload);
+      case "subagents:save": return hubSubagents.saveSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
       default: return { ok: false, error: "unknown action: " + action };
     }
   } catch (err) {

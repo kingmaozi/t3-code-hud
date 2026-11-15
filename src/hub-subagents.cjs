@@ -251,7 +251,32 @@ const DEFAULT_SUBAGENTS = [
     enabled: true,
     builtin: true,
   },
-];
+].map((item, index) => ({ ...item,
+  memoryPolicy: ["explorer", "code-review"].includes(item.id) ? "readonly" : "readwrite",
+  avatarColor: ["teal", "blue", "indigo", "pink", "amber", "cyan", "violet"][index],
+}));
+
+const MEMORY_POLICIES = ["readwrite", "readonly", "off"];
+const AVATAR_COLORS = ["teal", "blue", "indigo", "pink", "amber", "cyan", "violet"];
+function normalizeMemory(item) {
+  return { ...item,
+    memoryPolicy: MEMORY_POLICIES.includes(item.memoryPolicy) ? item.memoryPolicy : (["explorer", "code-review"].includes(item.id) ? "readonly" : "readwrite"),
+    avatarColor: AVATAR_COLORS.includes(item.avatarColor) ? item.avatarColor : (DEFAULT_SUBAGENTS.find(d => d.id === item.id)?.avatarColor || "teal"),
+  };
+}
+function memoryInstruction(item) {
+  const policy = normalizeMemory(item).memoryPolicy;
+  if (policy === "readonly") return "第一现场记忆联动：开工先调用 memory_search，只读检索，不调用 memory_write、不写记忆库。";
+  if (policy === "off") return "记忆策略 off：本子任务不调用 memory_search 或 memory_write。";
+  return "第一现场记忆联动：开工先调用 memory_search 检索项目规则与踩坑；收尾交差前，对已验证的非平凡根因或持久约束，借当前 100% 热缓存调用 memory_write 落盘，不记录猜测、秘密或流水账。";
+}
+function configItems(raw, withMemory = true) {
+  const items = Array.isArray(raw) ? raw : raw?.items || raw?.subagents || [];
+  return Array.isArray(items) ? items.filter(i => i && typeof i === "object" && (i.id || i.name)).map(i => {
+    const item = { ...i, id: String(i.id || i.name), name: String(i.name || i.id) };
+    return withMemory ? normalizeMemory(item) : item;
+  }) : [];
+}
 
 const VALID_PROVIDERS = ["muse", "codex", "pi", "antigravity", "claudeAgent"];
 const VALID_ROLES = ["research", "implementation", "general", "design", "test", "review"];
@@ -292,7 +317,7 @@ function createSubagentsManager(opts = {}) {
         writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
         return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
       }
-      return norm;
+      return norm.map(normalizeMemory);
     }
     if (raw && typeof raw === "object") {
       const arr = Array.isArray(raw.items) ? raw.items : Array.isArray(raw.subagents) ? raw.subagents : null;
@@ -303,7 +328,7 @@ function createSubagentsManager(opts = {}) {
           if (!id) return null;
           return { ...it, id: String(id), name: String(it.name || id), builtin: Boolean(it.builtin), enabled: it.enabled !== false };
         }).filter(Boolean);
-        if (norm.length) return norm;
+        if (norm.length) return norm.map(normalizeMemory);
       }
       if (Object.keys(raw).length === 0) {
         writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
@@ -331,11 +356,11 @@ function createSubagentsManager(opts = {}) {
         if (!it || typeof it !== "object") return null;
         const id = it.id || it.name;
         if (!id) return null;
-        return { ...it, id: String(id), name: String(it.name || id), enabled: it.enabled !== false, overridesGlobal: Boolean(it.overridesGlobal) };
-      }).filter(Boolean);
+        return { ...it, id: String(id), name: String(it.name || id), enabled: it.enabled !== false, overridesGlobal: it.overridesGlobal !== false };
+      }).filter(Boolean).map(normalizeMemory);
     }
     if (raw && typeof raw === "object" && Array.isArray(raw.items)) {
-      return raw.items.filter((x) => x && typeof x === "object" && (x.id || x.name)).map((it) => ({ ...it, id: String(it.id || it.name), name: String(it.name || it.id || it.name), enabled: it.enabled !== false, overridesGlobal: Boolean(it.overridesGlobal) }));
+      return configItems(raw).map(it => ({ ...it, enabled: it.enabled !== false, overridesGlobal: it.overridesGlobal !== false }));
     }
     return [];
   }
@@ -363,6 +388,8 @@ function createSubagentsManager(opts = {}) {
       // Allow but warn? Strict: reject unknown role to catch typos.
       throw new Error("invalid role: " + role);
     }
+    if (!MEMORY_POLICIES.includes(item.memoryPolicy)) throw new Error("invalid memoryPolicy");
+    if (!AVATAR_COLORS.includes(item.avatarColor)) throw new Error("invalid avatarColor");
     if (item.systemPrompt != null && typeof item.systemPrompt !== "string") throw new Error("systemPrompt must be string");
     if (item.description != null && typeof item.description !== "string") throw new Error("description must be string");
   }
@@ -416,7 +443,8 @@ function createSubagentsManager(opts = {}) {
     const end = isProject ? PROJECT_END : GLOBAL_END;
     const lines = [];
     lines.push(start);
-    lines.push(isProject ? "## T3 Hub Project Subagents" : "## T3 Hub Subagents (Global)");
+    lines.push("## 子智能体路由与系统提示词 (T3 Hub Sub-Agents)" + (isProject ? " · 项目" : " · 全局"));
+    lines.push("派发任何子智能体前，若会话较长或用户刚调整过配置，优先以 ~/.t3/hub/subagents.json（及项目覆盖配置）中的实时模型与思考强度为准；可调用 resolveSubagentRoute 查询，PreToolUse 路由守卫会在派单时重新读取磁盘。");
     lines.push("");
     lines.push("| id | role | providerInstanceId | model | options | description |");
     lines.push("|---|---|---|---|---|---|");
@@ -432,13 +460,15 @@ function createSubagentsManager(opts = {}) {
       lines.push(`- target: \`{ providerInstanceId: "${it.providerInstanceId}", model: "${it.model}", options: ${JSON.stringify(optionsForSubagent(it))} }\``);
       lines.push(`- toolBadge: ${it.toolBadge || ""}`);
       if (it.description) lines.push(`- description: ${String(it.description).replace(/\n/g, " ")}`);
+      lines.push(`- memoryPolicy: ${normalizeMemory(it).memoryPolicy}`);
       lines.push(`- systemPrompt: >`);
+      lines.push("  > " + memoryInstruction(it));
       if (it.systemPrompt) {
         for (const l of String(it.systemPrompt).split("\n")) lines.push("  > " + l);
       }
       lines.push("");
     }
-    lines.push("When dispatching via `delegate_task`, always use the exact `target` (`providerInstanceId`, `model`, `options`) shown above and prepend the configured `systemPrompt` to the task.");
+    lines.push("When dispatching via `delegate_task`, always use the exact `target` (`providerInstanceId`, `model`, `options`) resolved from the current disk configuration (the table above is a snapshot) and prepend the configured `systemPrompt` to the task.");
     lines.push(end);
     return lines.join("\n") + "\n";
   }
@@ -522,7 +552,7 @@ function createSubagentsManager(opts = {}) {
     const file = path.join(dir, item.id + ".md");
     assertContained(dir, file);
     safeMkdir(dir);
-    const fm = `---\nname: ${item.id}\ndescription: ${String(item.description || item.id).replace(/^["']|["']$/g, "").replace(/\n/g, " ")}\n---\n\n${item.systemPrompt || ""}\n`;
+    const fm = `---\nname: ${item.id}\ndescription: ${String(item.description || item.id).replace(/^["']|["']$/g, "").replace(/\n/g, " ")}\n---\n\n${item.systemPrompt || ""}\n\n${memoryInstruction(item)}\n`;
     writeTextAtomic(file, fm);
     return file;
   }
@@ -533,7 +563,7 @@ function createSubagentsManager(opts = {}) {
     try { if (fileExists(file)) fs.unlinkSync(file); } catch {}
   }
 
-  function injectGlobal(allGlobal) {
+  function injectGlobal(allGlobal, extraSyncPaths = opts.extraSyncPaths || []) {
     const block = renderBlock(allGlobal, false);
     injectIntoFile(globalAgentsMdPath, block, GLOBAL_START, GLOBAL_END);
     const targets = [
@@ -542,10 +572,12 @@ function createSubagentsManager(opts = {}) {
       path.join(homeDir, ".config", "muse", "AGENTS.md"),
       path.join(homeDir, ".claude", "CLAUDE.md"),
     ];
-    for (const t of targets) {
+    if (!Array.isArray(extraSyncPaths) || extraSyncPaths.some(p => typeof p !== "string" || !path.isAbsolute(p))) throw new Error("extraSyncPaths must contain absolute file paths");
+    const extras = extraSyncPaths.map(p => path.resolve(p));
+    for (const t of new Set([...targets, ...extras])) {
       // Sync only when parent dir exists (like hub-skills), to avoid creating stray dirs on fresh systems.
       // But still sync if file already exists regardless.
-      if (fileExists(t) || dirExists(path.dirname(t))) {
+      if (extras.includes(t) || fileExists(t) || dirExists(path.dirname(t))) {
         injectIntoFile(t, block, GLOBAL_START, GLOBAL_END);
       }
     }
@@ -630,7 +662,9 @@ function createSubagentsManager(opts = {}) {
   function saveSubagent(args = {}) {
     const scope = args.scope || "global";
     const projectRoot = args.projectRoot || null;
-    const item = args.item || args;
+    const input = args.item || args;
+    const previous = (scope === "project" && projectRoot ? readProject(projectRoot) : readGlobal()).find(i => i.id === (input.id || input.name));
+    const item = { ...previous, ...input };
     const catalog = listModelCatalog(homeDir);
     // Support being called as saveSubagent({scope, projectRoot, item}) or flat.
     const normalized = {
@@ -645,7 +679,9 @@ function createSubagentsManager(opts = {}) {
       systemPrompt: item.systemPrompt ? String(item.systemPrompt) : "",
       enabled: item.enabled !== false,
       builtin: Boolean(item.builtin),
-      overridesGlobal: Boolean(item.overridesGlobal),
+      overridesGlobal: scope === "project" ? item.overridesGlobal !== false : Boolean(item.overridesGlobal),
+      memoryPolicy: item.memoryPolicy ?? normalizeMemory({ id: item.id || item.name }).memoryPolicy,
+      avatarColor: item.avatarColor ?? normalizeMemory({ id: item.id || item.name }).avatarColor,
     };
     if (!normalized.id) throw new Error("item.id required");
     if (!normalized.name) normalized.name = normalized.id;
@@ -672,7 +708,7 @@ function createSubagentsManager(opts = {}) {
         items.push(normalized);
       }
       writeGlobal(items);
-      renderedMarkdownBlock = injectGlobal(items);
+      renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
       saved = items.find((x) => x.id === normalized.id);
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
@@ -713,13 +749,13 @@ function createSubagentsManager(opts = {}) {
         if (def) {
           items[idx] = { ...def };
           writeGlobal(items);
-          renderedMarkdownBlock = injectGlobal(items);
+          renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
           return { ok: true, scope, id, deleted: false, reset: true, item: items[idx], renderedMarkdownBlock };
         }
       }
       items = items.filter((x) => x.id !== id);
       writeGlobal(items);
-      renderedMarkdownBlock = injectGlobal(items);
+      renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
       return { ok: true, scope, id, deleted: true, renderedMarkdownBlock };
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
@@ -742,7 +778,47 @@ function createSubagentsManager(opts = {}) {
     throw new Error("invalid scope: " + scope);
   }
 
-  return { homeDir, hubDir, globalPath, projectDir, listSubagents, saveSubagent, deleteSubagent, listModelCatalog: () => listModelCatalog(homeDir) };
+  // Read on every call and never seed/synchronize configuration from a hook invocation.
+  function resolveSubagentRoute({ idOrTitle, role, projectRoot } = {}) {
+    const globals = configItems(readJsonFile(globalPath, []));
+    let projects = [];
+    if (projectRoot) {
+      let current = path.resolve(projectRoot);
+      // A tool may run below the project root. The closest project config wins.
+      while (true) {
+        const file = projectPathFor(current);
+        if (fileExists(file)) { projects = configItems(readJsonFile(file, []), false).map(i => ({ ...i, overridesGlobal: i.overridesGlobal !== false })); break; }
+        if (fileExists(path.join(current, ".git")) || dirExists(path.join(current, ".git"))) break;
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+      }
+    }
+    const items = buildEffective(globals, projects).map(normalizeMemory);
+    const hints = (Array.isArray(idOrTitle) ? idOrTitle : [idOrTitle]).filter(x => typeof x === "string" && x.trim()).map(x => x.trim().toLowerCase());
+    let item;
+    // An exact id/name wins over title prefixes; never infer a route from task prose.
+    for (const hint of hints) {
+      item = items.find(i => [i.id, i.name].some(v => String(v).toLowerCase() === hint));
+      if (item) break;
+    }
+    if (!item) for (const hint of hints) {
+      const matches = items.filter(i => [i.id, i.name].some(v => {
+        const id = String(v).toLowerCase();
+        return hint.startsWith(id) && /^(?:\s*[·:：|/]|\s+-\s)/.test(hint.slice(id.length));
+      }));
+      if (matches.length === 1) { item = matches[0]; break; }
+    }
+    // A role fallback is safe only when it is unambiguous and no explicit identity was supplied.
+    if (!item && !hints.length && role) {
+      item = items.find(i => i.id === role || i.name === role);
+      if (!item) { const matches = items.filter(i => i.role === role); if (matches.length === 1) item = matches[0]; }
+    }
+    if (!item || !item.providerInstanceId || !item.model || !item.effort) return { ok: true, matched: false, item: null, target: null };
+    return { ok: true, matched: true, item, target: { providerInstanceId: item.providerInstanceId, model: item.model, options: optionsForSubagent(item) } };
+  }
+
+  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, listModelCatalog: () => listModelCatalog(homeDir) };
 }
 
 let _singleton = null;
@@ -759,6 +835,7 @@ module.exports = {
   listModelCatalog,
   DEFAULT_SUBAGENTS,
   optionsForSubagent,
+  resolveSubagentRoute: a => getDefaultSubagentsManager().resolveSubagentRoute(a),
   getDefaultSubagentsManager,
   listSubagents,
   saveSubagent,

@@ -154,6 +154,16 @@ const vaultRead = (...args) => {
   throw new Error("memory-vault function not found: read");
 };
 const vaultWrite = memoizeVault(["write", "memoryWrite", "memory_write", "saveMemory"]);
+const vaultConsolidate = memoizeVault(["consolidateMemories"]);
+const vaultRollback = memoizeVault(["rollbackMemory"]);
+let hubSubagentsMod = null;
+for (const cand of [
+  path.join(__dirname, "..", "src", "hub-subagents.cjs"),
+  path.join(__dirname, "..", "hud-plugin", "hub-subagents.cjs"),
+  path.join(HOME_DIR, ".t3", "hud-plugin", "hub-subagents.cjs"),
+]) {
+  try { hubSubagentsMod = require(cand); if (hubSubagentsMod) break; } catch {}
+}
 function memoizeVault(names) {
   let cached;
   let tried = false;
@@ -168,7 +178,10 @@ function memoryTools() {
   return [
     { name: "memory_search", description: "Search shared project memory (rules, pitfalls, decisions).", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, includeGlobal: { type: "boolean" }, limit: { type: "number" } }, required: ["query"] } },
     { name: "memory_read", description: "Read a memory module entry.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" } } } },
-    { name: "memory_write", description: "Write a verified non-obvious pitfall or durable constraint.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" } }, required: ["module", "title", "content"] } },
+    { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" } }, required: ["module", "title", "content"] } },
+    { name: "memory_consolidate", description: "Consolidate overlapping project memories, or preview candidate pairs with dryRun.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string" }, dryRun: { type: "boolean" } } } },
+    { name: "memory_rollback", description: "Roll back an evolved memory item to a previous version from its history.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string" } }, required: ["id"] } },
+    ...(hubSubagentsMod && typeof hubSubagentsMod.resolveSubagentRoute === "function" ? [{ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } }] : []),
   ];
 }
 const HUB_LIST_DEF = { name: "hub_list_mcp_tools", description: "List tools from lazy upstream MCP servers (connects on demand).", inputSchema: { type: "object", properties: { server: { type: "string" } } } };
@@ -371,9 +384,27 @@ async function handleToolsCall(params) {
   if (name === "memory_write") {
     if (!memoryVault) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent });
+    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent, supersedesId: args.supersedesId, autoEvolve: args.autoEvolve });
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? true) }] };
+  }
+  if (name === "memory_consolidate") {
+    if (!memoryVault) throw new Error("memory-vault not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = await vaultConsolidate({ projectRoot, projectSlug: args.projectSlug, dryRun: args.dryRun });
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
+  }
+  if (name === "memory_rollback") {
+    if (!memoryVault) throw new Error("memory-vault not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = await vaultRollback({ projectRoot, projectSlug: args.projectSlug, id: args.id, targetVersion: args.targetVersion, revisionId: args.revisionId });
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
+  }
+  if (name === "subagent_resolve") {
+    if (!hubSubagentsMod || typeof hubSubagentsMod.resolveSubagentRoute !== "function") throw new Error("hub-subagents not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const res = hubSubagentsMod.resolveSubagentRoute({ idOrTitle: args.idOrTitle, role: args.role, projectRoot });
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "hub_list_mcp_tools") {
     const { servers } = enabledServers();

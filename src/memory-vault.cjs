@@ -140,6 +140,7 @@ function generateMemId() {
   return "mem_" + crypto.randomBytes(12).toString("hex");
 }
 function cosine(a, b) {
+  if (!a || !b || a.length !== b.length || !a.length) return 0;
   let dot = 0;
   let na = 0;
   let nb = 0;
@@ -161,6 +162,55 @@ function tagsToText(tags) {
 function escapeLike(term) {
   return String(term).replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
+function revisionMeta(value = {}) {
+  return {
+    version: Number.isInteger(value.version) && value.version > 0 ? value.version : 1,
+    hitCount: Number.isInteger(value.hitCount) && value.hitCount >= 0 ? value.hitCount : 0,
+    lastRecalledAt: value.lastRecalledAt || null,
+    supersedesId: value.supersedesId || null,
+    history: Array.isArray(value.history) ? value.history.slice(-10).map((entry, index) => ({
+      ...entry,
+      // Legacy histories get deterministic IDs so reads and index rebuilds do
+      // not change the selector shown in an already-open drawer.
+      revisionId: entry.revisionId || "rev_" + crypto.createHash("sha256")
+        .update(JSON.stringify([value.id || null, index, entry])).digest("hex").slice(0, 32),
+    })) : [],
+  };
+}
+function snapshot(item, reason) {
+  return { revisionId: "rev_" + crypto.randomUUID(), version: item.version || 1, title: item.title, content: item.content,
+    updatedAt: item.updatedAt, agent: item.agent, reason };
+}
+function lexicalTokens(text) {
+  const tokens = new Set();
+  for (const run of String(text || "").toLowerCase().match(/[\p{L}\p{N}_]+/gu) || []) {
+    // CJK bigrams bridge spaces/punctuation naturally without treating an
+    // entire Chinese sentence as one word. Latin words remain whole tokens.
+    for (const part of run.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) || []) {
+      if (/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(part)) {
+        const chars = [...part];
+        if (chars.length === 1) tokens.add(part);
+        for (let i = 0; i + 1 < chars.length; i++) tokens.add(chars[i] + chars[i + 1]);
+      } else tokens.add(part);
+    }
+  }
+  return tokens;
+}
+function jaccard(a, b) {
+  const union = new Set([...a, ...b]);
+  if (!union.size) return 0;
+  let common = 0;
+  for (const token of a) if (b.has(token)) common++;
+  return common / union.size;
+}
+function embeddingText(item) {
+  // Only the active revision is ever sent to the embedding service.
+  return (String(item.title || "") + "\n" + String(item.content || "")).slice(0, 8000);
+}
+function validVector(vec) {
+  return (Array.isArray(vec) || vec instanceof Float32Array) && vec.length > 0 &&
+    Array.from(vec).every(Number.isFinite) && vec.some((n) => n !== 0);
+}
 function parseMarkdownEntries(text, fallbackKind) {
   const entries = [];
   if (typeof text !== "string" || !text) return entries;
@@ -178,6 +228,8 @@ function parseMarkdownEntries(text, fallbackKind) {
       createdAt: cur.marker && cur.marker.createdAt ? String(cur.marker.createdAt) : null,
       updatedAt: cur.marker && cur.marker.updatedAt ? String(cur.marker.updatedAt) : null,
       content,
+      ...revisionMeta({ ...(cur.meta || cur.marker || {}), id: cur.marker?.id }),
+      _hasMeta: Boolean(cur.meta),
       _marker: cur.marker || null,
       _hasMarker: Boolean(cur.marker),
     });
@@ -186,11 +238,15 @@ function parseMarkdownEntries(text, fallbackKind) {
   for (const line of lines) {
     if (line.startsWith("## ")) {
       flush();
-      cur = { title: line.slice(3).trim(), marker: null, contentLines: [] };
+      cur = { title: line.slice(3).trim(), marker: null, meta: null, contentLines: [] };
       continue;
     }
     if (cur) {
       const t = line.trim();
+      if (t.startsWith("<!-- meta:") && t.endsWith("-->")) {
+        try { cur.meta = JSON.parse(t.slice("<!-- meta:".length, -3).trim()); } catch {}
+        continue;
+      }
       if (!cur.marker && t.startsWith("<!-- mem:") && t.endsWith("-->")) {
         try {
           cur.marker = JSON.parse(t.slice("<!-- mem:".length, -3).trim());
@@ -222,6 +278,9 @@ function serializeEntries(module, entries) {
     const content = e.content || "";
     parts.push("## " + title);
     parts.push("<!-- mem:" + JSON.stringify(marker) + " -->");
+    // Escape angle brackets so historical HTML/comment text cannot close the
+    // comment. JSON parsing restores the exact original revision text.
+    parts.push("<!-- meta: " + JSON.stringify(revisionMeta(e)).replace(/</g, "\\u003c").replace(/>/g, "\\u003e") + " -->");
     parts.push(content);
     parts.push("");
   }
@@ -262,6 +321,13 @@ function createMemoryVault(opts = {}) {
         "CREATE INDEX IF NOT EXISTS idx_memories_module ON memories(project_slug, module);" +
         "CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(project_slug, module, content_hash);"
     );
+    // Existing v1 projections remain usable; duplicate-column errors are
+    // expected on subsequent opens. Other migration failures must surface.
+    for (const column of ["version INTEGER NOT NULL DEFAULT 1", "hit_count INTEGER NOT NULL DEFAULT 0",
+      "last_recalled_at TEXT", "history_json TEXT NOT NULL DEFAULT '[]'", "supersedes_id TEXT"]) {
+      try { db.exec("ALTER TABLE memories ADD COLUMN " + column); }
+      catch (e) { if (!/duplicate column name/i.test(e.message)) { db.close(); throw e; } }
+    }
     return db;
   }
   function moduleFileFor(slug, module) {
@@ -338,6 +404,8 @@ function createMemoryVault(opts = {}) {
     } catch {
       tags = [];
     }
+    let history = [];
+    try { history = JSON.parse(row.history_json || "[]"); } catch {}
     return {
       id: row.id,
       projectSlug: row.project_slug,
@@ -349,15 +417,20 @@ function createMemoryVault(opts = {}) {
       tags,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      ...revisionMeta({ id: row.id, version: row.version, hitCount: row.hit_count, lastRecalledAt: row.last_recalled_at,
+        supersedesId: row.supersedes_id, history }),
     };
   }
-  function upsertRow(db, { id, projectSlug, projectRoot, module, kind, title, content, agent, tags, createdAt, updatedAt }) {
+  function upsertRow(db, { id, projectSlug, projectRoot, module, kind, title, content, agent, tags, createdAt, updatedAt, ...extra }) {
+    const meta = revisionMeta(extra);
     const tagsJson = JSON.stringify(Array.isArray(tags) ? tags : []);
     const ch = contentHashFor(content);
     db.prepare("DELETE FROM memories_fts WHERE id = ?").run(id);
     db.prepare(
       "INSERT INTO memories(id, project_slug, project_root, module, kind, title, content, agent, tags_json, content_hash, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET project_slug=excluded.project_slug, project_root=excluded.project_root, module=excluded.module, kind=excluded.kind, title=excluded.title, content=excluded.content, agent=excluded.agent, tags_json=excluded.tags_json, content_hash=excluded.content_hash, updated_at=excluded.updated_at"
     ).run(id, projectSlug, projectRoot || null, module, kind, title, content, agent, tagsJson, ch, createdAt, updatedAt);
+    db.prepare("UPDATE memories SET version=?, hit_count=?, last_recalled_at=?, history_json=?, supersedes_id=? WHERE id=?")
+      .run(meta.version, meta.hitCount, meta.lastRecalledAt, JSON.stringify(meta.history), meta.supersedesId, id);
     db.prepare("INSERT INTO memories_fts(id, title, content, tags) VALUES (?,?,?,?)").run(id, title, content, tagsToText(tags));
   }
   function deleteRowById(db, id) {
@@ -373,6 +446,12 @@ function createMemoryVault(opts = {}) {
     const f = moduleFileFor(slug, module);
     writeTextAtomic(f, serializeEntries(module, entries));
     recordSyncState(f);
+  }
+  function rewriteModules(db, slug, modules) {
+    for (const mod of new Set(modules)) {
+      const rows = db.prepare("SELECT * FROM memories WHERE project_slug=? AND module=? ORDER BY created_at ASC, id ASC").all(slug, mod);
+      rewriteModuleFile(slug, mod, rows.map(rowToItem));
+    }
   }
   function discoverSlugs(db) {
     const set = new Set([GLOBAL_SLUG]);
@@ -437,11 +516,15 @@ function createMemoryVault(opts = {}) {
     const filtered = entries.filter((e) => !e.id || (!containsSecret(e.title) && !containsSecret(e.content)));
     for (const e of filtered) {
       const row = byId.get(e.id);
+      // Old Markdown without a meta comment must not reset an indexed v2
+      // card's revision history or recall counters.
+      if (!e._hasMeta && row) Object.assign(e, revisionMeta(rowToItem(row)));
       const meta = readMetaFor(slug);
       const projectRoot = meta && meta.projectRoot ? meta.projectRoot : null;
       const ch = contentHashFor(e.content);
       if (!row) {
         upsertRow(db, {
+          ...revisionMeta(e),
           id: e.id,
           projectSlug: slug,
           projectRoot,
@@ -454,6 +537,7 @@ function createMemoryVault(opts = {}) {
           createdAt: e.createdAt,
           updatedAt: e.updatedAt,
         });
+        triggerBackgroundEmbedding(e.id, e.title, e.content);
         upserted += 1;
       } else {
         let oldTags = [];
@@ -465,10 +549,13 @@ function createMemoryVault(opts = {}) {
           row.title === e.title &&
           row.content === e.content &&
           row.kind === e.kind &&
+          row.agent === e.agent &&
+          JSON.stringify(revisionMeta(rowToItem(row))) === JSON.stringify(revisionMeta(e)) &&
           JSON.stringify(oldTags) === JSON.stringify(e.tags) &&
           row.content_hash === ch;
         if (!same) {
           upsertRow(db, {
+            ...revisionMeta(e),
             id: e.id,
             projectSlug: slug,
             projectRoot,
@@ -481,6 +568,10 @@ function createMemoryVault(opts = {}) {
             createdAt: row.created_at,
             updatedAt: nowIso(),
           });
+          if (row.title !== e.title || row.content !== e.content) {
+            db.prepare("DELETE FROM memory_vectors WHERE id=?").run(e.id);
+            triggerBackgroundEmbedding(e.id, e.title, e.content);
+          }
           upserted += 1;
           e.updatedAt = nowIso();
           needsRewrite = true;
@@ -499,6 +590,7 @@ function createMemoryVault(opts = {}) {
       // syncs match by id. Secret entries are kept as-is (not imported) to
       // avoid silently dropping user text.
       const withIds = entries.map((e) => ({
+        ...revisionMeta(e),
         id: e.id,
         title: e.title,
         kind: e.kind,
@@ -586,30 +678,33 @@ function createMemoryVault(opts = {}) {
       return null;
     }
   }
-  function storeVector(id, modelId, vec) {
+  function putVector(db, id, vec, modelId = "local") {
+    if (!validVector(vec)) return;
+    const f32 = new Float32Array(vec);
+    db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)")
+      .run(id, modelId, f32.length, Buffer.from(f32.buffer), nowIso());
+  }
+  function storeVector(id, modelId, vec, expectedText) {
     try {
-      const f32 = vec instanceof Float32Array ? vec : new Float32Array(vec);
-      const blob = Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
+      if (!validVector(vec) || !fileExists(indexDbPath)) return;
       const db = openDb();
       try {
-        db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)").run(
-          id,
-          String(modelId || "local"),
-          f32.length,
-          blob,
-          nowIso()
-        );
+        const row = db.prepare("SELECT title, content FROM memories WHERE id=?").get(id);
+        // A slow request for an old/deleted revision must never resurrect its
+        // vector after a newer save, Markdown sync, consolidation or rollback.
+        if (!row || (expectedText != null && embeddingText(row) !== expectedText)) return;
+        putVector(db, id, vec, modelId);
       } finally {
         db.close();
       }
     } catch {}
   }
   function triggerBackgroundEmbedding(id, title, content) {
-    const combined = (String(title || "") + "\n" + String(content || "")).slice(0, 8000);
+    const combined = embeddingText({ title, content });
     setImmediate(() => {
       embedTextsAsync([combined]).then((vecs) => {
         if (!vecs || !vecs[0]) return;
-        storeVector(id, "local", vecs[0]);
+        storeVector(id, "local", vecs[0], combined);
       }).catch(() => {});
     });
   }
@@ -630,7 +725,7 @@ function createMemoryVault(opts = {}) {
           const vecs = await embedTextsAsync(texts);
           if (!vecs) return;
           for (let k = 0; k < chunk.length; k += 1) {
-            if (vecs[k]) storeVector(chunk[k].id, "local", vecs[k]);
+            if (vecs[k]) storeVector(chunk[k].id, "local", vecs[k], texts[k]);
           }
         }
       } catch {}
@@ -639,7 +734,7 @@ function createMemoryVault(opts = {}) {
   function resolveVaultSlug(projectRoot) {
     const raw = String(projectRoot);
     const normRoot = normalizeProjectRoot(raw);
-    const baseSlug = slugify(path.basename(normRoot) || normRoot);
+    const baseSlug = slugFromProjectRoot(normRoot);
     const expectedHash = scopeHashFor(normRoot);
     const hash6 = expectedHash ? expectedHash.slice(0, 6) : "000000";
     const candidateDir = path.join(projectsDir(), baseSlug);
@@ -658,101 +753,145 @@ function createMemoryVault(opts = {}) {
     if (projectRoot) return resolveVaultSlug(String(projectRoot));
     return null;
   }
+  function vectorsFor(db, items) {
+    const vectors = new Map();
+    const missing = [];
+    for (const item of items) {
+      const stored = db.prepare("SELECT * FROM memory_vectors WHERE id=? AND model_id='local'").get(item.id);
+      let vec = null;
+      if (stored && stored.vec_f32.byteLength === stored.dim * 4) {
+        const bytes = Uint8Array.from(stored.vec_f32);
+        vec = new Float32Array(bytes.buffer);
+      }
+      if (validVector(vec)) vectors.set(item.id, vec);
+      else missing.push(item);
+    }
+    if (missing.length) {
+      const result = embedTextsSync(missing.map(embeddingText));
+      for (let i = 0; i < missing.length; i++) {
+        if (result && validVector(result[i])) vectors.set(missing[i].id, result[i]);
+      }
+    }
+    return vectors;
+  }
+  function similarity(a, b, vectors) {
+    const av = vectors.get(a.id), bv = vectors.get(b.id);
+    return {
+      cosine: av && bv && av.length === bv.length ? cosine(av, bv) : null,
+      titleSim: jaccard(lexicalTokens(a.title), lexicalTokens(b.title)),
+      lexicalSim: jaccard(lexicalTokens(a.title + " " + a.content), lexicalTokens(b.title + " " + b.content)),
+    };
+  }
+  function isNearDuplicate(sim) {
+    return sim.cosine >= 0.92 || sim.lexicalSim >= 0.85;
+  }
+  function isSameTopic(sim) {
+    return (sim.cosine >= 0.84 && sim.cosine < 0.92) || (sim.titleSim >= 0.78 && sim.lexicalSim >= 0.45);
+  }
+  function archiveRevision(item, reason) {
+    return [...item.history, snapshot(item, reason)].slice(-10);
+  }
+  function touchProject(slug, timestamp) {
+    const file = path.join(projectDirFor(slug), "_meta.json");
+    const meta = readJsonFile(file, null);
+    if (meta) writeJsonFileAtomic(file, { ...meta, updatedAt: timestamp });
+  }
   function saveMemory(args = {}) {
     try {
-      const projectSlug = args.projectSlug ? String(args.projectSlug) : null;
       const projectRoot = args.projectRoot ? path.resolve(String(args.projectRoot)) : null;
-      const slug = resolveSlug(projectSlug, projectRoot);
+      const slug = resolveSlug(args.projectSlug ? String(args.projectSlug) : null, projectRoot);
       if (!slug) return { ok: false, error: "projectRoot or projectSlug required" };
-      const module = args.module ? String(args.module) : null;
-      const kind = args.kind ? String(args.kind) : null;
-      const mod = module && MODULES.includes(module) ? module : kind ? kindToModule(kind) : "constraints";
-      const knd = kind || MODULE_DEFAULT_KIND[mod];
+      const mod = MODULES.includes(args.module) ? args.module : args.kind ? kindToModule(args.kind) : "constraints";
       const title = String(args.title ?? "").trim();
       const content = String(args.content ?? "").trim();
       if (!title) return { ok: false, error: "title required" };
       if (!content) return { ok: false, error: "content required" };
       if (containsSecret(title) || containsSecret(content)) return { ok: false, error: SECRET_ERROR };
-      const agent = args.agent ? String(args.agent) : "user";
-      const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
-      const t = nowIso();
-      let savedId = null;
+      syncFromMarkdownIfChanged(slug);
+      const incoming = {
+        id: generateMemId(), projectSlug: slug, module: mod,
+        kind: args.kind ? String(args.kind) : MODULE_DEFAULT_KIND[mod], title, content,
+        agent: args.agent ? String(args.agent) : "user",
+        tags: Array.isArray(args.tags) ? args.tags.map(String) : [],
+        createdAt: nowIso(), updatedAt: nowIso(), ...revisionMeta(),
+      };
       const db = openDb();
       try {
-        // Idempotent dedup by content_hash within (slug, module) when id omitted.
-        if (!args.id) {
-          const ch = contentHashFor(content);
-          const dup = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? AND content_hash = ?").get(slug, mod, ch);
-          if (dup) {
-            const item = rowToItem(dup);
-            item.score = 0;
-            return { ok: true, item, deduplicated: true };
-          }
-        }
-        let id = args.id ? String(args.id) : null;
-        let createdAt = t;
-        let existing = null;
-        if (id) {
-          existing = db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
-          if (existing) createdAt = existing.created_at;
+        let existing = null, action = "created", reason = null;
+        let vectors = new Map();
+        const targetId = args.id || args.supersedesId;
+        if (targetId) {
+          const row = db.prepare("SELECT * FROM memories WHERE id=?").get(String(targetId));
+          if (row && row.project_slug !== slug) return { ok: false, error: "memory belongs to another project" };
+          if (!row && args.supersedesId) return { ok: false, error: "memory not found: " + targetId };
+          existing = row ? rowToItem(row) : null;
+          incoming.id = String(targetId);
+          action = args.supersedesId && !args.id ? "superseded" : "updated";
+          reason = action === "superseded" ? "superseded" : "manual-edit";
         } else {
-          id = generateMemId();
-        }
-        savedId = id;
-        // Ensure vault exists before file write.
-        const meta = ensureProjectVault(slug, { title: path.basename(projectRoot || slug), projectRoot });
-        const pr = projectRoot || (meta && meta.projectRoot ? meta.projectRoot : null);
-        const updatedAt = t;
-        upsertRow(db, { id, projectSlug: slug, projectRoot: pr, module: mod, kind: knd, title, content, agent, tags, createdAt, updatedAt });
-      } finally {
-        db.close();
-      }
-      // Rewrite module Markdown from the DB projection (atomic).
-      try {
-        const db2 = openDb();
-        try {
-          const rows = db2.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? ORDER BY created_at ASC").all(slug, mod);
-          const entries = rows.map((r) => ({
-            id: r.id,
-            title: r.title,
-            kind: r.kind,
-            agent: r.agent,
-            tags: (() => {
-              try {
-                const x = JSON.parse(r.tags_json || "[]");
-                return Array.isArray(x) ? x : [];
-              } catch {
-                return [];
-              }
-            })(),
-            createdAt: r.created_at,
-            updatedAt: r.updated_at,
-            content: r.content,
-          }));
-          rewriteModuleFile(slug, mod, entries);
-          const metaPath = path.join(projectDirFor(slug), "_meta.json");
-          const m = readJsonFile(metaPath, null);
-          if (m) {
-            m.updatedAt = t;
-            writeJsonFileAtomic(metaPath, m);
+          const dup = db.prepare("SELECT * FROM memories WHERE project_slug=? AND module=? AND content_hash=?")
+            .get(slug, mod, contentHashFor(content));
+          if (dup) return { ok: true, item: { ...rowToItem(dup), score: 0 }, deduplicated: true, action: "deduplicated" };
+          if (args.autoEvolve !== false) {
+            const candidates = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY updated_at DESC, id ASC").all(slug).map(rowToItem);
+            vectors = vectorsFor(db, [...candidates, incoming]);
+            const ranked = candidates.map((item) => ({ item, sim: similarity(incoming, item, vectors) }));
+            ranked.sort((a, b) => (b.sim.cosine ?? b.sim.lexicalSim) - (a.sim.cosine ?? a.sim.lexicalSim));
+            const match = ranked.find((c) => isNearDuplicate(c.sim)) ||
+              ranked.find((c) => c.item.module === mod && isSameTopic(c.sim));
+            if (match) {
+              existing = match.item;
+              action = isNearDuplicate(match.sim) ? "merged" : "evolved";
+              reason = action === "merged" ? "auto-merge" : "auto-evolve";
+            }
           }
-        } finally {
-          db2.close();
         }
-      } catch {}
-      triggerBackgroundEmbedding(savedId, title, content);
-      const db3 = openDb();
-      try {
-        const row = db3.prepare("SELECT * FROM memories WHERE id = ?").get(savedId);
-        const item = rowToItem(row);
-        item.score = 0;
-        return { ok: true, item, deduplicated: false };
-      } finally {
-        db3.close();
-      }
-    } catch (e) {
-      return { ok: false, error: e.message || String(e) };
-    }
+        let item = incoming;
+        let evolvedFromVersion;
+        if (existing) {
+          item = { ...existing, ...incoming, id: existing.id, createdAt: existing.createdAt,
+            ...revisionMeta(existing) };
+          if (action === "merged") {
+            item.module = existing.module;
+            item.kind = existing.kind;
+            item.title = existing.title;
+            item.tags = [...new Set([...existing.tags, ...incoming.tags])];
+            // Prefer a fuller current explanation; never concatenate an old
+            // rule into a contradictory replacement rule.
+            if (content.length <= existing.content.length) item.content = existing.content;
+          }
+          const changed = existing.title !== item.title || existing.content !== item.content;
+          if (!changed && action !== "merged" && item.module === existing.module &&
+              item.kind === existing.kind && JSON.stringify(item.tags) === JSON.stringify(existing.tags) && item.agent === existing.agent) {
+            return { ok: true, item: { ...existing, score: 0 }, deduplicated: true, action: "deduplicated" };
+          }
+          if ((changed && args.recordHistory !== false) || action === "superseded" || action === "evolved") {
+            evolvedFromVersion = existing.version;
+            item.version = existing.version + 1;
+            item.history = archiveRevision(existing, reason);
+          }
+          if (args.supersedesId) item.supersedesId = String(args.supersedesId);
+        }
+        const meta = ensureProjectVault(slug, { title: path.basename(projectRoot || slug), projectRoot });
+        const projectPath = projectRoot || meta.projectRoot || null;
+        const textChanged = !existing || embeddingText(existing) !== embeddingText(item);
+        db.exec("BEGIN");
+        try {
+          upsertRow(db, { ...item, projectRoot: projectPath });
+          if (textChanged) db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
+          db.exec("COMMIT");
+        } catch (e) { db.exec("ROLLBACK"); throw e; }
+        if (textChanged) {
+          const vec = embeddingText(item) === embeddingText(incoming) ? vectors.get(incoming.id) : null;
+          const embedded = vec || embedTextsSync([embeddingText(item)])?.[0];
+          if (validVector(embedded)) putVector(db, item.id, embedded);
+        }
+        rewriteModules(db, slug, [mod, ...(existing ? [existing.module] : [])]);
+        touchProject(slug, item.updatedAt);
+        return { ok: true, deduplicated: action === "merged", action,
+          ...(evolvedFromVersion != null ? { evolvedFromVersion } : {}), item: { ...item, score: 0 } };
+      } finally { db.close(); }
+    } catch (e) { return { ok: false, error: e.message || String(e) }; }
   }
   function deleteMemory(args = {}) {
     try {
@@ -769,6 +908,7 @@ function createMemoryVault(opts = {}) {
         try {
           const rows = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? ORDER BY created_at ASC").all(slug, mod);
           const entries = rows.map((r) => ({
+            ...revisionMeta(rowToItem(r)),
             id: r.id,
             title: r.title,
             kind: r.kind,
@@ -981,7 +1121,7 @@ function createMemoryVault(opts = {}) {
           const pat = "%" + escapeLike(term) + "%";
           try {
             const rows = db
-              .prepare("SELECT * FROM memories" + (conds.length ? " WHERE " + conds.join(" AND ") : "") + " AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR tags_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC")
+              .prepare("SELECT * FROM memories WHERE " + (conds.length ? conds.join(" AND ") + " AND " : "") + "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR tags_json LIKE ? ESCAPE '\\') ORDER BY updated_at DESC")
               .all(...params, pat, pat, pat);
             for (const r of rows) {
               if (lexMap.has(r.id)) continue;
@@ -1012,7 +1152,7 @@ function createMemoryVault(opts = {}) {
               } catch {}
               if (!row) continue;
               // Apply project/module filter for vectors as well.
-              if (slug && slug !== GLOBAL_SLUG) {
+              if (slug) {
                 const ok = args.includeGlobal ? row.project_slug === slug || row.project_slug === GLOBAL_SLUG : row.project_slug === slug;
                 if (!ok) continue;
               }
@@ -1026,6 +1166,7 @@ function createMemoryVault(opts = {}) {
                 continue;
               }
               const sim = cosine(qv, vec);
+              if (sim <= 0) continue;
               cand.push({ id: vr.id, row, sim });
             }
             cand.sort((a, b) => b.sim - a.sim);
@@ -1045,17 +1186,143 @@ function createMemoryVault(opts = {}) {
           const lexPart = u.lexRank ? 1 / (60 + u.lexRank) : 0;
           const vecPart = u.vecRank ? 1.2 / (60 + u.vecRank) : 0;
           const it = rowToItem(u.row);
-          it.score = lexPart + vecPart;
+          it.score = (lexPart + vecPart) * (1 + 0.05 * Math.min(5, Math.log2(1 + it.hitCount)));
           return it;
         });
         items.sort((a, b) => b.score - a.score);
-        return { ok: true, projectSlug: slug, items: items.slice(0, limit) };
+        const hits = items.slice(0, limit);
+        if (args.trackHits !== false && hits.length) {
+          const t = nowIso();
+          const touched = new Map();
+          const update = db.prepare("UPDATE memories SET hit_count=hit_count+1, last_recalled_at=? WHERE id=?");
+          for (const item of hits) {
+            update.run(t, item.id);
+            item.hitCount++;
+            item.lastRecalledAt = t;
+            if (!touched.has(item.projectSlug)) touched.set(item.projectSlug, new Set());
+            touched.get(item.projectSlug).add(item.module);
+          }
+          for (const [project, modules] of touched) rewriteModules(db, project, modules);
+        }
+        return { ok: true, projectSlug: slug, items: hits };
       } finally {
         db.close();
       }
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
     }
+  }
+  function consolidateMemories(args = {}) {
+    try {
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      if (!slug) return { ok: false, error: "projectRoot or projectSlug required" };
+      syncFromMarkdownIfChanged(slug);
+      const db = openDb();
+      try {
+        const items = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY created_at ASC, id ASC").all(slug).map(rowToItem);
+        const vectors = vectorsFor(db, items);
+        const overlaps = (sim) => sim.cosine >= 0.82 || sim.titleSim >= 0.75 || sim.lexicalSim >= 0.60;
+        const pairs = [];
+        for (let i = 0; i < items.length; i++) {
+          for (let j = i + 1; j < items.length; j++) {
+            const sim = similarity(items[i], items[j], vectors);
+            if (overlaps(sim)) pairs.push({ id: items[i].id, mergeId: items[j].id, ...sim });
+          }
+        }
+        if (args.dryRun) return { ok: true, dryRun: true, mergedCount: 0, pairs, candidates: pairs, items: [] };
+        const active = new Map(items.map((item) => [item.id, item]));
+        const changed = new Map();
+        const modules = new Set();
+        let mergedCount = 0;
+        db.exec("BEGIN");
+        try {
+          for (const pair of pairs) {
+            const keep = active.get(pair.id), remove = active.get(pair.mergeId);
+            if (!keep || !remove || !overlaps(similarity(keep, remove, vectors))) continue;
+            // Preserve the fuller explanation for near duplicates. For a
+            // changed rule on the same topic, the newer revision wins.
+            const sim = similarity(keep, remove, vectors);
+            const source = isNearDuplicate(sim)
+              ? (remove.content.length > keep.content.length ? remove : keep)
+              : (remove.updatedAt >= keep.updatedAt ? remove : keep);
+            const combinedHistory = [...keep.history, ...remove.history, snapshot(remove, "consolidated"), snapshot(keep, "consolidated")];
+            const prevMaxVersion = Math.max(
+              Number(keep.version) || 1,
+              Number(remove.version) || 1,
+              ...combinedHistory.map((entry) => Number(entry.version) || 0)
+            );
+            let lastHistoryVersion = 0;
+            const history = combinedHistory.slice(-10).map((entry) => {
+              lastHistoryVersion = Math.max(lastHistoryVersion + 1, Number(entry.version) || 1);
+              return { ...entry, sourceVersion: entry.sourceVersion ?? entry.version, version: lastHistoryVersion };
+            });
+            const merged = { ...keep, title: source.title, content: source.content, agent: source.agent,
+              version: Math.max(prevMaxVersion, lastHistoryVersion) + 1, updatedAt: nowIso(),
+              tags: [...new Set([...keep.tags, ...remove.tags])],
+              hitCount: keep.hitCount + remove.hitCount,
+              lastRecalledAt: [keep.lastRecalledAt, remove.lastRecalledAt].filter(Boolean).sort().pop() || null,
+              history };
+            const sourceVector = vectors.get(source.id);
+            const root = db.prepare("SELECT project_root FROM memories WHERE id=?").get(keep.id).project_root;
+            upsertRow(db, { ...merged, projectRoot: root });
+            deleteRowById(db, remove.id);
+            db.prepare("DELETE FROM memory_vectors WHERE id=?").run(keep.id);
+            vectors.delete(keep.id);
+            vectors.delete(remove.id);
+            // The active text is exactly source's text. Retain that vector
+            // for subsequent pairs in this pass (including semantic-only
+            // matches), rather than falling back mid-consolidation.
+            if (sourceVector) {
+              vectors.set(keep.id, sourceVector);
+              putVector(db, keep.id, sourceVector);
+            }
+            active.set(keep.id, merged);
+            active.delete(remove.id);
+            changed.delete(remove.id);
+            changed.set(keep.id, merged);
+            modules.add(keep.module); modules.add(remove.module);
+            mergedCount++;
+          }
+          db.exec("COMMIT");
+        } catch (e) { db.exec("ROLLBACK"); throw e; }
+        if (mergedCount) {
+          rewriteModules(db, slug, modules);
+          touchProject(slug, nowIso());
+          for (const item of changed.values()) triggerBackgroundEmbedding(item.id, item.title, item.content);
+        }
+        return { ok: true, mergedCount, items: [...changed.values()] };
+      } finally { db.close(); }
+    } catch (e) { return { ok: false, error: e.message || String(e) }; }
+  }
+  function rollbackMemory(args = {}) {
+    try {
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      if (!slug || !args.id) return { ok: false, error: "projectRoot or projectSlug and id required" };
+      syncFromMarkdownIfChanged(slug);
+      const db = openDb();
+      try {
+        const row = db.prepare("SELECT * FROM memories WHERE project_slug=? AND id=?").get(slug, String(args.id));
+        if (!row) return { ok: false, error: "memory not found: " + args.id };
+        const current = rowToItem(row);
+        const matches = args.revisionId != null
+          ? current.history.filter((entry) => entry.revisionId === args.revisionId)
+          : args.targetVersion != null
+            ? current.history.filter((entry) => entry.version === Number(args.targetVersion))
+            : current.history.slice(-1);
+        if (matches.length > 1) return { ok: false, error: "ambiguous history version; revisionId required" };
+        const target = matches[0];
+        if (!target) return { ok: false, error: "history version not found" };
+        if (containsSecret(target.title) || containsSecret(target.content)) return { ok: false, error: SECRET_ERROR };
+        const item = { ...current, title: target.title, content: target.content, agent: target.agent,
+          version: current.version + 1, updatedAt: nowIso(), history: archiveRevision(current, "rollback") };
+        upsertRow(db, { ...item, projectRoot: row.project_root });
+        db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
+        rewriteModules(db, slug, [item.module]);
+        touchProject(slug, item.updatedAt);
+        triggerBackgroundEmbedding(item.id, item.title, item.content);
+        return { ok: true, action: "rolled-back", restoredFromVersion: target.version, restoredFromRevisionId: target.revisionId, item };
+      } finally { db.close(); }
+    } catch (e) { return { ok: false, error: e.message || String(e) }; }
   }
   function tableExists(src, name) {
     try {
@@ -1321,6 +1588,7 @@ function createMemoryVault(opts = {}) {
             for (const mod of MODULES) {
               const rows = vdb.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? ORDER BY created_at ASC").all(slug, mod);
               const entries = rows.map((r) => ({
+                ...revisionMeta(rowToItem(r)),
                 id: r.id,
                 title: r.title,
                 kind: r.kind,
@@ -1385,11 +1653,14 @@ function createMemoryVault(opts = {}) {
     getOverview,
     listMemories,
     saveMemory,
+    consolidateMemories,
+    rollbackMemory,
     deleteMemory,
     pinToAgentsMd,
     migrateFromPowerContext,
     syncFromMarkdownIfChanged,
     ensureProject,
+    resolveProjectSlug: resolveVaultSlug,
     reindexVectors,
     _ensureProjectVault: ensureProjectVault,
   };
@@ -1407,6 +1678,12 @@ function listMemories(a) {
 }
 function saveMemory(a) {
   return getDefaultMemoryVault().saveMemory(a || {});
+}
+function consolidateMemories(a) {
+  return getDefaultMemoryVault().consolidateMemories(a || {});
+}
+function rollbackMemory(a) {
+  return getDefaultMemoryVault().rollbackMemory(a || {});
 }
 function deleteMemory(a) {
   return getDefaultMemoryVault().deleteMemory(a || {});
@@ -1426,6 +1703,8 @@ module.exports = {
   getOverview,
   listMemories,
   saveMemory,
+  consolidateMemories,
+  rollbackMemory,
   deleteMemory,
   pinToAgentsMd,
   migrateFromPowerContext,

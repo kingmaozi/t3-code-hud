@@ -8,6 +8,8 @@
 //   rule --kind constraint --text "..." [--description "..."]
 //   experience --cue ... --symptom ... --situation ... --action ... --outcome ... --condition ... --lesson ...
 //   write --module ... --kind ... --title ... --content ... (aliases: --text for content)
+//   write / rule / experience ... --supersedes <id>
+//   consolidate [--dry-run]
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -37,7 +39,7 @@ function parseCliArgs(argv) {
     // Boolean-style flags like --force without a value.
     const next = rest[i + 1];
     if (next === undefined || next.startsWith("--")) {
-      if (key === "force") {
+      if (key === "force" || key === "dry-run") {
         flags[key] = "true";
         continue;
       }
@@ -79,13 +81,19 @@ export async function main(options = {}) {
   const stderr = options.stderr ?? ((s) => process.stderr.write(s));
   try {
     if (!argv.length || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
-      stdout("用法：node pc-lite.mjs <ensure | recall --query \"...\" | search --query \"...\" | experience ... | rule ... | write ...>\n");
-      stdout("flags: --root <projectRoot> --vault-dir <dir> --home-dir <dir> --query ... --kind ... --text ... --module ... --title ... --content ...\n");
+      stdout("用法：node pc-lite.mjs <ensure | recall --query \"...\" | search --query \"...\" | experience ... | rule ... | write ... | consolidate [--dry-run]>\n");
+      stdout("flags: --root <projectRoot> --vault-dir <dir> --home-dir <dir> --query ... --kind ... --text ... --module ... --title ... --content ... --supersedes <id>\n");
       return 0;
     }
     const { subcommand, flags } = parseCliArgs(argv);
     const projectRoot = (flags.root || flags.project) ? path.resolve(String(flags.root || flags.project)) : process.cwd();
     const vault = options.vault || buildVault(flags);
+    if (subcommand === "consolidate") {
+      const res = vault.consolidateMemories({ projectRoot, dryRun: flags["dry-run"] === "true" });
+      if (!res.ok) throw new Error(res.error || "consolidate failed");
+      stdout(JSON.stringify(res, null, 2) + "\n");
+      return 0;
+    }
     if (subcommand === "ensure") {
       const res = vault.ensureProject({ projectRoot });
       if (!res.ok) throw new Error(res.error || "ensure failed");
@@ -118,6 +126,7 @@ export async function main(options = {}) {
         content: text,
         agent: flags.agent ? String(flags.agent) : "user",
         tags: toTags(flags.tags),
+        supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
       });
       if (!res.ok) throw new Error(res.error || "rule failed");
       stdout(`Vault rule slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);
@@ -157,6 +166,7 @@ export async function main(options = {}) {
         content: parts.join("\n\n"),
         agent: flags.agent ? String(flags.agent) : "user",
         tags: toTags(flags.tags),
+        supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
       });
       if (!res.ok) throw new Error(res.error || "experience failed");
       stdout(`Vault experience slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);
@@ -177,12 +187,13 @@ export async function main(options = {}) {
         content,
         agent: flags.agent ? String(flags.agent) : "user",
         tags: toTags(flags.tags),
+        supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
       });
       if (!res.ok) throw new Error(res.error || "write failed");
       stdout(`Vault write slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);
       return 0;
     }
-    throw new Error('用法：node pc-lite.mjs <ensure | recall --query "..." | search --query "..." | experience ... | rule ... | write ...>');
+    throw new Error('用法：node pc-lite.mjs <ensure | recall --query "..." | search --query "..." | experience ... | rule ... | write ... | consolidate [--dry-run]>');
   } catch (err) {
     stderr(`${(err && err.message) || String(err)}\n`);
     return 1;
