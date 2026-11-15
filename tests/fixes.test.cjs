@@ -551,3 +551,372 @@ describe("Review regressions: dual-UUID, multi-projection, env collision & codes
     assert.ok(plistIdx > 0 && iconIdx > plistIdx && signIdx > iconIdx);
   });
 });
+
+describe("Fix A: Antigravity contextUsage double-count dedup (278570 @ 96% -> ~142127)", () => {
+  const T0 = 1735689600000;
+  function agyPayload() {
+    return {
+      provider: "antigravity",
+      model: "gemini-test",
+      contextUsage: { usedTokens: 278570, maxTokens: 1048576 },
+      toolIntervals: [],
+      turns: [
+        {
+          status: "completed",
+          driver: "antigravity",
+          startedMs: T0,
+          completedMs: T0 + 4000,
+          usage: { inputTokens: 142128, cachedInputTokens: 136443, cacheCreationTokens: 0, outputTokens: 2000, reasoningTokens: 500, models: ["gemini-test"] },
+        },
+      ],
+    };
+  }
+  it("backend priceRemoteProjection divides by (1 + 96% cache rate)", () => {
+    const r = backend.priceRemoteProjection(agyPayload());
+    assert.equal(r.ok, true, JSON.stringify(r.error || r));
+    assert.ok(Math.abs(r.tokens.contextUsed - 142127) <= 2, `contextUsed=${r.tokens.contextUsed}`);
+    const pct = (r.tokens.contextUsed / r.tokens.contextMax) * 100;
+    assert.ok(pct >= 13.4 && pct <= 13.8, `pct=${pct}`);
+  });
+  it("renderer buildLocalProjectionFallback divides by (1 + 96% cache rate)", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const start = src.indexOf("function toEpochMs(");
+    const end = src.indexOf("// Distinct, clean Git swimlane");
+    assert.ok(start !== -1 && end !== -1 && end > start);
+    const chunk = src.slice(start, end);
+    // eslint-disable-next-line no-new-func
+    const { buildLocalProjectionFallback } = new Function(chunk + "\nreturn { buildLocalProjectionFallback };")();
+    const r = buildLocalProjectionFallback(agyPayload());
+    assert.equal(r.ok, true);
+    assert.ok(Math.abs(r.tokens.contextUsed - 142127) <= 2, `contextUsed=${r.tokens.contextUsed}`);
+  });
+});
+
+describe("Fix A: remote pure streaming decode speed (~214 tok/s, tool wait ignored)", () => {
+  const T0 = 1735689600000;
+  function decodePayload() {
+    return {
+      provider: "antigravity",
+      model: "gemini-test",
+      contextUsage: { usedTokens: 142128, maxTokens: 1048576 },
+      // 78s of file_search inside a 95s wall turn: invisible to decode speed.
+      toolIntervals: [[T0 + 1000, T0 + 79400]],
+      turns: [
+        {
+          status: "completed",
+          driver: "antigravity",
+          startedMs: T0,
+          completedMs: T0 + 95000,
+          streamDecode: { streamSec: 2, visFraction: 1 },
+          usage: { inputTokens: 142128, cachedInputTokens: 136443, cacheCreationTokens: 0, outputTokens: 429, reasoningTokens: 0, models: ["gemini-test"] },
+        },
+      ],
+    };
+  }
+  it("backend prefers streamDecode over wall clock (429 tok / 2s = 214.5 t/s)", () => {
+    const r = backend.priceRemoteProjection(decodePayload());
+    assert.equal(r.ok, true, JSON.stringify(r.error || r));
+    assert.equal(r.speed.tokPerSec, 214.5);
+    assert.equal(r.speed.lastDecodeTps, 214.5);
+    assert.equal(r.speed.byModel["gemini-test"], 214.5);
+  });
+  it("renderer fallback mirrors streamDecode pricing", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const start = src.indexOf("function toEpochMs(");
+    const end = src.indexOf("// Distinct, clean Git swimlane");
+    assert.ok(start !== -1 && end !== -1 && end > start);
+    const chunk = src.slice(start, end);
+    // eslint-disable-next-line no-new-func
+    const { buildLocalProjectionFallback } = new Function(chunk + "\nreturn { buildLocalProjectionFallback };")();
+    const r = buildLocalProjectionFallback(decodePayload());
+    assert.equal(r.speed.tokPerSec, 214.5);
+  });
+  it("fiber walk emits streamDecode + toolIntervals incl. file_search", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m1 = src.match(/function toEpochMs\(v\) \{[\s\S]*?\n  \}/);
+    const m2 = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    const m3 = src.match(/function buildProjectionPayload\(p, stEnvId, uhProps\) \{[\s\S]*?\n  \}/);
+    const m4 = src.match(/function readFiberThreadProjection\(expectedThreadId\) \{[\s\S]*?\n  \}/);
+    assert.ok(m1 && m2 && m3 && m4);
+    const T = 1735689600000;
+    const turnItems = [
+      { type: "file_search", providerTurnId: "turn-1", startedAt: T + 1000, completedAt: T + 79400, input: "query" },
+      { type: "assistant_message", providerTurnId: "turn-1", startedAt: T + 80000, completedAt: T + 81000, text: "x".repeat(650) },
+    ];
+    const proj = {
+      thread: { id: "af3a2a24-7338-407b-9e28-e9a03f91b3e3", title: "Fiber", providerInstanceId: "antigravity" },
+      providerTurns: [
+        { id: "turn-1", status: "completed", startedAt: T, completedAt: T + 95000, nativeTurnRef: { driver: "antigravity" },
+          turnTokenUsage: { inputTokens: 142128, cachedInputTokens: 136443, cacheCreationTokens: 0, outputTokens: 215, reasoningTokens: 0, models: ["gemini-test"] } },
+      ],
+      nodes: turnItems.map((it) => ({ kind: it.type, providerTurnId: it.providerTurnId, startedAt: it.startedAt, completedAt: it.completedAt })),
+      turnItems,
+    };
+    const fakeDoc = {
+      getElementById: () => ({
+        __reactContainer$1: {
+          child: { memoizedState: { memoizedState: { environmentId: "env-1", projection: proj }, next: null }, sibling: null }
+        }
+      })
+    };
+    const runner = new Function("document", `${m1[0]}; ${m2[0]}; ${m3[0]}; return (${m4[0]});`)(fakeDoc);
+    const got = runner("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3");
+    assert.equal(got.threadId, "af3a2a24-7338-407b-9e28-e9a03f91b3e3");
+    // file_search (78.4s) must be inside toolIntervals now.
+    assert.ok(got.toolIntervals.some(([s, e]) => e - s === 78400), JSON.stringify(got.toolIntervals));
+    // Final assistant_message span: 80000 -> 81000 = 1s pure decode window.
+    assert.equal(got.turns.length, 1);
+    assert.equal(got.turns[0].streamDecode.streamSec, 1);
+    assert.ok(got.turns[0].streamDecode.visFraction > 0 && got.turns[0].streamDecode.visFraction < 1);
+  });
+});
+
+describe("Fix B: subagent %3A id preservation + running Turn 1 live tokens", () => {
+  const RAW_ID = "thread:delegated-task:command%3Amcp%3Aremote%3Aworker-7";
+  const ENC_ID = "thread%3Adelegated-task%3Acommand%253Amcp%253Aremote%253Aworker-7";
+  function extractFn() {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    assert.ok(m, "extractLastThreadIdFromHint missing");
+    // eslint-disable-next-line no-new-func
+    return new Function("return (" + m[0] + ")")();
+  }
+  it("raw thread: id with literal %3A is returned undecoded", () => {
+    assert.equal(extractFn()(RAW_ID), RAW_ID);
+    assert.equal(extractFn()("/some/route/" + RAW_ID), RAW_ID);
+  });
+  it("single-encoded thread%3A id decodes once, preserving inner %3A", () => {
+    assert.equal(extractFn()(ENC_ID), RAW_ID);
+  });
+  it("readFiberThreadProjection matches raw-pid against encoded hint and vice versa", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m1 = src.match(/function toEpochMs\(v\) \{[\s\S]*?\n  \}/);
+    const m2 = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    const m3 = src.match(/function buildProjectionPayload\(p, stEnvId, uhProps\) \{[\s\S]*?\n  \}/);
+    const m4 = src.match(/function readFiberThreadProjection\(expectedThreadId\) \{[\s\S]*?\n  \}/);
+    assert.ok(m1 && m2 && m3 && m4);
+    const makeDoc = (pid) => ({
+      getElementById: () => ({
+        __reactContainer$1: {
+          child: { memoizedState: { memoizedState: { environmentId: "env-1",
+            projection: { thread: { id: pid, title: "Sub", providerInstanceId: "codex" },
+              providerTurns: [{ turnTokenUsage: { inputTokens: 10, outputTokens: 5 } }] } }, next: null }, sibling: null }
+        }
+      })
+    });
+    // pid raw, hint encoded.
+    let runner = new Function("document", `${m1[0]}; ${m2[0]}; ${m3[0]}; return (${m4[0]});`)(makeDoc(RAW_ID));
+    let got = runner(ENC_ID);
+    assert.equal(got.threadId, RAW_ID, `raw-pid vs enc-hint: ${JSON.stringify(got)}`);
+    // pid encoded, hint raw.
+    runner = new Function("document", `${m1[0]}; ${m2[0]}; ${m3[0]}; return (${m4[0]});`)(makeDoc(ENC_ID));
+    got = runner(RAW_ID);
+    assert.equal(got.threadId, ENC_ID, `enc-pid vs raw-hint: ${JSON.stringify(got)}`);
+  });
+  it("running Turn 1 (pricedTurns 0) surfaces live contextUsed as tokens + cost", () => {
+    const r = backend.priceRemoteProjection({
+      environmentId: "env-1",
+      threadId: "thread:delegated-task:command%3Amcp%3Aremote%3Aworker-7",
+      provider: "codex",
+      model: "gpt-6.1-sol",
+      isRunning: true,
+      isServerThread: true,
+      contextUsage: { usedTokens: 50000, maxTokens: 200000 },
+      toolIntervals: [],
+      turns: [{ status: "running", driver: "codex", startedMs: 1735689600000, completedMs: null, usage: null }],
+    });
+    assert.equal(r.ok, true, JSON.stringify(r.error || r));
+    assert.equal(r.tokens.total, 50000);
+    assert.equal(r.tokens.input, 50000);
+    assert.equal(r.cost.estimated, true);
+    assert.ok(r.cost.sessionUsd > 0, "live cost must be positive");
+    assert.equal(r.cost.withSubagentsUsd, r.cost.sessionUsd);
+  });
+  it("renderer fallback mirrors live Turn 1 tokens + estimated cost", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const start = src.indexOf("function toEpochMs(");
+    const end = src.indexOf("// Distinct, clean Git swimlane");
+    assert.ok(start !== -1 && end !== -1 && end > start);
+    const chunk = src.slice(start, end);
+    // eslint-disable-next-line no-new-func
+    const { buildLocalProjectionFallback } = new Function(chunk + "\nreturn { buildLocalProjectionFallback };")();
+    const r = buildLocalProjectionFallback({
+      provider: "codex",
+      model: "gpt-6.1-sol",
+      isRunning: true,
+      contextUsage: { usedTokens: 50000, maxTokens: 200000 },
+      toolIntervals: [],
+      turns: [],
+    });
+    assert.equal(r.tokens.total, 50000);
+    assert.equal(r.cost.estimated, true);
+    assert.ok(r.cost.sessionUsd > 0);
+  });
+});
+
+describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)", () => {
+  const SHA1 = "a".repeat(40);
+  const SHA2 = "b".repeat(40);
+  const ZERO = "0".repeat(40);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const headLog = [
+    `${ZERO} ${SHA1} Jane Doe <jane@example.com> ${nowSec - 7200} +0000\tcommit (initial): Add feature`,
+    `${SHA1} ${SHA2} Jane Doe <jane@example.com> ${nowSec - 3600} +0000\tcommit: Second commit`,
+    `${SHA2} ${SHA2} Jane Doe <jane@example.com> ${nowSec - 1800} +0000\tcheckout: moving from main to main`,
+  ].join("\n") + "\n";
+
+  it("pure local remote repo: reflog -> commits (newest first, parents, badges)", async () => {
+    const g = await backend.getRemoteGitGraph({
+      environmentId: "env-1",
+      cwd: "/remote/myrepo",
+      branch: null,
+      gitConfig: "[core]\n\trepositoryformatversion = 0\n",
+      gitHead: "ref: refs/heads/main\n",
+      packedRefs: `${SHA2} refs/heads/main\n`,
+      headLog,
+      vcsRefs: [{ sha: SHA1, ref: "refs/heads/feature-x" }],
+      vcsStatus: { total: 2 },
+      branchCommits: null,
+    });
+    assert.equal(g.ok, true, JSON.stringify(g));
+    assert.equal(g.isRemoteGit, true);
+    assert.equal(g.remoteSource, "t3-connect");
+    assert.equal(g.githubRepo, null);
+    assert.equal(g.branch, "main");
+    assert.equal(g.repoName, "myrepo");
+    assert.equal(g.commits.length, 2);
+    assert.equal(g.commits[0].hash, SHA2);
+    assert.equal(g.commits[0].subject, "Second commit");
+    assert.deepEqual(g.commits[0].parents, [SHA1]);
+    assert.deepEqual(g.commits[1].parents, []);
+    assert.equal(g.commits[1].subject, "Add feature");
+    assert.match(g.commits[0].relTime, /hour/);
+    assert.ok(g.commits[0].refs.some((r) => r.isHead), JSON.stringify(g.commits[0].refs));
+    assert.ok(g.commits[0].refs.some((r) => r.label === "main"));
+    assert.ok(g.commits[1].refs.some((r) => r.label === "feature-x"), JSON.stringify(g.commits[1].refs));
+    assert.equal(g.workingTree.total, 2);
+    assert.equal(g.dirtyCount, 2);
+  });
+
+  it("github remote URL is extracted; unreachable API falls back to local history", async () => {
+    const g = await backend.getRemoteGitGraph({
+      environmentId: "env-1",
+      cwd: "/remote/myrepo",
+      gitConfig: '[remote "origin"]\n\turl = git@github.com:octocat-t3hud-nonexistent-xyz123/nope.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n',
+      gitHead: "ref: refs/heads/main\n",
+      packedRefs: "",
+      headLog,
+      vcsRefs: null,
+      vcsStatus: null,
+      branchCommits: null,
+    });
+    assert.equal(g.ok, true, JSON.stringify(g));
+    assert.equal(g.isRemoteGit, true);
+    assert.equal(g.githubRepo, "octocat-t3hud-nonexistent-xyz123/nope");
+    assert.ok(g.commits.length >= 2, JSON.stringify(g.commits));
+  });
+
+  it("getRemoteCommitDetail returns metadata summary for unpushed local commits", async () => {
+    const d = await backend.getRemoteCommitDetail({
+      githubRepo: null,
+      hash: SHA2,
+      cwd: "/remote/myrepo",
+      environmentId: "env-1",
+      commitMeta: { author: "Jane Doe", subject: "Second commit", relTime: "1 hour ago" },
+    });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.hash, SHA2);
+    assert.equal(d.authorName, "Jane Doe");
+    assert.equal(d.message, "Second commit");
+    assert.deepEqual(d.files, []);
+    assert.equal(d.patch, "");
+    assert.equal((await backend.getRemoteCommitDetail({ hash: "not-a-sha" })).ok, false);
+  });
+
+  it("preload tracks WebSockets and exposes __t3HudRemoteRpc; main-hook + renderer wired", () => {
+    const pl = fs.readFileSync(path.join(REPO, "src", "preload-bridge.cjs"), "utf8");
+    assert.match(pl, /webFrame/);
+    assert.match(pl, /executeJavaScript/);
+    assert.match(pl, /__t3HudRemoteRpc/);
+    assert.match(pl, /T3HudTrackedWebSocket/);
+    assert.match(pl, /socketByEnv/);
+    assert.match(pl, /server\.getConfig/);
+    assert.match(pl, /getRemoteGitGraph: \(bundle\) => ipcRenderer\.invoke\("t3hud:get-remote-git-graph", bundle\)/);
+    assert.match(pl, /getRemoteCommitDetail: \(req\) => ipcRenderer\.invoke\("t3hud:get-remote-commit-detail", req\)/);
+    const mh = fs.readFileSync(path.join(REPO, "src", "main-hook.cjs"), "utf8");
+    assert.match(mh, /t3hud:get-remote-git-graph/);
+    assert.match(mh, /t3hud:get-remote-commit-detail/);
+    assert.match(mh, /getRemoteGitGraph/);
+    assert.match(mh, /getRemoteCommitDetail/);
+    const ui = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    assert.match(ui, /function fetchRemoteGitBundle\(/);
+    assert.match(ui, /projects\.readFile/);
+    assert.match(ui, /__t3HudRemoteRpc/);
+    assert.match(ui, /isRemoteGit/);
+    assert.match(ui, /callBackend\("getRemoteGitGraph", bundle\)/);
+    assert.match(ui, /callBackend\("getRemoteCommitDetail", \{/);
+  });
+});
+
+describe("PR Review Round 2 regressions", () => {
+  it("getRemoteCommitDetail flags diffUnavailable: true on unpushed local commits", async () => {
+    const d = await backend.getRemoteCommitDetail({
+      githubRepo: null,
+      hash: "abcdef1234567",
+      commitMeta: { author: "Alice", subject: "wip local", relTime: "1m ago" }
+    });
+    assert.equal(d.ok, true);
+    assert.equal(d.diffUnavailable, true);
+    assert.equal(d.message, "wip local");
+  });
+
+  it("Antigravity live running turn preserves legitimate growing contextUsed (>1.6x previous turn)", () => {
+    const r = backend.priceRemoteProjection({
+      threadId: "t-grow",
+      provider: "antigravity",
+      model: "gemini-4-hydrogen",
+      isRunning: true,
+      contextUsage: { usedTokens: 98000, maxTokens: 1048576 },
+      toolIntervals: [],
+      turns: [
+        { driver: "antigravity", status: "completed", startedMs: 1000, completedMs: 3000, usage: { inputTokens: 39200, cachedInputTokens: 19200, cacheCreationTokens: 0, outputTokens: 200, reasoningTokens: 0, models: ["gemini-4-hydrogen"] } }
+      ]
+    });
+    // Turn 1 true input = 20000, cacheRate = 19200/20000 = 0.96; Turn 2 running raw 98000 / 1.96 = 50000 (> 20200 * 1.6, NOT clamped!)
+    assert.equal(r.tokens.contextUsed, 50000);
+  });
+
+  it("renderer source guards stale gitGraphReqSeq, running zero-turn threads, and untagged turnItems", () => {
+    const s = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    assert.match(s, /let gitGraphReqSeq = 0;/);
+    assert.match(s, /reqSeq !== gitGraphReqSeq/);
+    assert.match(s, /!proj\.isRunning && !\(proj\.contextUsage\?\.usedTokens > 0\)/);
+    assert.match(s, /if \(itTurnId == null \|\| String\(itTurnId\) !== turnId\) continue;/);
+    assert.match(s, /res\.diffUnavailable/);
+  });
+});
+
+describe("PR Review Round 3 regression: turnItems with threadId", () => {
+  it("buildProjectionPayload handles turnItems carrying threadId without ReferenceError and filters cross-thread items", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m1 = src.match(/function toEpochMs\(v\) \{[\s\S]*?\n  \}/);
+    const m2 = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    const m3 = src.match(/function buildProjectionPayload\(p, stEnvId, uhProps\) \{[\s\S]*?\n  \}/);
+    const m4 = src.match(/function readFiberThreadProjection\(expectedThreadId\) \{[\s\S]*?\n  \}/);
+    assert.ok(m1 && m2 && m3 && m4);
+    const proj = {
+      thread: { id: "thread:delegated-task:command%3Amcp%3Aabc", title: "Sub", providerInstanceId: "antigravity" },
+      turnItems: [
+        { threadId: "other-thread", providerTurnId: "turn-1", type: "assistant_message", startedAt: 1000, completedAt: 9000, text: "wrong thread" },
+        { threadId: "thread:delegated-task:command%3Amcp%3Aabc", providerTurnId: "turn-1", type: "assistant_message", startedAt: 2000, completedAt: 4000, text: "right thread streaming output text here" }
+      ],
+      providerTurns: [{ id: "turn-1", status: "completed", startedAt: 1000, completedAt: 5000, turnTokenUsage: { inputTokens: 1000, outputTokens: 200, reasoningTokens: 0 } }]
+    };
+    const fakeDoc = { getElementById: () => ({ __reactContainer$1: { memoizedState: { memoizedState: { environmentId: "env-r", projection: proj }, next: null } } }) };
+    const runner = new Function("document", `${m1[0]}; ${m2[0]}; ${m3[0]}; return (${m4[0]});`)(fakeDoc);
+    const got = runner("/env-r/thread%3Adelegated-task%3Acommand%253Amcp%253Aabc");
+    assert.ok(got && got.turns.length === 1);
+    assert.equal(got.turns[0].streamDecode.streamSec, 2);
+    assert.equal(got.turns[0].streamDecode.visFraction, 1);
+  });
+});

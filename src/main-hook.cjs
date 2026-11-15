@@ -377,6 +377,14 @@ function registerIpcAndPreload() {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.getCommitDetail(threadHint, commitHash, fallbackCwd);
     });
+    ipcMain.handle("t3hud:get-remote-git-graph", (evt, bundle) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getRemoteGitGraph(bundle);
+    });
+    ipcMain.handle("t3hud:get-remote-commit-detail", (evt, req) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getRemoteCommitDetail(req);
+    });
     ipcMain.handle("t3hud:get-config", (evt) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.getConfig();
