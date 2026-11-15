@@ -2,7 +2,7 @@
 // windows whose preload was created by an older HUD version.
 (function installT3HudWsRpc() {
   "use strict";
-  if (window.__t3HudWsRpcState?.version === 3) return;
+  if (window.__t3HudWsRpcState?.version === 4) return;
   let NativeWS = window.WebSocket;
   while (typeof NativeWS === "function" && Object.prototype.hasOwnProperty.call(NativeWS, "__t3HudTracked")) {
     NativeWS = NativeWS.__t3HudOriginal || Object.getPrototypeOf(NativeWS);
@@ -76,11 +76,14 @@
         pending.delete(id); clearTimeout(entry.timer); entry.resolve({ ok: false, error: "socket closed" });
       }
     }, { once: true });
+    let incoming = Promise.resolve();
     socket.addEventListener("message", event => {
       const data = event?.data;
-      if (typeof data === "string") receive(socket, data);
-      else if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) receive(socket, new TextDecoder().decode(data));
-      else if (typeof data?.arrayBuffer === "function") data.arrayBuffer().then(buf => receive(socket, new TextDecoder().decode(buf))).catch(() => {});
+      incoming = incoming.then(async () => {
+        if (typeof data === "string") receive(socket, data);
+        else if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) receive(socket, new TextDecoder().decode(data));
+        else if (typeof data?.arrayBuffer === "function") receive(socket, new TextDecoder().decode(await data.arrayBuffer()));
+      }).catch(() => {});
     });
     notify();
   }
@@ -124,8 +127,8 @@
   };
   window.__t3HudWsRpcInstalled = true;
   window.__t3HudWsRpcState = {
-    version: 3,
-    snapshot: () => ({ version: 3, openSockets: [...sockets].filter(value => value.readyState === 1).length, environments: [...byEnvironment.keys()] }),
+    version: 4,
+    snapshot: () => ({ version: 4, openSockets: [...sockets].filter(value => value.readyState === 1).length, environments: [...byEnvironment.keys()] }),
   };
 })();
 
@@ -3089,14 +3092,6 @@
     const countSuffix = res.diffUnavailable ? "" : ` · ${(res.files || []).length} ${t("filesCount")}`;
     const emailPart = res.authorEmail ? ` <${res.authorEmail}>` : "";
     commitMetaEl.textContent = `${res.authorName || ""}${emailPart} · ${res.hash.slice(0, 10)}${countSuffix}`;
-
-    if (res.diffUnavailable) {
-      const note = currentLang === "en"
-        ? "File patch unavailable over read-only remote channel — commit metadata shown (full diff loads automatically when available on GitHub)."
-        : "远端只读通道暂无法读取该提交的文件变更补丁 — 已展示提交元信息（若仓库已关联并同步至 GitHub 可自动加载完整 Diff）。";
-      commitBodyEl.innerHTML = `<div class="t3-git-empty" style="padding:18px 12px">${escapeHtml(note)}</div>`;
-      return;
-    }
 
     const filesHtml = (res.files || [])
       .map(

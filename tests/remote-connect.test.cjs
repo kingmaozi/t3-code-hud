@@ -50,7 +50,7 @@ test("uses the native contents field and includes the initial unpublished commit
   assert.ok(calls.some(c => c.input.commitSha === root));
 });
 
-test("hot reload adopts a legacy socket and reassembles native split response frames", async () => {
+for (const blobMode of [false, true]) test(`hot reload adopts a legacy socket and reassembles split ${blobMode ? "Blob" : "text"} frames`, async () => {
   const listeners = new Map();
   const env = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   class NativeSocket {
@@ -64,8 +64,10 @@ test("hot reload adopts a legacy socket and reassembles native split response fr
       const value = req.tag === "server.getConfig" ? { environment: { environmentId: env } } : "remote-result";
       queueMicrotask(() => {
         const wire = JSON.stringify({ _tag: "Exit", requestId: req.id, exit: { _tag: "Success", value } });
-        for (const part of ["\u001e" + wire.slice(0, 25), "\u001e" + wire.slice(25, 50), wire.slice(50)]) {
-          for (const fn of listeners.get(this).message || []) fn({ data: part });
+        const parts = ["\u001e" + wire.slice(0, 25), "\u001e" + wire.slice(25, 50), wire.slice(50)];
+        for (const [index, part] of parts.entries()) {
+          const data = blobMode && index < 2 ? { arrayBuffer: () => new Promise(resolve => setTimeout(() => resolve(new TextEncoder().encode(part).buffer), index === 0 ? 20 : 0)) } : part;
+          for (const fn of listeners.get(this).message || []) fn({ data });
         }
       });
       return "native-result";
@@ -89,4 +91,18 @@ test("hot reload adopts a legacy socket and reassembles native split response fr
   const listenerCount = listeners.get(existing).message.length;
   vm.runInNewContext(ui, context);
   assert.equal(listeners.get(existing).message.length, listenerCount);
+});
+
+test("incomplete remote diffs render their notice and retain the available files and patch", () => {
+  const start = ui.indexOf("  function renderCommitDetail(res)");
+  const end = ui.indexOf("\n  gitListEl.addEventListener", start);
+  for (const hudLang of ["zh", "en"]) {
+    const ctx = { hudLang, commitMsgEl: {}, commitMetaEl: {}, commitBodyEl: {}, t: key => key, escapeHtml: text => text, formatColoredPatch: text => text };
+    vm.createContext(ctx);
+    vm.runInContext(ui.slice(start, end) + "\nthis.renderDetail = renderCommitDetail;", ctx);
+    assert.doesNotThrow(() => ctx.renderDetail({ hash: tip, message: "second", files: [{ path: "visible.txt", added: 1, deleted: 0 }], patch: "+available patch", diffUnavailable: true }));
+    assert.ok(ctx.commitBodyEl.innerHTML.includes("visible.txt"));
+    assert.ok(ctx.commitBodyEl.innerHTML.includes("+available patch"));
+    assert.match(ctx.commitBodyEl.innerHTML, hudLang === "en" ? /incomplete/ : /不完整/);
+  }
 });
