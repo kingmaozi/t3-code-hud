@@ -20,6 +20,15 @@ const path = require("node:path");
 const electron = require("electron");
 const BACKEND_PATH = path.join(__dirname, "backend.cjs");
 let backend = require(BACKEND_PATH);
+function reloadBackend() {
+  try {
+    delete require.cache[require.resolve(BACKEND_PATH)];
+    backend = require(BACKEND_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const PRELOAD_BRIDGE_PATH = path.join(__dirname, "preload-bridge.cjs");
 const RENDERER_UI_PATH = path.join(__dirname, "renderer-ui.js");
@@ -274,10 +283,7 @@ function startLoopbackFallbackServer() {
                 res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
                 return;
               }
-              try {
-                delete require.cache[require.resolve(BACKEND_PATH)];
-                backend = require(BACKEND_PATH);
-              } catch {}
+              reloadBackend();
               const results = [];
               for (const w of getMainWindows()) {
                 results.push({ id: w.id, injected: await injectHudIntoWindow(w, true) });
@@ -297,10 +303,12 @@ function startLoopbackFallbackServer() {
               let out;
               if (method === "getThreadStats") {
                 out = backend.getThreadStats(args[0]);
+              } else if (method === "priceRemoteProjection") {
+                out = backend.priceRemoteProjection(args[0]);
               } else if (method === "getGitGraph") {
-                out = await backend.getGitGraph(args[0], args[1]);
+                out = await backend.getGitGraph(args[0], args[1], args[2]);
               } else if (method === "getCommitDetail") {
-                out = await backend.getCommitDetail(args[0], args[1]);
+                out = await backend.getCommitDetail(args[0], args[1], args[2]);
               } else if (method === "getConfig") {
                 out = backend.getConfig();
               } else if (method === "setConfig") {
@@ -357,13 +365,17 @@ function registerIpcAndPreload() {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.getThreadStats(threadHint);
     });
-    ipcMain.handle("t3hud:get-git-graph", (evt, threadHint, maxCommits) => {
+    ipcMain.handle("t3hud:price-remote-projection", (evt, payload) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
-      return backend.getGitGraph(threadHint, maxCommits);
+      return backend.priceRemoteProjection(payload);
     });
-    ipcMain.handle("t3hud:get-commit-detail", (evt, threadHint, commitHash) => {
+    ipcMain.handle("t3hud:get-git-graph", (evt, threadHint, maxCommits, fallbackCwd) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
-      return backend.getCommitDetail(threadHint, commitHash);
+      return backend.getGitGraph(threadHint, maxCommits, fallbackCwd);
+    });
+    ipcMain.handle("t3hud:get-commit-detail", (evt, threadHint, commitHash, fallbackCwd) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.getCommitDetail(threadHint, commitHash, fallbackCwd);
     });
     ipcMain.handle("t3hud:get-config", (evt) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };

@@ -9,13 +9,415 @@
   if (!document.getElementById("root")) return;
   window.__t3HudInitialized = true;
 
-  // --- Route hint (hash routing + pathname fallback) ---
+  // --- Route hint (hash routing + TanStack in-memory + pathname fallback) ---
+  let cachedRouter = null;
+  let unsubscribeRouter = null;
+
+  function getRouterPathname(router) {
+    try {
+      const p = router?.state?.location?.pathname;
+      if (typeof p === "string" && p) return p;
+    } catch {}
+    return null;
+  }
+
+  function findTanStackRouter() {
+    try {
+      if (window.__TSR_ROUTER__) {
+        cachedRouter = window.__TSR_ROUTER__;
+        return cachedRouter;
+      }
+    } catch {}
+    if (cachedRouter) return cachedRouter;
+    try {
+      const rootEl = document.getElementById("root");
+      if (!rootEl) return null;
+      const fk = Object.keys(rootEl).find(
+        (k) => k.startsWith("__reactContainer") || k.startsWith("__reactFiber")
+      );
+      if (!fk) return null;
+      const stack = [rootEl[fk]];
+      const seen = new Set();
+      let visited = 0;
+      while (stack.length && visited < 400) {
+        const f = stack.pop();
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
+        visited++;
+        const p = f.memoizedProps;
+        if (p && p.router && typeof p.router === "object") {
+          cachedRouter = p.router;
+          return cachedRouter;
+        }
+        if (f.child) stack.push(f.child);
+        if (f.sibling) stack.push(f.sibling);
+      }
+    } catch {}
+    return cachedRouter;
+  }
+
+  function ensureRouterSubscription() {
+    if (unsubscribeRouter) return;
+    try {
+      const r = findTanStackRouter();
+      if (!r || typeof r.subscribe !== "function") return;
+      let unsub = null;
+      try {
+        unsub = r.subscribe("onResolved", onRouteMaybeChanged);
+      } catch {
+        try {
+          unsub = r.subscribe(onRouteMaybeChanged);
+        } catch {}
+      }
+      if (typeof unsub === "function") unsubscribeRouter = unsub;
+      else if (unsub && typeof unsub.unsubscribe === "function") {
+        unsubscribeRouter = () => unsub.unsubscribe();
+      }
+    } catch {}
+  }
+
   function getRouteHint() {
     const hash = window.location.hash || "";
     if (hash.startsWith("#/") || hash.length > 1) {
       return hash.slice(1);
     }
+    try {
+      const rp = getRouterPathname(findTanStackRouter());
+      if (rp && rp !== "/") return rp;
+    } catch {}
     return window.location.pathname || "/";
+  }
+
+  function toEpochMs(v) {
+    if (!v) return null;
+    if (typeof v === "number") return v;
+    if (typeof v === "object" && typeof v.epochMilliseconds === "number") return v.epochMilliseconds;
+    if (typeof v === "string") {
+      const m = v.match(/\(([^)]+)\)/);
+      const t = Date.parse(m ? m[1] : v);
+      return Number.isFinite(t) ? t : null;
+    }
+    return null;
+  }
+
+  function extractLastThreadIdFromHint(rawHint) {
+    if (typeof rawHint !== "string" || !rawHint) return null;
+    const parts = rawHint.split(/[/?#]/).filter(Boolean);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      let seg = parts[i];
+      try { seg = decodeURIComponent(seg); } catch {}
+      if (seg.startsWith("thread:")) return seg;
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return seg;
+    }
+    return null;
+  }
+
+  function buildProjectionPayload(p, stEnvId, uhProps) {
+    const ctxList = Array.isArray(p.providerThreads) ? p.providerThreads : [];
+    const activeDriver = String(p.thread?.providerInstanceId || "");
+    let lastUsage = null;
+    let driverUsage = null;
+    for (const pt of ctxList) {
+      if (!pt || !pt.contextUsage) continue;
+      lastUsage = pt.contextUsage;
+      const drv = String(pt.driver || pt.providerThreadRef?.driver || pt.provider || "");
+      if (activeDriver && drv === activeDriver) driverUsage = pt.contextUsage;
+    }
+    const contextUsage = driverUsage ?? lastUsage;
+    const toolIntervals = [];
+    for (const n of p.nodes || []) {
+      if (!n) continue;
+      if (n.kind === "tool_call" || n.kind === "subagent" || n.kind === "command_execution") {
+        const s = toEpochMs(n.startedAt);
+        const e = toEpochMs(n.completedAt);
+        if (s != null && e != null && e > s) toolIntervals.push([s, e]);
+      }
+    }
+    const turns = (p.providerTurns || []).map((pt) => ({
+      status: pt?.status || null,
+      driver: pt?.nativeTurnRef?.driver || null,
+      startedMs: toEpochMs(pt?.startedAt),
+      completedMs: toEpochMs(pt?.completedAt),
+      usage: pt?.turnTokenUsage || null,
+    }));
+    const tid = String(p.thread?.id || "");
+    const uhMatches = uhProps && (!tid || !uhProps.threadId || String(uhProps.threadId) === tid);
+    return {
+      environmentId: String(stEnvId || (uhMatches ? uhProps.environmentId : "") || ""),
+      threadId: tid || (uhMatches ? String(uhProps.threadId || "") : ""),
+      title: String(p.thread?.title || ""),
+      provider: activeDriver,
+      model: String(p.thread?.modelSelection?.model || ""),
+      branch: p.thread?.branch || null,
+      repoPath: (uhMatches && uhProps.gitCwd) || p.thread?.worktreePath || null,
+      isServerThread: uhMatches ? Boolean(uhProps.isServerThread) : true,
+      isRunning:
+        (p.runs || []).some((run) => run && (run.status === "running" || run.status === "starting")) ||
+        (p.providerSessions || []).some((s) => s && s.status === "running"),
+      subagentCount: Array.isArray(p.subagents) ? p.subagents.length : 0,
+      contextUsage,
+      toolIntervals,
+      turns,
+      gitCwd: (uhMatches && uhProps.gitCwd) || p.thread?.worktreePath || null,
+    };
+  }
+
+  function readFiberThreadProjection(expectedThreadId) {
+    const expected = extractLastThreadIdFromHint(expectedThreadId);
+    let uhProps = null;
+    let matchedSt = null;
+    let fallbackSt = null;
+    try {
+      const rootEl = document.getElementById("root");
+      if (!rootEl) return null;
+      const fk = Object.keys(rootEl).find(
+        (k) => k.startsWith("__reactContainer") || k.startsWith("__reactFiber")
+      );
+      if (!fk) return null;
+      const stack = [rootEl[fk]];
+      const seen = new Set();
+      let visited = 0;
+      while (stack.length && visited < 20000) {
+        const f = stack.pop();
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
+        visited++;
+        try {
+          const mp = f.memoizedProps;
+          if (mp && typeof mp === "object" && "gitCwd" in mp && "isServerThread" in mp) {
+            const candTid = String(mp.threadId || "");
+            if (!uhProps || (expected && candTid === expected)) {
+              uhProps = {
+                environmentId: mp.environmentId,
+                threadId: mp.threadId,
+                isServerThread: Boolean(mp.isServerThread),
+                gitCwd: mp.gitCwd || null,
+                isGitRepo: Boolean(mp.isGitRepo),
+                activeProjectName: mp.activeProjectName || null,
+              };
+            }
+          }
+        } catch {}
+        try {
+          let h = f.memoizedState;
+          let d = 0;
+          while (h && d < 10) {
+            const st = h.memoizedState;
+            if (st && typeof st === "object" && st.projection && Array.isArray(st.projection.providerTurns)) {
+              const pid = String(st.projection.thread?.id || "");
+              if (!fallbackSt) fallbackSt = st;
+              if (expected && pid === expected && !matchedSt) {
+                matchedSt = st;
+              }
+            }
+            h = h.next;
+            d++;
+          }
+        } catch {}
+        if (matchedSt && uhProps && (!expected || String(uhProps.threadId || "") === expected)) break;
+        if (f.child) stack.push(f.child);
+        if (f.sibling) stack.push(f.sibling);
+      }
+    } catch {}
+
+    if (matchedSt) {
+      return buildProjectionPayload(matchedSt.projection, matchedSt.environmentId, uhProps);
+    }
+    if (!expected && fallbackSt) {
+      return buildProjectionPayload(fallbackSt.projection, fallbackSt.environmentId, uhProps);
+    }
+    if (uhProps && (!expected || String(uhProps.threadId || "") === expected)) {
+      return {
+        environmentId: String(uhProps.environmentId || ""),
+        threadId: String(uhProps.threadId || ""),
+        title: "",
+        provider: "",
+        model: "",
+        branch: null,
+        repoPath: uhProps.gitCwd || null,
+        isServerThread: Boolean(uhProps.isServerThread),
+        isRunning: false,
+        subagentCount: 0,
+        contextUsage: null,
+        toolIntervals: [],
+        turns: [],
+        gitCwd: uhProps.gitCwd || null,
+      };
+    }
+    return null;
+  }
+
+  function fallbackModelRate(model) {
+    const m = String(model || "").trim().toLowerCase();
+    if (m.includes("muse-ember")) return { input: 0.1 / 1e6, output: 0.5 / 1e6, cacheRead: 0.004 / 1e6, cacheWrite: 0.1 / 1e6 };
+    if (m.includes("muse-wonder")) return { input: 4.0 / 1e6, output: 20.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 4.0 / 1e6 };
+    if (m.includes("opus")) return { input: 5.0 / 1e6, output: 25.0 / 1e6, cacheRead: 0.5 / 1e6, cacheWrite: 6.25 / 1e6 };
+    if (m.includes("sonnet")) return { input: 3.0 / 1e6, output: 15.0 / 1e6, cacheRead: 0.3 / 1e6, cacheWrite: 3.75 / 1e6 };
+    if (m.includes("gpt-6.1-terra")) return { input: 1.0 / 1e6, output: 5.0 / 1e6, cacheRead: 0.05 / 1e6, cacheWrite: 1.0 / 1e6 };
+    if (m.includes("gpt-6") || m.includes("carbon") || m.includes("argon")) return { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.1 / 1e6, cacheWrite: 2.0 / 1e6 };
+    if (m.includes("hydrogen")) return { input: 1.5 / 1e6, output: 7.5 / 1e6, cacheRead: 0.075 / 1e6, cacheWrite: 1.5 / 1e6 };
+    return { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 2.0 / 1e6 };
+  }
+
+  function buildLocalProjectionFallback(remotePayload) {
+    const payload = remotePayload && typeof remotePayload === "object" ? remotePayload : null;
+    if (!payload) return { ok: false, error: "Invalid remote payload" };
+    const turns = Array.isArray(payload.turns) ? payload.turns : [];
+    const intervals = (Array.isArray(payload.toolIntervals) ? payload.toolIntervals : [])
+      .filter((iv) => Array.isArray(iv) && Number.isFinite(iv[0]) && Number.isFinite(iv[1]) && iv[1] > iv[0])
+      .map(([s, e]) => [s, e])
+      .sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const [s, e] of intervals) {
+      const last = merged[merged.length - 1];
+      if (last && s <= last[1]) {
+        if (e > last[1]) last[1] = e;
+      } else {
+        merged.push([s, e]);
+      }
+    }
+    const subtractWait = (startMs, endMs) => {
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+      let waitMs = 0;
+      for (const [s, e] of merged) {
+        const os = Math.max(startMs, s);
+        const oe = Math.min(endMs, e);
+        if (oe > os) waitMs += oe - os;
+      }
+      return Math.max(0, endMs - startMs - waitMs) / 1000;
+    };
+    let sumUncached = 0;
+    let sumCached = 0;
+    let sumCacheWrite = 0;
+    let sumOutput = 0;
+    let sumReasoning = 0;
+    let sumUsd = 0;
+    let sumSavedUsd = 0;
+    let pricedTurns = 0;
+    let netOutSum = 0;
+    let netSecSum = 0;
+    let wallOutSum = 0;
+    let wallSecSum = 0;
+    let lastTurnTps = null;
+    let lastTurnNetSec = null;
+    let lastPromptTotal = null;
+    let lastTurnCacheRate = null;
+    let lastTurnDriver = null;
+    let lastTurnModel = null;
+    const byModel = {};
+    for (const t of turns) {
+      const u = t?.usage;
+      if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") continue;
+      const driver = t.driver || payload.provider || "unknown";
+      let inp = Math.max(0, u.inputTokens || 0);
+      const cr = Math.max(0, u.cachedInputTokens || 0);
+      const cw = Math.max(0, u.cacheCreationTokens || 0);
+      if (driver === "antigravity" && inp >= cr * 2) inp = inp - cr;
+      const unc = Math.max(0, inp - cr - cw);
+      const out = Math.max(0, u.outputTokens || 0);
+      const reas = Math.min(out, Math.max(0, u.reasoningTokens || 0));
+      const turnModel = (Array.isArray(u.models) && u.models[0]) || payload.model || null;
+      const r = fallbackModelRate(turnModel || driver);
+      sumUsd += unc * r.input + cr * r.cacheRead + cw * r.cacheWrite + out * r.output;
+      sumSavedUsd += cr * Math.max(0, r.input - r.cacheRead);
+      sumUncached += unc;
+      sumCached += cr;
+      sumCacheWrite += cw;
+      sumOutput += out;
+      sumReasoning += reas;
+      pricedTurns++;
+      lastPromptTotal = inp + out;
+      lastTurnCacheRate = inp > 0 ? cr / inp : null;
+      lastTurnDriver = driver;
+      lastTurnModel = turnModel;
+      if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs && out > 0) {
+        wallOutSum += out;
+        wallSecSum += (t.completedMs - t.startedMs) / 1000;
+      }
+      if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
+        const netSec = subtractWait(t.startedMs, t.completedMs);
+        if (netSec > 0.05) {
+          netOutSum += out;
+          netSecSum += netSec;
+          lastTurnTps = out / netSec;
+          lastTurnNetSec = netSec;
+          if (turnModel) {
+            const cur = (byModel[turnModel] ||= { tok: 0, sec: 0 });
+            cur.tok += out;
+            cur.sec += netSec;
+          }
+        }
+      }
+    }
+    const promptTotal = sumUncached + sumCached + sumCacheWrite;
+    const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
+    const effDriver = lastTurnDriver || payload.provider || "unknown";
+    const effModel = lastTurnModel || payload.model || null;
+    let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
+    if (effDriver === "antigravity" && payload.contextUsage?.usedTokens != null && lastPromptTotal != null && payload.contextUsage.usedTokens > lastPromptTotal * 1.6) {
+      contextUsed = lastPromptTotal;
+    }
+    let contextMax = payload.contextUsage?.maxTokens || (effDriver === "antigravity" ? (/opus|sonnet|haiku|claude/i.test(String(effModel || "")) ? 1000000 : 1048576) : effDriver === "muse" ? 1007997 : null);
+    const tokPerSec = netSecSum > 0.2 ? netOutSum / netSecSum : null;
+    const e2eTokPerSec = wallSecSum > 0.2 && wallOutSum > 0 ? wallOutSum / wallSecSum : tokPerSec;
+    const byModelSpeed = Object.fromEntries(
+      Object.entries(byModel)
+        .filter(([, v]) => v.sec > 0.1)
+        .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
+    );
+    return {
+      ok: true,
+      telemetrySource: "remote-projection",
+      isRemote: true,
+      threadId: String(payload.threadId || ""),
+      title: String(payload.title || ""),
+      provider: effDriver,
+      model: effModel,
+      projectTitle: payload.projectTitle || null,
+      repoPath: payload.repoPath || null,
+      branch: payload.branch || null,
+      isRunning: Boolean(payload.isRunning),
+      turnCount: turns.length,
+      stepCount: pricedTurns,
+      speed: {
+        tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
+        byModel: byModelSpeed,
+        lastDecodeTps: lastTurnTps != null ? Math.round(lastTurnTps * 10) / 10 : null,
+        e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
+        durationSec: lastTurnNetSec != null ? Math.round(lastTurnNetSec * 10) / 10 : null,
+      },
+      tokens: {
+        input: promptTotal,
+        uncached: sumUncached,
+        uncachedInput: sumUncached,
+        cached: sumCached,
+        cachedInput: sumCached,
+        cacheWrite: sumCacheWrite,
+        cacheWriteInput: sumCacheWrite,
+        output: sumOutput,
+        reasoning: sumReasoning,
+        mainTotal: promptTotal + sumOutput,
+        subagentTokens: 0,
+        total: promptTotal + sumOutput,
+        contextUsed: contextUsed ?? null,
+        contextMax: contextMax ?? null,
+      },
+      cache: {
+        cachedTokens: sumCached,
+        cacheWriteTokens: sumCacheWrite,
+        sessionRate: sessionCacheRate,
+        lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
+        displayRate: lastTurnCacheRate ?? sessionCacheRate,
+        savedUsd: sumSavedUsd,
+      },
+      cost: {
+        sessionUsd: sumUsd,
+        subagentUsd: 0,
+        withSubagentsUsd: sumUsd,
+        subagentCount: Math.max(0, Number(payload.subagentCount) || 0),
+        estimated: false,
+      },
+    };
   }
 
   // Distinct, clean Git swimlane colors that work well on both stock Light (#fff) and stock Dark (#000/#141414)
@@ -172,6 +574,7 @@
       uncommitted: "未提交",
       modified: "改",
       newFiles: "新",
+      remoteWorkspace: "当前会话运行在远程服务器，本地无法直接读取远端 Git 仓库",
     },
     en: {
       cache: "Cache",
@@ -234,6 +637,7 @@
       uncommitted: "Uncommitted",
       modified: "mod",
       newFiles: "new",
+      remoteWorkspace: "This thread runs on a remote server; its Git repo is not mounted locally",
     },
   };
 
@@ -1242,6 +1646,7 @@
   const commitBodyEl = document.getElementById("t3-commit-body");
 
   let latestStats = null;
+  let lastRemotePayload = null;
   let liveStreamTps = null;
   let latestGraph = null;
   let drawerOpen = false;
@@ -1491,18 +1896,19 @@
   // Live reader of T3's in-memory usageLimits, contextWindow, AND active composer model picker!
   function readLiveT3State() {
     let usage = null;
+    let contextWindow = null;
     let selectedModel = null;
     let selectedProvider = null;
     try {
       const rootEl = document.getElementById("root");
-      if (!rootEl) return { usage, selectedModel, selectedProvider };
+      if (!rootEl) return { usage, contextWindow, selectedModel, selectedProvider };
       const fk = Object.keys(rootEl).find(
         (k) => k.startsWith("__reactContainer") || k.startsWith("__reactFiber")
       );
-      if (!fk) return { usage, selectedModel, selectedProvider };
+      if (!fk) return { usage, contextWindow, selectedModel, selectedProvider };
       const stack = [rootEl[fk]];
       let visited = 0;
-      while (stack.length && visited < 2600) {
+      while (stack.length && visited < 20000) {
         const f = stack.pop();
         if (!f) continue;
         visited++;
@@ -1510,6 +1916,9 @@
         if (p) {
           if (!usage && p.usage && Array.isArray(p.usage.providers)) {
             usage = p.usage;
+          }
+          if (!contextWindow && p.contextWindow && typeof p.contextWindow.usedTokens === "number") {
+            contextWindow = p.contextWindow;
           }
           if (!selectedModel && typeof p.selectedModel === "string") {
             selectedModel = p.selectedModel;
@@ -1519,12 +1928,12 @@
             selectedProvider = p.modelSelection.instanceId || p.modelSelection.provider || selectedProvider;
           }
         }
-        if (usage && selectedModel) break;
+        if (usage && selectedModel && (contextWindow || usage.contextWindow)) break;
         if (f.child) stack.push(f.child);
         if (f.sibling) stack.push(f.sibling);
       }
     } catch {}
-    return { usage, selectedModel, selectedProvider };
+    return { usage, contextWindow, selectedModel, selectedProvider };
   }
 
   function formatResetShort(isoStr) {
@@ -1556,7 +1965,8 @@
   }
 
   function computeQuotaAndContext(stats) {
-    const { usage: live, selectedModel, selectedProvider } = readLiveT3State();
+    const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider } = readLiveT3State();
+    const liveContext = live?.contextWindow ?? liveCtx ?? null;
     const activeProviderRaw = (
       selectedProvider ||
       live?.providerInstanceId ||
@@ -1570,12 +1980,19 @@
     let ctxMax;
     let ctxPct;
     if (!stats || !stats.ok) {
-      ctxUsed = 0;
-      ctxMax = stats?.tokens?.contextMax ?? null;
-      ctxPct = 0;
+      if (!stats?.nonThreadRoute && stats?.tokens?.contextUsed == null && liveContext && liveContext.usedTokens > 0) {
+        ctxUsed = liveContext.usedTokens;
+        ctxMax = stats?.tokens?.contextMax ?? liveContext.maxTokens ?? null;
+        ctxPct =
+          ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
+      } else {
+        ctxUsed = 0;
+        ctxMax = stats?.tokens?.contextMax ?? null;
+        ctxPct = 0;
+      }
     } else {
-      ctxUsed = stats?.tokens?.contextUsed ?? live?.contextWindow?.usedTokens ?? null;
-      ctxMax = stats?.tokens?.contextMax ?? live?.contextWindow?.maxTokens ?? null;
+      ctxUsed = stats?.tokens?.contextUsed ?? liveContext?.usedTokens ?? null;
+      ctxMax = stats?.tokens?.contextMax ?? liveContext?.maxTokens ?? null;
       ctxPct =
         ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
     }
@@ -2095,6 +2512,15 @@
       statusBadgeEl.textContent = "";
       statusBadgeEl.title = "";
       dirtyBadge.style.display = "none";
+      if (latestGraph.remoteOnly) {
+        const remoteCwd = latestGraph.remoteCwd || "";
+        const msg =
+          hudLang === "en"
+            ? `This thread runs on a remote server (${remoteCwd}); its Git repo is not mounted locally`
+            : `当前会话运行在远程服务器 (${remoteCwd})，本地无法直接读取远端 Git 仓库`;
+        gitListEl.innerHTML = header + `<div class="t3-empty-msg">${escapeHtml(msg)}</div>`;
+        return;
+      }
       gitListEl.innerHTML = header + `<div class="t3-empty-msg">${escapeHtml(latestGraph.error || t("noCommits"))}</div>`;
       return;
     }
@@ -2179,6 +2605,14 @@
     gitListEl.textContent = "";
   }
 
+  function getFallbackCwd() {
+    if (!lastRemotePayload) return null;
+    const cwd = lastRemotePayload.gitCwd || lastRemotePayload.repoPath || null;
+    const environmentId = lastRemotePayload.environmentId || "";
+    if (!cwd && !environmentId) return null;
+    return { cwd, environmentId };
+  }
+
   async function openCommitDetail(hash) {
     if (selectedCommitHash === hash && !commitPane.classList.contains("hidden")) {
       clearCommitPaneDom();
@@ -2193,7 +2627,7 @@
     commitMetaEl.textContent = hash.slice(0, 10);
     commitBodyEl.textContent = "";
 
-    const res = await callBackend("getCommitDetail", getRouteHint(), hash);
+    const res = await callBackend("getCommitDetail", getRouteHint(), hash, getFallbackCwd());
     if (selectedCommitHash !== hash || !drawerOpen) return;
     if (!res || !res.ok) {
       commitMsgEl.textContent = res?.error || t("readFail");
@@ -2255,7 +2689,7 @@
   async function refreshGitGraph(force = false) {
     const hint = getRouteHint();
     if (!drawerOpen && !force) return;
-    const graph = await callBackend("getGitGraph", hint, 120);
+    const graph = await callBackend("getGitGraph", hint, 120, getFallbackCwd());
     if (!drawerOpen) return;
     latestGraph = graph;
     lastLoadedGraphThreadId = graph?.threadId || null;
@@ -2268,7 +2702,26 @@
     statsInFlight = true;
     try {
       const hint = getRouteHint();
-      const stats = await callBackend("getThreadStats", hint);
+      let stats = await callBackend("getThreadStats", hint);
+      if (!stats?.ok && !stats?.nonThreadRoute) {
+        try {
+          const proj = readFiberThreadProjection(hint);
+          lastRemotePayload = proj;
+          if (proj) {
+            if (proj.isServerThread === false || (Array.isArray(proj.turns) && proj.turns.length === 0)) {
+              stats = { ok: false, nonThreadRoute: "new", isDraftThread: true };
+            } else {
+              let priced = null;
+              try { priced = await callBackend("priceRemoteProjection", proj); } catch { priced = null; }
+              stats = priced && priced.ok ? priced : buildLocalProjectionFallback(proj);
+            }
+          }
+        } catch {
+          // Keep original stats on fiber read failure
+        }
+      } else {
+        lastRemotePayload = null;
+      }
       renderTopbarStats(stats);
 
       // Sync Git Graph only if drawer is open; clear stale hidden graph when switching threads while closed
@@ -2366,6 +2819,7 @@
   let lastPickerSig = "";
   const routeWatchTimer = setInterval(() => {
     if (document.hidden) return;
+    if (!unsubscribeRouter) ensureRouterSubscription();
     const next = getRouteHint();
     if (next !== currentPathHint) {
       currentPathHint = next;
@@ -2501,6 +2955,11 @@
 
   window.__t3HudCleanup = () => {
     disposed = true;
+    try {
+      if (typeof unsubscribeRouter === "function") unsubscribeRouter();
+    } catch {}
+    unsubscribeRouter = null;
+    cachedRouter = null;
     clearInterval(routeWatchTimer);
     clearInterval(streamWatchTimer);
     if (pollTimer) clearTimeout(pollTimer);
@@ -2528,6 +2987,7 @@
     await syncConfigLang();
     hudLang = resolveLang();
     applyLangToDom();
+    ensureRouterSubscription();
     refreshStats(true);
     pollTimer = setTimeout(pollLoop, 1200);
   })();

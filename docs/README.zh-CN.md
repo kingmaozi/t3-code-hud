@@ -41,6 +41,7 @@
 - **零遮挡布局** —— `isChatComposerVisibleAndUncovered()` 在设置页、`/usage`、`/pair`、弹窗/对话框、被遮挡输入框时隐藏 HUD；顶栏 `z-index: 30` 低于原生弹窗 `50`。
 - **可拖拽 Git 图谱悬浮窗**（`Option+G` / `Esc`）—— 默认居中，最大 920 × 600，单色矢量图标，顶栏集成搜索和仓库状态。固定五列表头「图 / 描述 / 日期 / 作者 / 提交」，橙色 HEAD 双圆环、独立 HEAD/分支标签、`MM/DD HH:mm` 时间。点击提交展开底部分屏，查看文件 `+新增 / -删除` 与高亮统一 Diff。窄于 680px 时隐藏作者并压缩日期/SHA 列；窄屏胶囊的 Token/额度明细可在悬停卡查看。设置页关闭浮窗，原生弹窗显示期间临时隐藏；过滤 `refs/t3/*` 噪音。
 - **双语自动识别**（`中文` / `English`）一键切换。
+- **远程服务器（T3 Connect）支持 + 官方 `T3 Code v0.1.9` 内存路由** —— 运行在远程服务器（`environmentId`）的会话在本地 `statev2.sqlite` 无行，因此遥测从 T3 内存中的 React Fiber `projection` 投影，由后端 `priceRemoteProjection` 计价，主进程未更新时由浏览器端 `buildLocalProjectionFallback` 兜底。草稿/未发送会话显示 `新会话` 而非 `-- tok/s`。远端 Git 图谱可回退到本地挂载的 `fallbackCwd`，或显示干净的双语“远程工作区”空状态。TanStack Router 内存路由（`window.__TSR_ROUTER__.state.location.pathname`）在 `location.hash` 为空时也会在 `/settings` / `/usage` / `/pair` 隐藏 HUD。
 - **加固本地 RPC** —— 私有目录 `~/.t3/hud-plugin/run/rpc.json`（`0700` 目录、`0600` 文件、`wx` + 防 symlink），分离 `rpcToken`（只读）与 `adminToken`（CLI），已删除 `/admin/eval`，严格的 `t3code://` origin 白名单。
 
 ---

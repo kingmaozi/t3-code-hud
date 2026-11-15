@@ -41,6 +41,7 @@
 - **ゼロオーバーラップレイアウト** —— 設定画面、`/usage`、`/pair`、ダイアログ／モーダル、遮断されたコンポーザーでは `isChatComposerVisibleAndUncovered()` が HUD を隠します。トップバー `z-index: 30` はネイティブモーダル `50` の下。
 - **ドラッグ可能な Git グラフフローティングウィンドウ**（`Option+G` / `Esc`）—— 中央配置、最大 920 × 600、単色ベクターアイコン、検索とリポジトリ状態をタイトルバーに集約。固定ヘッダーの 5 列（Graph / Description / Date / Author / Commit）、オレンジの HEAD 二重リング、独立した HEAD／ブランチラベル、`MM/DD HH:mm` 日時。クリックで下部にファイルの追加／削除数とハイライト差分。680px 未満では作者列を省略し日時／SHA 列を縮小。狭いカプセルのトークン／クォータ詳細はホバーで確認。設定画面では閉じ、ネイティブダイアログ中は一時非表示。`refs/t3/*` ノイズを自動除外。
 - **日英バイリンガル自動検出**（`中文` / `English`）ワンクリック切替。
+- **リモートサーバー（T3 Connect）対応＋公式 `T3 Code v0.1.9` インメモリルーティング** —— リモートサーバー（`environmentId`）で動作するスレッドはローカルの `statev2.sqlite` に行がないため、テレメトリを T3 のメモリ内 React Fiber `projection` から投影し、バックエンド `priceRemoteProjection` で料金計算、メインプロセスが古い場合はブラウザ側 `buildLocalProjectionFallback` にフォールバックします。下書き／未送信スレッドは `-- tok/s` の代わりに `New` / `新会话` を表示。リモート Git グラフはローカルマウント済みの `fallbackCwd` にフォールバックするか、二言語対応の「リモートワークスペース」空状態を表示。TanStack Router のインメモリルート（`window.__TSR_ROUTER__.state.location.pathname`）により、`location.hash` が空でも `/settings` / `/usage` / `/pair` で HUD が非表示になります。
 - **堅牢なローカル RPC** —— プライベート `~/.t3/hud-plugin/run/rpc.json`（ディレクトリ `0700`、ファイル `0600`、`wx`＋symlink ガード）、`rpcToken`（読取専用）と `adminToken`（CLI 専用）を分離、`/admin/eval` を完全削除、`t3code://` 起点ホワイトリスト厳格化。
 
 ---

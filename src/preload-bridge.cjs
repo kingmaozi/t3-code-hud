@@ -4,10 +4,11 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const bridge = {
   getThreadStats: (threadHint) => ipcRenderer.invoke("t3hud:get-thread-stats", threadHint),
-  getGitGraph: (threadHint, maxCommits) =>
-    ipcRenderer.invoke("t3hud:get-git-graph", threadHint, maxCommits),
-  getCommitDetail: (threadHint, commitHash) =>
-    ipcRenderer.invoke("t3hud:get-commit-detail", threadHint, commitHash),
+  priceRemoteProjection: (payload) => ipcRenderer.invoke("t3hud:price-remote-projection", payload),
+  getGitGraph: (threadHint, maxCommits, fallbackCwd) =>
+    ipcRenderer.invoke("t3hud:get-git-graph", threadHint, maxCommits, fallbackCwd),
+  getCommitDetail: (threadHint, commitHash, fallbackCwd) =>
+    ipcRenderer.invoke("t3hud:get-commit-detail", threadHint, commitHash, fallbackCwd),
   getConfig: () => ipcRenderer.invoke("t3hud:get-config"),
   setConfig: (patch) => ipcRenderer.invoke("t3hud:set-config", patch),
 };

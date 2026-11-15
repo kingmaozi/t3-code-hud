@@ -232,6 +232,36 @@ function priceStep(totals, model, provider) {
   return { usd, savedUsd };
 }
 
+function mergeToolIntervals(intervals) {
+  const valid = (Array.isArray(intervals) ? intervals : [])
+    .filter((iv) => Array.isArray(iv) && Number.isFinite(iv[0]) && Number.isFinite(iv[1]) && iv[1] > iv[0])
+    .map(([s, e]) => [s, e])
+    .sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [s, e] of valid) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) {
+      if (e > last[1]) last[1] = e;
+    } else {
+      merged.push([s, e]);
+    }
+  }
+  return merged;
+}
+
+function subtractToolWait(startMs, endMs, toolIntervals) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+  const merged = mergeToolIntervals(toolIntervals);
+  let waitMs = 0;
+  for (const [s, e] of merged) {
+    const os = Math.max(startMs, s);
+    const oe = Math.min(endMs, e);
+    if (oe > os) waitMs += oe - os;
+  }
+  const netMs = Math.max(0, endMs - startMs - waitMs);
+  return netMs / 1000;
+}
+
 // ============================================================================
 // 2. Native Provider Telemetry Readers (Muse, Antigravity, Codex) with Cache
 // ============================================================================
@@ -1506,6 +1536,157 @@ function getThreadStats(threadHint) {
 }
 
 // ============================================================================
+// 3b. Remote Server Thread Pricing (React Fiber projection - no local DB rows)
+// ============================================================================
+function priceRemoteProjection(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "Invalid remote payload" };
+  }
+  const turns = Array.isArray(payload.turns) ? payload.turns : [];
+  const mergedToolIntervals = mergeToolIntervals(payload.toolIntervals);
+  let sumUncached = 0;
+  let sumCached = 0;
+  let sumCacheWrite = 0;
+  let sumOutput = 0;
+  let sumReasoning = 0;
+  let sumUsd = 0;
+  let sumSavedUsd = 0;
+  let pricedTurns = 0;
+  let netOutSum = 0;
+  let netSecSum = 0;
+  let wallOutSum = 0;
+  let wallSecSum = 0;
+  let lastTurnTps = null;
+  let lastTurnNetSec = null;
+  let lastPromptTotal = null;
+  let lastTurnCacheRate = null;
+  let lastTurnDriver = null;
+  let lastTurnModel = null;
+  const byModel = {};
+  for (const t of turns) {
+    const u = t?.usage;
+    if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") continue;
+    const driver = t.driver || payload.provider || "unknown";
+    let inp = Math.max(0, u.inputTokens || 0);
+    const cr = Math.max(0, u.cachedInputTokens || 0);
+    const cw = Math.max(0, u.cacheCreationTokens || 0);
+    if (driver === "antigravity" && inp >= cr * 2) inp = inp - cr;
+    const unc = Math.max(0, inp - cr - cw);
+    const out = Math.max(0, u.outputTokens || 0);
+    const reas = Math.min(out, Math.max(0, u.reasoningTokens || 0));
+    const turnModel = (Array.isArray(u.models) && u.models[0]) || payload.model || null;
+    const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, turnModel, driver);
+    sumUncached += unc;
+    sumCached += cr;
+    sumCacheWrite += cw;
+    sumOutput += out;
+    sumReasoning += reas;
+    sumUsd += priced.usd;
+    sumSavedUsd += priced.savedUsd;
+    pricedTurns++;
+    lastPromptTotal = inp + out;
+    lastTurnCacheRate = inp > 0 ? cr / inp : null;
+    lastTurnDriver = driver;
+    lastTurnModel = turnModel;
+    if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs && out > 0) {
+      wallOutSum += out;
+      wallSecSum += (t.completedMs - t.startedMs) / 1000;
+    }
+    if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
+      const netSec = subtractToolWait(t.startedMs, t.completedMs, mergedToolIntervals);
+      if (netSec > 0.05) {
+        netOutSum += out;
+        netSecSum += netSec;
+        lastTurnTps = out / netSec;
+        lastTurnNetSec = netSec;
+        if (turnModel) {
+          const cur = (byModel[turnModel] ||= { tok: 0, sec: 0 });
+          cur.tok += out;
+          cur.sec += netSec;
+        }
+      }
+    }
+  }
+  const promptTotal = sumUncached + sumCached + sumCacheWrite;
+  const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
+  const effDriver = lastTurnDriver || payload.provider || "unknown";
+  const effModel = lastTurnModel || payload.model || null;
+  let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
+  if (effDriver === "antigravity" && payload.contextUsage?.usedTokens != null && lastPromptTotal != null && payload.contextUsage.usedTokens > lastPromptTotal * 1.6) {
+    contextUsed = lastPromptTotal;
+  }
+  let contextMax = payload.contextUsage?.maxTokens || lookupCatalogContextMax(effModel, effDriver) || null;
+  if (contextMax == null && effDriver === "antigravity") {
+    const model = (effModel || "").toLowerCase();
+    contextMax = /opus|sonnet|haiku|claude/.test(model) ? 1000000 : 1048576;
+  }
+  if (contextMax == null && effDriver === "muse") {
+    contextMax = 1007997;
+  }
+  const tokPerSec = netSecSum > 0.2 ? netOutSum / netSecSum : null;
+  const e2eTokPerSec = wallSecSum > 0.2 && wallOutSum > 0 ? wallOutSum / wallSecSum : tokPerSec;
+  const byModelSpeed = Object.fromEntries(
+    Object.entries(byModel)
+      .filter(([, v]) => v.sec > 0.1)
+      .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
+  );
+  const subagentCount = Math.max(0, Number(payload.subagentCount) || 0);
+  return {
+    ok: true,
+    telemetrySource: "remote-projection",
+    isRemote: true,
+    threadId: String(payload.threadId || ""),
+    title: String(payload.title || ""),
+    provider: effDriver,
+    model: effModel,
+    projectTitle: payload.projectTitle || null,
+    repoPath: payload.repoPath || null,
+    branch: payload.branch || null,
+    isRunning: Boolean(payload.isRunning),
+    turnCount: turns.length,
+    stepCount: pricedTurns,
+    speed: {
+      tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
+      byModel: byModelSpeed,
+      lastDecodeTps: lastTurnTps != null ? Math.round(lastTurnTps * 10) / 10 : null,
+      e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
+      durationSec: lastTurnNetSec != null ? Math.round(lastTurnNetSec * 10) / 10 : null,
+    },
+    tokens: {
+      input: promptTotal,
+      uncached: sumUncached,
+      uncachedInput: sumUncached,
+      cached: sumCached,
+      cachedInput: sumCached,
+      cacheWrite: sumCacheWrite,
+      cacheWriteInput: sumCacheWrite,
+      output: sumOutput,
+      reasoning: sumReasoning,
+      mainTotal: promptTotal + sumOutput,
+      subagentTokens: 0,
+      total: promptTotal + sumOutput,
+      contextUsed: contextUsed ?? null,
+      contextMax: contextMax ?? null,
+    },
+    cache: {
+      cachedTokens: sumCached,
+      cacheWriteTokens: sumCacheWrite,
+      sessionRate: sessionCacheRate,
+      lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
+      displayRate: lastTurnCacheRate ?? sessionCacheRate,
+      savedUsd: sumSavedUsd,
+    },
+    cost: {
+      sessionUsd: sumUsd,
+      subagentUsd: 0,
+      withSubagentsUsd: sumUsd,
+      subagentCount,
+      estimated: false,
+    },
+  };
+}
+
+// ============================================================================
 // 4. Git Graph & Commit Diff Engine (Filters T3 internal refs/t3/* snapshots)
 // ============================================================================
 function buildSwimlanes(commits) {
@@ -1613,9 +1794,26 @@ function parseRefs(decorateStr) {
     .filter((r) => !r.label.startsWith("refs/t3/") && !r.label.includes("t3/checkpoint"));
 }
 
-async function getGitGraph(threadHint, maxCommits = 100) {
+async function getGitGraph(threadHint, maxCommits = 90, fallbackCwd = null) {
   const stats = getThreadStats(threadHint);
   let repoPath = stats?.repoPath || null;
+
+  if (!repoPath && fallbackCwd) {
+    const fbCwd = typeof fallbackCwd === "string" ? fallbackCwd : typeof fallbackCwd?.cwd === "string" ? fallbackCwd.cwd : null;
+    const fbEnvId = typeof fallbackCwd === "object" && typeof fallbackCwd?.environmentId === "string" ? fallbackCwd.environmentId.trim() : "";
+    let localEnvId = "";
+    try { localEnvId = fs.readFileSync(path.join(T3_USERDATA, "environment-id"), "utf8").trim(); } catch {}
+    if (fbEnvId && (!localEnvId || fbEnvId !== localEnvId)) {
+      return { ok: false, remoteOnly: true, remoteCwd: fbCwd || "(remote)", error: "Remote workspace" };
+    }
+    if (fbCwd) {
+      if (fs.existsSync(fbCwd)) {
+        repoPath = fbCwd;
+      } else {
+        return { ok: false, remoteOnly: true, remoteCwd: fbCwd, error: "Remote workspace" };
+      }
+    }
+  }
 
   if (!repoPath) {
     try {
@@ -1737,13 +1935,18 @@ async function getGitGraph(threadHint, maxCommits = 100) {
   }
 }
 
-async function getCommitDetail(threadHint, commitHash) {
+async function getCommitDetail(threadHint, commitHash, fallbackCwd = null) {
   if (!commitHash || !/^[0-9a-f]{6,40}$/i.test(commitHash)) {
     return { ok: false, error: "非法 Commit SHA" };
   }
-  const graphInfo = await getGitGraph(threadHint, 20);
+  const graphInfo = await getGitGraph(threadHint, 20, fallbackCwd);
   if (!graphInfo.ok || !graphInfo.repoPath) {
-    return { ok: false, error: graphInfo.error || "找不到仓库路径" };
+    return {
+      ok: false,
+      remoteOnly: Boolean(graphInfo.remoteOnly),
+      remoteCwd: graphInfo.remoteCwd || (typeof fallbackCwd === "string" ? fallbackCwd : fallbackCwd?.cwd) || null,
+      error: graphInfo.error || "找不到仓库路径",
+    };
   }
 
   try {
@@ -1860,6 +2063,9 @@ function setConfig(patch) {
 
 module.exports = {
   getThreadStats,
+  priceRemoteProjection,
+  mergeToolIntervals,
+  subtractToolWait,
   getGitGraph,
   getCommitDetail,
   getConfig,

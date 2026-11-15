@@ -265,3 +265,289 @@ describe("Fix 4: install.sh AppleLanguages precedence", () => {
     assert.equal(detect({ LANG: "C.UTF-8" }, "zh-Hans-SG"), "zh");
   });
 });
+
+describe("Remote: priceRemoteProjection backend", () => {
+  const T0 = 1735689600000;
+  function payload(overrides = {}) {
+    return {
+      environmentId: "env-1",
+      threadId: "remote-thread-1",
+      title: "Remote thread",
+      provider: "codex",
+      model: "test-model-remote",
+      branch: "main",
+      repoPath: "/tmp/repo",
+      isServerThread: true,
+      isRunning: false,
+      subagentCount: 2,
+      contextUsage: { usedTokens: 5000, maxTokens: 200000 },
+      toolIntervals: [[T0 + 1000, T0 + 3000]],
+      turns: [
+        {
+          status: "completed",
+          driver: "codex",
+          startedMs: T0,
+          completedMs: T0 + 5000,
+          usage: { inputTokens: 1000, cachedInputTokens: 200, cacheCreationTokens: 0, outputTokens: 150, reasoningTokens: 0, models: ["test-model-remote"] },
+        },
+      ],
+      ...overrides,
+    };
+  }
+  it("prices a simple remote turn with tool-wait subtraction", () => {
+    const r = backend.priceRemoteProjection(payload());
+    assert.equal(r.ok, true, JSON.stringify(r.error || r));
+    assert.equal(r.telemetrySource, "remote-projection");
+    assert.equal(r.isRemote, true);
+    assert.equal(r.threadId, "remote-thread-1");
+    assert.equal(r.provider, "codex");
+    assert.equal(r.model, "test-model-remote");
+    assert.equal(r.tokens.input, 1000);
+    assert.equal(r.tokens.uncached, 800);
+    assert.equal(r.tokens.cached, 200);
+    assert.equal(r.tokens.output, 150);
+    assert.equal(r.tokens.total, 1150);
+    assert.equal(r.cache.sessionRate, 0.2);
+    assert.equal(r.cost.subagentCount, 2);
+    assert.equal(r.cost.subagentUsd, 0);
+    assert.equal(r.cost.withSubagentsUsd, r.cost.sessionUsd);
+    assert.equal(r.cost.estimated, false);
+    assert.ok(r.cost.sessionUsd > 0, "cost should be positive");
+    assert.equal(r.speed.tokPerSec, 50);
+    assert.equal(r.speed.lastDecodeTps, 50);
+    assert.equal(r.speed.byModel["test-model-remote"], 50);
+    assert.equal(r.tokens.contextUsed, 5000);
+    assert.equal(r.tokens.contextMax, 200000);
+    assert.equal(r.turnCount, 1);
+    assert.equal(r.stepCount, 1);
+  });
+  it("dedupes Antigravity double-counted cached tokens", () => {
+    const r = backend.priceRemoteProjection(
+      payload({
+        provider: "antigravity",
+        model: "gemini-test",
+        contextUsage: null,
+        toolIntervals: [],
+        turns: [
+          {
+            status: "completed",
+            driver: "antigravity",
+            startedMs: T0,
+            completedMs: T0 + 4000,
+            usage: { inputTokens: 2000, cachedInputTokens: 800, cacheCreationTokens: 0, outputTokens: 100, reasoningTokens: 0, models: ["gemini-test"] },
+          },
+        ],
+      })
+    );
+    assert.equal(r.ok, true);
+    // inp 2000 >= 800*2 -> inp = 1200, unc = 400
+    assert.equal(r.tokens.uncached, 400);
+    assert.equal(r.tokens.cached, 800);
+    assert.equal(r.tokens.input, 1200);
+    // context falls back to lastPromptTotal (inp + out = 1300) and AGY max 1048576
+    assert.equal(r.tokens.contextUsed, 1300);
+    assert.equal(r.tokens.contextMax, 1048576);
+  });
+  it("prefers lastPromptTotal when AGY contextUsage is double-counted", () => {
+    const r = backend.priceRemoteProjection(
+      payload({
+        provider: "antigravity",
+        model: "gemini-test",
+        contextUsage: { usedTokens: 999999, maxTokens: 1048576 },
+        toolIntervals: [],
+        turns: [
+          {
+            status: "completed",
+            driver: "antigravity",
+            startedMs: T0,
+            completedMs: T0 + 4000,
+            usage: { inputTokens: 2000, cachedInputTokens: 800, cacheCreationTokens: 0, outputTokens: 100, reasoningTokens: 0, models: ["gemini-test"] },
+          },
+        ],
+      })
+    );
+    assert.equal(r.tokens.contextUsed, 1300);
+  });
+  it("rejects invalid payloads", () => {
+    assert.equal(backend.priceRemoteProjection(null).ok, false);
+    assert.equal(backend.priceRemoteProjection("nope").ok, false);
+  });
+});
+
+describe("Remote: getGitGraph fallbackCwd", () => {
+  it("reads local repo via fallbackCwd when thread has no local rows", async () => {
+    const repoDir = path.join(tmpRoot, "remote-local-repo");
+    fs.mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["init", "-q"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.email", "t@t.t"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: repoDir });
+    fs.writeFileSync(path.join(repoDir, "a.txt"), "hello\n");
+    execFileSync("git", ["add", "a.txt"], { cwd: repoDir });
+    execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir });
+    const g = await backend.getGitGraph("thread:remote-unknown-xyz", 10, repoDir);
+    assert.equal(g.ok, true, JSON.stringify(g));
+    assert.equal(g.repoPath, repoDir);
+    assert.ok(g.commits.length >= 1);
+  });
+  it("returns remoteOnly for non-existent remote cwd", async () => {
+    const g = await backend.getGitGraph("thread:remote-unknown-xyz", 10, "/root/app-nonexistent-xyz-123");
+    assert.equal(g.ok, false);
+    assert.equal(g.remoteOnly, true);
+    assert.equal(g.remoteCwd, "/root/app-nonexistent-xyz-123");
+    assert.equal(g.error, "Remote workspace");
+  });
+  it("getCommitDetail forwards remoteOnly", async () => {
+    const d = await backend.getCommitDetail("thread:remote-unknown-xyz", "deadbeef", "/root/app-nonexistent-xyz-123");
+    assert.equal(d.ok, false);
+    assert.equal(d.remoteOnly, true);
+  });
+});
+
+describe("Remote: renderer fiber projection + router (source + local fallback)", () => {
+  const src = () => fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+  function loadPure() {
+    const s = src();
+    const start = s.indexOf("function toEpochMs(");
+    const end = s.indexOf("// Distinct, clean Git swimlane");
+    assert.ok(start !== -1 && end !== -1 && end > start, "pure chunk not found");
+    const chunk = s.slice(start, end);
+    // eslint-disable-next-line no-new-func
+    return new Function(chunk + "\nreturn { toEpochMs, buildLocalProjectionFallback, fallbackModelRate };")();
+  }
+  it("implements fiber walk, router lookup, and draft handling", () => {
+    const s = src();
+    assert.match(s, /function readFiberThreadProjection\(/);
+    assert.match(s, /function findTanStackRouter\(/);
+    assert.match(s, /window\.__TSR_ROUTER__/);
+    assert.match(s, /visited < 20000/);
+    assert.match(s, /visited < 400/);
+    assert.match(s, /function buildLocalProjectionFallback\(/);
+    assert.match(s, /function toEpochMs\(/);
+    assert.match(s, /r\.subscribe\("onResolved"/);
+    assert.match(s, /unsubscribeRouter/);
+    assert.match(s, /isServerThread === false/);
+    assert.match(s, /isDraftThread: true/);
+    assert.match(s, /priceRemoteProjection/);
+    assert.match(s, /remoteOnly/);
+    assert.match(s, /This thread runs on a remote server \(/);
+    assert.match(s, /"gitCwd" in mp/);
+    assert.match(s, /isServerThread" in mp/);
+  });
+  it("toEpochMs normalizes numbers, epoch objects, and parenthesized strings", () => {
+    const { toEpochMs } = loadPure();
+    assert.equal(toEpochMs(123), 123);
+    assert.equal(toEpochMs({ epochMilliseconds: 456 }), 456);
+    assert.equal(toEpochMs("foo (2025-01-01T00:00:00Z)"), Date.parse("2025-01-01T00:00:00Z"));
+    assert.equal(toEpochMs("2025-01-01T00:00:00Z"), Date.parse("2025-01-01T00:00:00Z"));
+    assert.equal(toEpochMs(null), null);
+    assert.equal(toEpochMs("not-a-date"), null);
+  });
+  it("buildLocalProjectionFallback mirrors backend pricing without a main process", () => {
+    const { buildLocalProjectionFallback } = loadPure();
+    assert.equal(buildLocalProjectionFallback(null).ok, false);
+    const r = buildLocalProjectionFallback({
+      threadId: "t1",
+      title: "x",
+      provider: "codex",
+      model: "test-model-remote",
+      contextUsage: { usedTokens: 5000, maxTokens: 200000 },
+      toolIntervals: [[1000, 3000]],
+      turns: [
+        { driver: "codex", startedMs: 0, completedMs: 5000, usage: { inputTokens: 1000, cachedInputTokens: 200, cacheCreationTokens: 0, outputTokens: 150, reasoningTokens: 0, models: ["test-model-remote"] } },
+      ],
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.telemetrySource, "remote-projection");
+    assert.equal(r.speed.tokPerSec, 50);
+    assert.equal(r.speed.byModel["test-model-remote"], 50);
+    assert.equal(r.tokens.total, 1150);
+    assert.ok(r.cost.sessionUsd > 0);
+    assert.equal(r.tokens.contextUsed, 5000);
+  });
+  it("buildLocalProjectionFallback dedupes Antigravity cache", () => {
+    const { buildLocalProjectionFallback } = loadPure();
+    const r = buildLocalProjectionFallback({
+      provider: "antigravity",
+      model: "gemini-test",
+      contextUsage: null,
+      toolIntervals: [],
+      turns: [
+        { driver: "antigravity", startedMs: 0, completedMs: 4000, usage: { inputTokens: 2000, cachedInputTokens: 800, cacheCreationTokens: 0, outputTokens: 100, reasoningTokens: 0, models: ["gemini-test"] } },
+      ],
+    });
+    assert.equal(r.tokens.uncached, 400);
+    assert.equal(r.tokens.input, 1200);
+  });
+  it("main-hook and preload wire price-remote IPC/RPC and hot-reload", () => {
+    const mh = fs.readFileSync(path.join(REPO, "src", "main-hook.cjs"), "utf8");
+    const pl = fs.readFileSync(path.join(REPO, "src", "preload-bridge.cjs"), "utf8");
+    assert.match(mh, /function reloadBackend\(\)/);
+    assert.match(mh, /reloadBackend\(\);/);
+    assert.match(mh, /t3hud:price-remote-projection/);
+    assert.match(mh, /priceRemoteProjection/);
+    assert.match(mh, /args\[2\]/);
+    assert.match(pl, /priceRemoteProjection: \(payload\) => ipcRenderer\.invoke\("t3hud:price-remote-projection", payload\)/);
+    assert.match(pl, /fallbackCwd/);
+  });
+});
+
+describe("Review regressions: dual-UUID, multi-projection, env collision & codesign order", () => {
+  it("extractLastThreadIdFromHint picks threadId (2nd UUID) on /environmentId/threadId", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    assert.ok(m, "extractLastThreadIdFromHint missing");
+    const fn = new Function("return (" + m[0] + ")")();
+    assert.equal(
+      fn("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3"),
+      "af3a2a24-7338-407b-9e28-e9a03f91b3e3"
+    );
+  });
+
+  it("readFiberThreadProjection returns matched 2nd projection instead of 1st projection", () => {
+    const src = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    const m1 = src.match(/function toEpochMs\(v\) \{[\s\S]*?\n  \}/);
+    const m2 = src.match(/function extractLastThreadIdFromHint\(rawHint\) \{[\s\S]*?\n  \}/);
+    const m3 = src.match(/function buildProjectionPayload\(p, stEnvId, uhProps\) \{[\s\S]*?\n  \}/);
+    const m4 = src.match(/function readFiberThreadProjection\(expectedThreadId\) \{[\s\S]*?\n  \}/);
+    assert.ok(m1 && m2 && m3 && m4);
+    const proj1 = { thread: { id: "11111111-1111-4111-8111-111111111111", title: "WrongFirst", providerInstanceId: "muse" }, providerTurns: [{ turnTokenUsage: { inputTokens: 10, outputTokens: 5 } }] };
+    const proj2 = { thread: { id: "af3a2a24-7338-407b-9e28-e9a03f91b3e3", title: "RightSecond", providerInstanceId: "codex" }, providerTurns: [{ turnTokenUsage: { inputTokens: 900, outputTokens: 80 } }] };
+    const fakeDoc = {
+      getElementById: () => ({
+        __reactContainer$1: {
+          child: { memoizedState: { memoizedState: { environmentId: "env-1", projection: proj1 }, next: null }, sibling: { memoizedState: { memoizedState: { environmentId: "env-2", projection: proj2 }, next: null } } }
+        }
+      })
+    };
+    const runner = new Function("document", `${m1[0]}; ${m2[0]}; ${m3[0]}; return (${m4[0]});`)(fakeDoc);
+    const got = runner("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3");
+    assert.equal(got.threadId, "af3a2a24-7338-407b-9e28-e9a03f91b3e3");
+    assert.equal(got.title, "RightSecond");
+    assert.equal(got.environmentId, "env-2");
+  });
+
+  it("getGitGraph rejects local-existing path when remote environmentId differs from local environment-id", async () => {
+    fs.writeFileSync(path.join(tmpUserdata, "environment-id"), "6ee0c274-d218-41d6-b277-cbfc803dfbc0\n");
+    const res = await backend.getGitGraph("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3", 20, {
+      cwd: REPO,
+      environmentId: "394c13c6-05ea-4538-8e6d-7fafe1a362d5"
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.remoteOnly, true);
+    fs.unlinkSync(path.join(tmpUserdata, "environment-id"));
+    const resMissing = await backend.getGitGraph("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3", 20, {
+      cwd: REPO,
+      environmentId: "394c13c6-05ea-4538-8e6d-7fafe1a362d5"
+    });
+    assert.equal(resMissing.ok, false);
+    assert.equal(resMissing.remoteOnly, true);
+  });
+
+  it("install.sh runs codesign AFTER Info.plist and icon.icns", () => {
+    const sh = fs.readFileSync(path.join(REPO, "install.sh"), "utf8");
+    const plistIdx = sh.indexOf("Contents/Info.plist");
+    const iconIdx = sh.indexOf("Contents/Resources/icon.icns");
+    const signIdx = sh.indexOf("codesign --force --deep --sign -");
+    assert.ok(plistIdx > 0 && iconIdx > plistIdx && signIdx > iconIdx);
+  });
+});

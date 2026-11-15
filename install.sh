@@ -56,12 +56,42 @@ fi
 APP_WRAPPER="$HOME/Applications/T3 Code HUD.app"
 mkdir -p "$APP_WRAPPER/Contents/MacOS" "$APP_WRAPPER/Contents/Resources"
 
-cat > "$APP_WRAPPER/Contents/MacOS/T3 Code HUD" <<'EOF'
+LAUNCHER_BIN="$APP_WRAPPER/Contents/MacOS/T3 Code HUD"
+if command -v clang >/dev/null 2>&1; then
+  LAUNCHER_SRC="$(mktemp /tmp/t3-hud-launcher.XXXXXX.c)"
+  cat > "$LAUNCHER_SRC" <<'EOF'
+#include <unistd.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+  const char *home = getenv("HOME");
+  if (!home || !home[0]) home = "/Users";
+  char bin[4096];
+  snprintf(bin, sizeof(bin), "%s/.t3/bin/t3-hud", home);
+  char *args[] = { "t3-hud", "start", (char *)0 };
+  execv(bin, args);
+  return 1;
+}
+EOF
+  if clang -arch arm64 -arch x86_64 -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
+    : # universal Mach-O launcher ready
+  elif clang -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
+    : # single-arch fallback ready
+  else
+    cat > "$LAUNCHER_BIN" <<'EOF2'
+#!/usr/bin/env bash
+exec "$HOME/.t3/bin/t3-hud" start
+EOF2
+  fi
+  rm -f "$LAUNCHER_SRC"
+else
+  cat > "$LAUNCHER_BIN" <<'EOF'
 #!/usr/bin/env bash
 exec "$HOME/.t3/bin/t3-hud" start
 EOF
-chmod +x "$APP_WRAPPER/Contents/MacOS/T3 Code HUD"
-
+fi
+chmod +x "$LAUNCHER_BIN"
 cat > "$APP_WRAPPER/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -93,6 +123,10 @@ for candidate in "/Applications/T3 Code (Beta).app" "/Applications/T3 Code.app" 
     break
   fi
 done
+
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "$APP_WRAPPER" >/dev/null 2>&1 || true
+fi
 
 # ---------------------------------------------------------------------------
 # Language detection: --lang en|zh | T3_HUD_LANG | auto-detect system locale

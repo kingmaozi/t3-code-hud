@@ -41,6 +41,7 @@
 - **제로 오버랩 레이아웃** — `isChatComposerVisibleAndUncovered()` 가 설정, `/usage`, `/pair`, 다이어로그/모달, 가려진 컴포저에서 HUD 숨김. 탑바 `z-index: 30` 으로 네이티브 모달(`50`) 아래 유지.
 - **드래그 가능한 Git 그래프 플로팅 창**(`Option+G` / `Esc`) — 중앙 배치, 최대 920 × 600, 단색 벡터 아이콘, 제목 표시줄에 검색과 저장소 상태 통합. 고정된 5열 헤더(Graph / Description / Date / Author / Commit), 주황색 HEAD 이중 링, 분리된 HEAD/브랜치 라벨과 `MM/DD HH:mm` 날짜. 커밋 클릭 시 하단 분할 창에서 파일 추가/삭제 수와 강조된 diff 확인. 680px 미만에서는 작성자 열을 숨기고 날짜/SHA 폭을 축소하며, 좁은 캡슐의 토큰/쿼터 정보는 호버 카드에 유지. 설정에서 창을 닫고 네이티브 모달 중에는 일시 숨김. `refs/t3/*` 노이즈 자동 제외.
 - **이중언어 자동 감지**(`中文` / `English`) 원클릭 전환.
+- **원격 서버(T3 Connect) 지원 + 공식 `T3 Code v0.1.9` 인메모리 라우팅** — 원격 서버(`environmentId`)에서 실행되는 스레드는 로컬 `statev2.sqlite` 에 행이 없으므로, T3 메모리의 React Fiber `projection` 에서 텔레메트리를 프로젝션하고 백엔드 `priceRemoteProjection` 으로 요금을 계산하며, 메인 프로세스가 오래된 경우 브라우저 측 `buildLocalProjectionFallback` 으로 폴백합니다. 초안/미전송 스레드는 `-- tok/s` 대신 `New` / `新会话` 를 표시합니다. 원격 Git 그래프는 로컬 마운트된 `fallbackCwd` 로 폴백하거나, 깔끔한 이중언어 "원격 워크스페이스" 빈 상태를 표시합니다. TanStack Router 인메모리 라우트(`window.__TSR_ROUTER__.state.location.pathname`)로 `location.hash` 가 비어 있어도 `/settings` / `/usage` / `/pair` 에서는 HUD 가 숨겨집니다.
 - **강화 로컬 RPC** — 프라이빗 `~/.t3/hud-plugin/run/rpc.json`(디렉토리 `0700`, 파일 `0600`, `wx` + symlink 가드), `rpcToken`(읽기 전용)과 `adminToken`(CLI 전용) 분리, `/admin/eval` 완전 제거, `t3code://` 오리진 허용목록 강화.
 
 ---
