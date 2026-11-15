@@ -534,6 +534,11 @@ describe("Review regressions: dual-UUID, multi-projection, env collision & codes
     });
     assert.equal(res.ok, false);
     assert.equal(res.remoteOnly, true);
+    const withLocalThread = await backend.getGitGraph(THREAD_A, 20, {
+      cwd: REPO,
+      environmentId: "394c13c6-05ea-4538-8e6d-7fafe1a362d5"
+    });
+    assert.equal(withLocalThread.remoteOnly, true, "a known local thread must not override an explicitly selected remote environment");
     fs.unlinkSync(path.join(tmpUserdata, "environment-id"));
     const resMissing = await backend.getGitGraph("/394c13c6-05ea-4538-8e6d-7fafe1a362d5/af3a2a24-7338-407b-9e28-e9a03f91b3e3", 20, {
       cwd: REPO,
@@ -765,6 +770,23 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
     `${SHA2} ${SHA2} Jane Doe <jane@example.com> ${nowSec - 1800} +0000\tcheckout: moving from main to main`,
   ].join("\n") + "\n";
 
+  it("preserves native review response when git metadata is unavailable", async () => {
+    const g = await backend.getRemoteGitGraph({ cwd: "/remote/myrepo", branchCommits: { commits: [
+      { sha: SHA2, subject: "Unpushed", committedAt: "2026-01-01T00:00:00Z" }
+    ], truncated: false } });
+    assert.equal(g.commits.length, 1);
+    assert.equal(g.commits[0].hash, SHA2);
+  });
+
+  it("marks inaccessible history and parent relationships as incomplete", async () => {
+    const g = await backend.getRemoteGitGraph({ cwd: "/remote/repo", branch: "main", branchCommits: { commits: [{ sha: SHA2, subject: "tip", committedAt: "2026-01-01T00:00:00Z" }], truncated: false } });
+    assert.equal(g.partialHistory, true);
+    assert.equal(g.parentsUnavailable, true);
+    assert.deepEqual(g.commits[0].parents, []);
+    const missing = await backend.getRemoteGitGraph({ cwd: "/remote/repo" });
+    assert.equal(missing.ok, false);
+  });
+
   it("pure local remote repo: reflog -> commits (newest first, parents, badges)", async () => {
     const g = await backend.getRemoteGitGraph({
       environmentId: "env-1",
@@ -787,7 +809,7 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
     assert.equal(g.commits.length, 2);
     assert.equal(g.commits[0].hash, SHA2);
     assert.equal(g.commits[0].subject, "Second commit");
-    assert.deepEqual(g.commits[0].parents, [SHA1]);
+    assert.deepEqual(g.commits[0].parents, []);
     assert.deepEqual(g.commits[1].parents, []);
     assert.equal(g.commits[1].subject, "Add feature");
     assert.match(g.commits[0].relTime, /hour/);
@@ -833,14 +855,8 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
     assert.equal((await backend.getRemoteCommitDetail({ hash: "not-a-sha" })).ok, false);
   });
 
-  it("preload tracks WebSockets and exposes __t3HudRemoteRpc; main-hook + renderer wired", () => {
+  it("renderer hot reload installs the WebSocket bridge; main-hook and preload keep RPC wired", () => {
     const pl = fs.readFileSync(path.join(REPO, "src", "preload-bridge.cjs"), "utf8");
-    assert.match(pl, /webFrame/);
-    assert.match(pl, /executeJavaScript/);
-    assert.match(pl, /__t3HudRemoteRpc/);
-    assert.match(pl, /T3HudTrackedWebSocket/);
-    assert.match(pl, /socketByEnv/);
-    assert.match(pl, /server\.getConfig/);
     assert.match(pl, /getRemoteGitGraph: \(bundle\) => ipcRenderer\.invoke\("t3hud:get-remote-git-graph", bundle\)/);
     assert.match(pl, /getRemoteCommitDetail: \(req\) => ipcRenderer\.invoke\("t3hud:get-remote-commit-detail", req\)/);
     const mh = fs.readFileSync(path.join(REPO, "src", "main-hook.cjs"), "utf8");
@@ -849,6 +865,9 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
     assert.match(mh, /getRemoteGitGraph/);
     assert.match(mh, /getRemoteCommitDetail/);
     const ui = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+    assert.match(ui, /T3HudTrackedWebSocket/);
+    assert.match(ui, /server\.getConfig/);
+    assert.match(ui, /NativeWS\.prototype\.send =/);
     assert.match(ui, /function fetchRemoteGitBundle\(/);
     assert.match(ui, /projects\.readFile/);
     assert.match(ui, /__t3HudRemoteRpc/);
@@ -918,5 +937,61 @@ describe("PR Review Round 3 regression: turnItems with threadId", () => {
     assert.ok(got && got.turns.length === 1);
     assert.equal(got.turns[0].streamDecode.streamSec, 2);
     assert.equal(got.turns[0].streamDecode.visFraction, 1);
+  });
+});
+
+describe("remote RPC existing connection", () => {
+  it("discovers a pre-existing socket and correlates replies to the originating socket", async () => {
+    const vm = require("node:vm");
+    const listeners = new Map();
+    class WS {
+      constructor(url) { this.url = url; this.readyState = 1; this.sent = []; listeners.set(this, {}); }
+      addEventListener(type, fn) { (listeners.get(this)[type] ||= []).push(fn); }
+      send(data) { this.sent.push(data); return "original-result"; }
+      receive(value) { for (const fn of listeners.get(this).message || []) fn({data: JSON.stringify(value)}); }
+    }
+    const existing = new WS("wss://remote");
+    const other = new WS("wss://other");
+    const code = fs.readFileSync(path.join(REPO, "src/renderer-ui.js"), "utf8");
+    const win = {WebSocket: WS};
+    vm.runInNewContext(code, {window: win, document: { getElementById: () => null }, setTimeout, clearTimeout, Promise, Set, Map, ArrayBuffer, TextDecoder});
+    assert.equal(existing.send("heartbeat"), "original-result");
+    other.send("heartbeat");
+    const env = "394c13c6-05ea-4538-8e6d-7fafe1a362d5";
+    const result = win.__t3HudRemoteRpc(env, "test.read", {}, 200);
+    const a = JSON.parse(existing.sent.at(-1));
+    const b = JSON.parse(other.sent.at(-1));
+    assert.equal(a.tag, "server.getConfig");
+    existing.receive({_tag:"Exit", requestId:a.id, exit:{_tag:"Success", value:{environment:{environmentId:env, serverVersion:"1"}}}});
+    other.receive({_tag:"Exit", requestId:b.id, exit:{_tag:"Success", value:{environment:{environmentId:"11111111-1111-1111-1111-111111111111", serverVersion:"1"}}}});
+    await new Promise(resolve => setImmediate(resolve));
+    const req = JSON.parse(existing.sent.at(-1));
+    assert.equal(req.tag, "test.read");
+    other.receive({_tag:"Exit", requestId:req.id, exit:{_tag:"Success", value:"wrong"}});
+    existing.receive({_tag:"Exit", requestId:req.id, exit:{_tag:"Success", value:"right"}});
+    assert.equal((await result).value, "right");
+    assert.equal(listeners.get(existing).message.length, 1);
+  });
+});
+
+describe("remote graph native review", () => {
+  it("returns partial native range when the remote has no upstream", async () => {
+    const vm = require("node:vm");
+    const src = fs.readFileSync(path.join(REPO, "src/renderer-ui.js"), "utf8");
+    const start = src.indexOf("  async function fetchRemoteGitBundle(");
+    const end = src.indexOf("\n  async function openCommitDetail", start);
+    const calls = [];
+    const a = "a".repeat(40), b = "b".repeat(40);
+    const ctx = { window: { __t3HudRemoteRpc: async (_env, tag, payload) => {
+      calls.push({tag, payload});
+      if (tag === "review.getBranchCommits" && payload.baseRef === "HEAD~1") return {ok:true,value:{commits:[{sha:b,subject:"second",committedAt:"2026-01-01T00:00:00Z"}],truncated:false}};
+      return {ok:false};
+    } }, callBackend: async (_method, bundle) => backend.getRemoteGitGraph(bundle) };
+    vm.createContext(ctx); vm.runInContext(src.slice(start, end) + "\nthis.fetchBundle = fetchRemoteGitBundle;", ctx);
+    const g = await ctx.fetchBundle("env", "/remote/repo", "main");
+    assert.equal(g.ok, true);
+    assert.deepEqual(Array.from(g.commits, c => c.hash), [b]);
+    assert.equal(g.partialHistory, true);
+    assert.ok(calls.some(c => c.tag === "review.getBranchCommits" && c.payload.baseRef === "HEAD~1"));
   });
 });
