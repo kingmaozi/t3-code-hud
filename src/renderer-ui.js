@@ -811,6 +811,25 @@
     return { ok: false, error: "HUD bridge unavailable" };
   }
 
+  // Keep Sidecar Hub on the same authenticated transport as the resident HUD.
+  const callRpc = (method, ...args) => callBackend(method, ...args);
+  window.__t3HubRpc = async (action, payload) => {
+    const res = await callRpc("getGitGraph", "__HUB_RPC__", action, payload || {});
+    if (res && (res.ok || !/Git|Unknown method|unknown action:/i.test(String(res.error || "")))) return res;
+    const bridge = window.__t3HubSidecarBridge;
+    if (bridge && bridge.url && bridge.token) {
+      try {
+        const r = await fetch(bridge.url + "/hub-rpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+          body: JSON.stringify({ action, payload: payload || {} }),
+        });
+        if (r.ok) return await r.json();
+      } catch {}
+    }
+    return res;
+  };
+
   function formatCompactTokens(n) {
     if (n == null || !Number.isFinite(n)) return "--";
     if (n >= 1e9) return (n / 1e9).toFixed(n >= 10e9 ? 1 : 2) + "B";
@@ -874,12 +893,12 @@
       cumCacheRound: "累计缓存 / 本轮缓存",
       cacheSaved: "缓存节省费用",
       contextRatio: "上下文容量占比",
-      totalTokensWithSub: "本会话总 Token (含子代理)",
-      mainSubPrefix: "↳ 主会话 / 子代理",
+      totalTokensWithSub: "本会话总 Token (含子智能体)",
+      mainSubPrefix: "↳ 主会话 / 子智能体",
       inpCacheRead: "↳ 输入 / 缓存读取",
       outReasoning: "↳ 输出 / 思考推理",
       mainSessionCost: "主会话等效费用",
-      subagents: "子代理",
+      subagents: "子智能体",
       totalCost: "单会话总计",
       unknownModel: "未知模型",
       untitled: "未命名会话",
@@ -3429,6 +3448,8 @@
 
   window.__t3HudCleanup = () => {
     disposed = true;
+    // Hub owns its lifecycle: the next drawer script snapshots drafts/open state.
+    // Leave window.__t3SidecarHub intact across /admin/reload-ui.
     try {
       if (typeof unsubscribeRouter === "function") unsubscribeRouter();
     } catch {}
@@ -3458,7 +3479,29 @@
 
   // Boot: load language config, resolve language, then start polling
   (async () => {
+    // Fetch on every injection, so reload-ui never reuses an embedded stale drawer.
+    // Keep telemetry boot independent if an older Hub backend is slow or missing.
+    void (async () => {
+      try {
+        // Embedded drawer (same executeJavaScript payload) mounts directly
+        // without eval, which is blocked by script-src CSP in t3code://app.
+        if (!window.__t3HubDrawerEmbedded) {
+          const res = await window.__t3HubRpc("hub:getDrawerScript", {});
+          if (disposed) return;
+          if (res?.ok && res.code) {
+            window.__t3HubDrawerLoading = true;
+            try { (0, eval)(res.code); }
+            finally { delete window.__t3HubDrawerLoading; }
+          }
+        }
+        window.__t3MountSidecarHub?.({ hubRpc: window.__t3HubRpc });
+      } catch (error) {
+        if (!disposed) console.warn("[T3 HUD] Sidecar Hub could not be refreshed:", error?.message || error);
+      }
+    })();
+    if (disposed) return;
     await syncConfigLang();
+    if (disposed) return;
     hudLang = resolveLang();
     applyLangToDom();
     ensureRouterSubscription();

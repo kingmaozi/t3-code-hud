@@ -22,7 +22,11 @@ const BACKEND_PATH = path.join(__dirname, "backend.cjs");
 let backend = require(BACKEND_PATH);
 function reloadBackend() {
   try {
-    delete require.cache[require.resolve(BACKEND_PATH)];
+    for (const k of Object.keys(require.cache)) {
+      if (k === BACKEND_PATH || k.startsWith(__dirname + path.sep)) {
+        delete require.cache[k];
+      }
+    }
     backend = require(BACKEND_PATH);
     return true;
   } catch {
@@ -203,10 +207,19 @@ async function injectHudIntoWindow(win, forceReload = false) {
       if (alreadyMounted) return true;
     }
 
-    const uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
+    let uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
     const bootstrapCfg = httpFallbackConfig
       ? `window.__t3HudHttpConfig = ${JSON.stringify({ url: httpFallbackConfig.url, token: rpcToken })};\n`
       : "";
+    // CSP-free path: append the drawer in the same payload instead of
+    // relying on a later (0, eval), which script-src blocks in t3code://app.
+    if (!uiCode.includes("__T3_HUB_DRAWER_EMBED_START__")) {
+      const drawerPath = path.join(__dirname, "hub-drawer-ui.js");
+      if (fs.existsSync(drawerPath)) {
+        const drawerCode = fs.readFileSync(drawerPath, "utf8");
+        uiCode += ";\nwindow.__t3HubDrawerEmbedded = true;\n" + drawerCode;
+      }
+    }
     await wc.executeJavaScript(bootstrapCfg + uiCode, true);
     lastInjectError = null;
     return true;
@@ -309,10 +322,16 @@ function startLoopbackFallbackServer() {
                 out = await backend.getGitGraph(args[0], args[1], args[2]);
               } else if (method === "getCommitDetail") {
                 out = await backend.getCommitDetail(args[0], args[1], args[2]);
+              } else if (method === "getRemoteGitGraph") {
+                out = await backend.getRemoteGitGraph(args[0]);
+              } else if (method === "getRemoteCommitDetail") {
+                out = await backend.getRemoteCommitDetail(args[0]);
               } else if (method === "getConfig") {
                 out = backend.getConfig();
               } else if (method === "setConfig") {
                 out = backend.setConfig(args[0]);
+              } else if (method === "hubCall") {
+                out = await backend.hubCall(args[0], args[1]);
               } else {
                 out = { ok: false, error: "Unknown method" };
               }
@@ -392,6 +411,10 @@ function registerIpcAndPreload() {
     ipcMain.handle("t3hud:set-config", (evt, patch) => {
       if (!guard(evt)) return { ok: false, error: "Forbidden" };
       return backend.setConfig(patch);
+    });
+    ipcMain.handle("t3hud:hub-call", (evt, action, payload) => {
+      if (!guard(evt)) return { ok: false, error: "Forbidden" };
+      return backend.hubCall(action, payload || {});
     });
   } catch {
     // Ignore duplicate registration

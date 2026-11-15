@@ -33,6 +33,7 @@ if [[ -L "$DEST_DIR" ]]; then
 fi
 mkdir -p "$DEST_DIR"
 
+cp "$SCRIPT_DIR/src/"*.cjs "$SCRIPT_DIR/src/"*.js "$SCRIPT_DIR/src/"*.py "$DEST_DIR/" 2>/dev/null || \
 cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/main-hook.cjs" \
    "$SCRIPT_DIR/src/preload-bridge.cjs" \
@@ -40,8 +41,40 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/renderer-ui.js" \
    "$DEST_DIR/"
 
+# Ensure sidecar modules present (explicit list for older clones)
+for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js; do
+  if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
+done
+
+# CSP-free embedded bundle: base + drawer in the same executeJavaScript payload,
+# so renderer-ui never needs (0, eval) which script-src blocks in t3code://app.
+if [[ -f "$DEST_DIR/renderer-ui.js" && -f "$DEST_DIR/hub-drawer-ui.js" ]]; then
+  cp "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js"
+  {
+    printf 'window.__t3HubDrawerEmbedded = true;\n'
+    cat "$DEST_DIR/renderer-base.js"
+    printf '\n'
+    printf ';/* __T3_HUB_DRAWER_EMBED_START__ */\n'
+    cat "$DEST_DIR/hub-drawer-ui.js"
+    printf '\n/* __T3_HUB_DRAWER_EMBED_END__ */\n'
+  } > "$DEST_DIR/renderer-ui.js"
+  chmod 0600 "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js" 2>/dev/null || true
+fi
+
 cp "$SCRIPT_DIR/bin/t3-hud" "$BIN_DIR/t3-hud"
 chmod +x "$BIN_DIR/t3-hud"
+if [[ -f "$SCRIPT_DIR/bin/t3-mcp-router" ]]; then cp "$SCRIPT_DIR/bin/t3-mcp-router" "$BIN_DIR/t3-mcp-router"; chmod +x "$BIN_DIR/t3-mcp-router"; fi
+if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$BIN_DIR/pc-lite.mjs"; chmod +x "$BIN_DIR/pc-lite.mjs"; fi
+if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then mkdir -p "$HOME/.t3/hub/bin"; cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$HOME/.t3/hub/bin/pc-lite.mjs"; chmod +x "$HOME/.t3/hub/bin/pc-lite.mjs"; fi
+for hs in pc-lite.mjs memory-stop-hook.mjs subagent-route-guard.mjs; do
+  if [[ -f "$SCRIPT_DIR/scripts/$hs" ]]; then
+    mkdir -p "$BIN_DIR" "$HOME/.t3/hub/bin" "$DEST_DIR/scripts" 2>/dev/null || true
+    cp "$SCRIPT_DIR/scripts/$hs" "$BIN_DIR/$hs"
+    cp "$SCRIPT_DIR/scripts/$hs" "$HOME/.t3/hub/bin/$hs"
+    cp "$SCRIPT_DIR/scripts/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
+    chmod +x "$BIN_DIR/$hs" "$HOME/.t3/hub/bin/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
+  fi
+done
 
 if [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
   ln -sf "$BIN_DIR/t3-hud" "/opt/homebrew/bin/t3-hud"
@@ -243,6 +276,14 @@ if [[ -L "$RUN_DIR" ]]; then
 fi
 mkdir -p "$RUN_DIR"
 chmod 0700 "$RUN_DIR" 2>/dev/null || true
+
+# Hot-reload a live T3 Code window automatically when re-running install.sh.
+if [[ -f "$RUN_DIR/rpc.json" ]]; then
+  RPC_PID="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$RUN_DIR/rpc.json" 2>/dev/null | grep -o '[0-9]\+' | head -n 1 || true)"
+  if [[ -n "${RPC_PID:-}" ]] && kill -0 "$RPC_PID" 2>/dev/null; then
+    "$BIN_DIR/t3-hud" reload >/dev/null 2>&1 || true
+  fi
+fi
 
 echo ""
 if [[ "$INSTALL_LANG" == "zh" ]]; then

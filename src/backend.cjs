@@ -6,6 +6,13 @@ const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { DatabaseSync } = require("node:sqlite");
+const hubSkills = require("./hub-skills.cjs");
+const mcpRouter = require("./mcp-router.cjs");
+const memoryVault = require("./memory-vault.cjs");
+const embedManager = require("./embed-manager.cjs");
+const hubSubagents = require("./hub-subagents.cjs");
+const hubPlugins = require("./hub-plugins.cjs");
+const hubHooks = require("./hub-hooks.cjs");
 
 const execFileAsync = promisify(execFile);
 
@@ -1847,7 +1854,254 @@ function parseRefs(decorateStr) {
     .filter((r) => !r.label.startsWith("refs/t3/") && !r.label.includes("t3/checkpoint"));
 }
 
+// ============================================================================
+// 3c. Hub Context & Unified RPC (zero-restart hot-reload via getGitGraph)
+// ============================================================================
+let didAutoSyncHosts = false;
+function discoverAntigravityRulesPaths(extra = []) {
+  const out = new Set(Array.isArray(extra) ? extra.filter(Boolean) : []);
+  try {
+    if (fs.existsSync(AGY_PROVIDERS_ROOT)) {
+      for (const entry of fs.readdirSync(AGY_PROVIDERS_ROOT, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const rulesDir = path.join(AGY_PROVIDERS_ROOT, entry.name, "config", "rules");
+        const rulesFile = path.join(rulesDir, "AGENTS.md");
+        if (fs.existsSync(rulesFile) || fs.existsSync(rulesDir)) out.add(rulesFile);
+      }
+    }
+  } catch {}
+  return [...out];
+}
+
+function resolveHubContext(args = {}) {
+  if (!didAutoSyncHosts) {
+    didAutoSyncHosts = true;
+    try { mcpRouter.autoSyncHosts(); } catch {}
+  }
+  const threadHint = args.threadHint || args.threadId || "";
+  const routeHint = args.routeHint || args.threadHint || args.threadId || "";
+  const hint = routeHint || threadHint;
+  let parsed = extractThreadId(hint);
+  if (parsed && parsed.startsWith("__ROUTE_")) parsed = null;
+  if (parsed === "__NEW__") parsed = null;
+  try {
+    if (!fs.existsSync(DB_PATH)) {
+      return { ok: false, error: "statev2.sqlite not found" };
+    }
+    let db;
+    try {
+      db = new DatabaseSync(DB_PATH, { open: true, readOnly: true });
+      let threadRow = null;
+      if (parsed) {
+        threadRow = db.prepare("SELECT thread_id, project_id, title, default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?").get(parsed);
+      }
+      if (!threadRow) {
+        // Fall back to most recently updated non-delegated thread.
+        const rows = db.prepare("SELECT thread_id, project_id, title, default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE archived_at IS NULL AND deleted_at IS NULL ORDER BY updated_at DESC").all();
+        threadRow = rows.find((r) => r.thread_id && !String(r.thread_id).startsWith("delegated:") && !String(r.thread_id).startsWith("thread:delegated")) || rows[0] || null;
+      }
+      if (!threadRow) return { ok: false, error: "No active thread" };
+      const threadId = threadRow.thread_id;
+      const projectId = threadRow.project_id;
+      const payload = (() => { try { return JSON.parse(threadRow.payload_json || "{}"); } catch { return {}; } })();
+      let projectRow = null;
+      if (projectId) {
+        try { projectRow = db.prepare("SELECT title, workspace_root FROM projection_projects WHERE project_id = ?").get(projectId); } catch {}
+      }
+      if (!projectRow) {
+        try { projectRow = db.prepare("SELECT title, workspace_root FROM projection_projects ORDER BY updated_at DESC LIMIT 1").get(); } catch {}
+      }
+      const projectRoot = projectRow?.workspace_root || payload.worktreePath || null;
+      const projectTitle = projectRow?.title || path.basename(projectRoot || "") || threadRow.title || "";
+      const projectSlug = (() => {
+        if (projectRoot) {
+          try { return require("./memory-vault.cjs").slugFromProjectRoot(projectRoot); } catch { return path.basename(projectRoot); }
+        }
+        return null;
+      })();
+      let activeProvider = threadRow.default_provider || null;
+      let activeModel = payload?.modelSelection?.model || null;
+      try {
+        const psRow = db.prepare("SELECT provider, driver, model FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ? ORDER BY updated_at DESC LIMIT 1").get(threadId);
+        if (psRow) {
+          activeProvider = psRow.driver || psRow.provider || activeProvider;
+          activeModel = psRow.model || activeModel;
+        }
+      } catch {}
+      db.close();
+      // Counts (best-effort, never throw)
+      let activePlugins = 0;
+      let activeSkills = 0;
+      let activeMcps = 0;
+      let activeHooks = 0;
+      let projectMemories = 0;
+      let subagents = 0;
+      try {
+        const pl = hubPlugins.listPlugins({ projectRoot });
+        activePlugins = (pl.items || []).filter((i) => projectRoot ? (i.scope === "global" || i.scope === "project") : i.scope === "global").length;
+      } catch {}
+      try {
+        const hk = hubHooks.listHooks({ projectRoot });
+        activeHooks = (hk.items || []).filter((h) => h.enabled !== false && h.scope !== "off").length;
+      } catch {}
+      try {
+        if (projectRoot) {
+          const listed = hubSkills.listAssets({ projectRoot });
+          activeSkills = (listed.items || []).filter((i) => i.scope === "global" || i.scope === "project").length;
+        } else {
+          const listed = hubSkills.listAssets({});
+          activeSkills = (listed.items || []).filter((i) => i.scope === "global").length;
+        }
+      } catch {}
+      try {
+        const m = mcpRouter.listMcpServers({ projectRoot });
+        activeMcps = (m.items || []).filter((x) => x.mode && x.mode !== "off").length;
+      } catch {}
+      try {
+        if (projectRoot) {
+          const ov = memoryVault.getOverview({ projectRoot });
+          const entry = (ov.projects || []).find((p) => p.slug === projectSlug) || (ov.projects || []).find((p) => p.projectRoot === projectRoot);
+          projectMemories = entry ? Number(entry.total) || 0 : 0;
+        } else {
+          const ov = memoryVault.getOverview({});
+          projectMemories = Number(ov.totalMemories) || 0;
+        }
+      } catch {}
+      try {
+        const s = hubSubagents.listSubagents({ projectRoot });
+        subagents = (s.effectiveItems || []).length;
+      } catch {}
+      return { ok: true, threadId, projectId, projectRoot, projectSlug, projectTitle, activeProvider, activeModel, counts: { activePlugins, activeSkills, activeMcps, activeHooks, projectMemories, subagents } };
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function hubCall(action, payload = {}) {
+  try {
+    switch (action) {
+      case "hub:getDrawerScript": {
+        const code = fs.readFileSync(path.join(__dirname, "hub-drawer-ui.js"), "utf8");
+        return { ok: true, code };
+      }
+      case "hub:getContext": return resolveHubContext(payload);
+      case "slash:list": {
+        const projectRoot = payload.projectRoot || null;
+        const listed = hubSkills.listAssets({ projectRoot });
+        const skills = (listed.items || []).filter((i) => i.scope === "global" || i.scope === "project").map((i) => ({
+          id: i.id, name: i.name, description: i.description, scope: i.scope, path: i.path, source: i.source,
+        }));
+        // Enforce per-project isolation: project-scoped skills only for this projectRoot.
+        // listAssets already checks filesystem, but double-filter ensures no cross-project leak.
+        let subagentsList = [];
+        try {
+          const s = hubSubagents.listSubagents({ projectRoot });
+          subagentsList = (s.effectiveItems || []).filter((x) => x.enabled !== false);
+        } catch {}
+        return { ok: true, projectRoot: projectRoot || null, skills, subagents: subagentsList };
+      }
+      case "skills:list": return hubSkills.listAssets(payload);
+      case "skills:setScope": return hubSkills.setSkillScope(payload);
+      case "skills:importGitHub": return await hubSkills.importFromGitHub(payload);
+      case "skills:update":
+      case "skills:updatePackage": return await hubSkills.updatePackage(payload);
+      case "skills:remove":
+      case "skills:removePackage": return await hubSkills.removePackage(payload);
+      case "agentsMd:get": return hubSkills.getAgentsMd(payload);
+      case "agentsMd:save": return hubSkills.saveAgentsMd(payload);
+      case "agentsMd:injectSoftRoute": return hubSkills.injectSoftRoute(payload);
+      case "mcp:list": return mcpRouter.listMcpServers(payload);
+      case "mcp:setMode": return mcpRouter.setMcpMode(payload);
+      case "mcp:upsert": return mcpRouter.upsertMcpServer(payload);
+      case "mcp:remove": return mcpRouter.removeMcpServer(payload);
+      case "plugins:list": return hubPlugins.listPlugins(payload);
+      case "plugins:setScope": {
+        const res = hubPlugins.setPluginScope(payload);
+        if (payload && payload.id === "t3-memory-vault" && payload.scope && payload.scope !== "off") {
+          try { mcpRouter.autoSyncHosts(); } catch {}
+        }
+        return res;
+      }
+      case "plugins:installGitHub":
+      case "plugins:importGitHub":
+        return await hubPlugins.installPluginFromGitHub({
+          ...(payload || {}),
+          input: payload?.input || payload?.repoInput || payload?.url || "",
+        });
+      case "mcp:probe": return await mcpRouter.probeMcpServers(payload);
+      case "mcp:autoSync": return mcpRouter.autoSyncHosts();
+      case "mcp:syncClis": return mcpRouter.syncRouterToClis();
+      case "hooks:list": return hubHooks.listHooks(payload);
+      case "hooks:toggle":
+      case "hooks:setScope": return hubHooks.toggleHook(payload);
+      case "hooks:save":
+      case "hooks:upsert": return hubHooks.saveCustomHook(payload);
+      case "hooks:delete":
+      case "hooks:remove": return hubHooks.deleteCustomHook(payload);
+      case "hooks:setPlugin": return hubHooks.setPluginHooks(payload);
+      case "memory:overview": return memoryVault.getOverview(payload);
+      case "memory:list":
+      case "memory:search": return await memoryVault.listMemories(payload);
+      case "memory:save": return await memoryVault.saveMemory(payload);
+      case "memory:consolidate": return await memoryVault.consolidateMemories(payload);
+      case "memory:rollback": return await memoryVault.rollbackMemory(payload);
+      case "memory:delete": return memoryVault.deleteMemory(payload);
+      case "memory:pinToAgentsMd": return memoryVault.pinToAgentsMd(payload);
+      case "memory:migratePowerContext": return await memoryVault.migrateFromPowerContext(payload);
+      case "embed:status": return await embedManager.getStatus();
+      case "embed:switch": return await embedManager.switchModel(payload);
+      case "subagents:list": return hubSubagents.listSubagents(payload);
+      case "subagents:resolveRoute":
+      case "subagents:resolve": return hubSubagents.resolveSubagentRoute(payload);
+      case "subagents:save": return hubSubagents.saveSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      case "subagents:update": {
+        const p = payload || {};
+        if (p.item && typeof p.item === "object") {
+          return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+        }
+        if (p.id || p.name) {
+          const { id, item: _item, scope, projectRoot, extraSyncPaths, ...patch } = p;
+          const targetId = id || patch.name;
+          const targetScope = scope || (projectRoot ? "project" : "global");
+          let existing;
+          try {
+            const listed = hubSubagents.listSubagents({ projectRoot: targetScope === "project" ? (projectRoot || null) : null });
+            const findIn = (arr) => (arr || []).find((x) => x.id === targetId)
+              || (arr || []).find((x) => x.name === (patch.name || targetId));
+            existing = targetScope === "project"
+              ? (findIn(listed.projectItems) || findIn(listed.globalItems))
+              : findIn(listed.globalItems);
+          } catch {}
+          const mergedItem = {
+            ...existing, ...patch,
+            id: existing ? existing.id : targetId,
+            name: patch.name !== undefined ? patch.name : (existing ? existing.name : targetId),
+          };
+          return hubSubagents.saveSubagent({
+            ...p,
+            scope: targetScope,
+            projectRoot: targetScope === "project" ? projectRoot : null,
+            extraSyncPaths: discoverAntigravityRulesPaths(extraSyncPaths),
+            item: mergedItem,
+          });
+        }
+        return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+      }
+      case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      default: return { ok: false, error: "unknown action: " + action };
+    }
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 async function getGitGraph(threadHint, maxCommits = 90, fallbackCwd = null) {
+  if (threadHint === "__HUB_RPC__") {
+    return hubCall(maxCommits, fallbackCwd || {});
+  }
   const selectedEnvironment = typeof fallbackCwd === "object" && typeof fallbackCwd?.environmentId === "string" ? fallbackCwd.environmentId.trim() : "";
   if (selectedEnvironment) {
     let localEnvironment = "";
@@ -2549,4 +2803,6 @@ module.exports = {
   getConfig,
   setConfig,
   lookupCatalogContextMax,
+  resolveHubContext,
+  hubCall,
 };
