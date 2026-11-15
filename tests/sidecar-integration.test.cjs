@@ -100,6 +100,29 @@ function buildDb() {
 before(() => buildDb());
 
 describe("backend hubCall via getGitGraph __HUB_RPC__ bridge", () => {
+  it("dispatches Hub RPC before remote workspace detection even without a local environment ID", async () => {
+    const environmentFile = path.join(tmpUserdata, "environment-id");
+    const original = fs.existsSync(environmentFile) ? fs.readFileSync(environmentFile) : null;
+    try {
+      for (const localEnvironment of [null, "sidecar-local-env"]) {
+        if (localEnvironment == null) fs.rmSync(environmentFile, { force: true });
+        else fs.writeFileSync(environmentFile, localEnvironment);
+        const payload = { environmentId: "sidecar-remote-env", cwd: PROJECT_ROOT };
+        const hub = await backend.getGitGraph("__HUB_RPC__", "hub:getDrawerScript", payload);
+        assert.equal(hub.ok, true, JSON.stringify(hub));
+        assert.ok(hub.code.includes("__t3MountSidecarHub"));
+        assert.equal(hub.remoteOnly, undefined);
+        const graph = await backend.getGitGraph(THREAD_ID, 90, payload);
+        assert.equal(graph.ok, false);
+        assert.equal(graph.remoteOnly, true);
+        assert.equal(graph.remoteCwd, PROJECT_ROOT);
+      }
+    } finally {
+      if (original == null) fs.rmSync(environmentFile, { force: true });
+      else fs.writeFileSync(environmentFile, original);
+    }
+  });
+
   it("hub:getDrawerScript returns code", async () => {
     const res = await backend.getGitGraph("__HUB_RPC__", "hub:getDrawerScript", {});
     assert.equal(res.ok, true);
