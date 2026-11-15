@@ -440,6 +440,19 @@ describe("install.sh sidecar copies", () => {
   });
 });
 
+it("renderer fallback bills unknown models at Muse Wonder's conservative rate", () => {
+  const source = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
+  const start = source.indexOf("  function fallbackModelRate(model) {");
+  const end = source.indexOf("\n  function buildLocalProjectionFallback", start);
+  assert.ok(start >= 0 && end > start, "fallback rate resolver found");
+  const resolve = vm.runInNewContext(`(${source.slice(start, end).trim()})`);
+  const expected = { input: 5.4 / 1e6, output: 27 / 1e6, cacheRead: 0.54 / 1e6, cacheWrite: 5.4 / 1e6 };
+  for (const model of ["muse-wonder-full-1.0", "future-provider/unknown-model", "", undefined]) {
+    for (const [kind, price] of Object.entries(expected)) assert.equal(resolve(model)[kind], price, `${model || "unidentified"} ${kind}`);
+  }
+  assert.equal(resolve("muse-ember-1.0").input, 0.1 / 1e6, "known low-cost models retain their rate");
+});
+
 function extractHubRpc(rendererSrc) {
   const start = rendererSrc.indexOf("window.__t3HubRpc = async");
   assert.ok(start !== -1, "window.__t3HubRpc definition found");
@@ -450,7 +463,7 @@ function extractHubRpc(rendererSrc) {
 }
 
 describe("CSP-free embedded bundle + bridge-first RPC", () => {
-  it("(a) embedded bundle mounts 7-tab v2 Hub and replaces pre-existing Hub without eval", async () => {
+  it("(a) embedded bundle mounts 9-tab v3 Hub and replaces pre-existing Hub without eval", async () => {
     const rendererSrc = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
     const drawerSrc = fs.readFileSync(path.join(REPO, "src", "hub-drawer-ui.js"), "utf8");
     // Embedded guard: no fetch/eval when __t3HubDrawerEmbedded is truthy.
@@ -462,11 +475,14 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     assert.ok(guardIdx < evalIdx, "embedded guard precedes eval");
     // Backward compat: eval branch still exists for non-embedded path.
     assert.ok(rendererSrc.includes("if (!window.__t3HubDrawerEmbedded)"));
-    // 7-tab v2 Hub tabs.
-    for (const tab of ["plugins", "mcp", "skills", "hooks", "subagents", "memory", "agents"]) {
+    // Keep the complete top-level navigation in its intended order.
+    const expectedTabs = ["board", "plugins", "mcp", "skills", "memory", "subagents", "hooks", "settings", "agents"];
+    for (const tab of expectedTabs) {
       assert.ok(drawerSrc.includes(`"${tab}"`), `drawer defines tab ${tab}`);
     }
-    assert.ok(drawerSrc.includes('["plugins", "mcp", "skills", "hooks", "subagents", "memory", "agents"]'));
+    const tabKeys = drawerSrc.match(/const tabKeys = (\[[^;]+\]);/);
+    assert.ok(tabKeys, "drawer declares top-level navigation");
+    assert.deepEqual(JSON.parse(tabKeys[1]), expectedTabs);
     // Assembled bundle matches install.sh / bin/t3-hud format.
     const bundle =
       "window.__t3HubDrawerEmbedded = true;\n" + rendererSrc +
@@ -508,7 +524,7 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     vm.createContext(sandbox);
     vm.runInContext(drawerSrc, sandbox);
     assert.ok(oldDestroyed, "pre-existing Hub destroyed");
-    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 7-tab Hub mounted");
+    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 9-tab Hub mounted");
     assert.equal(typeof sandbox.window.__t3SidecarHub.snapshot, "function");
     assert.equal(typeof sandbox.window.__t3SidecarHub.destroy, "function");
     assert.equal(typeof sandbox.window.__t3MountSidecarHub, "function");
