@@ -10,14 +10,30 @@ const pluginDir = process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-
 const runDir = path.join(pluginDir, "run");
 const bridgeFile = path.join(runDir, "hub-bridge.json");
 const token = crypto.randomBytes(32).toString("hex");
+let backend = null;
+const disposedBackends = new WeakSet();
+
+function stopBackendScheduler(target = backend) {
+  if (!target || (typeof target !== "object" && typeof target !== "function") || disposedBackends.has(target)) return;
+  disposedBackends.add(target);
+  try { if (typeof target.stopDreamScheduler === "function") target.stopDreamScheduler(); } catch {}
+}
 
 function loadBackend() {
+  stopBackendScheduler();
+  let cacheRoot = path.resolve(pluginDir);
+  try { cacheRoot = fs.realpathSync(pluginDir); } catch {}
+  let backendPath = path.resolve(pluginDir, "backend.cjs");
+  try { backendPath = fs.realpathSync(backendPath); } catch {}
   for (const k of Object.keys(require.cache)) {
-    if (k.startsWith(pluginDir + path.sep)) delete require.cache[k];
+    if (k === backendPath || k.startsWith(cacheRoot + path.sep)) delete require.cache[k];
   }
-  return require(path.join(pluginDir, "backend.cjs"));
+  const next = require(backendPath);
+  backend = next;
+  try { if (typeof next.ensureDreamScheduler === "function") next.ensureDreamScheduler(); } catch {}
+  return next;
 }
-let backend = loadBackend();
+backend = loadBackend();
 
 function allowedOrigin(origin) {
   if (!origin || origin === "null") return null;
@@ -65,6 +81,19 @@ const server = http.createServer((req, res) => {
     }
   });
 });
+
+server.once("close", () => {
+  stopBackendScheduler();
+});
+process.once("beforeExit", () => {
+  stopBackendScheduler();
+});
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    stopBackendScheduler();
+    server.close(() => { process.exitCode = 0; });
+  });
+}
 
 server.listen(0, "127.0.0.1", () => {
   const addr = server.address();

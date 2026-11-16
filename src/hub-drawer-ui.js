@@ -47,6 +47,7 @@
     let unsubscribeRouter = null;
     let routerProbeAt = 0;
     let drag = null;
+    let boardDrag = null;
     let suppressClick = false;
     let contextLoading = true;
     let slashVersion = 0;
@@ -55,8 +56,8 @@
     let slashSession = null;
     const slashCache = new Map();
     const subagentSaves = new Map();
-    const tabKeys = ["memory", "skills", "subagents", "settings", "board", "agents"];
-    const cache = { hooks: null, skills: null, subagents: null, orchestration: null, mcp: null, overview: null, memory: null, worktree: null, dream: null, health: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
+    const tabKeys = ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"];
+    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, overview: null, memory: null, worktree: null, dream: null, health: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
     const errors = {};
     const drafts = initial?.drafts || {};
     const state = {
@@ -65,11 +66,11 @@
       width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
       resourceFilters: initial?.resourceFilters || {},
       memoryScope: initial?.memoryScope || "smart",
-      // Migrate the old collapsed default; preserve new explicit choices.
-      boardExpanded: storageGet("t3-hub-board-expanded-v2") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-board-expanded-v2") === "true"),
+      // A new floating dashboard starts open; only its own explicit choice persists.
+      boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
       boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "",
       orchestrationDraft: initial?.orchestrationDraft || null,
-      dreamSaving: false, dreamRunning: false, memoryImporting: false, embedTrimming: false,
+      dreamSaving: false, dreamRunning: false, dreamEngineDraft: initial?.dreamEngineDraft || null, memoryImporting: false, embedTrimming: false,
       settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
       settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
       clearedHostFields: new Set(Array.isArray(initial?.clearedHostFields) ? initial.clearedHostFields : []),
@@ -292,6 +293,13 @@
         .hub-mcp-mode-controls{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end;margin-top:9px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-mcp-mode-controls label{min-width:0;font-size:9px;color:var(--hub-secondary)}.hub-mcp-mode-controls label small{display:block;margin-bottom:4px}.hub-mcp-mode-controls .hub-select{font-size:10px!important;padding:6px 22px 6px 8px}.hub-mcp-mode-hint{grid-column:1/-1;margin:0;font-size:9px;line-height:1.65;color:var(--hub-secondary)}
         .hub-resource-grid{align-items:stretch;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.hub-resource-card{display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:14px;margin:0;min-width:0}.hub-resource-card .hub-card-top{align-items:flex-start;min-width:0}.hub-resource-card .hub-grow{min-width:0}.hub-resource-card .hub-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:6px;min-width:0}.hub-resource-card .hub-card-description{margin:0;min-height:42px}.hub-resource-card .hub-resource-toggle{width:100%;max-width:none;align-items:flex-start;margin-top:auto;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-resource-card .hub-agent-toggle{width:100%;justify-content:flex-start}.hub-resource-controls-label{font-size:9px;color:var(--hub-secondary);margin-top:2px}.hub-resource-card .hub-mcp-mode-controls{grid-column:auto;width:100%;grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:0;padding:9px}.hub-resource-card .hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}.hub-unavailable-hint{color:var(--hub-secondary);font-size:9px}.hub-unavailable{border-color:color-mix(in srgb,var(--hud-amber) 45%,var(--hub-border));color:var(--hub-secondary)}.hub-route-status{white-space:normal;text-overflow:clip}
         @media(max-width:639px){.hub-mcp-mode-controls{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}}
+        #t3-hub-live-board{border-radius:14px;padding:0;box-shadow:0 12px 36px #0f172a24,0 2px 8px #0f172a12;max-width:calc(100vw - 16px)}
+        .hub-board-toolbar{gap:4px;flex-wrap:nowrap;padding:10px 10px 8px;border-bottom:1px solid var(--hub-border)}
+        .hub-board-drag{display:flex;align-items:center;gap:7px;min-width:0;flex:1;cursor:grab;user-select:none;touch-action:none;-webkit-app-region:no-drag}.hub-board-drag:active{cursor:grabbing}.hub-board-grip{font-size:15px;letter-spacing:-3px;color:var(--hub-muted);padding-right:4px}.hub-board-drag strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.hub-board-drag .hub-board-status{font-size:10px;color:var(--hub-secondary);white-space:nowrap}
+        .hub-board-toolbar .hub-icon-btn{width:25px;height:25px;flex:none}.hub-board-content{padding:10px 12px 12px}.hub-board-source{display:flex;justify-content:space-between;gap:6px;font-size:10px;color:var(--hub-secondary);margin-bottom:8px}.hub-board-meter{height:5px;border-radius:10px;background:var(--hub-border);overflow:hidden;margin:0 0 12px}.hub-board-meter>i{display:block;height:100%;border-radius:inherit;background:var(--hub-accent)}.hub-dashboard-links{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--hub-border);margin-top:12px;padding-top:10px}.hub-dashboard-links button{border:0;border-radius:7px;background:var(--hub-bg-subtle);padding:4px 7px;color:var(--hub-secondary);font-size:10px!important}.hub-dashboard-links button:hover{color:var(--hub-ink)}
+        .hub-progress-ring{flex:none;transform:rotate(-90deg)}.hub-step-icon{width:16px;height:16px;border:1.5px solid var(--hub-muted);border-radius:50%;font-size:10px;line-height:1}.hub-board-step.is-completed .hub-step-icon{background:var(--hub-accent);border-color:var(--hub-accent);color:var(--hub-on-active)}.hub-board-step.is-in-progress .hub-step-icon{border-color:var(--hub-accent)}
+        .hub-commander .hub-segments>button[aria-pressed=true],.hub-commander .hub-segments>button[aria-pressed=true]:hover{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:600}
+        .hub-subagent-main{grid-template-columns:36px minmax(0,1fr)}#t3-hub-drawer.is-wide .hub-subagent-main{grid-template-columns:36px minmax(0,1fr) minmax(280px,1fr)}.hub-robot{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;background:var(--hub-bg-subtle);flex:none}.hub-robot-face{width:23px;height:23px;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:4px;background:var(--robot-color,#3980f6);box-shadow:inset 0 -2px #00000012}.hub-robot-face i{display:block;width:4px;height:7px;background:#fff;border-radius:4px}.hub-subagent-meta{margin-left:45px}#t3-hub-drawer.is-compact .hub-subagent-meta{margin-left:0}
       `;
       document.head.appendChild(style);
       root = document.createElement("div");
@@ -318,9 +326,11 @@
       listen(root, "click", onClick);
       listen(root, "input", onInput);
       listen(root, "change", onChange);
-      listen(liveBoard, "click", onClick);
-      listen(liveBoard, "input", onInput);
-      listen(liveBoard, "keydown", onEditorKeydown);
+      // Events bubble through the independent Hub root; do not run actions twice.
+      listen(liveBoard, "pointerdown", startBoardDrag);
+      listen(liveBoard, "pointermove", moveBoardDrag);
+      listen(liveBoard, "pointerup", endBoardDrag);
+      listen(liveBoard, "pointercancel", cancelBoardDrag);
       listen(root, "error", (event) => { if (event.target.matches?.(".hub-brand-icon>img")) { event.target.parentElement.classList.remove("has-image"); event.target.remove(); } }, true);
       const resizeHandle = root.querySelector("#t3-hub-resize-handle");
       listen(resizeHandle, "pointerdown", startResize);
@@ -408,7 +418,7 @@
       handle.title = tr("Hub 工作台 · ⌘⇧K / Alt+H", "Hub Studio · ⌘⇧K / Alt+H");
       handle.setAttribute("aria-label", tr("打开 Hub 工作台", "Open Hub Studio"));
       root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("工作空间作用域", "Workspace scope"))}"><option value="global" ${state.scope === "global" ? "selected" : ""}>${esc(tr("本机 · 全局", "Local · Global"))}</option><option value="project" ${state.scope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("当前项目", "Project"))} · ${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
-      const tabs = [["memory", "memory", tr("记忆库", "Memory")], ["skills", "bolt", tr("技能与 MCP", "Skills & MCP")], ["subagents", "hub", tr("编排路由", "Routing")], ["settings", "edit", tr("宿主设置", "Settings")]];
+      const tabs = [["memory", "memory", tr("记忆库", "Memory")], ["skills", "bolt", tr("技能与 MCP", "Skills & MCP")], ["plugins", "plug", tr("插件", "Plugins")], ["subagents", "hub", tr("编排路由", "Routing")], ["hooks", "check", "Hooks"], ["settings", "edit", tr("宿主设置", "Settings")]];
       root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, glyph, label]) => {
         const count = tabCount(key);
         return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === state.tab}" tabindex="${key === state.tab ? 0 : -1}">${icon(glyph, 14)}<span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
@@ -421,6 +431,7 @@
       if (key === "board") { const b = boardData(); return b.progress.total ? `${b.progress.completed}/${b.progress.total}` : null; }
       if (key === "mcp") return cache.mcp ? mcpServers().length : counts.activeMcps ?? null;
       if (key === "skills") return cache.skills ? items(cache.skills, ["items", "skills"]).length : counts.activeSkills ?? null;
+      if (key === "plugins") return cache.plugins ? pluginItems().length : null;
       if (key === "hooks") return cache.hooks ? hookItems().length : counts.hooks ?? null;
       if (key === "subagents") return cache.subagents ? subagentItems().length : counts.subagents ?? null;
       if (key === "memory") {
@@ -448,7 +459,7 @@
       loadTab().then(() => { if (!disposed && drafts.__new?.open && state.tab === "memory") openNewMemory(); });
     }
     function scopeControl(domain, item, disabled = false) {
-      return `<div class="hub-segments hub-scope-control" role="group" aria-label="${esc(item.title || item.name || item.id)} ${esc(tr("启用范围", "Activation scope"))}">${[["off", tr("关闭", "Off")], ["project", tr("仅本项目", "This project")], ["global", tr("全局", "Global")]].map(([scope, label]) => `<button type="button" data-action="${domain}-scope" data-id="${esc(item.id)}" data-scope="${scope}" class="${(item.scope || "off") === scope ? "is-active" : ""}" aria-pressed="${(item.scope || "off") === scope}" ${disabled || scope === "project" && projectDisabled() ? "disabled" : ""}>${esc(label)}</button>`).join("")}</div>`;
+      return `<div class="hub-segments hub-scope-control" role="group" aria-label="${esc(item.title || item.name || item.id)} ${esc(tr("保存范围（实际配置状态见上方）", "Saved scope (actual status above)"))}">${[["off", tr("关闭", "Off")], ["project", tr("仅本项目", "This project")], ["global", tr("全局", "Global")]].map(([scope, label]) => `<button type="button" data-action="${domain}-scope" data-id="${esc(item.id)}" data-scope="${scope}" class="${(item.scope || "off") === scope ? "is-active" : ""}" aria-pressed="${(item.scope || "off") === scope}" ${disabled || scope === "project" ? "disabled" : ""}>${esc(label)}</button>`).join("")}</div>`;
     }
     const agentHosts = [
       { id: "antigravity", label: "AGY", aliases: ["agy", "antigravity"] },
@@ -589,19 +600,31 @@
       { id: "secret-guard", title: " 敏感密钥提交守卫", event: "PreToolUse", description: "提交前检查敏感密钥，避免凭据进入版本历史。", builtin: true, scope: "off", unavailable: true },
       { id: "syntax-check", title: " JS/CJS 语法快检", event: "PostToolUse", description: "修改 JavaScript 后执行语法检查，及时发现错误。", builtin: true, scope: "off", unavailable: true },
     ];
+    function projectOwnedHook(item) { return item?.scope === "project" || !!item?.projectRoot; }
     function hookItems() {
       const list = items(cache.hooks, ["items", "hooks"]);
       if (cache.hooks?.unavailable) return builtinHooks;
       const templates = { "memory-stop-guard": builtinHooks[0], "secret-commit-guard": builtinHooks[1], "js-syntax-postcheck": builtinHooks[2] };
-      return list.map((item) => ({ ...item, title: templates[item.id]?.title || item.title || item.id, description: item.description || templates[item.id]?.description || "", event: item.event || items(item, ["events"]).join(" / ") }));
+      // The manager also reports Hub hooks for other project roots. Never expose
+      // them as writable entries for the current session or while it resolves.
+      return list.filter((item) => !projectOwnedHook(item) || projectContextReady() && (item.projectRoot === state.projectRoot || item.readonly && !item.projectRoot)).map((item) => ({ ...item, title: templates[item.id]?.title || item.title || item.id, description: item.description || templates[item.id]?.description || "", event: item.event || items(item, ["events"]).join(" / ") }));
+    }
+    function hookConfigurationMarkup(item) {
+      if (item.unavailable) return `<span class="hub-badge">${esc(tr("实际配置不可用", "Configuration unavailable"))}</span>`;
+      const configured = typeof item.configured === "boolean" ? item.configured : typeof item.enabled === "boolean" ? item.enabled : null;
+      const full = Array.isArray(item.configuredIn) ? item.configuredIn : [], partial = Array.isArray(item.partialIn) ? item.partialIn : [];
+      const hostNames = (values) => values.map((name) => ({ codex: "Codex", claude: "Claude" })[name] || String(name)).join(" / ");
+      const label = item.configurationStatus === "partial" ? partial.length ? tr("配置不完整", "Configuration incomplete") : tr("部分宿主已配置", "Partially configured") : configured === null ? tr("配置状态未知", "Configuration unknown") : configured === false ? tr("未检测到配置", "Not configured") : tr("已检测到配置", "Configured");
+      const hosts = partial.length ? [full.length ? `${tr("完整", "Complete")}: ${hostNames(full)}` : "", `${tr("未完整", "Incomplete")}: ${hostNames(partial)}`].filter(Boolean).join(" · ") : hostNames(full);
+      return `<span class="hub-badge">${esc(label)}${hosts ? ` · ${esc(hosts)}` : ""}</span>`;
     }
     function renderHooks(target = content) {
       const list = hookItems();
       const draft = state.hookDraft;
-      const group = (title, entries) => entries.length ? `<div class="hub-section-heading hub-group-heading"><span>${esc(title)}</span><span class="hub-count">${entries.length}</span></div><div class="hub-hook-group">${entries.map((item) => `<article class="hub-card hub-hook-card"><div class="hub-card-top"><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.id)}</div><div class="hub-card-meta"><span class="hub-badge hub-purple">${esc(item.event)}</span>${item.readonly ? `<span class="hub-badge">${esc(tr("外部 · 只读", "External · read-only"))}</span>` : ""}</div></div>${!item.builtin && !item.readonly ? button("delete-hook", tr("删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` }) : ""}</div><p class="hub-card-description">${esc(item.description || item.matcher || "")}</p>${item.command ? `<code class="hub-hook-command">${esc(redact(item.command))}</code>` : ""}${scopeControl("hook", item, !!(item.readonly || item.unavailable))}<div class="hub-confirm-delete" data-hook-confirm="${esc(item.id)}" hidden>${esc(tr("删除这个自定义 Hook？", "Delete this custom hook?"))}<div class="hub-row">${button("confirm-delete-hook", tr("确认删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-delete-hook", tr("取消", "Cancel"), { small: true })}</div></div></article>`).join("")}</div>` : "";
+      const group = (title, entries) => entries.length ? `<div class="hub-section-heading hub-group-heading"><span>${esc(title)}</span><span class="hub-count">${entries.length}</span></div><div class="hub-hook-group">${entries.map((item) => `<article class="hub-card hub-hook-card"><div class="hub-card-top"><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.id)}</div><div class="hub-card-meta"><span class="hub-badge hub-purple">${esc(item.event)}</span>${item.readonly ? `<span class="hub-badge">${esc(projectOwnedHook(item) ? tr("项目 · 只读", "Project · read-only") : tr("外部 · 只读", "External · read-only"))}</span>` : ""}${hookConfigurationMarkup(item)}</div></div>${!item.builtin && !item.readonly && !projectOwnedHook(item) ? button("delete-hook", tr("删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` }) : ""}</div><p class="hub-card-description">${esc(item.description || item.matcher || "")}</p>${item.command ? `<code class="hub-hook-command">${esc(redact(item.command))}</code>` : ""}${scopeControl("hook", item, !!(item.readonly || item.unavailable || projectOwnedHook(item)))}<div class="hub-confirm-delete" data-hook-confirm="${esc(item.id)}" hidden>${esc(tr("删除这个自定义 Hook？", "Delete this custom hook?"))}<div class="hub-row">${button("confirm-delete-hook", tr("确认删除", "Delete"), { small: true, danger: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-delete-hook", tr("取消", "Cancel"), { small: true })}</div></div></article>`).join("")}</div>` : "";
       const external = new Map();
       list.filter((item) => !item.builtin).forEach((item) => { const key = item.source || tr("自定义", "Custom"); if (!external.has(key)) external.set(key, []); external.get(key).push(item); });
-      target.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("让工作流自动收尾", "A little automation, at the right moment"))}</span></div><p class="hub-description">${esc(tr("在关键生命周期运行检查与记忆整理。", "Run checks and memory routines at lifecycle events."))}</p>${button("new-hook", tr("新建自定义 Hook", "New custom hook"), { icon: "plus", primary: true, attrs: `aria-expanded="${!!draft}"` })}${draft ? `<form class="hub-form-panel" data-form="hook"><label class="hub-field">${esc(tr("名称", "Name"))}<input class="hub-input" name="hook-title" value="${esc(draft.title)}" placeholder="My workflow hook"></label><div class="hub-form-grid"><label class="hub-field">${esc(tr("生命周期事件", "Event"))}<select class="hub-select" name="hook-event">${["Stop", "SubagentStop", "PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "PreCompact", "SessionEnd"].map((event) => `<option ${event === draft.event ? "selected" : ""}>${event}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("范围", "Scope"))}<select class="hub-select" name="hook-scope">${["off", "project", "global"].map((scope) => `<option value="${scope}" ${scope === draft.scope ? "selected" : ""} ${scope === "project" && projectDisabled() ? "disabled" : ""}>${esc(scope === "off" ? tr("关闭", "Off") : scope === "project" ? tr("本项目", "Project") : tr("全局", "Global"))}</option>`).join("")}</select></label></div><label class="hub-field">Matcher<input class="hub-input" name="hook-matcher" value="${esc(draft.matcher)}" placeholder="Bash|Edit|Write"></label><label class="hub-field">${esc(tr("执行命令", "Command"))}<textarea class="hub-input" name="hook-command" rows="3" spellcheck="false">${esc(draft.command)}</textarea></label><div class="hub-row">${button("save-hook", tr("保存 Hook", "Save hook"), { primary: true, icon: "save" })}${button("cancel-hook", tr("取消", "Cancel"))}</div></form>` : ""}${errors.hooks ? inlineError(errors.hooks) : !cache.hooks ? loading() : `${cache.hooks.unavailable ? `<p class="hub-hint hub-domain-hint">${esc(tr("Hooks 服务尚未接入，以下为内置模板预览。", "Hooks service is not connected. Built-in templates are previewed below."))}</p>` : ""}${group(tr("内置 Hooks", "Built-in hooks"), list.filter((item) => item.builtin))}${[...external].map(([name, entries]) => group(name, entries)).join("")}${!list.length ? empty(tr("还没有 Hook", "No hooks yet")) : ""}`}`;
+      target.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("让工作流自动收尾", "A little automation, at the right moment"))}</span></div><p class="hub-description">${esc(tr("在关键生命周期运行检查与记忆整理。项目 Hook 只读，保留现有配置；全局 Hook 可在此管理。", "Run checks and memory routines at lifecycle events. Project hooks are read-only; existing settings remain intact. Global hooks can be managed here."))}</p>${button("new-hook", tr("新建自定义 Hook", "New custom hook"), { icon: "plus", primary: true, attrs: `aria-expanded="${!!draft}"` })}${draft ? `<form class="hub-form-panel" data-form="hook"><label class="hub-field">${esc(tr("名称", "Name"))}<input class="hub-input" name="hook-title" value="${esc(draft.title)}" placeholder="My workflow hook"></label><div class="hub-form-grid"><label class="hub-field">${esc(tr("生命周期事件", "Event"))}<select class="hub-select" name="hook-event">${["Stop", "SubagentStop", "PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "PreCompact", "SessionEnd"].map((event) => `<option ${event === draft.event ? "selected" : ""}>${event}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("范围", "Scope"))}<select class="hub-select" name="hook-scope">${["off", "project", "global"].map((scope) => `<option value="${scope}" ${scope === draft.scope ? "selected" : ""} ${scope === "project" ? "disabled" : ""}>${esc(scope === "off" ? tr("关闭", "Off") : scope === "project" ? tr("本项目", "Project") : tr("全局", "Global"))}</option>`).join("")}</select></label></div><label class="hub-field">Matcher<input class="hub-input" name="hook-matcher" value="${esc(draft.matcher)}" placeholder="Bash|Edit|Write"></label><label class="hub-field">${esc(tr("执行命令", "Command"))}<textarea class="hub-input" name="hook-command" rows="3" spellcheck="false">${esc(draft.command)}</textarea></label><div class="hub-row">${button("save-hook", tr("保存 Hook", "Save hook"), { primary: true, icon: "save" })}${button("cancel-hook", tr("取消", "Cancel"))}</div></form>` : ""}${errors.hooks ? inlineError(errors.hooks) : !cache.hooks ? loading() : `${cache.hooks.unavailable ? `<p class="hub-hint hub-domain-hint">${esc(tr("Hooks 服务尚未接入，以下为内置模板预览。", "Hooks service is not connected. Built-in templates are previewed below."))}</p>` : ""}${group(tr("内置 Hooks", "Built-in hooks"), list.filter((item) => item.builtin))}${[...external].map(([name, entries]) => group(name, entries)).join("")}${!list.length ? empty(tr("还没有 Hook", "No hooks yet")) : ""}`}`;
     }
 
     function sourceLabel(source, fallback) {
@@ -653,11 +676,20 @@
     function renderTab() {
       if (!content || disposed) return;
       if (state.tab === "skills") state.libraryView === "mcp" ? renderMcp() : renderSkills();
+      if (state.tab === "plugins") renderPlugins();
       if (state.tab === "subagents") renderSubagents();
+      if (state.tab === "hooks") renderHooks();
       if (state.tab === "memory") renderMemory();
       if (state.tab === "board") renderBoardTab();
       if (state.tab === "settings") renderSettings();
       if (state.tab === "agents") renderAgents();
+    }
+    function pluginItems() {
+      return items(cache.plugins, ["installed", "items", "plugins"]).filter((item) => item.installed !== false && item.catalogSection !== "marketplace");
+    }
+    function renderPlugins() {
+      const list = pluginItems();
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("已安装插件", "Installed plugins"))}</span><span class="hub-count">${cache.plugins ? list.length : ""}</span></div><p class="hub-description">${esc(tr("查看本机发现的插件及其包含的能力；插件由各自宿主管理。", "Installed plugins and their capabilities as discovered on this device. Plugins are managed by their hosts."))}</p>${errors.plugins ? inlineError(errors.plugins) : !cache.plugins ? loading() : !list.length ? empty(tr("没有发现已安装插件", "No installed plugins found")) : `<div class="hub-market-grid hub-resource-grid">${list.map((item) => { const parts = item.capabilities || {}; const caps = [["skillsCount", "Skills"], ["mcpCount", "MCP"], ["hooksCount", "Hooks"], ["commandsCount", tr("命令", "Commands")]].filter(([key]) => Number(parts[key]) > 0).map(([key, label]) => `<span class="hub-badge">${esc(parts[key])} ${esc(label)}</span>`).join(""); return `<article class="hub-card hub-resource-card"><div class="hub-card-top">${brandIcon(item, "plugin")}<div class="hub-grow"><div class="hub-card-name">${esc(item.displayName || item.title || item.name || item.id)}</div><div class="hub-card-meta">${item.version ? `<span class="hub-badge">v${esc(String(item.version).replace(/^v/, ""))}</span>` : ""}<span class="hub-badge">${esc(item.marketplace || tr("本机", "Local"))}</span>${caps}</div></div></div><p class="hub-card-description">${esc(item.shortDescription || item.description || tr("暂无描述", "No description available"))}</p></article>`; }).join("")}</div>`}`;
     }
     function librarySegments() { return `<div class="hub-segments">${[["skills", "Skills 技能"], ["mcp", "MCP 服务"]].map(([key, label]) => `<button type="button" class="hub-pill ${state.libraryView === key ? "is-active" : ""}" data-action="library-view" data-view="${key}" aria-pressed="${state.libraryView === key}">${esc(label)}</button>`).join("")}</div>`; }
     function renderSkills() {
@@ -693,7 +725,21 @@
     const builtinSubagents = new Set(["explorer", "worker", "worker-pro", "frontend", "qa", "code-review", "general-purpose"]);
     function subagentId(item) { return String(item?.id || item?.name || ""); }
     function subagentKey(id, scope = state.subagentScope, projectRoot = state.projectRoot) { return `${scope}:${scope === "project" ? projectRoot || "" : ""}\u0000${id}`; }
-    function subagentItems(scope = state.subagentScope) { return items(cache.subagents, [scope === "global" ? "globalItems" : "projectItems"]); }
+    function tierLevel(id) {
+      for (const group of items(cache.subagents, ["tierGroups"])) for (const level of items(group, ["levels"])) if (level.id === id) return { ...level, group: group.id };
+      return null;
+    }
+    function subagentItems(scope = state.subagentScope) {
+      const list = [...items(cache.subagents, [scope === "global" ? "globalItems" : "projectItems"])];
+      for (const group of items(cache.subagents, ["tierGroups"])) for (const level of items(group, ["levels"])) {
+        if (level.kind !== "agent") continue;
+        const item = scope === "project" && level.source === "project" ? level.item : level.globalItem;
+        if (!item) continue;
+        const index = list.findIndex((entry) => subagentId(entry) === subagentId(item));
+        if (index < 0) list.push(item); else list[index] = item;
+      }
+      return list;
+    }
     function subagentProviders() {
       const raw = cache.subagents?.catalog;
       const catalog = Array.isArray(raw?.providers) ? raw.providers : Object.entries(raw || {}).filter(([, value]) => value && typeof value === "object" && !Array.isArray(value)).map(([id, value]) => ({ id, ...value }));
@@ -721,6 +767,8 @@
       return state.subagentDrafts[key];
     }
     function canDeleteSubagent(item) {
+      const level = tierLevel(subagentId(item));
+      if (level && (state.subagentScope === "project" ? level.source !== "project" : !!level.globalItem?.suggestedDefault)) return false;
       return state.subagentScope === "project" || !(item.builtin ?? item.builtIn ?? item.isBuiltin ?? builtinSubagents.has(subagentId(item)));
     }
     function memoryPolicy(item) {
@@ -731,7 +779,10 @@
       const policy = memoryPolicy(item);
       return `<select class="hub-select hub-memory-policy policy-${policy}" name="subagent-memoryPolicy" data-subagent-id="${esc(id)}" aria-label="${esc(tr("记忆权限", "Memory policy"))} · ${esc(id)}" ${disabled ? "disabled" : ""}>${[["readwrite", tr(" 第一现场读写记忆", " First-hand memory · read & write")], ["readonly", tr(" 只读项目记忆", " Project memory · read only")], ["off", tr(" 不挂载记忆", " No memory")]].map(([value, label]) => `<option value="${value}" ${value === policy ? "selected" : ""}>${esc(label)}</option>`).join("")}</select>`;
     }
-    function renderBotAvatar(item) { return `<span class="hub-asset-icon" style="width:28px;height:28px">${icon((subagentRoles[item.role] || subagentRoles.general)[0], 15)}</span>`; }
+    function renderBotAvatar(item) {
+      const color = { research: "#4eb7a5", implementation: "#3f83f8", general: "#4b8df8", design: "#a775e9", test: "#f09b55", review: "#e17685" }[item.role] || "#7188ad";
+      return `<span class="hub-robot" aria-hidden="true"><span class="hub-robot-face" style="--robot-color:${color}"><i></i><i></i></span></span>`;
+    }
     function greetBots(id = null) {
       if (!content || state.tab !== "subagents") return;
       content.querySelectorAll("[data-subagent-card]").forEach((card) => {
@@ -772,15 +823,16 @@
         const id = subagentId(item), key = subagentKey(id), expanded = !!state.subagentExpanded[key];
         const role = subagentRoles[item.role] || subagentRoles.general;
         const saved = item.injected === true || item.agentsMdInjected === true || item.injectedAt;
-        const status = scope === "project" ? tr("仅本项目", "This project") : saved ? tr("已注入 AGENTS.md", "Injected into AGENTS.md") : tr("全局模板", "Global template");
+        const tier = tierLevel(id);
+        const inherited = scope === "project" && tier && tier.source !== "project";
+        const status = inherited ? tr("继承全局 · 保存后仅覆盖本项目", "Inherited · save to override this project") : scope === "project" ? tr("仅本项目", "This project") : item.suggestedDefault ? tr("默认建议 · 尚未保存", "Suggested default · not saved") : saved ? tr("已注入 AGENTS.md", "Injected into AGENTS.md") : tr("全局模板", "Global template");
         const busy = subagentSaves.has(key);
         const custom = state.subagentCustom[key];
         const draft = expanded ? subagentDraft(id) : null;
-        return `<article class="hub-subagent-card" data-subagent-card="${esc(id)}"><div class="hub-subagent-main">${renderBotAvatar(item)}<button type="button" class="hub-subagent-summary" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="t3-subagent-editor-${esc(id)}"><span class="hub-subagent-name">${esc(item.name || id)}<span class="hub-tool-badge">${esc(item.toolBadge || role[2])}</span></span><span class="hub-subagent-desc">${esc(item.description || tr("为这位子智能体添加职责与交付说明。", "Add responsibilities and delivery guidelines."))}</span></button>${subagentControls(item, id, busy)}</div><div class="hub-subagent-meta"><span class="hub-badge ${scope === "project" ? "hub-cyan" : saved ? "hub-green" : ""}">${busy ? spinner() : icon(saved ? "check" : scope === "project" ? "folder" : "globe", 10)}${esc(busy ? tr("保存并注入中…", "Saving & injecting…") : status)}${item.enabled === false ? ` · ${esc(tr("已停用", "Disabled"))}` : ""}</span>${memoryPolicyControl(item, id, busy)}<button type="button" class="hub-subagent-edit" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}">${icon("edit", 11)}${esc(expanded ? tr("收起设置", "Close settings") : tr("编辑提示词 / 设置", "Prompt / settings"))}</button></div>${custom ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="${esc(id)}" value="${esc(custom.value || "")}" placeholder="group/1m-auto" autocomplete="off" spellcheck="false">${button("save-subagent-model", tr("保存", "Save"), { small: true, primary: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: `data-id="${esc(id)}"` })}</div></label></div>` : ""}<div id="t3-subagent-editor-${esc(id)}" class="hub-subagent-expand ${expanded ? "is-expanded" : ""}" ${expanded ? "" : "inert"}><div>${draft ? renderSubagentEditor(draft, id) : ""}</div></div></article>`;
+        return `<article class="hub-subagent-card" data-subagent-card="${esc(id)}"><div class="hub-subagent-main">${renderBotAvatar(item)}<button type="button" class="hub-subagent-summary" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="t3-subagent-editor-${esc(id)}"><span class="hub-subagent-name">${tier ? `<span class="hub-tool-badge">${esc(tier.group === "work" ? "Work" : "Review")} · L${esc(tier.level)}</span>` : ""}${esc(item.name || id)}<span class="hub-tool-badge">${esc(item.toolBadge || role[2])}</span></span><span class="hub-subagent-desc">${esc(item.description || tr("为这位子智能体添加职责与交付说明。", "Add responsibilities and delivery guidelines."))}</span></button>${subagentControls(item, id, busy)}</div><div class="hub-subagent-meta"><span class="hub-badge ${scope === "project" ? "hub-cyan" : saved ? "hub-green" : ""}">${busy ? spinner() : icon(saved ? "check" : scope === "project" ? "folder" : "globe", 10)}${esc(busy ? tr("保存并注入中…", "Saving & injecting…") : status)}${item.enabled === false ? ` · ${esc(tr("已停用", "Disabled"))}` : ""}</span>${memoryPolicyControl(item, id, busy)}<button type="button" class="hub-subagent-edit" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}">${icon("edit", 11)}${esc(expanded ? tr("收起设置", "Close settings") : tr("编辑提示词 / 设置", "Prompt / settings"))}</button></div>${custom ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="${esc(id)}" value="${esc(custom.value || "")}" placeholder="group/1m-auto" autocomplete="off" spellcheck="false">${button("save-subagent-model", tr("保存", "Save"), { small: true, primary: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: `data-id="${esc(id)}"` })}</div></label></div>` : ""}<div id="t3-subagent-editor-${esc(id)}" class="hub-subagent-expand ${expanded ? "is-expanded" : ""}" ${expanded ? "" : "inert"}><div>${draft ? renderSubagentEditor(draft, id) : ""}</div></div></article>`;
       }).join("");
-      content.innerHTML = `${renderCommander()}${cache.subagents?.legacyProjectConfig ? `<p class="hub-error" role="alert">${esc(tr("发现旧项目路由，无法确认归属，暂未应用；请核对后重新配置。", "An older project route has unknown ownership and was not applied."))}</p>` : ""}<div class="hub-subagent-scopes" aria-label="${esc(tr("子智能体作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}"> ${esc(tr("全局子智能体", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}"> ${esc(tr("项目子智能体", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子智能体", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子智能体", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子智能体。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子智能体，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子智能体。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后自动注入全局 AGENTS.md，并同步 5 个 CLI。", "Saving injects global AGENTS.md and synchronizes five CLIs.") : tr("保存后自动写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
-      content.innerHTML += `<details class="hub-import" ${state.hooksOpen ? "open" : ""}><summary data-action="hooks-fold">${esc(tr("高级生命周期 Hooks", "Advanced lifecycle hooks"))}</summary><div id="t3-hub-hooks-section"></div></details>`;
-      const hooksSection = root.querySelector("#t3-hub-hooks-section"); if (hooksSection) renderHooks(hooksSection);
+      const tierOverview = items(cache.subagents, ["tierGroups"]).length ? `<div class="hub-card"><strong>${esc(tr("Work / Review 三级", "Work / Review levels"))}</strong><p class="hub-hint">${esc(tr("Work：L1 常规实现 → L2 攻坚 → L3 主会话兜底；Review：L1 快审 → L2 深审 → L3 高风险终审。带等级的卡片可设置模型和提示词；主会话兜底不另建代理。升级是分工提示，实际调用由宿主决定。", "Work: L1 implementation → L2 advanced → L3 main-agent fallback. Review: L1 quick → L2 deep → L3 high-risk. Cards control each agent's model and prompt; escalation is guidance, not an automatic guarantee."))}</p></div>` : "";
+      content.innerHTML = `${renderCommander()}${tierOverview}${cache.subagents?.legacyProjectConfig ? `<p class="hub-error" role="alert">${esc(tr("发现旧项目路由，无法确认归属，暂未应用；请核对后重新配置。", "An older project route has unknown ownership and was not applied."))}</p>` : ""}<div class="hub-subagent-scopes" aria-label="${esc(tr("子智能体作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}"> ${esc(tr("全局子智能体", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}"> ${esc(tr("项目子智能体", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子智能体", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子智能体", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子智能体。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子智能体，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子智能体。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后写入宿主规则文件；实际采用情况取决于宿主加载规则。", "Saving writes host rules; hosts decide when to load them.") : tr("保存后写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
       greetBots();
     }
     function newSubagent() {
@@ -818,8 +870,14 @@
         if (projectRoot === state.projectRoot) {
           const listKey = scope === "global" ? "globalItems" : "projectItems";
           if (cache.subagents) {
-            const list = subagentItems(scope), index = list.findIndex((entry) => subagentId(entry) === saved.id);
+            const list = items(cache.subagents, [listKey]), index = list.findIndex((entry) => subagentId(entry) === saved.id);
             cache.subagents[listKey] = index < 0 ? [...list, saved] : list.map((entry, i) => i === index ? saved : entry);
+            for (const group of items(cache.subagents, ["tierGroups"])) for (const level of items(group, ["levels"])) if (level.id === saved.id) {
+              delete saved.suggestedDefault;
+              if (scope === "project") { level.projectItem = saved; level.item = saved; level.source = "project"; }
+              else { level.globalItem = saved; if (level.source !== "project") { level.item = saved; level.source = "global"; } }
+              level.configured = true;
+            }
           }
           if (patch && state.subagentDrafts[key]) Object.assign(state.subagentDrafts[key], patch);
           else if (JSON.stringify(state.subagentDrafts[key] || null) === snapshot) {
@@ -837,14 +895,18 @@
       const projectRoot = state.projectRoot, version = contextVersion;
       if (!item) return;
       if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
-      const existing = subagentItems("project").find((entry) => subagentId(entry) === id);
+      const existing = items(cache.subagents, ["projectItems"]).find((entry) => subagentId(entry) === id);
       if (existing) { state.subagentScope = "project"; state.subagentExpanded[subagentKey(id)] = true; renderSubagents(); renderChrome(); toast(tr("已打开现有项目配置", "Opened the existing project override")); return; }
       await busy(`clone:${projectRoot}:${id}`, element, async () => {
         if (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
         const result = await request("subagents:update", { scope: "project", projectRoot, item: { ...item, memoryPolicy: memoryPolicy(item), id, scope: "project", projectRoot, builtin: false, builtIn: false, isBuiltin: false, overridesGlobal: true } });
         if (disposed || version !== contextVersion || !projectContextReady() || projectRoot !== state.projectRoot) return;
         cache.agents = null;
-        if (cache.subagents) cache.subagents.projectItems = [...subagentItems("project"), { ...item, ...(result.item || {}), id, scope: "project", projectRoot, builtin: false, overridesGlobal: true, injected: true }];
+        if (cache.subagents) {
+          const saved = { ...item, ...(result.item || {}), id, scope: "project", projectRoot, builtin: false, overridesGlobal: true, injected: true };
+          cache.subagents.projectItems = [...items(cache.subagents, ["projectItems"]), saved];
+          for (const group of items(cache.subagents, ["tierGroups"])) for (const level of items(group, ["levels"])) if (level.id === id) { level.projectItem = saved; level.item = saved; level.source = "project"; level.configured = true; }
+        }
         state.subagentScope = "project";
         state.subagentExpanded[subagentKey(id)] = true;
         renderSubagents(); renderChrome();
@@ -861,7 +923,15 @@
         await request("subagents:delete", { scope, projectRoot, id });
         if (disposed || (scope === "project" && (version !== contextVersion || !projectContextReady())) || projectRoot !== state.projectRoot) return;
         cache.agents = null;
-        if (cache.subagents) cache.subagents[scope === "global" ? "globalItems" : "projectItems"] = subagentItems(scope).filter((entry) => subagentId(entry) !== id);
+        if (cache.subagents) {
+          const listKey = scope === "global" ? "globalItems" : "projectItems";
+          cache.subagents[listKey] = items(cache.subagents, [listKey]).filter((entry) => subagentId(entry) !== id);
+          for (const group of items(cache.subagents, ["tierGroups"])) for (const level of items(group, ["levels"])) if (level.id === id) {
+            if (scope === "project") { level.projectItem = null; level.source = level.globalItem ? "global" : "default"; }
+            else { level.globalItem = null; level.source = level.projectItem ? "project" : "default"; }
+            level.configured = !!(level.projectItem || level.globalItem);
+          }
+        }
         delete state.subagentDrafts[key]; delete state.subagentExpanded[key]; delete state.subagentCustom[key];
         if (state.tab === "subagents") { renderSubagents(); renderChrome(); }
         toast(tr("已删除配置并更新 AGENTS.md", "Configuration deleted and AGENTS.md updated"));
@@ -887,7 +957,7 @@
       if (node) node.innerHTML = `<div class="hub-hint">${esc(tr("目录来源：Magpie 本机服务、本机 Agent 配置和 Hub 内置项。", "Catalog sources: local Magpie services, native agent configs, and built-ins."))}</div><div class="hub-filters">${filters.map(([key, label]) => `<button type="button" class="hub-pill ${state.mcpFilter === key ? "is-active" : ""}" data-action="mcp-filter" data-filter="${key}" aria-pressed="${state.mcpFilter === key}">${esc(label)}</button>`).join("")}</div>`;
     }
     function renderMcp() {
-      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务目录", "MCP service catalog"))}</span><div class="hub-row">${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}${button("sync-mcp", tr("同步 Hub 入口", "Sync Hub entry"), { small: true })}</div></div><p class="hub-description">${esc(tr("“启用到 Agent”会把上游服务写进该 Agent 的原生配置；“通过 Hub 使用”单独控制Hub路由。首次使用Hub路由时，先同步Hub入口。新会话通常读取配置，当前会话是否刷新由Agent决定。", "“Enable for Agent” writes the upstream service to that agent's native config. “Use through Hub” controls Hub routing separately. Sync the Hub entry before first use. New sessions usually read saved config; active-session refresh depends on the agent."))}</p><div id="t3-hub-mcp-source-filters"></div>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
+      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务目录", "MCP service catalog"))}</span><div class="hub-row">${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}${button("sync-mcp", tr("同步 Hub 入口", "Sync Hub entry"), { small: true })}</div></div><p class="hub-description">${esc(tr("“启用到 Agent”会把上游服务写进该 Agent 的原生配置；“通过 Hub 使用”单独控制 Hub 路由。同一服务两边同时启用时可能出现重复工具。首次使用 Hub 路由时先同步 Hub 入口；新会话通常读取配置，当前会话是否刷新由 Agent 决定。", "“Enable for Agent” writes to that agent's native config; “Use through Hub” controls Hub routing separately. Enabling the same server both ways may duplicate tools. Sync the Hub entry before first use. New sessions usually read saved config; active-session refresh depends on the agent."))}</p><div id="t3-hub-mcp-source-filters"></div>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
       renderMcpSourceFilters();
       renderMcpForm(); renderMcpList();
     }
@@ -1033,26 +1103,59 @@
         { id: "pi-magpie", dreamMode: "agent", providerInstanceId: "pi", model: "magpie/group/code", label: "Pi · magpie/group/code", estCostPerNightUsd: 0.005 },
       ];
     }
+    function dreamEngineDraft() {
+      const config = dreamConfig();
+      return state.dreamEngineDraft || { providerInstanceId: config.dreamMode === "local" ? "local" : config.providerInstanceId, model: config.model || "", reasoningEffort: config.reasoningEffort || "medium" };
+    }
     function renderDream() {
       const node = root.querySelector("#t3-hub-dream");
       if (!node) return;
-      const data = dreamConfig(), overview = cache.overview || {}, busy = state.dreamSaving || state.dreamRunning;
-      const loaded = !!(cache.dream || overview.dream);
+      const data = dreamConfig(), overview = cache.overview || {}, runtime = cache.dream?.runtime || {};
+      const busy = state.dreamSaving || state.dreamRunning, loaded = !!(cache.dream || overview.dream);
       const report = data.lastReport || cache.dream?.lastReport || overview.dream?.lastReport;
-      const presets = dreamPresets();
-      const current = presets.find((preset) => preset.dreamMode === data.dreamMode && preset.providerInstanceId === data.providerInstanceId && preset.model === data.model);
-      const metric = (value) => Math.max(0, Number(value) || 0).toLocaleString(state.lang === "en" ? "en-US" : "zh-CN", { maximumFractionDigits: 2 });
-      const cost = (value, digits = 6) => `$${Number(value).toFixed(digits).replace(/\.?0+$/, "") || "0"}`;
-      const tokenLimit = Number(data.maxInputTokens) || 8000;
-      const tokenLabel = tokenLimit >= 1000 ? `${Math.round(tokenLimit / 100) / 10}K` : String(tokenLimit);
-      const budget = data.dreamMode === "local" ? tr("0 Token 本地 · $0/晚", "0 tokens · Local · $0/night") : tr(`上限 <${tokenLabel} tok${current?.estCostPerNightUsd != null ? ` · 约 ${cost(current.estCostPerNightUsd, 3)}/晚` : ""}`, `Cap <${tokenLabel} tok${current?.estCostPerNightUsd != null ? ` · ~${cost(current.estCostPerNightUsd, 3)}/night` : ""}`);
-      const summary = report ? tr(`上次梦境：合并 ${metric(report.mergedCount)} 条 · 提纯晋升 ${metric(report.promotedCount)} 条 · 归档 ${metric(report.archivedCount)} 条 · 耗时 ${metric(report.durationMs)}ms`, `Last dream: ${metric(report.mergedCount)} merged · ${metric(report.promotedCount)} promoted · ${metric(report.archivedCount)} archived · ${metric(report.durationMs)}ms`) : tr("尚未运行梦境周期 · 开启后将在每日设定时间自动聚变去重、提纯分支经验并归档冷数据", "No dream cycle yet. Enable daily merging, branch-knowledge promotion, and cold-memory archiving.");
-      const agent = report?.agentUsed;
-      const consumption = report ? [agent === false || report.dreamMode === "local" ? tr("本地整理", "Local processing") : typeof agent === "string" ? agent : agent && typeof agent === "object" ? [agent.providerInstanceId || agent.provider, agent.model].filter(Boolean).join(" · ") : agent === true ? tr("后台 Agent", "Background agent") : "", report.estimatedInputTokens != null ? `${metric(report.estimatedInputTokens)} input tok` : "", report.estimatedCostUsd != null ? tr(`预估 ${cost(report.estimatedCostUsd)}`, `Estimated ${cost(report.estimatedCostUsd)}`) : ""].filter(Boolean).join(" · ") : "";
-      const status = state.dreamRunning ? tr("正在整理…", "Dreaming…") : state.dreamSaving ? tr("保存中…", "Saving…") : !loaded ? tr("正在读取", "Loading") : data.enabled ? tr(`已开启 · 每日 ${data.dreamTime}`, `Enabled · Daily ${data.dreamTime}`) : tr("未开启", "Disabled");
+      const draft = dreamEngineDraft(), providers = Array.isArray(runtime.providers) ? runtime.providers : [];
+      const selectedRuntime = runtime.selected || providers.find((provider) => provider.id === data.providerInstanceId);
+      const selectedBlocked = data.dreamMode !== "local" && (/^(agy|antigravity)$/i.test(String(data.providerInstanceId)) || ["missing", "unsupported"].includes(selectedRuntime?.status));
+      const providerLabels = { local: tr("本地整理", "Local"), muse: "Muse", codex: "Codex", claude: "Claude", pi: "Pi · Magpie", antigravity: "AGY", agy: "AGY" };
+      const choices = ["local", "muse", "codex", "claude", "pi"];
+      if (!choices.includes(draft.providerInstanceId)) choices.push(draft.providerInstanceId);
+      const providerOptions = choices.map((id) => {
+        const status = providers.find((entry) => entry.id === id)?.status;
+        const unavailable = /^(agy|antigravity)$/i.test(id) || status === "missing" || status === "unsupported";
+        const suffix = unavailable ? tr(" · 暂不可执行", " · unavailable") : "";
+        return `<option value="${esc(id)}" ${draft.providerInstanceId === id ? "selected" : ""} ${unavailable ? "disabled" : ""}>${esc(providerLabels[id] || id)}${esc(suffix)}</option>`;
+      }).join("");
+      const agentProvider = providers.find((entry) => entry.id === draft.providerInstanceId);
+      const draftBlocked = /^(agy|antigravity)$/i.test(String(draft.providerInstanceId)) || ["missing", "unsupported"].includes(agentProvider?.status) || providers.length > 0 && !agentProvider;
+      const supportedEfforts = Array.isArray(agentProvider?.efforts) && agentProvider.efforts.length ? agentProvider.efforts : ["low", "medium", "high"];
+      const efforts = [...new Set([...(draft.reasoningEffort ? [draft.reasoningEffort] : []), ...supportedEfforts])];
+      const optionLabels = { none: tr("关闭", "None"), minimal: tr("极简", "Minimal"), low: tr("低", "Low"), medium: tr("中", "Medium"), high: tr("高", "High"), xhigh: tr("超高", "Extra high"), max: tr("最高", "Max"), ultra: tr("极高", "Ultra") };
+      const presetModels = dreamPresets().filter((preset) => preset.providerInstanceId === draft.providerInstanceId).map((preset) => preset.model).filter(Boolean);
+      const status = state.dreamRunning ? tr("正在整理…", "Organizing…") : state.dreamSaving ? tr("保存中…", "Saving…") : !loaded ? tr("正在读取", "Loading") : data.enabled ? tr(`已开启 · 每日 ${data.dreamTime}`, `Enabled · Daily ${data.dreamTime}`) : tr("未开启", "Disabled");
+      const resultLabels = { success: tr("完成", "Completed"), skipped: tr("已跳过", "Skipped"), failed: tr("失败", "Failed"), partial: tr("部分完成", "Partial"), deferred: tr("已延期", "Deferred"), unavailable: tr("暂不可用", "Unavailable"), unsupported: tr("不支持", "Unsupported") };
+      const resultText = (part) => {
+        if (!part) return tr("暂无记录", "No result yet");
+        const label = resultLabels[part.status] || tr("状态未知", "Unknown status");
+        const detail = part.reason || part.error;
+        return detail ? `${label} · ${errorText(detail)}` : label;
+      };
+      const schedule = runtime.scheduler || {};
+      const nextDue = data.enabled && schedule.nextDueAt ? exactTimeMarkup(schedule.nextDueAt) : esc(data.enabled ? tr("等待调度信息", "Awaiting scheduler information") : tr("未开启", "Disabled"));
+      const schedulerStatus = schedule.started === true ? schedule.running === true ? tr("定时器正在检查", "Scheduler checking") : tr("定时器运行中", "Scheduler running") : schedule.started === false ? tr("定时器未运行", "Scheduler stopped") : tr("定时器状态待确认", "Scheduler status unknown");
       const vectors = cache.embed?.vectorStats;
-      const syncSummary = cache.embed?.vectorStatsError ? tr("记忆统计不可用", "Memory statistics unavailable") : vectors?.syncedVectors != null && vectors?.totalMemories != null ? `${metric(vectors.syncedVectors)}/${metric(vectors.totalMemories)} ${tr("向量同步", "vectors synced")}` : tr("统计读取中", "Loading statistics");
-      node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold">AutoDream · ${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Dream now"))}</summary><section aria-label="${esc(tr("梦境整理 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境整理", "Memory Dream"))} · AutoDream</span><span class="hub-badge">${esc(status)}</span><span class="hub-dream-size">${esc(tr(`索引体积 ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`, `Index size ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`))}</span></div><p class="hub-dream-description">${esc(tr("T3 开着，就会在设定时间整理记忆。", "Keep T3 open to organize memory at the chosen time."))}</p><div class="hub-dream-engine-row"><label class="hub-field hub-dream-engine">${esc(tr("执行引擎 · 后台 Agent / 模型", "Execution engine · Background agent / model"))}<select class="hub-select" name="dream-engine" aria-label="${esc(tr("AutoDream 执行引擎", "AutoDream execution engine"))}" ${busy || !loaded ? "disabled" : ""}>${!current ? `<option value="__current__" selected>${esc(`${data.providerInstanceId} · ${data.model}`)}</option>` : ""}${presets.map((preset) => `<option value="${esc(preset.id)}" ${current?.id === preset.id ? "selected" : ""}>${esc(preset.label || `${preset.providerInstanceId} · ${preset.model}`)}</option>`).join("")}</select></label><span class="hub-dream-budget" aria-label="${esc(tr("省流闸门", "Token budget"))}">${icon("bolt", 11)}${esc(budget)}</span></div><div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日做梦时间", "Daily dream time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补梦", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Dreaming…") : tr("立即做梦", "Dream now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded })}</div><div class="hub-dream-report">${state.dreamRunning ? `${spinner()} ` : ""}${esc(summary)}${consumption ? `<div class="hub-dream-consumption">${esc(consumption)}</div>` : ""}${overview.archivedCount != null || overview.staleVectorCount != null ? `<div class="hub-hint">${esc(tr(`已归档 ${metric(overview.archivedCount)} 条 · 待同步向量 ${metric(overview.staleVectorCount)} 条`, `${metric(overview.archivedCount)} archived · ${metric(overview.staleVectorCount)} stale vectors`))}</div>` : ""}</div><div class="hub-dream-times"><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span></div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
+      const syncSummary = cache.embed?.vectorStatsError ? tr("记忆统计不可用", "Memory statistics unavailable") : vectors?.syncedVectors != null && vectors?.totalMemories != null ? `${Number(vectors.syncedVectors).toLocaleString()}/${Number(vectors.totalMemories).toLocaleString()} ${tr("向量同步", "vectors synced")}` : tr("统计读取中", "Loading statistics");
+      node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold">AutoDream · ${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Run now"))}</summary><section aria-label="${esc(tr("梦境整理 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境整理", "Memory Dream"))} · AutoDream</span><span class="hub-badge">${esc(status)}</span></div><p class="hub-dream-description">${esc(tr("T3 和 Hub 运行时按本地时间检查是否需要整理；未运行时不会执行，唤醒补做以设置为准。", "While T3 and Hub are running, the scheduler checks the local time; it does not run while closed. Catch-up follows your setting."))}</p><div class="hub-form-grid"><label class="hub-field">${esc(tr("执行 Agent", "Agent"))}<select class="hub-select" name="dream-provider" aria-label="${esc(tr("AutoDream 执行 Agent", "AutoDream agent"))}" ${busy || !loaded ? "disabled" : ""}>${providerOptions}</select></label><label class="hub-field">${esc(tr("模型 ID", "Model ID"))}<input class="hub-input" name="dream-model" list="t3-hub-dream-models" value="${esc(draft.model)}" aria-label="${esc(tr("AutoDream 模型", "AutoDream model"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}><datalist id="t3-hub-dream-models">${presetModels.map((model) => `<option value="${esc(model)}"></option>`).join("")}</datalist></label><label class="hub-field">${esc(tr("思考程度", "Reasoning effort"))}<select class="hub-select" name="dream-effort" aria-label="${esc(tr("AutoDream 思考程度", "AutoDream reasoning effort"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}>${efforts.map((effort) => `<option value="${esc(effort)}" ${draft.reasoningEffort === effort ? "selected" : ""} ${!supportedEfforts.includes(effort) ? "disabled" : ""}>${esc(optionLabels[effort] || effort)} (${esc(effort)})${!supportedEfforts.includes(effort) ? ` · ${esc(tr("请重新选择", "select another"))}` : ""}</option>`).join("")}</select></label><div class="hub-field"><div class="hub-row">${button("save-dream-engine", tr("保存 Agent 和模型", "Save agent and model"), { small: true, primary: true, icon: "save", disabled: busy || !loaded || !state.dreamEngineDraft || draftBlocked })}${button("cancel-dream-engine", tr("取消修改", "Discard changes"), { small: true, disabled: busy || !state.dreamEngineDraft })}</div></div></div><p class="hub-hint">${esc(tr("找到可执行程序不代表已登录或有模型权限；AGY 暂不支持自动执行。", "An executable does not prove sign-in or model access. AGY automatic execution is not supported."))}</p>${selectedBlocked ? `<p class="hub-dream-error">${esc(tr("当前 Agent 暂不可执行；可更换 Agent 或关闭自动整理。", "The configured agent is unavailable; choose another or disable the schedule."))}</p>` : ""}<div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded || !data.enabled && selectedBlocked ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日整理时间", "Daily time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补做", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Organizing…") : tr("立即整理", "Run now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded || selectedBlocked || !!state.dreamEngineDraft })}</div><div class="hub-dream-times"><span>${esc(schedulerStatus)}</span><span>${esc(tr("下次计划", "Next scheduled time"))} ${nextDue}${schedule.timeZone ? ` · ${esc(schedule.timeZone)}` : ""}</span><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span>${schedule.lastCheckAt ? `<span>${esc(tr("最近调度检查", "Last scheduler check"))} ${exactTimeMarkup(schedule.lastCheckAt)}</span>` : ""}</div><div class="hub-dream-report">${schedule.lastError ? `<div class="hub-dream-error">${esc(tr("调度错误", "Scheduler error"))}：${esc(errorText(schedule.lastError))}</div>` : ""}<div>${esc(tr("本地整理", "Local result"))}：${esc(resultText(report?.local))}</div><div>${esc(tr("Agent 整理", "Agent result"))}：${esc(resultText(report?.agent))}</div>${report?.agent?.providerInstanceId || report?.agent?.model ? `<div class="hub-hint">${esc([report.agent.providerInstanceId, report.agent.model, report.agent.reasoningEffort].filter(Boolean).join(" · "))}</div>` : ""}</div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
+    }
+    async function saveDreamEngine() {
+      if (!state.dreamEngineDraft) return;
+      const draft = state.dreamEngineDraft, provider = String(draft.providerInstanceId || "");
+      const providers = cache.dream?.runtime?.providers || [];
+      const candidate = providers.find((entry) => entry.id === provider);
+      if (!["local", "muse", "codex", "claude", "pi"].includes(provider) || ["missing", "unsupported"].includes(candidate?.status) || providers.length && !candidate) { toast(tr("该 Agent 暂不可执行，请选择其他 Agent", "That agent is unavailable; choose another"), true); return; }
+      const model = provider === "local" ? "mlx-vector-only" : String(draft.model || "").trim();
+      if (!model) { toast(tr("请填写模型 ID", "Enter a model ID"), true); return; }
+      if (provider !== "local" && Array.isArray(candidate?.efforts) && !candidate.efforts.includes(draft.reasoningEffort)) { toast(tr("请选择该 Agent 支持的思考程度", "Choose an effort supported by this agent"), true); return; }
+      await saveDream({ dreamMode: provider === "local" ? "local" : "agent", providerInstanceId: provider, model, ...(provider === "local" ? {} : { reasoningEffort: draft.reasoningEffort }) });
     }
     async function saveDream(patch) {
       if (disposed || state.dreamSaving || state.dreamRunning) return;
@@ -1061,7 +1164,9 @@
       const version = contextVersion;
       state.dreamSaving = true; delete errors.dream; renderDream();
       try {
-        const payload = { enabled: data.enabled, dreamTime: data.dreamTime, catchUpOnWake: data.catchUpOnWake, dreamMode: data.dreamMode, providerInstanceId: data.providerInstanceId, model: data.model, maxInputTokens: data.maxInputTokens, ...(data.reasoningEffort ? { reasoningEffort: data.reasoningEffort } : {}) };
+        // Write only the edited fields. In particular, changing the schedule
+        // must not accidentally reselect an unsupported historical provider.
+        const payload = Object.fromEntries(Object.entries(patch).filter(([key]) => ["enabled", "dreamTime", "catchUpOnWake", "dreamMode", "providerInstanceId", "model", "maxInputTokens", "reasoningEffort"].includes(key)));
         let result;
         try { result = await request("memory:dream:save", payload); }
         catch (error) {
@@ -1069,25 +1174,44 @@
           result = await request("memory:dream:update", payload);
         }
         if (disposed || version !== contextVersion) return;
-        cache.dream = { ...cache.dream, ...result, config: { ...data, ...(result.config || result.dream || {}) } };
+        const readback = await request("memory:dream:get", {});
+        if (disposed || version !== contextVersion) return;
+        const confirmed = readback.config || readback.dream || {};
+        cache.dream = { ...cache.dream, ...result, ...readback, config: confirmed };
         if (cache.overview) cache.overview.dream = cache.dream.config;
+        if (Object.entries(payload).some(([key, value]) => confirmed[key] !== value)) throw new Error(tr("设置已提交，但读取到的值不同；请检查后重试。", "Settings were submitted but the readback differs; review and try again."));
+        if (["dreamMode", "providerInstanceId", "model", "reasoningEffort"].some((key) => Object.hasOwn(payload, key))) state.dreamEngineDraft = null;
         toast(tr("梦境设置已保存", "Memory Dream settings saved"));
       } catch (error) { if (!disposed && version === contextVersion) { errors.dream = error; toast(errorText(error), true); } }
       finally { state.dreamSaving = false; if (!disposed) renderDream(); }
     }
     async function runDream() {
       if (disposed || state.dreamSaving || state.dreamRunning) return;
+      const config = dreamConfig();
+      const selected = cache.dream?.runtime?.selected;
+      if (state.dreamEngineDraft || config.dreamMode !== "local" && (/^(agy|antigravity)$/i.test(String(config.providerInstanceId)) || ["missing", "unsupported"].includes(selected?.status))) { toast(tr("请先保存可执行的整理配置", "Save an available execution configuration first"), true); return; }
       const version = contextVersion, projectRoot = state.projectRoot;
       state.dreamRunning = true; delete errors.dream; renderDream();
       try {
-        const result = await request("memory:dream:run", { projectRoot });
+        const response = await hubRpc("memory:dream:run", { projectRoot });
+        const result = response?.data ?? response?.result ?? response ?? {};
+        const failed = response?.ok === false || response?.success === false || result?.ok === false;
+        if (failed && !result.report) throw new Error(result.error?.message || result.error || tr("整理未完成", "The run did not complete"));
         if (disposed || version !== contextVersion) return;
         cache.dream = { ...cache.dream, ...result, config: { ...dreamConfig(), ...(result.config || {}), ...(result.report ? { lastReport: result.report } : {}) } };
+        try {
+          const readback = await request("memory:dream:get", {});
+          if (disposed || version !== contextVersion) return;
+          cache.dream = { ...cache.dream, ...readback, config: { ...cache.dream.config, ...(readback.config || {}), ...(result.report ? { lastReport: result.report } : {}) } };
+        } catch {
+          if (cache.dream?.runtime?.scheduler) cache.dream.runtime.scheduler = { ...cache.dream.runtime.scheduler, started: undefined };
+        }
         if (cache.overview) cache.overview.dream = cache.dream.config;
         await Promise.all([refreshMemoryOverview(), refreshEmbed(false, true), loadMemories(false)]);
         if (disposed || version !== contextVersion) return;
         if (state.tab === "memory") { renderEngine(); renderMemoryList(); }
-        toast(tr("梦境整理已完成", "Memory Dream completed"));
+        if (failed) throw new Error(result.error?.message || result.error || tr("本地整理已完成，Agent 整理未完成；请查看结果。", "Local processing completed, but the agent did not finish; review the result."));
+        toast(tr("整理周期已结束，请查看本地与 Agent 结果", "Run finished; review the local and agent results"));
       } catch (error) { if (!disposed && version === contextVersion) { errors.dream = error; toast(errorText(error), true); } }
       finally { state.dreamRunning = false; if (!disposed) renderDream(); }
     }
@@ -1445,56 +1569,31 @@
       }
       return null;
     }
+    let boardPosition = (() => {
+      try {
+        const value = JSON.parse(storageGet("t3-hub-dashboard-position-v1") || "null");
+        return Number.isFinite(value?.x) && Number.isFinite(value?.y) ? { x: value.x, y: value.y } : null;
+      } catch { return null; }
+    })();
     function positionConversationTools() {
       if (!root || !liveBoard || disposed) return;
-      const route = routeKey();
-      if (route !== anchorRoute || (anchorCache && !anchorCache.card.isConnected)) {
-        anchorResize?.disconnect(); anchorCache = null; anchorRoute = route; anchorScanAt = 0;
-      }
-      if (!anchorCache && Date.now() - anchorScanAt >= 2000) {
-        anchorScanAt = Date.now();
-        anchorCache = findSessionRelationsCard();
-        if (anchorCache) {
-          anchorCache.viewport = anchorCache.card.closest('aside,[role="complementary"],[data-testid*="inspector"],[data-slot*="sidebar"],[data-thread-details]');
-          anchorResize?.observe(anchorCache.card);
-          if (anchorCache.viewport) anchorResize?.observe(anchorCache.viewport);
-        }
-      }
-      const anchor = anchorCache;
       const routeHintValue = routeHint();
       const blocked = state.open || root.classList.contains("is-occluded") || /^\/(settings|usage|pair)(\/|$)/.test(routeHintValue) || routeHintValue === "/" ||
-        (state.threadId === "__NEW__" && !/(?:^|\/)(?:new|draft)(?:\/|[?#]|$)/i.test(routeHintValue));
-      let hidden = !anchor || blocked, reason = tr("会话详情侧栏未显示或布局不同", "Session details are not visible");
-      if (!hidden) {
-        const rect = anchor.card.getBoundingClientRect();
-        const clip = anchor.viewport?.getBoundingClientRect();
-        const bounds = {
-          top: Math.max(0, clip?.top ?? 0), bottom: Math.min(innerHeight, clip?.bottom ?? innerHeight),
-          left: Math.max(0, clip?.left ?? 0), right: Math.min(innerWidth, clip?.right ?? innerWidth),
-        };
-        hidden = !rect.width || !rect.height || bounds.bottom <= bounds.top || bounds.right <= bounds.left ||
-          rect.bottom <= bounds.top || rect.top >= bounds.bottom || rect.right <= bounds.left || rect.left >= bounds.right;
-        if (!hidden) {
-          const left = Math.max(rect.left, bounds.left), right = Math.min(rect.right, bounds.right);
-          const top = Math.max(0, rect.bottom - 1);
-          // The inspector can shrink to content; use the window bottom.
-          const maxHeight = Math.max(0, innerHeight - top - 8);
-          // Never cover native controls when even the toolbar cannot fit.
-          const limited = maxHeight < 120;
-          liveBoard.classList.toggle("is-space-limited", limited);
-          liveBoard.querySelector(".hub-board-toggle")?.setAttribute("aria-expanded", String(state.boardExpanded && !limited));
-          hidden = maxHeight < 48;
-          if (hidden) reason = tr("空间不足", "Not enough space");
-          if (!hidden) Object.assign(liveBoard.style, { left: `${left}px`, width: `${right - left}px`, top: `${top}px`, maxHeight: `${maxHeight}px` });
-        }
-      }
-      liveBoard.hidden = !!hidden;
+        (state.threadId === "__NEW__" && !/(?:^|\/)(?:new|draft)(?:\/|[?#]|$)/i.test(routeHintValue)) || (slashSession && innerWidth < 760);
+      const width = Math.max(0, Math.min(320, innerWidth - 16));
+      const desired = boardPosition || { x: innerWidth - width - 24, y: 96 };
+      const x = Math.max(8, Math.min(Math.max(8, innerWidth - width - 8), desired.x));
+      // Keep the header and, when expanded, a usable part of the body visible.
+      const visibleHeight = Math.min(Math.max(0, innerHeight - 16), state.boardExpanded ? 150 : 48);
+      const y = Math.max(8, Math.min(Math.max(8, innerHeight - visibleHeight - 8), desired.y));
+      Object.assign(liveBoard.style, { left: `${x}px`, width: `${width}px`, top: `${y}px`, maxHeight: `${Math.max(0, innerHeight - y - 8)}px` });
+      liveBoard.classList.toggle("is-space-limited", false);
+      liveBoard.hidden = !!blocked;
       if (planHandle) {
-        planHandle.hidden = !hidden || blocked;
+        planHandle.hidden = true;
         const status = boardStatus();
-        planHandle.textContent = status === tr("暂无计划", "No plan") ? status : `${tr("计划", "Plan")} · ${status}`;
-        planHandle.title = `${reason} · ${status} · ${tr("点击查看计划", "Open plan")}`;
-        planHandle.setAttribute("aria-label", planHandle.title);
+        planHandle.textContent = status;
+        planHandle.title = `${tr("查看计划", "Open plan")} · ${status}`;
       }
       if (slashSession) positionSlash();
     }
@@ -1523,13 +1622,19 @@
       if (boardMismatch()) return tr("会话未匹配", "Session mismatch");
       if (errors.board?.code === "board_thread_mismatch") return tr("会话未匹配", "Session mismatch");
       if (errors.board) return tr("读取失败，请刷新", "Read failed; refresh");
+      if (cache.board?.planReadError === "too_large") return tr("计划文件过大，暂无法显示", "Plan file is too large to display");
+      if (cache.board?.planReadError === "unsafe_path") return tr("计划路径无法安全确认", "Plan path cannot be verified safely");
+      if (cache.board?.planReadError) return tr("计划读取失败", "Could not read the plan");
       return cache.board ? "" : tr("读取中", "Loading");
     }
     function boardStatus() {
       const problem = boardProblem();
       if (problem) return problem;
-      const progress = boardData().progress;
-      return progress.total ? `${progress.completed}/${progress.total}` : tr("暂无计划", "No plan");
+      const board = boardData(), progress = board.progress;
+      if (progress.total) return `${progress.completed}/${progress.total} ${tr("完成", "complete")}`;
+      if (board.planMarkdown) return tr("计划文档", "Plan document");
+      if (board.subagents.length) return tr(`${board.subagents.length} 项`, `${board.subagents.length} tasks`);
+      return tr("暂无计划", "No plan");
     }
     function boardData() {
       const raw = cache.board?.board || cache.board || {};
@@ -1553,28 +1658,83 @@
       const name = typeof source === "object" ? source?.label || source?.kind || source?.type : source;
       return /native|t3/i.test(name || "") ? tr("T3 原生", "T3 native") : /agy|brain|antigravity/i.test(name || "") ? "AGY Brain" : tr("Hub 打卡", "Hub plan");
     }
+    function planSourceSummary(board) {
+      return `${tr("最近计划", "Most recent plan")}${board.planStatus === "completed" ? ` · ${tr("已完成", "Completed")}` : ""} · ${boardSourceLabel(board.source)}${isManualBoard(board) ? "" : ` · ${tr("只读", "Read only")}`}`;
+    }
+    function hasActualPlan(board = boardData()) { return board.steps.length > 0 || !!String(board.planMarkdown || "").trim(); }
+    function isManualBoard(board = boardData()) { return /^(hub|hub-mcp)$/i.test(String(board.source || "")); }
+    function runCategory(run) {
+      const raw = String(run.rawStatus || "").trim().toLowerCase().replace(/[- ]/g, "_");
+      if (["completed", "succeeded", "success", "done"].includes(raw)) return "completed";
+      if (["failed", "failure", "error"].includes(raw)) return "failed";
+      if (["cancelled", "canceled", "aborted"].includes(raw)) return "cancelled";
+      if (["running", "in_progress", "started", "working"].includes(raw)) return "running";
+      if (["pending", "waiting", "queued", "requested"].includes(raw)) return "waiting";
+      return "unknown";
+    }
+    function subagentSummary(board, full = false) {
+      if (!board.subagents.length) return "";
+      const labels = { completed: tr("已完成", "Completed"), failed: tr("失败", "Failed"), running: tr("进行中", "Running"), waiting: tr("等待", "Waiting"), cancelled: tr("已取消", "Cancelled"), unknown: tr("状态未知", "Unknown") };
+      const counts = Object.fromEntries(Object.keys(labels).map((key) => [key, 0]));
+      for (const run of board.subagents) counts[runCategory(run)]++;
+      const summary = Object.entries(counts).filter(([, n]) => n).map(([key, n]) => `${labels[key]} ${n}`).join(" · ");
+      const sorted = [...board.subagents].sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")));
+      const shown = full ? sorted : sorted.slice(0, 3);
+      return `<div class="hub-board-section"><span>${esc(tr("本会话子任务", "Subtasks in this conversation"))} · ${board.subagents.length}</span></div><p class="hub-hint">${esc(summary)}</p><ol class="hub-board-steps">${shown.map((run) => `<li class="hub-board-step"><span class="hub-step-text">${esc(String(run.title || run.name || run.model || tr("子任务", "Subtask")).slice(0, 180))}</span><span class="hub-badge">${esc(labels[runCategory(run)])}</span></li>`).join("")}</ol>${!full && board.subagents.length > shown.length ? `<p class="hub-hint">${esc(tr("在 Hub 查看全部子任务", "Open Hub to see all subtasks"))}</p>` : ""}`;
+    }
     function boardMarkup(manual = false, compact = false) {
       const board = boardData();
+      manual = manual && isManualBoard(board);
       const artifactButtons = board.artifacts.map((artifact, index) => {
         const file = typeof artifact === "string" ? artifact : artifact.name || artifact.title || artifact.path || artifact.id;
         return `<button type="button" class="hub-artifact-chip" data-action="read-artifact" data-index="${index}" title="${esc(file)}">${icon("edit", 11)} ${esc(String(file || "document.md").split(/[\\/]/).pop())}</button>`;
       }).join("");
-      return `${compact ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact ? "" : `<div class="hub-board-section"><span>${esc(tr("进程", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("") || `<li class="hub-hint">${esc(tr("当前没有计划步骤", "No plan steps yet"))}</li>`}</ol>${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
+      const markdown = String(board.planMarkdown || "").trim();
+      const markdownLimit = compact ? 1800 : 40000;
+      const markdownHtml = markdown && !board.steps.length ? `<p class="hub-hint">${esc(tr("计划原文 · 暂无可计算的步骤进度", "Plan text · no countable step progress"))}</p><div class="hub-board-background">${esc(markdown.slice(0, markdownLimit))}${markdown.length > markdownLimit ? esc(tr("\n…内容较长，打开完整计划查看更多", "\n…Open the full plan to see more")) : ""}</div>` : "";
+      const hasPlan = hasActualPlan(board);
+      return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${esc(step.id)}" data-step-text="${esc(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!hasPlan ? subagentSummary(board, !compact) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
     function renderLiveBoard() {
       if (!liveBoard) return;
       const problem = boardProblem(), status = boardStatus();
       const threadId = state.threadId || "";
-      const scrollTop = liveBoard.dataset.threadId === threadId ? liveBoard.querySelector(".hub-board-content")?.scrollTop ?? 0 : 0;
+      const sameThread = liveBoard.dataset.threadId === threadId && liveBoard.dataset.projectRoot === (state.projectRoot || "");
+      const scrollTop = sameThread ? liveBoard.querySelector(".hub-board-content")?.scrollTop ?? 0 : 0;
+      const active = document.activeElement;
+      const focus = sameThread && liveBoard.contains(active) && active?.matches?.("[data-board-drag],button[data-action]")
+        ? { drag: active.matches("[data-board-drag]"), action: active.dataset.action, stepId: active.dataset.stepId, stepText: active.dataset.stepText, tab: active.dataset.tab } : null;
       // A poll must not replace an input (or a checkbox) under the user's hands.
       if (document.activeElement?.matches('input[name="board-step-draft"]') && liveBoard.contains(document.activeElement) && liveBoard.dataset.threadId === (state.threadId || "")) { positionConversationTools(); return; }
       liveBoard.dataset.threadId = threadId;
+      liveBoard.dataset.projectRoot = state.projectRoot || "";
       liveBoard.classList.toggle("is-collapsed", !state.boardExpanded);
-      liveBoard.innerHTML = `<div class="hub-board-toolbar"><button type="button" class="hub-board-toggle" data-action="toggle-board" aria-expanded="${state.boardExpanded}"><span>${icon("check", 12)} ${esc(tr("计划进度", "Plan progress"))} ${esc(status)}</span><span aria-hidden="true">${state.boardExpanded ? "−" : "+"}</span></button>${themeSwitcher()}<button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 13)}<span class="hub-board-open-label">${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}</span></button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${boardMarkup(true, true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("+ 添加本会话步骤", "+ Add a step to this thread"))}" aria-label="${esc(tr("添加本会话步骤", "Add a thread step"))}">${button("board-add", tr("添加", "Add"), { small: true, icon: "plus" })}</div>`}</div>` : ""}`;
+      const board = boardData(), hasPlan = hasActualPlan(board);
+      const heading = !problem && !hasPlan && board.subagents.length ? tr("子代理任务进度", "Subagent tasks") : tr("计划进度", "Plan progress");
+      const percent = board.progress.total > 0 ? Math.max(0, Math.min(100, board.progress.completed / board.progress.total * 100)) : 0;
+      liveBoard.innerHTML = `<div class="hub-board-toolbar"><div class="hub-board-drag" data-board-drag tabindex="0" aria-label="${esc(tr("拖动仪表盘；方向键可移动", "Drag dashboard; use arrow keys to move"))}" title="${esc(tr("拖动到窗口任意位置", "Drag anywhere in the window"))}"><span class="hub-board-grip" aria-hidden="true">⋮⋮</span><strong>${esc(heading)}</strong>${board.progress.total ? `<svg class="hub-progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-border)" stroke-width="3"></circle><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-accent)" stroke-width="3" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="${44 * (1 - percent / 100)}"></circle></svg>` : ""}<span class="hub-board-status">${esc(status)}</span></div><button type="button" class="hub-icon-btn" data-action="reset-dashboard-position" aria-label="${esc(tr("重置悬浮位置", "Reset dashboard position"))}" title="${esc(tr("重置悬浮位置", "Reset dashboard position"))}">${icon("refresh", 12)}</button><button type="button" class="hub-icon-btn" data-action="toggle-board" aria-expanded="${state.boardExpanded}" aria-label="${esc(state.boardExpanded ? tr("收起仪表盘", "Collapse dashboard") : tr("展开仪表盘", "Expand dashboard"))}">${state.boardExpanded ? "−" : "+"}</button><button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 14)}</button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${hasPlan ? `<div class="hub-board-source"><span>${esc(planSourceSummary(board))}</span><span>${esc(board.progress.total ? status : tr("进度未量化", "Progress not quantified"))}</span></div>${board.progress.total ? `<div class="hub-board-meter" role="progressbar" aria-label="${esc(tr("计划完成进度", "Plan completion"))}" aria-valuemin="0" aria-valuemax="${board.progress.total}" aria-valuenow="${board.progress.completed}"><i style="width:${percent}%"></i></div>` : ""}` : ""}${boardMarkup(true, true)}`}<nav class="hub-dashboard-links" aria-label="${esc(tr("仪表盘快捷入口", "Dashboard shortcuts"))}"><button type="button" data-action="dashboard-tab" data-tab="subagents">${esc(tr("子代理", "Agents"))}</button><button type="button" data-action="dashboard-tab" data-tab="hooks">Hooks</button><button type="button" data-action="dashboard-tab" data-tab="plugins">${esc(tr("插件", "Plugins"))}</button></nav></div>` : ""}`;
       applyTheme();
       positionConversationTools();
       const scroller = liveBoard.querySelector(".hub-board-content");
       if (scroller) scroller.scrollTop = scrollTop;
+      if (focus && !liveBoard.hidden && sameThread && state.threadId === threadId) {
+        let next;
+        if (focus.drag) next = liveBoard.querySelector("[data-board-drag]");
+        else if (focus.action === "board-step") {
+          // Some backends synthesize positional step-1/0 IDs; never treat
+          // those as identities after an insertion, deletion or reordering.
+          if (focus.stepId && !/^(?:step[-_])?\d+$/i.test(focus.stepId)) {
+            const matches = [...liveBoard.querySelectorAll('button[data-action="board-step"]')].filter((button) => button.dataset.stepId === focus.stepId && button.dataset.stepText === focus.stepText);
+            if (matches.length === 1) next = matches[0];
+          }
+          next ||= liveBoard.querySelector("[data-board-drag]");
+        } else if (focus.action === "read-artifact") next = liveBoard.querySelector("[data-board-drag]");
+        else {
+          const matches = [...liveBoard.querySelectorAll("button[data-action]")].filter((button) => button.dataset.action === focus.action && button.dataset.tab === focus.tab);
+          next = matches.length === 1 ? matches[0] : liveBoard.querySelector("[data-board-drag]");
+        }
+        next?.focus?.({ preventScroll: true });
+      }
     }
     function artifactMarkup() {
       if (!state.artifact) return "";
@@ -1583,7 +1743,8 @@
     function renderBoardTab() {
       const problem = boardProblem();
       if (problem) { content.innerHTML = `<p class="hub-hint">${esc(problem)} · ${esc(tr("可点右上角刷新连接", "Use refresh to reconnect"))}</p>`; return; }
-      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务进度", "Task progress"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划步骤与产物文档，随会话实时同步。", "Plan steps and artifacts, synced to this thread."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio">${boardMarkup(true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("添加一个步骤…", "Add a step…"))}" aria-label="${esc(tr("新计划步骤", "New plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus" })}</div><div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}<span class="hub-hint">${esc(tr("约每 3.5 秒同步 · 五宿主通用", "Synced every 3.5s · All agents"))}</span></div></section>`}${artifactMarkup()}`;
+      const board = boardData(), editable = isManualBoard(board), canCreate = !hasActualPlan(board);
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务进度", "Task progress"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划与产物，随会话实时同步。Agent 原生计划为只读。", "Plans and artifacts in this conversation are synced. Agent-native plans are read-only."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio">${boardMarkup(true)}${editable || canCreate ? `<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("添加手动计划步骤…", "Add a manual step…"))}" aria-label="${esc(tr("手动计划步骤", "Manual plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus" })}</div>${editable ? `<div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}</div>` : ""}` : ""}<p class="hub-hint">${esc(tr("约每 3.5 秒同步", "Synced every 3.5s"))}</p></section>`}${artifactMarkup()}`;
     }
     async function pollBoard() {
       if (disposed || document.hidden || !state.connected || boardLoading) return;
@@ -1599,9 +1760,8 @@
         const recovered = !!errors.board;
         cache.board = data; delete errors.board;
         const signature = JSON.stringify(data);
-        renderLiveBoard();
         if (recovered || signature !== boardSignature) {
-          boardSignature = signature; renderChrome();
+          boardSignature = signature; renderLiveBoard(); renderChrome();
           if (state.open && state.tab === "board" && !content.contains(document.activeElement)) renderBoardTab();
         }
       } catch (error) {
@@ -1614,6 +1774,8 @@
     }
     async function updateBoard(element, action, index) {
       if (boardMismatch() || errors.board?.code === "board_thread_mismatch") { toast(tr("会话未匹配，请刷新连接", "Session mismatch; refresh the connection"), true); return; }
+      const current = boardData();
+      if ((action === "toggle" || action === "clear") && !isManualBoard(current) || action === "add" && hasActualPlan(current) && !isManualBoard(current)) { toast(tr("原生计划为只读", "Native plans are read-only"), true); return; }
       const projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", version = contextVersion;
       await busy(`board-update:${threadId || "project"}`, element, async () => {
         if (action === "clear") await request("board:clear", { projectRoot, threadId: threadId || undefined, strictThreadMatch: true });
@@ -1676,10 +1838,39 @@
     }
     function renderCommander() {
       if (!cache.orchestration) return errors.orchestration ? inlineError(errors.orchestration) : loading();
-      const legacy = orchestrationValues();
-      const legacyState = cache.orchestration?.legacyStatus?.state || "unknown";
-      const active = legacy.orchestratorMode !== "off" || legacy.swarmMode === "on" || legacyState !== "clear";
-      return `<section class="hub-card hub-commander"><div class="hub-commander-title">${esc(tr("协作策略", "Collaboration policy"))}</div><p class="hub-description">${esc(tr("统一使用下方角色路由：按任务分配，独立工作可并行；极小修改可由主会话处理，子代理连续两次未解决时由主会话接管。", "Use the role routes below; parallelize independent work. The main agent may make tiny changes or take over after two unsuccessful attempts."))}</p><p class="hub-hint">${esc(tr("全局角色是默认值，项目可单独覆盖；实际采用情况取决于宿主加载的规则。角色卡片可修改模型和思考强度。", "Global role routes are defaults; projects may override them. The host decides which rules it loads."))}</p>${active ? `<p class="hub-error" role="alert">${esc(legacyState === "unknown" ? tr("无法确认旧编排提示是否残留；可检查并清理托管区块。", "Legacy guidance status is unknown; check managed blocks.") : tr(`检测到旧总控/蜂群提示（${legacy.orchestratorMode} / ${legacy.swarmMode}），可能与现有协作规则重复或冲突。`, `Legacy commander/swarm guidance (${legacy.orchestratorMode} / ${legacy.swarmMode}) may conflict with your current policy.`))}</p>${button("disable-legacy-orchestration", tr("关闭旧编排提示", "Disable legacy guidance"), { small: true })}` : `<p class="hub-hint">${esc(tr("未发现旧 Carbon / Argon 或蜂群托管提示；不需要再开一套。", "Legacy Carbon, Argon and swarm guidance are off."))}</p>`}</section>`;
+      const outer = cache.orchestration, data = outer.orchestration || outer.config || outer;
+      const version = outer.policyVersion ?? data.policyVersion;
+      const mode = data.swarmMode === "on" ? "on" : "off";
+      const applied = (outer.modeApplied ?? data.modeApplied) === true;
+      const status = version === 2 ? applied ? tr("已同步", "Synced") : tr("待同步 / 请检查宿主", "Not fully synced") : tr("未应用 / 待同步", "Not applied / not synced");
+      return `<section class="hub-card hub-commander"><div class="hub-commander-title">${esc(tr("T3 分工方式", "T3 collaboration"))}</div><p class="hub-description">${esc(tr("只保留一种分工方式。常规：短小任务主会话处理，长任务按需派单；总指挥：主会话以协调为主，Work L1 / L2 均未解决时再接管。", "Choose one policy. Normal: main agent handles small tasks and delegates longer work as needed. Commander: coordinate first, then take over after Work L1 / L2 cannot resolve it."))}</p><div class="hub-segments" role="group" aria-label="${esc(tr("选择 T3 分工方式", "Select T3 collaboration policy"))}"><button type="button" data-action="set-cooperation-mode" data-mode="off" aria-pressed="${version === 2 && mode === "off"}">${esc(tr("常规分工", "Normal"))}</button><button type="button" data-action="set-cooperation-mode" data-mode="on" aria-pressed="${version === 2 && mode === "on"}">${esc(tr("总指挥", "Commander"))}</button></div><p class="hub-hint">${esc(status)}。${esc(tr("写入宿主规则文件；分工提示仅用于 T3，属于提示词约定，不是自动调度或权限隔离。现有会话可能需要重新加载规则。", "Host rule files receive guidance for T3 only. It is prompt guidance, not automatic dispatch or a permission boundary; existing sessions may need to reload rules."))}</p></section>`;
+    }
+    async function setCooperationMode(element, mode) {
+      if (!["on", "off"].includes(mode) || !cache.orchestration) return;
+      const version = contextVersion, projectRoot = state.projectRoot;
+      const expectedRevision = cache.orchestration.modeRevision ?? cache.orchestration.config?.modeRevision ?? cache.orchestration.orchestration?.modeRevision;
+      if (!expectedRevision) { toast(tr("无法确认配置版本，请刷新后重试", "Cannot verify config revision; refresh first"), true); return; }
+      await busy("orchestration-save", element, async () => {
+        let result, failure;
+        try {
+          result = await hubRpc("subagents:orchestration:update", { swarmMode: mode, expectedRevision });
+          if (result?.ok === false || result?.success === false) {
+            const reason = result.error?.message || result.error || tr("保存未完成", "Save incomplete");
+            const warning = result.rolledBack === false ? tr(`；${Array.isArray(result.rollbackFailures) && result.rollbackFailures.length ? `${result.rollbackFailures.length} 个` : "部分"}规则文件未能自动恢复，请检查宿主规则。`, "; some rule files could not be restored automatically; inspect host rules.") : "";
+            throw new Error(`${reason}${warning}`);
+          }
+        }
+        catch (error) { failure = error; }
+        try { const next = await request("subagents:orchestration:get", { projectRoot }); if (!disposed && version === contextVersion && projectRoot === state.projectRoot) { cache.orchestration = next; delete errors.orchestration; renderSubagents(); } }
+        catch (error) { failure ||= error; }
+        if (failure) throw failure;
+        if (disposed || version !== contextVersion) return;
+        const next = cache.orchestration, data = next?.orchestration || next?.config || next;
+        const applied = next?.modeApplied ?? data?.modeApplied;
+        if (data?.swarmMode !== mode) throw new Error(tr(`分工方式已被其他操作改为${data?.swarmMode === "on" ? "总指挥" : data?.swarmMode === "off" ? "常规分工" : "未知状态"}；已重新读取，请检查后重试。`, "Collaboration mode changed in another operation; the current state was reloaded."));
+        if (applied !== true) throw new Error(tr("已提交设置，但宿主规则尚未全部同步；请检查状态。", "Setting submitted, but host rules are not fully synced."));
+        toast(tr("分工提示已保存并同步到宿主规则", "Collaboration guidance saved to host rules"));
+      });
     }
     async function disableLegacyOrchestration(element) {
       const version = contextVersion, projectRoot = state.projectRoot;
@@ -2310,7 +2501,7 @@
       if (before !== state.projectRoot) {
         requestVersion++;
         memoryVersion++;
-        for (const key of ["hooks", "skills", "subagents", "orchestration", "mcp", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[key] = null; delete errors[key]; }
+      for (const key of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[key] = null; delete errors[key]; }
         if (state.scope === "project" && !state.projectRoot) state.scope = "global";
         state.importScope = defaultScope();
         state.subagentScope = defaultScope();
@@ -2347,7 +2538,7 @@
     const catalogInflight = new Set();
     async function primeCatalogs() {
       const projectRoot = state.projectRoot, version = contextVersion;
-      const domains = [["mcp", "mcp:list"], ["skills", "skills:list"], ["hooks", "hooks:list"], ["subagents", "subagents:list"], ["overview", "memory:overview"]];
+      const domains = [["mcp", "mcp:list"], ["skills", "skills:list"], ["plugins", "plugins:list"], ["hooks", "hooks:list"], ["subagents", "subagents:list"], ["overview", "memory:overview"]];
       await Promise.all(domains.map(async ([key, action]) => {
         const token = `${version}:${key}`;
         if (cache[key] || catalogInflight.has(token)) return;
@@ -2379,6 +2570,7 @@
       };
       if (tab === "board") await pollBoard();
       if (tab === "hooks") await load("hooks", "hooks:list", { projectRoot });
+      if (tab === "plugins") await load("plugins", "plugins:list", { projectRoot });
       if (tab === "skills") await Promise.all([load("skills", "skills:list", { projectRoot }), load("mcp", "mcp:list", { projectRoot })]);
       if (tab === "subagents") await Promise.all([load("subagents", "subagents:list", { projectRoot }), load("orchestration", "subagents:orchestration:get", { projectRoot }), load("hooks", "hooks:list", { projectRoot })]);
       if (tab === "mcp") await load("mcp", "mcp:list", { projectRoot });
@@ -2551,6 +2743,38 @@
     }
     function onDragCancel() { drag = null; suppressClick = false; }
 
+    function startBoardDrag(event) {
+      if (event.button !== 0 || !event.target.closest?.("[data-board-drag]")) return;
+      const rect = liveBoard.getBoundingClientRect();
+      boardDrag = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: rect.left, y: rect.top, before: boardPosition, moved: false };
+      liveBoard.setPointerCapture?.(event.pointerId);
+    }
+    function moveBoardDrag(event) {
+      if (!boardDrag || boardDrag.pointerId !== event.pointerId) return;
+      const dx = event.clientX - boardDrag.startX, dy = event.clientY - boardDrag.startY;
+      if (Math.abs(dx) + Math.abs(dy) < 4 && !boardDrag.moved) return;
+      boardDrag.moved = true;
+      event.preventDefault();
+      boardPosition = { x: boardDrag.x + dx, y: boardDrag.y + dy };
+      positionConversationTools();
+    }
+    function endBoardDrag(event) {
+      if (!boardDrag || boardDrag.pointerId !== event.pointerId) return;
+      const moved = boardDrag.moved;
+      boardDrag = null;
+      liveBoard.releasePointerCapture?.(event.pointerId);
+      if (moved) {
+        boardPosition = { x: parseFloat(liveBoard.style.left), y: parseFloat(liveBoard.style.top) };
+        storageSet("t3-hub-dashboard-position-v1", JSON.stringify(boardPosition));
+      }
+    }
+    function cancelBoardDrag(event) {
+      if (!boardDrag || boardDrag.pointerId !== event.pointerId) return;
+      boardPosition = boardDrag.before;
+      boardDrag = null;
+      positionConversationTools();
+    }
+
     function onClick(event) {
       const target = event.target.closest("[data-action],#t3-hub-handle");
       if (!target || (!root.contains(target) && !liveBoard?.contains(target)) || target.disabled) return;
@@ -2559,6 +2783,8 @@
       const id = target.dataset.id;
       if (action === "set-theme") setTheme(target.dataset.theme);
       else if (action === "open-board-studio") { switchTab("board"); setOpen(true); }
+      else if (action === "dashboard-tab") { switchTab(target.dataset.tab); setOpen(true); }
+      else if (action === "reset-dashboard-position") { boardPosition = null; storageSet("t3-hub-dashboard-position-v1", "null"); positionConversationTools(); }
       else if (action === "set-width") setWidth(target.dataset.width);
       else if (action === "open-picker") { if (slashSession) closeSlash(); else openPicker(); }
       else if (action === "slash-tab") { if (slashSession) { slashSession.tab = target.dataset.tab; slashSession.active = 0; filterSlashRows(); renderSlash(); } }
@@ -2569,10 +2795,8 @@
       else if (action === "resource-toggle") toggleResource(target);
       else if (action === "resource-toggle-all") toggleResource(target, true);
       else if (action === "save-mcp-mode") saveMcpMode(target);
-      else if (action === "toggle-board") {
-        if (liveBoard.classList.contains("is-space-limited")) { switchTab("board"); setOpen(true); }
-        else { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-board-expanded-v2", state.boardExpanded); renderLiveBoard(); }
-      }
+      else if (action === "set-cooperation-mode") setCooperationMode(target, target.dataset.mode);
+      else if (action === "toggle-board") { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-dashboard-expanded-v1", state.boardExpanded); renderLiveBoard(); }
       else if (action === "board-background") { state.boardBackground = !state.boardBackground; renderLiveBoard(); if (state.tab === "board") renderBoardTab(); }
       else if (action === "board-add") updateBoard(target, "add");
       else if (action === "board-step") updateBoard(target, "toggle", Number(target.dataset.index));
@@ -2586,6 +2810,8 @@
       else if (action === "promote-memory") promoteMemory(id, target);
       else if (action === "dream-fold") { state.dreamOpen = !state.dreamOpen; }
       else if (action === "toggle-dream") saveDream({ enabled: !dreamConfig().enabled });
+      else if (action === "save-dream-engine") saveDreamEngine();
+      else if (action === "cancel-dream-engine") { state.dreamEngineDraft = null; renderDream(); }
       else if (action === "run-dream") runDream();
       else if (action === "import-host-memories") importHostMemories(target);
       else if (action === "trim-embed") trimEmbedCache(target);
@@ -2615,8 +2841,8 @@
       else if (action === "tab") switchTab(target.dataset.tab);
       else if (action === "refresh") refresh();
       else if (action === "hook-scope") setDomainScope("hooks", id, target.dataset.scope, target);
-      else if (action === "new-hook") { state.hookDraft ||= { title: "", event: "Stop", matcher: "", command: "", scope: defaultScope() }; renderSubagents(); content.querySelector('[name="hook-title"]')?.focus(); }
-      else if (action === "cancel-hook") { state.hookDraft = null; renderSubagents(); }
+      else if (action === "new-hook") { state.hookDraft ||= { title: "", event: "Stop", matcher: "", command: "", scope: "global" }; renderHooks(); content.querySelector('[name="hook-title"]')?.focus(); }
+      else if (action === "cancel-hook") { state.hookDraft = null; renderHooks(); }
       else if (action === "save-hook") saveHook(target);
       else if (action === "delete-hook") target.closest(".hub-hook-card").querySelector("[data-hook-confirm]").hidden = false;
       else if (action === "cancel-delete-hook") target.closest("[data-hook-confirm]").hidden = true;
@@ -2691,6 +2917,13 @@
       const name = input.name;
       if (name === "slash-query" && slashSession) { slashSession.query = input.value.toLowerCase(); slashSession.active = 0; filterSlashRows(); renderSlash(); return; }
       if (name === "board-step-draft") { state.boardDraft = input.value; return; }
+      if (name === "dream-model") {
+        state.dreamEngineDraft = { ...dreamEngineDraft(), model: input.value };
+        const save = root.querySelector('[data-action="save-dream-engine"]'); if (save) save.disabled = false;
+        const cancel = root.querySelector('[data-action="cancel-dream-engine"]'); if (cancel) cancel.disabled = false;
+        const run = root.querySelector('[data-action="run-dream"]'); if (run) run.disabled = true;
+        return;
+      }
       if (name === "native-setting") {
         const key = input.dataset.settingsKey;
         if (!editableSettingKeys().includes(key)) return;
@@ -2729,9 +2962,20 @@
     function onChange(event) {
       const input = event.target;
       const name = input.name;
-      if (name === "dream-engine") {
-        const preset = dreamPresets().find((item) => item.id === input.value);
-        if (preset) saveDream({ dreamMode: preset.dreamMode, providerInstanceId: preset.providerInstanceId, model: preset.model, ...(preset.reasoningEffort ? { reasoningEffort: preset.reasoningEffort } : {}) });
+      if (name === "dream-provider") {
+        const provider = input.value, available = cache.dream?.runtime?.providers || [], entry = available.find((item) => item.id === provider);
+        if (!["local", "muse", "codex", "claude", "pi"].includes(provider) || ["missing", "unsupported"].includes(entry?.status) || available.length && !entry) return;
+        const preset = dreamPresets().find((item) => item.providerInstanceId === provider);
+        const efforts = entry?.efforts || ["low", "medium", "high"], old = dreamEngineDraft();
+        state.dreamEngineDraft = { providerInstanceId: provider, model: provider === "local" ? "mlx-vector-only" : preset?.model || "", reasoningEffort: efforts.includes(old.reasoningEffort) ? old.reasoningEffort : efforts.includes("medium") ? "medium" : efforts[0] || "medium" };
+        renderDream();
+        return;
+      }
+      if (name === "dream-effort") {
+        const entry = cache.dream?.runtime?.providers?.find((item) => item.id === dreamEngineDraft().providerInstanceId);
+        const allowed = entry?.efforts || ["low", "medium", "high"];
+        if (allowed.includes(input.value)) state.dreamEngineDraft = { ...dreamEngineDraft(), reasoningEffort: input.value };
+        renderDream();
         return;
       }
       if (name === "dream-time") { saveDream({ dreamTime: input.value }); return; }
@@ -2810,10 +3054,20 @@
     }
     function onEditorKeydown(event) {
       const input = event.target;
+      if (input.matches?.("[data-board-drag]") && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+        event.preventDefault();
+        const step = event.shiftKey ? 40 : 10;
+        const x = parseFloat(liveBoard.style.left) || 8, y = parseFloat(liveBoard.style.top) || 8;
+        boardPosition = { x: x + (event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0), y: y + (event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0) };
+        positionConversationTools();
+        boardPosition = { x: parseFloat(liveBoard.style.left), y: parseFloat(liveBoard.style.top) };
+        storageSet("t3-hub-dashboard-position-v1", JSON.stringify(boardPosition));
+        return;
+      }
       if (input.name === "board-step-draft" && event.key === "Enter" && !event.isComposing) { event.preventDefault(); updateBoard(input, "add"); return; }
       if (input.getAttribute("role") === "tab" && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        const tabs = ["memory", "skills", "subagents", "settings"];
+        const tabs = ["memory", "skills", "plugins", "subagents", "hooks", "settings"];
         const index = tabs.indexOf(state.tab);
         const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
         switchTab(tabs[next], true);
@@ -2837,41 +3091,49 @@
     }
 
     async function setDomainScope(domain, id, scope, element) {
-      const projectRoot = state.projectRoot;
+      const projectRoot = state.projectRoot, version = contextVersion, route = routeKey();
       const item = hookItems().find((entry) => String(entry.id) === id);
-      if (!item || item.readonly || item.unavailable || scope === "project" && !projectRoot) return;
+      const projectWrite = scope === "project" || projectOwnedHook(item);
+      if (!item || item.readonly || item.unavailable) return;
+      if (projectWrite) { toast(tr("项目 Hook 暂只读，现有配置保持不变", "Project hooks are read-only; existing settings remain unchanged"), true); return; }
+      if (!["off", "global"].includes(scope)) return;
       await busy(`${domain}-scope:${id}`, element, async () => {
-        const result = await request("hooks:toggle", { id, scope, projectRoot });
-        if (disposed || projectRoot !== state.projectRoot) return;
-        const list = items(cache[domain], ["items", domain]);
-        const original = list.find((entry) => String(entry.id) === id);
-        if (original) Object.assign(original, result.item || {}, { scope });
-        if (state.tab === "subagents") renderSubagents();
+        await request("hooks:toggle", { id, scope, projectRoot: null });
+        if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || route !== routeKey()) return;
+        const refreshed = await request("hooks:list", { projectRoot: projectContextReady() ? projectRoot : null });
+        if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || route !== routeKey()) return;
+        cache.hooks = refreshed;
+        if (state.tab === "hooks") renderHooks();
         renderChrome();
-        toast(tr("启用范围已更新", "Activation scope updated"));
+        const updated = hookItems().find((entry) => String(entry.id) === id);
+        const confirmed = updated?.scope === scope && (scope === "off" ? updated?.configured === false && updated?.configurationStatus === "not-configured" : updated?.configured === true && updated?.configurationStatus === "configured");
+        if (!confirmed) { toast(tr("设置已提交，实际配置尚未全部确认，请查看卡片状态。", "Setting submitted, but configuration is not fully confirmed; review the card."), true); return; }
+        toast(tr("Hook 配置已保存并读取确认；当前会话是否加载取决于宿主。", "Hook configuration saved and read back; the host determines when the session loads it."));
       });
     }
     async function saveHook(element = content.querySelector('[data-action="save-hook"]')) {
       if (state.hookDraft) state.hookDraft.id ||= `hook-${window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`}`;
-      const draft = { ...state.hookDraft }, projectRoot = state.projectRoot;
+      const draft = { ...state.hookDraft }, projectRoot = state.projectRoot, version = contextVersion, route = routeKey();
       if (!draft.command?.trim() || !draft.title?.trim()) { toast(tr("请填写名称和执行命令", "Enter a name and command"), true); return; }
-      if (draft.scope === "project" && !projectRoot) return;
+      if (draft.scope === "project") { toast(tr("项目 Hook 暂只读，现有配置保持不变", "Project hooks are read-only; existing settings remain unchanged"), true); return; }
+      if (!["off", "global"].includes(draft.scope)) return;
       await busy("save-hook", element, async () => {
-        await request("hooks:save", { ...draft, projectRoot });
-        if (disposed || projectRoot !== state.projectRoot) return;
+        await request("hooks:save", { ...draft, projectRoot: null });
+        if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || route !== routeKey()) return;
         state.hookDraft = null; cache.hooks = null;
-        if (state.tab === "subagents") await loadTab(true);
+        if (state.tab === "hooks") await loadTab(true);
         toast(tr("自定义 Hook 已保存", "Custom hook saved"));
       });
     }
     async function deleteHook(id, element) {
-      const projectRoot = state.projectRoot, item = hookItems().find((entry) => String(entry.id) === id);
+      const projectRoot = state.projectRoot, version = contextVersion, route = routeKey(), item = hookItems().find((entry) => String(entry.id) === id);
       if (!item || item.builtin || item.readonly) return;
+      if (projectOwnedHook(item)) { toast(tr("项目 Hook 暂只读，现有配置保持不变", "Project hooks are read-only; existing settings remain unchanged"), true); return; }
       await busy(`delete-hook:${id}`, element, async () => {
-        await request("hooks:delete", { id, projectRoot });
-        if (disposed || projectRoot !== state.projectRoot) return;
+        await request("hooks:delete", { id, projectRoot: null });
+        if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || route !== routeKey()) return;
         cache.hooks = null;
-        if (state.tab === "subagents") await loadTab(true);
+        if (state.tab === "hooks") await loadTab(true);
         toast(tr("自定义 Hook 已删除", "Custom hook deleted"));
       });
     }
@@ -3124,7 +3386,7 @@
       toggle: () => setOpen(!state.open),
       refresh,
       selectTab: (tab) => switchTab(tab),
-      snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
+      snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, dreamEngineDraft: state.dreamEngineDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
       destroy: () => {
         if (disposed) return;
         closeSlash();

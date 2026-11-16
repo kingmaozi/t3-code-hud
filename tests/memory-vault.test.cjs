@@ -629,7 +629,7 @@ describe("Dream System (AutoDream)", () => {
     const { v, isoHub } = makeDreamVault();
     const state0 = v.getDreamState();
     assert.equal(state0.ok, true);
-    assert.equal(state0.config.enabled, true);
+    assert.equal(state0.config.enabled, false);
     assert.equal(state0.config.dreamTime, "03:00");
     assert.equal(state0.config.catchUpOnWake, true);
     assert.equal(state0.config.lastDreamAt, null);
@@ -671,11 +671,11 @@ describe("Dream System (AutoDream)", () => {
     assert.equal(v.getDreamState().config.catchUpOnWake, true);
   });
 
-  it("runDreamCycle 四阶段联动：合并/晋升/归档/日志与 overview", async () => {
+  it("runDreamCycle 保留近似项，并按权威工作树清单归档、晋升和记录报告", async () => {
     const { v, isoVault, isoHub } = makeDreamVault();
     const proj = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dream-proj-")), "proj");
     fs.mkdirSync(proj, { recursive: true });
-    // Phase1 合并：两条同义记忆（autoEvolve 关闭保证双行）
+    // 近似但不完全相同的记录不能被本地层自动合并。
     const a = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-cache-ttl-rule", content: "cache ttl must be 60 seconds for api responses to reduce load", autoEvolve: false });
     const b = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-cache-ttl-rule", content: "cache ttl must be 60 seconds for api responses to reduce load retries", autoEvolve: false });
     assert.equal(a.ok, true, JSON.stringify(a));
@@ -694,9 +694,10 @@ describe("Dream System (AutoDream)", () => {
     const immortal = v.saveMemory({ projectRoot: proj, module: "constraints", kind: "constraint", title: "dream-immortal", content: "dream immortal constraint " + Date.now(), autoEvolve: false });
     assert.equal(immortal.ok, true, JSON.stringify(immortal));
     setUpdatedAtDream(isoVault, immortal.item.id, old);
-    const res = await v.runDreamCycle({ reason: "manual" });
+    v.updateDreamConfig({ dreamMode: "local" });
+    const res = await v.runDreamCycle({ reason: "manual", activeWorktreeIds: [], activeWorktreeIdsAuthoritative: true });
     assert.equal(res.ok, true, JSON.stringify(res));
-    assert.ok(res.report.mergedCount >= 1, "mergedCount " + res.report.mergedCount);
+    assert.equal(res.report.mergedCount, 0);
     assert.ok(res.report.promotedCount >= 1, "promotedCount " + res.report.promotedCount);
     assert.ok(res.report.archivedCount >= 1, "archivedCount " + res.report.archivedCount);
     assert.equal(typeof res.report.scannedProjects, "number");
@@ -704,6 +705,8 @@ describe("Dream System (AutoDream)", () => {
     assert.equal(res.report.reason, "manual");
     // 晋升验证：worktree 已变 shared
     const promotedList = v.listMemories({ projectRoot: proj, scopeFilter: "all", limit: 50 });
+    assert.ok(promotedList.items.some((i) => i.id === a.item.id));
+    assert.ok(promotedList.items.some((i) => i.id === b.item.id));
     const promotedItem = promotedList.items.find((i) => i.id === w.item.id);
     assert.ok(promotedItem, "promoted item still present");
     assert.equal(promotedItem.scope === "shared" || promotedItem.memory_scope === "shared" ? "shared" : String(promotedItem.scope || promotedItem.memory_scope), "shared");

@@ -58,16 +58,16 @@ describe("hub-subagents catalog", () => {
 });
 
 describe("hub-subagents global seeding and listing", () => {
-  it("seeds 7 default builtin agents on first load", () => {
+  it("seeds seven builtin agents and exposes two virtual review tiers", () => {
     const home = makeTmp("home");
     const hub = path.join(home, ".t3", "hub");
     const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
     const res = mgr.listSubagents({});
     assert.equal(res.ok, true);
     assert.equal(res.projectRoot, null);
-    assert.equal(res.globalItems.length, 7);
+    assert.equal(res.globalItems.length, 9);
     const ids = res.globalItems.map((i) => i.id).sort();
-    assert.deepEqual(ids, ["code-review", "default", "explorer", "frontend", "qa", "worker", "worker-pro"]);
+    assert.deepEqual(ids, ["code-review", "default", "explorer", "frontend", "qa", "review-fast", "review-pro", "worker", "worker-pro"]);
     for (const id of ids) {
       const item = res.globalItems.find((x) => x.id === id);
       assert.equal(item.builtin, true);
@@ -79,7 +79,7 @@ describe("hub-subagents global seeding and listing", () => {
     // catalog present
     assert.ok(res.catalog.muse && res.catalog.codex);
     assert.ok(Array.isArray(res.effectiveItems));
-    assert.equal(res.effectiveItems.length, 7);
+    assert.equal(res.effectiveItems.length, 9);
   });
 
   it("listSubagents with projectRoot returns projectItems and effective merge", () => {
@@ -1145,7 +1145,7 @@ describe("hub-subagents final-review regressions", () => {
       assert.throws(() => mgr.saveSubagent({
         scope: "global",
         item: { id: "perm-agent", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", enabled: true },
-      }), /EACCES|permission/i);
+      }), /EACCES|permission|不可安全读取|不可读取/i);
       fs.chmodSync(codexAgents, 0o600);
       assert.equal(fs.readFileSync(codexAgents, "utf8"), precious, "precious unreadable AGENTS.md must remain 100% untouched");
     } finally {

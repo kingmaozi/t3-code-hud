@@ -838,15 +838,88 @@
   // Keep Sidecar Hub on the same authenticated transport as the resident HUD.
   const callRpc = (method, ...args) => callBackend(method, ...args);
   window.__t3HubRpc = async (action, payload) => {
+    const bridge = window.__t3HubSidecarBridge;
+    const normalizedPayload = payload || {};
+    if (typeof action === "string" && action.startsWith("memory:dream:")) {
+      const english = typeof hudLang !== "undefined" && hudLang === "en";
+      const unknownRun = (detail) => ({
+        ok: false,
+        status: "unknown",
+        error: english
+          ? `Dream run result is not yet known. Check the latest record before deciding whether to retry. (${detail})`
+          : `整理结果暂无法确认，请先查看最近记录，再决定是否重试。(${detail})`,
+      });
+      const safeErrorKind = (error) => {
+        const value = String(error?.code || error?.name || "NetworkError");
+        return /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(value) ? value : "NetworkError";
+      };
+      if (!bridge || !bridge.url || !bridge.token) {
+        return {
+          ok: false,
+          status: "unavailable",
+          error: english ? "Dream service is not connected. Try again later." : "梦境服务未连接，请稍后重试。",
+        };
+      }
+      let response;
+      try {
+        response = await fetch(bridge.url + "/hub-rpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+          body: JSON.stringify({ action, payload: normalizedPayload }),
+        });
+      } catch (error) {
+        const detail = safeErrorKind(error);
+        return action === "memory:dream:run"
+          ? unknownRun(detail)
+          : {
+              ok: false,
+              status: "unavailable",
+              error: english ? `Dream service connection failed (${detail}).` : `梦境服务连接失败（${detail}）。`,
+            };
+      }
+      let sidecarResult;
+      try {
+        sidecarResult = await response.json();
+      } catch {
+        const detail = `HTTP ${Number(response?.status) || 0}, invalid JSON`;
+        return action === "memory:dream:run"
+          ? unknownRun(detail)
+          : {
+              ok: false,
+              status: "invalid_response",
+              error: english ? `Dream service returned an unreadable response (${detail}).` : `梦境服务返回了无法读取的响应（${detail}）。`,
+            };
+      }
+      if (!sidecarResult || typeof sidecarResult !== "object" || Array.isArray(sidecarResult)) {
+        const detail = `HTTP ${Number(response?.status) || 0}, invalid response`;
+        return action === "memory:dream:run"
+          ? unknownRun(detail)
+          : {
+              ok: false,
+              status: "invalid_response",
+              error: english ? `Dream service returned an unreadable response (${detail}).` : `梦境服务返回了无法读取的响应（${detail}）。`,
+            };
+      }
+      if (!response.ok) {
+        const detail = `HTTP ${Number(response?.status) || 0}`;
+        return action === "memory:dream:run"
+          ? unknownRun(detail)
+          : {
+              ok: false,
+              status: "sidecar_error",
+              error: english ? `Dream service request failed (${detail}).` : `梦境服务请求失败（${detail}）。`,
+            };
+      }
+      return sidecarResult;
+    }
     const res = await callRpc("getGitGraph", "__HUB_RPC__", action, payload || {});
     if (res && (res.ok || !/Git|Unknown method|unknown action:/i.test(String(res.error || "")))) return res;
-    const bridge = window.__t3HubSidecarBridge;
     if (bridge && bridge.url && bridge.token) {
       try {
         const r = await fetch(bridge.url + "/hub-rpc", {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
-          body: JSON.stringify({ action, payload: payload || {} }),
+          body: JSON.stringify({ action, payload: normalizedPayload }),
         });
         if (r.ok) return await r.json();
       } catch {}

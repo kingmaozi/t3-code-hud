@@ -2139,9 +2139,36 @@ function createMemoryVault(opts = {}) {
       syncFromMarkdownIfChanged(slug, lock);
       const db = openDb();
       try {
-        const items = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY created_at ASC, id ASC").all(slug).map(rowToItem);
+        const sourceRows = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY created_at ASC, id ASC").all(slug)
+          .filter((row) => args.excludeProtected !== true || !isDreamProtectedRow(row));
+        const items = sourceRows.map(rowToItem);
+        const originals = new Map(sourceRows.map((row) => [row.id, row]));
+        const roots = new Map(sourceRows.map((row) => [row.id, String(row.project_root || "")]));
         const vectors = vectorsFor(db, items);
-        const overlaps = (sim) => sim.cosine >= 0.82 || sim.titleSim >= 0.75 || sim.lexicalSim >= 0.60;
+        const retainedExactPairs = new Set();
+        const retainedReferencedPairs = new Set();
+        let retainedExactConflicts = 0;
+        const referenced = args.exactOnly === true ? referencedDreamIds(db) : new Set();
+        const normalizeExact = (value) => String(value ?? "").replace(/\r\n/g, "\n");
+        const overlaps = (sim, a, b) => {
+          if (args.exactOnly !== true) return sim.cosine >= 0.82 || sim.titleSim >= 0.75 || sim.lexicalSim >= 0.60;
+          const rootA = roots.get(a.id), rootB = roots.get(b.id);
+          const sameRoot = a.projectSlug === GLOBAL_SLUG ? rootA === rootB : Boolean(rootA && rootA === rootB);
+          if (!sameRoot || a.module !== b.module || a.kind !== b.kind || a.branchName !== b.branchName || a.supersedesId !== b.supersedesId ||
+              normalizeExact(a.title) !== normalizeExact(b.title) || normalizeExact(a.content) !== normalizeExact(b.content)) return false;
+          if (referenced.has(String(a.id)) || referenced.has(String(b.id))) {
+            retainedReferencedPairs.add([String(a.id), String(b.id)].sort().join("\0"));
+            return false;
+          }
+          // The legacy survivor stores at most ten history entries. Never
+          // merge automatically if either record's existing revisions and
+          // both new snapshots would overflow that bound.
+          if ((a.history || []).length + (b.history || []).length + 2 > 10) {
+            retainedExactPairs.add([String(a.id), String(b.id)].sort().join("\0"));
+            return false;
+          }
+          return true;
+        };
         const pairs = [];
         for (let i = 0; i < items.length; i++) {
           for (let j = i + 1; j < items.length; j++) {
@@ -2149,14 +2176,14 @@ function createMemoryVault(opts = {}) {
             if (normalizedDreamScopeFromItem(items[i]) !== normalizedDreamScopeFromItem(items[j])) continue;
             if (normalizedWorktreeFromItem(items[i]) !== normalizedWorktreeFromItem(items[j])) continue;
             const sim = similarity(items[i], items[j], vectors);
-            if (overlaps(sim)) pairs.push({ id: items[i].id, mergeId: items[j].id, ...sim });
+            if (overlaps(sim, items[i], items[j])) pairs.push({ id: items[i].id, mergeId: items[j].id, ...sim });
           }
         }
         if (args.dryRun) return { ok: true, dryRun: true, mergedCount: 0, pairs, candidates: pairs, items: [] };
         const active = new Map(items.map((item) => [item.id, item]));
         const changed = new Map();
         let mergedCount = 0;
-        if (!pairs.length) return { ok: true, mergedCount: 0, items: [] };
+        if (!pairs.length) return { ok: true, mergedCount: 0, retainedExactDuplicates: retainedExactPairs.size, retainedReferencedDuplicates: retainedReferencedPairs.size, items: [] };
         const affected = new Set(pairs.flatMap((p) => [active.get(p.id).module, active.get(p.mergeId).module]));
         const currentRows = db.prepare("SELECT * FROM memories WHERE project_slug=?").all(slug);
         const journal = { version: 2, kind: "consolidate", txId: crypto.randomUUID(), createdAt: nowIso(), clusters: [{
@@ -2168,11 +2195,13 @@ function createMemoryVault(opts = {}) {
         db.exec("PRAGMA synchronous = FULL");
         db.exec("BEGIN IMMEDIATE");
         try {
-          const checkLiveStmt = db.prepare("SELECT version, updated_at, content_hash FROM memories WHERE id = ?");
+          const checkLiveStmt = db.prepare(args.exactOnly === true ? "SELECT * FROM memories WHERE id = ?" : "SELECT version, updated_at, content_hash FROM memories WHERE id = ?");
+          const liveReferences = args.exactOnly === true ? referencedDreamIds(db) : new Set();
           const rowStillMatchesSnapshot = (snapItem) => {
             if (changed.has(snapItem.id)) return true;
             const live = checkLiveStmt.get(snapItem.id);
             if (!live) return false;
+            if (args.exactOnly === true) return !isDreamProtectedRow(live) && dreamRowFingerprint(live) === dreamRowFingerprint(originals.get(snapItem.id));
             return Number(live.version) === Number(snapItem.version)
               && String(live.updated_at || "") === String(snapItem.updatedAt || "")
               && String(live.content_hash || "") === contentHashFor(snapItem.content);
@@ -2181,8 +2210,15 @@ function createMemoryVault(opts = {}) {
           for (const pair of pairs) {
             const keep = active.get(pair.id), remove = active.get(pair.mergeId);
             if (!keep || !remove || normalizedDreamScopeFromItem(keep) !== normalizedDreamScopeFromItem(remove) || normalizedWorktreeFromItem(keep) !== normalizedWorktreeFromItem(remove)) continue;
-            if (!rowStillMatchesSnapshot(keep) || !rowStillMatchesSnapshot(remove)) continue;
-            if (!overlaps(similarity(keep, remove, vectors))) continue;
+            if (args.exactOnly === true && (liveReferences.has(String(keep.id)) || liveReferences.has(String(remove.id)))) {
+              retainedReferencedPairs.add([String(keep.id), String(remove.id)].sort().join("\0"));
+              continue;
+            }
+            if (!rowStillMatchesSnapshot(keep) || !rowStillMatchesSnapshot(remove)) {
+              if (args.exactOnly === true) retainedExactConflicts += 1;
+              continue;
+            }
+            if (!overlaps(similarity(keep, remove, vectors), keep, remove)) continue;
             // Preserve the fuller explanation for near duplicates. For a
             // changed rule on the same topic, the newer revision wins.
             const sim = similarity(keep, remove, vectors);
@@ -2239,7 +2275,7 @@ function createMemoryVault(opts = {}) {
           touchProject(slug, nowIso());
           for (const item of changed.values()) triggerBackgroundEmbedding(item.id, item.title, item.content);
         }
-        return { ok: true, mergedCount, items: [...changed.values()] };
+        return { ok: true, mergedCount, retainedExactDuplicates: retainedExactPairs.size, retainedReferencedDuplicates: retainedReferencedPairs.size, retainedExactConflicts, items: [...changed.values()] };
       } finally { db.close(); }
     } catch (e) { if (e.dreamTxFatal) throw e; return { ok: false, error: e.message || String(e) }; }
     finally { releaseDreamTxLock(lock); }
@@ -2790,9 +2826,38 @@ function createMemoryVault(opts = {}) {
     }
     return parts.join("\n");
   }
-  function appendHygieneArchive(slug, fileName, items, rollbackActions = null) {
+  function appendHygieneArchive(slug, fileName, items, rollbackActions = null, dreamSafe = false) {
     if (!items || !items.length) return 0;
     const dir = path.join(projectDirFor(slug), "_archive");
+    if (dreamSafe) {
+      // Publish every automatic batch as a new immutable file. Existing
+      // archives (including concurrent manual appends) are never overwritten.
+      const vaultReal = fs.realpathSync(vaultDir);
+      const projectReal = fs.realpathSync(projectDirFor(slug));
+      const projectRelative = path.relative(vaultReal, projectReal);
+      if (!projectRelative || projectRelative === ".." || projectRelative.startsWith(".." + path.sep) || path.isAbsolute(projectRelative)) throw new Error("unsafe archive project");
+      try { fs.mkdirSync(dir); } catch (e) { if (e.code !== "EEXIST") throw e; }
+      const archiveEntry = fs.lstatSync(dir);
+      if (!archiveEntry.isDirectory() || archiveEntry.isSymbolicLink()) throw new Error("unsafe archive directory");
+      const archiveRelative = path.relative(projectReal, fs.realpathSync(dir));
+      if (!archiveRelative || archiveRelative === ".." || archiveRelative.startsWith(".." + path.sep) || path.isAbsolute(archiveRelative)) throw new Error("unsafe archive path");
+      const token = crypto.randomUUID();
+      const tmp = path.join(dir, `.dream-archive-${token}.tmp`);
+      const destination = path.join(dir, `${path.basename(fileName, ".md")}-dream-${token}.md`);
+      let fd;
+      try {
+        fd = fs.openSync(tmp, "wx", 0o600);
+        fs.writeFileSync(fd, renderHygieneArchive(fileName, items, ""), "utf8");
+        fs.fsyncSync(fd);
+        fs.closeSync(fd); fd = undefined;
+        fs.linkSync(tmp, destination); // atomic publish, never replace a file
+        fsyncDir(dir);
+      } finally {
+        if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+        try { fs.unlinkSync(tmp); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      }
+      return items.length;
+    }
     safeMkdir(dir);
     const file = path.join(dir, fileName);
     // Dream 在数据库事务失败时恢复归档（包括本次发生的轮转），避免假归档和重复归档。
@@ -2830,9 +2895,36 @@ function createMemoryVault(opts = {}) {
     writeTextAtomic(file, renderHygieneArchive(fileName, items, existing));
     return items.length;
   }
+  function deleteDreamArchivedRows(db, rows) {
+    const deleted = [];
+    let conflicts = 0;
+    let referencedRetained = 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const currentRow = db.prepare("SELECT * FROM memories WHERE id=?");
+      const referenced = referencedDreamIds(db);
+      for (const snapshot of rows) {
+        const current = currentRow.get(snapshot.id);
+        if (!current || isDreamProtectedRow(current) || dreamRowFingerprint(current) !== dreamRowFingerprint(snapshot)) {
+          conflicts += 1;
+          continue;
+        }
+        if (referenced.has(String(snapshot.id))) { referencedRetained += 1; continue; }
+        deleteRowById(db, snapshot.id);
+        deleted.push(snapshot);
+      }
+      db.exec("COMMIT");
+      return { deleted, conflicts, referencedRetained };
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
   function runHygiene(opts = {}) {
+    let dreamLock = null;
     try {
       const o = opts && typeof opts === "object" ? opts : {};
+      if (o.excludeProtected === true) dreamLock = requireDreamTxLock();
       const orphanWorktreeDays = o.orphanWorktreeDays != null ? Number(o.orphanWorktreeDays) : 7;
       const maxActivePerProject = o.maxActivePerProject != null ? Number(o.maxActivePerProject) : 250;
       const staleDays = o.staleDays != null ? Number(o.staleDays) : 60;
@@ -2859,6 +2951,10 @@ function createMemoryVault(opts = {}) {
       let coldArchived = 0;
       let orphanVectorsDeleted = 0;
       let staleVectorsDeleted = 0;
+      let archiveConflicts = 0;
+      let referencedRetained = 0;
+      const preRetainedReferences = new Set();
+      const preRetainedHistory = new Set();
       let optimized = false;
       let vacuumed = false;
       try {
@@ -2866,22 +2962,31 @@ function createMemoryVault(opts = {}) {
         try {
           const slugsForSync = discoverSlugs(db);
           for (const s of slugsForSync) {
-            try { syncFromMarkdownIfChanged(s); } catch {}
+            try { syncFromMarkdownIfChanged(s, dreamLock); } catch (e) { if (dreamLock) throw e; }
           }
-        } catch {}
+        } catch (e) { if (dreamLock) throw e; }
         // Re-open after sync (sync opens its own connections)
+        const referencedBeforeArchive = dreamLock ? referencedDreamIds(db) : new Set();
         // ---- 第 2 重：孤儿工作树临时记忆自动归档回收 ----
         const worktreeRows = db.prepare("SELECT * FROM memories WHERE memory_scope = 'worktree' ORDER BY updated_at ASC, id ASC").all();
         const orphanRows = [];
         const orphanMs = Number.isFinite(orphanWorktreeDays) && orphanWorktreeDays >= 0 ? Number(orphanWorktreeDays) * 86400000 : 7 * 86400000;
         for (const r of worktreeRows) {
+          if (o.excludeProtected === true && isDreamProtectedRow(r)) continue;
           const wid = String(r.worktree_id || "");
           const updatedAt = r.updated_at || r.created_at || "";
           const ageMs = hygieneAgeMs(updatedAt, nowMs);
           let orphan = false;
-          if (activeSet && !activeSet.has(wid)) orphan = true;
-          if (!orphan && Number.isFinite(orphanWorktreeDays) && ageMs > orphanMs) orphan = true;
-          if (!orphan) {
+          // project_root is often the canonical repository, not the linked
+          // worktree path. Age, an incomplete list, or that root alone cannot
+          // prove an automatic dream may archive a worktree's memories.
+          if (o.excludeProtected === true) {
+            orphan = Boolean(wid && activeSet && o.activeWorktreeIdsAuthoritative === true && !activeSet.has(wid));
+          } else {
+            if (activeSet && !activeSet.has(wid)) orphan = true;
+            if (!orphan && Number.isFinite(orphanWorktreeDays) && ageMs > orphanMs) orphan = true;
+          }
+          if (!orphan && o.excludeProtected !== true) {
             // 原工作树路径已不存在于磁盘
             try {
               const pr = r.project_root ? String(r.project_root) : null;
@@ -2902,7 +3007,9 @@ function createMemoryVault(opts = {}) {
               }
             } catch {}
           }
-          if (orphan) orphanRows.push(r);
+          if (orphan && dreamLock && !dreamArchiveHistorySafe(r)) preRetainedHistory.add(String(r.id));
+          else if (orphan && referencedBeforeArchive.has(String(r.id))) preRetainedReferences.add(String(r.id));
+          else if (orphan) orphanRows.push(r);
         }
         if (orphanRows.length) {
           if (dryRun) {
@@ -2919,18 +3026,21 @@ function createMemoryVault(opts = {}) {
             const affectedWorktrees = new Map(); // slug -> Set(wid)
             for (const [slug, rows] of bySlug) {
               const items = rows.map((r) => rowToItem(r));
-              appendHygieneArchive(slug, "worktrees.md", items);
-              worktreeArchived += rows.length;
+              appendHygieneArchive(slug, "worktrees.md", items, null, o.excludeProtected === true);
+              const outcome = o.excludeProtected === true ? deleteDreamArchivedRows(db, rows) : { deleted: rows, conflicts: 0 };
+              worktreeArchived += outcome.deleted.length;
+              archiveConflicts += outcome.conflicts;
+              referencedRetained += Number(outcome.referencedRetained) || 0;
               if (!affectedModules.has(slug)) affectedModules.set(slug, new Set());
               if (!affectedWorktrees.has(slug)) affectedWorktrees.set(slug, new Set());
-              for (const r of rows) {
+              for (const r of outcome.deleted) {
                 affectedModules.get(slug).add(String(r.module || "topics"));
                 const wid = String(r.worktree_id || "");
                 if (wid) affectedWorktrees.get(slug).add(wid);
-                deleteRowById(db, r.id);
+                if (o.excludeProtected !== true) deleteRowById(db, r.id);
               }
             }
-            try { for (const [slug, mods] of affectedModules) { const h = affectedWorktrees.get(slug) ? [...affectedWorktrees.get(slug)] : []; rewriteModules(db, slug, [...mods], null, h); } } catch {}
+            try { for (const [slug, mods] of affectedModules) { const h = affectedWorktrees.get(slug) ? [...affectedWorktrees.get(slug)] : []; rewriteModules(db, slug, [...mods], null, h); } } catch (e) { if (dreamLock) throw e; }
             // 清理空的 _worktrees/<worktreeId> 目录
             try {
               for (const [slug, wids] of affectedWorktrees) {
@@ -2938,7 +3048,12 @@ function createMemoryVault(opts = {}) {
                   const remaining = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE project_slug = ? AND memory_scope = 'worktree' AND worktree_id = ?").get(slug, wid);
                   if (remaining && Number(remaining.c) === 0) {
                     const d = path.join(projectDirFor(slug), "_worktrees", wid);
-                    try { if (dirExists(d)) fs.rmSync(d, { recursive: true, force: true }); } catch {}
+                    try {
+                      if (dirExists(d)) {
+                        if (o.excludeProtected === true) fs.rmdirSync(d);
+                        else fs.rmSync(d, { recursive: true, force: true });
+                      }
+                    } catch {}
                   }
                 }
               }
@@ -2965,19 +3080,28 @@ function createMemoryVault(opts = {}) {
           try {
             candidates = db.prepare("SELECT * FROM memories WHERE project_slug = ? ORDER BY updated_at ASC, id ASC").all(r);
           } catch { candidates = []; }
-          const cold = candidates.filter((row) => !isHygieneImmortalRow(row) && Number(row.hit_count) === 0 && hygieneAgeMs(row.updated_at || row.created_at || "", nowMs) > staleMs);
+          const cold = candidates.filter((row) => {
+            if (o.excludeProtected === true && (isDreamProtectedRow(row) || normalizedDreamScopeFromRow(row) === "worktree")) return false;
+            if (isHygieneImmortalRow(row) || Number(row.hit_count) !== 0 || hygieneAgeMs(row.updated_at || row.created_at || "", nowMs) <= staleMs) return false;
+            if (dreamLock && !dreamArchiveHistorySafe(row)) { preRetainedHistory.add(String(row.id)); return false; }
+            if (referencedBeforeArchive.has(String(row.id))) { preRetainedReferences.add(String(row.id)); return false; }
+            return true;
+          });
           if (!cold.length) continue;
           if (dryRun) {
             coldArchived += cold.length;
           } else {
             const items = cold.map((row) => rowToItem(row));
-            appendHygieneArchive(r, "cold.md", items);
-            coldArchived += cold.length;
-            const mods = new Set(cold.map((row) => String(row.module || "topics")));
+            appendHygieneArchive(r, "cold.md", items, null, o.excludeProtected === true);
+            const outcome = o.excludeProtected === true ? deleteDreamArchivedRows(db, cold) : { deleted: cold, conflicts: 0 };
+            coldArchived += outcome.deleted.length;
+            archiveConflicts += outcome.conflicts;
+            referencedRetained += Number(outcome.referencedRetained) || 0;
+            const mods = new Set(outcome.deleted.map((row) => String(row.module || "topics")));
             const wHints = [];
-            for (const row of cold) { if (String(row.memory_scope||"")==="worktree" && String(row.worktree_id||"")) wHints.push(String(row.worktree_id)); }
-            for (const row of cold) deleteRowById(db, row.id);
-            try { rewriteModules(db, r, [...mods], null, wHints); } catch {}
+            for (const row of outcome.deleted) { if (String(row.memory_scope||"")==="worktree" && String(row.worktree_id||"")) wHints.push(String(row.worktree_id)); }
+            if (o.excludeProtected !== true) for (const row of outcome.deleted) deleteRowById(db, row.id);
+            try { rewriteModules(db, r, [...mods], null, wHints); } catch (e) { if (dreamLock) throw e; }
           }
         }
         // ---- 第 4 重：陈旧/孤儿向量清扫 ----
@@ -3071,6 +3195,9 @@ function createMemoryVault(opts = {}) {
         orphanVectorsDeleted,
         staleVectorsDeleted,
         deletedVectors: orphanVectorsDeleted + staleVectorsDeleted,
+        archiveConflicts,
+        referencedRetained: referencedRetained + preRetainedReferences.size,
+        retainedArchiveHistoryCount: preRetainedHistory.size,
         staleVectorDeleted: staleVectorsDeleted,
         orphanVectorDeleted: orphanVectorsDeleted,
         optimized,
@@ -3078,7 +3205,7 @@ function createMemoryVault(opts = {}) {
       };
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
-    }
+    } finally { if (dreamLock) releaseDreamTxLock(dreamLock); }
   }
   // ---- AutoDream 梦境系统 ----
   let _dreaming = false;
@@ -3092,15 +3219,22 @@ function createMemoryVault(opts = {}) {
   ];
   const DREAM_MODES = ["local", "agent"];
   const DREAM_PROVIDERS = ["local", "muse", "codex", "claude", "antigravity", "pi"];
-  const DREAM_EFFORTS = ["low", "medium", "high"];
+  const DREAM_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+  const DREAM_PROVIDER_EFFORTS = {
+    muse: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    codex: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    claude: ["low", "medium", "high", "xhigh", "max"],
+    pi: ["minimal", "low", "medium", "high", "xhigh", "max"],
+  };
+  const DREAM_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,199}$/;
   // 梦境 Agent 输入硬闸门：严格 < 8000 token，配置上限钉死 7900（留指令头余量）。
   const DREAM_MAX_INPUT_TOKENS = 7900;
   const DREAM_MAX_REVIEWED_SIGS = 8192;
   const DREAM_PROMPT_HEAD = "你作为 T3 梦境精炼子智能体(dream-worker)，只读精炼以下记忆簇的冲突/近义条目，绝不倾倒全库全文。要求只输出严格 JSON：{\"merges\":[{\"keepId\":12,\"mergeIds\":[15],\"title\":\"...\",\"summary\":\"...\",\"content\":\"...\",\"reason\":\"...\"}]}。簇数据：";
   const DREAM_PROMPT_TAIL = "\n\n必须只输出 JSON，不要 Markdown、不要解释。";
-  const DEFAULT_DREAM_CONFIG = { enabled: true, dreamTime: "03:00", catchUpOnWake: true, lastDreamAt: null, lastDreamDate: null, dreamCount: 0, lastReport: null, dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium", minDeltaMemories: 3, maxClustersPerDream: 8, maxInputTokens: DREAM_MAX_INPUT_TOKENS, hasDeferredClusters: false, reviewedClusterSigs: [] };
+  const DEFAULT_DREAM_CONFIG = { enabled: false, dreamTime: "03:00", catchUpOnWake: true, lastDreamAt: null, lastDreamDate: null, dreamCount: 0, lastReport: null, dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium", minDeltaMemories: 3, maxClustersPerDream: 8, maxInputTokens: DREAM_MAX_INPUT_TOKENS, hasDeferredClusters: false, reviewedClusterSigs: [] };
   function defaultDreamConfig() {
-    return { enabled: true, dreamTime: "03:00", catchUpOnWake: true, lastDreamAt: null, lastDreamDate: null, dreamCount: 0, lastReport: null, dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium", minDeltaMemories: 3, maxClustersPerDream: 8, maxInputTokens: DREAM_MAX_INPUT_TOKENS, hasDeferredClusters: false, reviewedClusterSigs: [] };
+    return { ...DEFAULT_DREAM_CONFIG, reviewedClusterSigs: [] };
   }
   function clampMaxInputTokens(raw, fallback) {
     const n = Number(raw);
@@ -3129,14 +3263,49 @@ function createMemoryVault(opts = {}) {
   function dreamRowFingerprint(row) {
     return JSON.stringify([row.id, row.updated_at, row.title, row.content, row.tags_json,
       row.project_slug, row.project_root, row.module, row.kind, row.agent, row.created_at,
-      row.memory_scope, row.worktree_id, row.branch_name, row.version, row.history_json, row.supersedes_id]);
+      row.memory_scope, row.worktree_id, row.branch_name, row.version, row.history_json, row.supersedes_id,
+      row.content_hash, row.hit_count, row.last_recalled_at]);
   }
   function dreamRowPinned(row) {
     const tags = rowToItem(row).tags;
     return tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase()));
   }
+  function isDreamProtectedRow(row) {
+    return dreamRowPinned(row) || containsSecret(row && row.title) || containsSecret(row && row.content) || containsSecret(row && row.tags_json);
+  }
+  function dreamArchiveHistorySafe(row) {
+    try {
+      const history = JSON.parse(row.history_json || "[]");
+      return Array.isArray(history) && history.length <= 10;
+    } catch { return false; }
+  }
+  // Restrict automatic removal when another in-vault memory depends on an
+  // ID, title, module or supersedes edge. This mirrors health's link syntax.
+  function referencedDreamIds(db) {
+    const rows = db.prepare("SELECT id,title,content,module,supersedes_id FROM memories").all();
+    const targets = new Set();
+    for (const row of rows) {
+      for (const link of extractMemoryLinks(String(row.title || "") + "\n" + String(row.content || ""))) targets.add(link);
+      if (row.supersedes_id) targets.add(String(row.supersedes_id));
+    }
+    const result = new Set();
+    for (const row of rows) {
+      const id = String(row.id || ""), title = String(row.title || "").trim(), module = String(row.module || "").trim();
+      if (targets.has(id) || targets.has("#" + id) || (title && targets.has(title)) || (module && targets.has(module))) result.add(id);
+    }
+    return result;
+  }
   function buildDreamPrompt(clusters) {
     return DREAM_PROMPT_HEAD + JSON.stringify(clusters) + DREAM_PROMPT_TAIL;
+  }
+  function safeDreamError(error) {
+    const text = String(error && error.message || error || "");
+    const exit = /^cli-exit-(\d+)/.exec(text);
+    if (exit) return "cli-exit-" + exit[1];
+    for (const code of ["cli-timeout", "cli-output-overflow", "cli-unavailable", "cli-spawn-failed", "executable-not-found", "unsupported-provider", "unsupported-effort", "invalid-model", "json-parse-failed", "invalid-agent-result", "prompt-over-budget", "gate-skip-delta"]) {
+      if (text === code || text.startsWith(code + ":")) return code;
+    }
+    return "agent-run-failed";
   }
   // 梦境 CLI 纯异步非阻塞执行：child_process.spawn + stdin，stdout/stderr 流式收集（512KB 封顶），
   // 60s 超时先 SIGTERM、100ms 后 SIGKILL，超时/溢出/非零退出均经 Promise 拒绝优雅降级。
@@ -3149,7 +3318,7 @@ function createMemoryVault(opts = {}) {
     return new Promise((resolve, reject) => {
       let child = null;
       try {
-        child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, T3_SUBAGENT_ROLE: "dream-worker" } });
+        child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, T3_SUBAGENT_ROLE: "dream-worker", MUSE_NO_AUTO_UPDATE: "1", MUSE_LOGIN: "0", PI_OFFLINE: "1" } });
       } catch (e) {
         reject(new Error("cli-spawn-failed:" + String((e && e.message) || e)));
         return;
@@ -3273,7 +3442,7 @@ function createMemoryVault(opts = {}) {
     const base = defaultDreamConfig();
     if (!raw || typeof raw !== "object") return base;
     const out = { ...base, ...raw };
-    if (typeof out.enabled !== "boolean") out.enabled = true;
+    if (typeof out.enabled !== "boolean") out.enabled = base.enabled;
     if (typeof out.dreamTime !== "string" || !/^([01]\d|2[0-3]):([0-5]\d)$/.test(out.dreamTime)) out.dreamTime = "03:00";
     if (typeof out.catchUpOnWake !== "boolean") out.catchUpOnWake = true;
     if (out.lastDreamAt != null && typeof out.lastDreamAt !== "string") out.lastDreamAt = null;
@@ -3286,11 +3455,11 @@ function createMemoryVault(opts = {}) {
     // 新增字段向后兼容
     if (!DREAM_MODES.includes(String(out.dreamMode || "").toLowerCase())) out.dreamMode = base.dreamMode;
     else out.dreamMode = String(out.dreamMode).toLowerCase();
-    if (!DREAM_PROVIDERS.includes(String(out.providerInstanceId || "").toLowerCase())) out.providerInstanceId = base.providerInstanceId;
-    else out.providerInstanceId = String(out.providerInstanceId).toLowerCase();
+    if (typeof out.providerInstanceId !== "string" || !out.providerInstanceId.trim()) out.providerInstanceId = base.providerInstanceId;
+    else out.providerInstanceId = out.providerInstanceId.trim().toLowerCase();
     if (typeof out.model !== "string" || !out.model.trim()) out.model = base.model;
-    if (!DREAM_EFFORTS.includes(String(out.reasoningEffort || "").toLowerCase())) out.reasoningEffort = base.reasoningEffort;
-    else out.reasoningEffort = String(out.reasoningEffort).toLowerCase();
+    if (typeof out.reasoningEffort !== "string" || !out.reasoningEffort.trim()) out.reasoningEffort = base.reasoningEffort;
+    else out.reasoningEffort = out.reasoningEffort.trim().toLowerCase();
     const nd = Number(out.minDeltaMemories);
     if (!Number.isFinite(nd) || nd < 0) out.minDeltaMemories = base.minDeltaMemories;
     else out.minDeltaMemories = Math.max(0, Math.floor(nd));
@@ -3332,11 +3501,13 @@ function createMemoryVault(opts = {}) {
     return defaultDreamConfig();
   }
   function writeDreamConfig(config) {
-    try { writeJsonFileAtomic(dreamConfigPath(), config); } catch {}
+    let saved = false;
+    try { writeJsonFileAtomic(dreamConfigPath(), config); saved = true; } catch {}
     const mirror = dreamConfigMirrorPath();
     if (mirror !== dreamConfigPath()) {
       try { writeJsonFileAtomic(mirror, config); } catch {}
     }
+    return saved;
   }
   function readDreamJournal() {
     let raw = readJsonFile(dreamJournalPath(), null);
@@ -3371,13 +3542,79 @@ function createMemoryVault(opts = {}) {
     const day = String(d.getDate()).padStart(2, "0");
     return y + "-" + m + "-" + day;
   }
-  function getDreamState() {
+  // Capability is deliberately a static PATH check: no help/login/version
+  // process, authentication access or model request is performed here.
+  function findDreamExecutable(provider) {
+    const searchPath = opts._dreamPath != null ? String(opts._dreamPath) : String(process.env.PATH || "");
+    for (const dir of searchPath.split(path.delimiter)) {
+      if (!dir || !path.isAbsolute(dir)) continue;
+      const executable = path.join(dir, provider);
+      try {
+        if (fs.statSync(executable).isFile()) { fs.accessSync(executable, fs.constants.X_OK); return executable; }
+      } catch {}
+    }
+    return null;
+  }
+  function dreamProviderCapabilities(config) {
+    const providers = DREAM_PROVIDERS.map((id) => {
+      if (id === "local") return { id, status: "available", reason: "local-only", efforts: [] };
+      if (id === "antigravity") return { id, status: "unsupported", reason: "no-compatible-adapter", efforts: [] };
+      if (id !== "muse") return { id, status: "unsupported", reason: "adapter-unverified", efforts: [] };
+      const installed = Boolean(findDreamExecutable(id));
+      return { id, status: installed ? "available" : "missing", reason: installed ? "auth-and-model-unverified" : "executable-not-found", efforts: DREAM_PROVIDER_EFFORTS[id] || [] };
+    });
+    const selectedId = config.dreamMode === "local" ? "local" : config.providerInstanceId;
+    const base = providers.find((p) => p.id === selectedId) || { id: selectedId, status: "unsupported", reason: "unknown-provider", efforts: [] };
+    let selected = { ...base };
+    if (config.dreamMode === "agent" && selected.status !== "unsupported") {
+      if (!DREAM_MODEL_PATTERN.test(String(config.model || ""))) selected = { ...selected, status: "unsupported", reason: "invalid-model" };
+      else if (!selected.efforts.includes(config.reasoningEffort)) selected = { ...selected, status: "unsupported", reason: "unsupported-effort" };
+    }
+    return { providers, selected };
+  }
+  function dreamSchedulerStatus(config, now) {
+    let timeZone = "local";
+    try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local"; } catch {}
+    let nextDueAt = null;
+    if (config.enabled) {
+      const [hours, minutes] = String(config.dreamTime || "03:00").split(":").map(Number);
+      const last = Date.parse(config.lastDreamAt || "");
+      const hasLast = Number.isFinite(last);
+      for (let offset = 0; offset < 3 && !nextDueAt; offset++) {
+        const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+        if (config.lastDreamDate === formatLocalDate(day)) continue;
+        const dayStart = day.getTime();
+        const dayEnd = new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime();
+        const target = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hours, minutes).getTime();
+        const lower = Math.max(now.getTime(), dayStart);
+        const possibilities = [];
+        const scheduled = Math.max(lower, target);
+        if (scheduled < Math.min(target + 5 * 60 * 1000, dayEnd)) possibilities.push(scheduled);
+        if (config.catchUpOnWake !== false) {
+          const afterWindow = Math.max(lower, target + 5 * 60 * 1000, hasLast ? last + 12 * 3600 * 1000 + 1 : dayStart);
+          if (afterWindow < dayEnd) possibilities.push(afterWindow);
+          if (hasLast) {
+            const after28Hours = Math.max(lower, last + 28 * 3600 * 1000 + 1);
+            if (after28Hours < dayEnd) possibilities.push(after28Hours);
+          }
+        }
+        if (possibilities.length) nextDueAt = new Date(Math.min(...possibilities)).toISOString();
+      }
+    }
+    return { enabled: config.enabled === true, requiresHubActive: true, intervalSeconds: 60, timeZone, nextDueAt, catchUpOnWake: config.catchUpOnWake !== false, initialCatchUpRequiresMemories: true };
+  }
+  function getAutoDreamStatus(options = {}) {
+    const config = options.config || readDreamConfig();
+    const now = options.now ? new Date(options.now) : new Date();
+    return { ...dreamProviderCapabilities(config), scheduler: dreamSchedulerStatus(config, Number.isNaN(now.getTime()) ? new Date() : now) };
+  }
+  function getDreamState(options = {}) {
     ensureDreamFiles();
     const config = readDreamConfig();
     const journal = readDreamJournal();
-    return { ok: true, config, journal, presets: DREAM_AGENT_PRESETS, dreamAgentPresets: DREAM_AGENT_PRESETS, DREAM_AGENT_PRESETS: DREAM_AGENT_PRESETS };
+    return { ok: true, config, journal, presets: DREAM_AGENT_PRESETS, dreamAgentPresets: DREAM_AGENT_PRESETS, DREAM_AGENT_PRESETS: DREAM_AGENT_PRESETS, runtime: getAutoDreamStatus({ config, now: options.now }) };
   }
-  function getDreamOverview() {
+  function getDreamOverview(options = {}) {
     ensureDreamFiles();
     const config = readDreamConfig();
     const journal = readDreamJournal();
@@ -3388,7 +3625,7 @@ function createMemoryVault(opts = {}) {
       currentPreset = match || null;
     } catch {}
     const nextPresetCost = currentPreset ? currentPreset.estCostPerNightUsd : 0;
-    return { ok: true, config, journal, presets: DREAM_AGENT_PRESETS, dreamAgentPresets: DREAM_AGENT_PRESETS, DREAM_AGENT_PRESETS: DREAM_AGENT_PRESETS, currentPreset, estCostPerNightUsd: nextPresetCost };
+    return { ok: true, config, journal, presets: DREAM_AGENT_PRESETS, dreamAgentPresets: DREAM_AGENT_PRESETS, DREAM_AGENT_PRESETS: DREAM_AGENT_PRESETS, currentPreset, estCostPerNightUsd: nextPresetCost, runtime: getAutoDreamStatus({ config, now: options.now }) };
   }
   function updateDreamConfig(patch = {}) {
     const p = patch && typeof patch === "object" ? patch : {};
@@ -3419,12 +3656,12 @@ function createMemoryVault(opts = {}) {
       next.providerInstanceId = v;
     }
     if ("model" in p) {
-      if (typeof p.model !== "string" || !p.model.trim()) return { ok: false, error: "invalid model (expected string)" };
+      if (typeof p.model !== "string" || !DREAM_MODEL_PATTERN.test(p.model.trim())) return { ok: false, error: "invalid model (expected model identifier)" };
       next.model = p.model.trim();
     }
     if ("reasoningEffort" in p) {
       const v = String(p.reasoningEffort || "").toLowerCase();
-      if (!DREAM_EFFORTS.includes(v)) return { ok: false, error: "invalid reasoningEffort (expected low|medium|high)" };
+      if (!DREAM_EFFORTS.includes(v)) return { ok: false, error: "invalid reasoningEffort" };
       next.reasoningEffort = v;
     }
     if ("minDeltaMemories" in p) {
@@ -3443,8 +3680,16 @@ function createMemoryVault(opts = {}) {
       // 硬锁：超大值直接 clamp 到上限（严格 < 8000），不原样落盘。
       next.maxInputTokens = clampMaxInputTokens(n, current.maxInputTokens);
     }
-    writeDreamConfig(next);
-    return { ok: true, config: next };
+    const changingAgent = ["dreamMode", "providerInstanceId", "reasoningEffort"].some((key) => key in p);
+    const unsupportedAgent = next.dreamMode === "agent" && next.providerInstanceId !== "muse";
+    const changedSelection = ["dreamMode", "providerInstanceId", "model", "reasoningEffort"].some((key) => key in p && next[key] !== current[key]);
+    if (unsupportedAgent && (changedSelection || (next.enabled && !current.enabled))) return { ok: false, error: "unsupported-provider" };
+    if (changingAgent && next.dreamMode === "agent" && !unsupportedAgent) {
+      const efforts = DREAM_PROVIDER_EFFORTS[next.providerInstanceId];
+      if (!efforts || !efforts.includes(next.reasoningEffort)) return { ok: false, error: "unsupported-effort" };
+    }
+    if (!writeDreamConfig(next)) return { ok: false, error: "dream-config-write-failed" };
+    return { ok: true, config: next, runtime: getAutoDreamStatus({ config: next }) };
   }
   async function runDreamCycle(opts = {}) {
     if (_dreaming) return { ok: false, error: "dream already in progress" };
@@ -3452,8 +3697,19 @@ function createMemoryVault(opts = {}) {
     const reason = typeof o.reason === "string" && o.reason ? o.reason : "manual";
     let now = o.now ? (o.now instanceof Date ? o.now : new Date(o.now)) : new Date();
     if (Number.isNaN(now.getTime())) now = new Date();
+    const initialConfig = readDreamConfig();
+    const initialCapability = dreamProviderCapabilities(initialConfig).selected;
+    if (initialConfig.dreamMode === "agent" && initialCapability.status === "unsupported") {
+      const error = initialCapability.reason === "unsupported-effort" ? "unsupported-effort" : initialCapability.reason === "invalid-model" ? "invalid-model" : "unsupported-provider";
+      const report = { at: now.toISOString(), date: formatLocalDate(now), reason, dreamMode: "agent", local: { status: "skipped", reason: "provider-unavailable" }, agent: { status: "failed", error, providerInstanceId: initialConfig.providerInstanceId, model: initialConfig.model, reasoningEffort: initialConfig.reasoningEffort }, agentFallbackReason: error };
+      const config = { ...initialConfig, lastDreamDate: report.date, lastReport: report, dreamCount: (Number(initialConfig.dreamCount) || 0) + 1 };
+      if (!writeDreamConfig(config)) return { ok: false, status: "failed", error: "dream-config-write-failed", report, config: initialConfig };
+      const journal = readDreamJournal(); journal.push(report); writeDreamJournal(journal);
+      return { ok: false, status: "failed", error, report, config };
+    }
     _dreaming = true;
     const startedAt = Date.now();
+    const localErrors = new Set();
     try {
       const recovery = recoverPendingDreamJournal();
       if (recovery.reason === "active-transaction") return { ok: false, error: "dream transaction lock busy" };
@@ -3461,15 +3717,26 @@ function createMemoryVault(opts = {}) {
       try {
         const db = openDb();
         try { slugs = discoverSlugs(db); } finally { db.close(); }
-      } catch { slugs = [GLOBAL_SLUG]; }
+      } catch { slugs = [GLOBAL_SLUG]; localErrors.add("project-scan-failed"); }
       if (!slugs.includes(GLOBAL_SLUG)) slugs.unshift(GLOBAL_SLUG);
       const scannedProjects = slugs.length;
       let mergedCount = 0;
+      let retainedExactDuplicates = 0;
+      let retainedReferencedCount = 0;
+      let retainedExactConflicts = 0;
+      let retainedAgentHistoryCount = 0;
       for (const slug of slugs) {
         try {
-          const r = consolidateMemories({ projectSlug: slug });
-          if (r && r.ok && Number.isFinite(Number(r.mergedCount))) mergedCount += Number(r.mergedCount) || 0;
-        } catch {}
+          const r = consolidateMemories({ projectSlug: slug, excludeProtected: true, exactOnly: true });
+          if (r && r.ok && Number.isFinite(Number(r.mergedCount))) {
+            mergedCount += Number(r.mergedCount) || 0;
+            retainedExactDuplicates += Number(r.retainedExactDuplicates) || 0;
+            retainedReferencedCount += Number(r.retainedReferencedDuplicates) || 0;
+            retainedExactConflicts += Number(r.retainedExactConflicts) || 0;
+            if (Number(r.retainedExactConflicts) > 0) localErrors.add("exact-conflicts");
+          }
+          else localErrors.add("consolidation-failed");
+        } catch { localErrors.add("consolidation-failed"); }
       }
       let promotedCount = 0;
       try {
@@ -3478,6 +3745,7 @@ function createMemoryVault(opts = {}) {
         try { rows = db.prepare("SELECT * FROM memories WHERE memory_scope='worktree'").all(); } finally { db.close(); }
         const candidates = [];
         for (const r of rows) {
+          if (isDreamProtectedRow(r)) continue;
           const hc = Number(r.hit_count) || 0;
           let tags = [];
           try { const j = JSON.parse(r.tags_json || "[]"); if (Array.isArray(j)) tags = j; } catch { tags = []; }
@@ -3489,25 +3757,30 @@ function createMemoryVault(opts = {}) {
           try {
             const res = promoteWorktreeMemory({ id: r.id });
             if (res && res.ok) promotedCount += 1;
-          } catch {}
+            else localErrors.add("promotion-failed");
+          } catch { localErrors.add("promotion-failed"); }
         }
-      } catch {}
+      } catch { localErrors.add("promotion-failed"); }
       let archivedCount = 0;
+      let archiveConflicts = 0;
+      let retainedArchiveHistoryCount = 0;
       let purgedVectorsCount = 0;
-      for (const slug of slugs) {
-        try {
-          const hygieneOpts = { projectSlug: slug, purgeStaleModelVectors: true, ...o };
-          if (hygieneOpts.now == null) hygieneOpts.now = now.toISOString();
-          const res = runHygiene(hygieneOpts);
-          if (res && res.ok) {
-            const orphan = Number(res.worktreeArchivedCount ?? res.worktreeArchived ?? 0) || 0;
-            const cold = Number(res.coldArchivedCount ?? res.coldArchived ?? 0) || 0;
-            archivedCount += orphan + cold;
-            const purged = Number(res.deletedVectors ?? ((Number(res.orphanVectorsDeleted) || 0) + (Number(res.staleVectorsDeleted) || 0))) || 0;
-            purgedVectorsCount += purged;
-          }
-        } catch {}
-      }
+      try {
+        // Hygiene scans all projects itself; invoke it once per dream.
+        const hygieneOpts = { purgeStaleModelVectors: true, ...o, excludeProtected: true };
+        if (hygieneOpts.now == null) hygieneOpts.now = now.toISOString();
+        const res = runHygiene(hygieneOpts);
+        if (res && res.ok) {
+          const orphan = Number(res.worktreeArchivedCount ?? res.worktreeArchived ?? 0) || 0;
+          const cold = Number(res.coldArchivedCount ?? res.coldArchived ?? 0) || 0;
+          archivedCount = orphan + cold;
+          archiveConflicts = Number(res.archiveConflicts) || 0;
+          retainedReferencedCount += Number(res.referencedRetained) || 0;
+          retainedArchiveHistoryCount = Number(res.retainedArchiveHistoryCount) || 0;
+          if (archiveConflicts) localErrors.add("archive-conflicts");
+          purgedVectorsCount = Number(res.deletedVectors ?? ((Number(res.orphanVectorsDeleted) || 0) + (Number(res.staleVectorsDeleted) || 0))) || 0;
+        } else localErrors.add("hygiene-failed");
+      } catch { localErrors.add("hygiene-failed"); }
       let vectorsSynced = 0;
       try {
         let beforeCount = 0;
@@ -3596,7 +3869,7 @@ function createMemoryVault(opts = {}) {
           let rowsAll = [];
           try { rowsAll = db.prepare("SELECT * FROM memories").all(); } finally { db.close(); }
           const snapshotRows = new Map(rowsAll.map((row) => [String(row.id), row]));
-          const itemsAll = rowsAll.filter((row) => !dreamRowPinned(row)).map(rowToItem);
+          const itemsAll = rowsAll.filter((row) => !isDreamProtectedRow(row)).map(rowToItem);
           // 按 slug+module+scope+worktree 分组，隔离不同 worktree 专属记忆
           const groups = new Map();
           for (const it of itemsAll) {
@@ -3726,7 +3999,9 @@ function createMemoryVault(opts = {}) {
             let agentResult = null;
             let runnerError = null;
             const runner = typeof o.agentRunner === "function" ? o.agentRunner : null;
-            if (runner) {
+            if (dreamProviderCapabilities(earlyConfig).selected.status === "unsupported") {
+              runnerError = "unsupported-provider";
+            } else if (runner) {
               try {
                 const out = await runner(payloadForAgent);
                 if (typeof out === "string") {
@@ -3743,14 +4018,11 @@ function createMemoryVault(opts = {}) {
               // 默认生产实现：子进程调用宿主 CLI，非交互，timeout 60000，环境 T3_SUBAGENT_ROLE=dream-worker
               try {
                 const prompt = fullPrompt;
-                let cmd, args;
                 const prov = String(providerInstanceId).toLowerCase();
-                if (prov === "codex") { cmd = "codex"; args = ["exec", "--skip-git-repo-check", "-m", model]; }
-                else if (prov === "claude") { cmd = "claude"; args = ["-p", "--model", model]; }
-                else if (prov === "pi") { cmd = "pi"; args = ["-p", "--model", model]; }
-                else if (prov === "muse") { cmd = "muse"; args = []; }
-                else if (prov === "antigravity") { cmd = "antigravity"; args = ["--model", model]; }
-                else { cmd = "muse"; args = []; }
+                if (prov !== "muse") throw new Error("unsupported-provider");
+                const cmd = findDreamExecutable(prov);
+                if (!cmd) throw new Error("executable-not-found");
+                const args = ["exec", "--model", model, "--reasoning-effort", reasoningEffort, "--preset", "empty", "--prompt-file", "/dev/stdin", "--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--disable-request-user-input", "--no-foreign-personal-context", "--no-session-log", "--approval-mode", "never"];
                 try {
                   // 纯异步非阻塞执行：await 让出事件循环，深睡等待期间 Node 仍可并发响应。
                   const res = await runDreamAgentCli({ cmd, args, prompt, timeoutMs: 60000, maxOutputBytes: 512 * 1024 });
@@ -3854,9 +4126,27 @@ function createMemoryVault(opts = {}) {
                       currentRows.set(id, current);
                     }
                     // P1-A: 校验 scope+worktree 隔离，禁止跨树合并
+                    const references = proposals.length ? referencedDreamIds(db3) : new Set();
                     for (const m of proposals) {
                       const keepRow = currentRows.get(m.keepId);
                       const mergeRows = m.mergeIds.map((id) => currentRows.get(id));
+                      const referenced = [m.keepId, ...m.mergeIds].filter((id) => references.has(String(id)));
+                      if (referenced.length) {
+                        retainedReferencedCount += referenced.length;
+                        const error = new Error("dream-reference-protected");
+                        error.dreamConflict = true;
+                        throw error;
+                      }
+                      const historyLength = (row) => {
+                        try { const history = JSON.parse(row.history_json || "[]"); return Array.isArray(history) ? history.length : Infinity; }
+                        catch { return Infinity; }
+                      };
+                      if (historyLength(keepRow) + 1 > 10 || mergeRows.some((row) => historyLength(row) > 10)) {
+                        retainedAgentHistoryCount += 1;
+                        const error = new Error("dream-history-protected");
+                        error.dreamConflict = true;
+                        throw error;
+                      }
                       const kScope = normalizedDreamScopeFromRow(keepRow);
                       const kWid = normalizedWorktreeFromRow(keepRow);
                       if (mergeRows.some((row) => row.project_slug !== keepRow.project_slug || row.module !== keepRow.module || normalizedDreamScopeFromRow(row) !== kScope || normalizedWorktreeFromRow(row) !== kWid)) throw new Error("dream-cluster-mismatch");
@@ -4042,6 +4332,21 @@ function createMemoryVault(opts = {}) {
         const st = fs.statSync(indexDbPath);
         dbSizeMb = Math.round((Number(st.size) / (1024 * 1024)) * 100) / 100;
       } catch { dbSizeMb = 0; }
+      const safeFallback = agentFallbackReason ? safeDreamError(agentFallbackReason) : null;
+      const local = localErrors.size ? { status: "partial", error: [...localErrors][0], errors: [...localErrors] } : { status: "success" };
+      let agent;
+      if (dreamMode !== "agent") agent = { status: "skipped", reason: "local-mode" };
+      else if (safeFallback === "gate-skip-delta") agent = { status: "skipped", reason: safeFallback };
+      else if (safeFallback === "prompt-over-budget") agent = { status: "skipped", reason: safeFallback };
+      else if (safeFallback) agent = { status: "failed", error: safeFallback };
+      else if (!agentUsed && scannedClusterCount === 0) agent = { status: "skipped", reason: "no-ambiguous-clusters" };
+      else if (mergeErrors || invalidSuggestions || conflictSkippedCount) agent = { status: "partial", error: "merge-review-incomplete" };
+      else if (deferredClusterCount > 0) agent = { status: "partial", reason: "deferred" };
+      else agent = { status: "success" };
+      if (dreamMode === "agent") Object.assign(agent, { providerInstanceId, model, reasoningEffort });
+      const agentFailed = agent.status === "failed" || (agent.status === "partial" && Boolean(agent.error));
+      const overallOk = !localErrors.size && !agentFailed;
+      const runStatus = overallOk ? (agent.status === "partial" ? "partial" : "success") : "partial";
       const report = {
         at: now.toISOString(),
         date: formatLocalDate(now),
@@ -4049,8 +4354,14 @@ function createMemoryVault(opts = {}) {
         durationMs,
         scannedProjects,
         mergedCount,
+        retainedExactDuplicates,
+        retainedReferencedCount,
+        retainedExactConflicts,
+        retainedAgentHistoryCount,
+        retainedArchiveHistoryCount,
         promotedCount,
         archivedCount,
+        archiveConflicts,
         purgedVectorsCount,
         vectorsSynced,
         dbSizeMb,
@@ -4067,7 +4378,9 @@ function createMemoryVault(opts = {}) {
         estimatedInputTokens,
         estimatedOutputTokens,
         estimatedCostUsd: Math.round(estimatedCostUsd * 1e6) / 1e6,
-        agentFallbackReason,
+        agentFallbackReason: safeFallback,
+        local,
+        agent,
         deltaSinceLastDream: deltaSince,
         minDeltaMemories,
         maxInputTokens,
@@ -4105,11 +4418,11 @@ function createMemoryVault(opts = {}) {
         hasDeferredClusters: nextHasDeferred,
         reviewedClusterSigs: mergedReviewedSigs,
       };
-      writeDreamConfig(nextConfig);
+      if (!writeDreamConfig(nextConfig)) return { ok: false, status: "partial", error: "dream-config-write-failed", report, config: currentConfig };
       const journal = readDreamJournal();
       journal.push(report);
       writeDreamJournal(journal.slice(-30));
-      return { ok: true, report, config: nextConfig };
+      return { ok: overallOk, status: runStatus, ...(overallOk ? {} : { error: agent.error || local.errors[0] }), report, config: nextConfig };
     } finally {
       _dreaming = false;
     }
@@ -4127,9 +4440,9 @@ function createMemoryVault(opts = {}) {
     if (dm) targetMins = Number(dm[1]) * 60 + Number(dm[2]);
     if (config.lastDreamDate === today) return { ok: true, triggered: false, reason: "already-dreamed-today" };
     if (nowMins >= targetMins && nowMins < targetMins + 5) {
-      const res = await runDreamCycle({ reason: "scheduled", now });
-      if (res && res.ok) return { ok: true, triggered: true, reason: "scheduled", report: res.report, config: res.config };
-      return { ok: true, triggered: false, reason: res && res.error ? String(res.error) : "busy", error: res && res.error };
+      const res = await runDreamCycle({ reason: "scheduled", now, agentRunner: o.agentRunner });
+      if (res && res.report) return { ok: res.ok, triggered: true, reason: "scheduled", status: res.status, report: res.report, config: res.config, ...(res.error ? { error: res.error } : {}) };
+      return { ok: false, triggered: false, reason: res && res.error ? String(res.error) : "busy", error: res && res.error };
     }
     if (config.catchUpOnWake !== false) {
       const lastAtRaw = config.lastDreamAt || null;
@@ -4154,9 +4467,9 @@ function createMemoryVault(opts = {}) {
           } catch { total = 0; }
           if (!(total > 0)) return { ok: true, triggered: false, reason: "no-memories" };
         }
-        const res = await runDreamCycle({ reason: "catchup", now });
-        if (res && res.ok) return { ok: true, triggered: true, reason: "catchup", report: res.report, config: res.config };
-        return { ok: true, triggered: false, reason: res && res.error ? String(res.error) : "busy", error: res && res.error };
+        const res = await runDreamCycle({ reason: "catchup", now, agentRunner: o.agentRunner });
+        if (res && res.report) return { ok: res.ok, triggered: true, reason: "catchup", status: res.status, report: res.report, config: res.config, ...(res.error ? { error: res.error } : {}) };
+        return { ok: false, triggered: false, reason: res && res.error ? String(res.error) : "busy", error: res && res.error };
       }
     }
     return { ok: true, triggered: false, reason: "not-due" };
@@ -4435,6 +4748,7 @@ function createMemoryVault(opts = {}) {
     runHygiene,
     getDreamState,
     getDreamOverview,
+    getAutoDreamStatus,
     updateDreamConfig,
     runDreamCycle,
     checkAndRunDueDream,

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { spawnSync, spawn } = require("node:child_process");
 const { createSubagentsManager, resolveSubagentRoute } = require("../src/hub-subagents.cjs");
 
@@ -17,6 +18,10 @@ function fixture(t) {
   fs.mkdirSync(projectRoot, { recursive: true });
   spawnSync("git", ["init", "-q", projectRoot]);
   return { dir, homeDir, hubDir, projectRoot, binDir: path.join(root, "scripts") };
+}
+function projectRoutePath(f) {
+  const canonical = fs.realpathSync(f.projectRoot);
+  return path.join(f.hubDir, "project-subagents", `${path.basename(canonical)}-${crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 20)}.json`);
 }
 function run(f, script, payload, env = {}) {
   const result = spawnSync(process.execPath, [path.join(root, "scripts", script)], {
@@ -34,7 +39,10 @@ test("hooks: defaults synchronize losslessly, expose LCU read-only, back up once
   const lcu = { matcher: "Bash", hooks: [{ type: "command", command: "lcu-check" }] };
   const original = { permissions: { allow: ["Read"] }, sandbox: { enabled: true }, hooks: { PreToolUse: [lcu], Stop: [{ hooks: [{ type: "command", command: "codegraph-index" }] }] } };
   write(claude, original); write(codex, { sandbox: "preserve", hooks: { PreToolUse: [lcu] } });
-  const mgr = hookManager(f), listed = mgr.listHooks({ projectRoot: f.projectRoot });
+  const mgr = hookManager(f);
+  mgr.toggleHook({ id: "memory-stop-guard", scope: "global" });
+  mgr.toggleHook({ id: "subagent-route-guard", scope: "global" });
+  const listed = mgr.listHooks({ projectRoot: f.projectRoot });
   assert.equal(listed.ok, true); assert.equal(listed.items.filter(x => x.builtin).length, 4);
   assert.ok(listed.items.some(x => x.readonly && x.source === "claude" && x.command === "lcu-check"));
   assert.deepEqual(read(claude).permissions, original.permissions); assert.deepEqual(read(claude).sandbox, original.sandbox);
@@ -60,7 +68,7 @@ test("hooks: custom create/update/scope migration/delete preserves unrelated gro
   const exclude = fs.readFileSync(path.join(f.projectRoot, ".git/info/exclude"), "utf8");
   assert.ok(exclude.includes(".claude/settings.local.json")); assert.ok(exclude.includes(".codex/hooks.json"));
   const doc = read(local); doc.hooks.UserPromptSubmit[0].hooks.push({ type: "command", command: "user-added" }); write(local, doc);
-  mgr.deleteCustomHook({ id: "custom" });
+  mgr.deleteCustomHook({ id: "custom", scope: "project", projectRoot: f.projectRoot });
   assert.equal(read(local).hooks.UserPromptSubmit[0].hooks[0].command, "user-added");
   assert.ok(!mgr.listHooks({}).items.some(x => x.id === "custom"));
   assert.throws(() => mgr.deleteCustomHook({ id: "memory-stop-guard" }));
@@ -104,7 +112,7 @@ test("hooks: project worktree excludes and prompt plugin handlers preserve user 
   mgr.setPluginHooks({ pluginId: "prompt", scope: "project", projectRoot: f.projectRoot, hooks: { Stop: [{ hooks: [{ type: "prompt", prompt: "Review $ARGUMENTS", timeout: 20 }] }] } });
   assert.equal(read(file).hooks.Stop[0].hooks[0].prompt, "Review $ARGUMENTS");
   assert.deepEqual(read(file).hooks.SessionStart, []);
-  mgr.setPluginHooks({ pluginId: "prompt", scope: "off" });
+  mgr.setPluginHooks({ pluginId: "prompt", scope: "off", projectRoot: f.projectRoot });
   assert.deepEqual(read(file).permissions, { deny: ["secret"] });
   assert.ok(fs.readFileSync(path.join(gitDir, "info/exclude"), "utf8").includes(".codex/hooks.json"));
 });
@@ -118,6 +126,8 @@ test("hooks: composite plugin hooks substitute install roots, update idempotentl
   const plugin = managed(local, "PreToolUse").find(x => x._t3HubHookId.startsWith("plugin:"));
   assert.ok(plugin.hooks[0].command.includes(installPath)); assert.equal(plugin.hooks[0].timeout, 8);
   mgr.setPluginHooks({ pluginId: "demo", scope: "off" });
+  assert.equal(managed(read(path.join(f.projectRoot, ".codex/hooks.json")), "PreToolUse").length, 1, "global off must preserve the project-owned copy");
+  mgr.setPluginHooks({ pluginId: "demo", scope: "off", projectRoot: f.projectRoot });
   assert.equal(managed(read(path.join(f.projectRoot, ".codex/hooks.json")), "PreToolUse").length, 0);
 });
 
@@ -126,13 +136,14 @@ test("hooks: generated commands execute with the configured Hub and flattened bi
   for (const script of ["subagent-route-guard.mjs", "memory-stop-hook.mjs"]) fs.copyFileSync(path.join(root, "scripts", script), path.join(binDir, script));
   fs.copyFileSync(path.join(root, "src/hub-subagents.cjs"), path.join(binDir, "hub-subagents.cjs"));
   fs.copyFileSync(path.join(root, "src/memory-vault.cjs"), path.join(binDir, "memory-vault.cjs"));
-  const mgr = hookManager({ ...f, binDir }); mgr.listHooks({});
+  const mgr = hookManager({ ...f, binDir }); mgr.toggleHook({ id: "memory-stop-guard", scope: "global" });
+  mgr.toggleHook({ id: "subagent-route-guard", scope: "global" });
   const doc = read(path.join(f.homeDir, ".codex/hooks.json"));
   write(path.join(f.hubDir, "subagents.json"), [agent("worker")]);
   const command = managed(doc, "PreToolUse")[0].hooks[0].command;
   const env = { ...process.env, HOME: f.homeDir }; delete env.T3_HUB_DIR;
   const call = () => {
-    const result = spawnSync("/bin/sh", ["-c", command], { input: JSON.stringify({ cwd: f.projectRoot, tool_name: "delegate_task", tool_input: { title: "worker · task", target: { options: { reasoningEffort: "medium" } } } }), env, encoding: "utf8", timeout: 3000 });
+    const result = spawnSync("/bin/sh", ["-c", command], { input: JSON.stringify({ cwd: f.projectRoot, tool_name: "mcp__t3_code__delegate_task", tool_input: { title: "worker · task", target: { options: { reasoningEffort: "medium" } } } }), env, encoding: "utf8", timeout: 3000 });
     assert.equal(result.status, 0, result.stderr); return JSON.parse(result.stdout).hookSpecificOutput.updatedInput.target;
   };
   assert.equal(call().options.reasoningEffort, "high");
@@ -203,7 +214,8 @@ test("route: old sessions get current provider/model/effort and reread disk next
   const first = run(f, "subagent-route-guard.mjs", payload).hookSpecificOutput;
   assert.equal(first.hookEventName, "PreToolUse"); assert.equal(first.permissionDecision, undefined);
   assert.deepEqual(first.updatedInput.target, { providerInstanceId: "codex", model: "gpt-6.1-sol", options: { reasoningEffort: "high" } });
-  assert.equal(first.updatedInput.task, "keep task");
+  assert.match(first.updatedInput.task, /t3-hub-subagent-prompt:start/);
+  assert.match(first.updatedInput.task, /keep task$/);
   assert.equal(run(f, "subagent-route-guard.mjs", { ...payload, tool_input: first.updatedInput }), null);
   write(config, [agent("worker", { providerInstanceId: "antigravity", model: "gemini-4-carbon", effort: "xhigh" })]);
   assert.deepEqual(run(f, "subagent-route-guard.mjs", payload).hookSpecificOutput.updatedInput.target.options, { thinking_level: "xhigh" });
@@ -211,22 +223,24 @@ test("route: old sessions get current provider/model/effort and reread disk next
 
 test("route: project overrides, nested cwd, wrapper, custom id, disabled and ambiguous routes", t => {
   const f = fixture(t); write(path.join(f.hubDir, "subagents.json"), [agent("worker"), agent("worker-pro"), agent("custom"), agent("disabled", { enabled: false })]);
-  write(path.join(f.hubDir, "project-subagents", path.basename(f.projectRoot) + ".json"), [agent("worker-pro", { model: "project-model", overridesGlobal: true })]);
+  write(projectRoutePath(f), [agent("worker-pro", { model: "project-model", overridesGlobal: true })]);
   const subdir = path.join(f.projectRoot, "src"); fs.mkdirSync(subdir);
   const wrapper = { ToolName: "delegate_task", Arguments: { title: "worker-pro · task", target: {}, task: "preserve" } };
-  const result = run(f, "subagent-route-guard.mjs", { tool_name: "mcp_dispatch", tool_input: wrapper, cwd: subdir }).hookSpecificOutput.updatedInput;
-  assert.equal(result.Arguments.target.model, "project-model"); assert.equal(result.Arguments.task, "preserve"); assert.equal(result.ToolName, "delegate_task");
-  const payload = { tool_name: "delegate_task", tool_input: { clientRequestId: "custom", target: {} }, cwd: f.projectRoot };
+  assert.equal(run(f, "subagent-route-guard.mjs", { tool_name: "mcp_dispatch", tool_input: wrapper, cwd: subdir }), null);
+  const result = run(f, "subagent-route-guard.mjs", { tool_name: "mcp__t3-code__delegate_task", tool_input: wrapper.Arguments, cwd: subdir }).hookSpecificOutput.updatedInput;
+  assert.equal(result.target.model, "project-model"); assert.match(result.task, /preserve$/);
+  const payload = { tool_name: "mcp__t3_code__delegate_task", tool_input: { clientRequestId: "custom", target: {} }, cwd: f.projectRoot };
   assert.equal(run(f, "subagent-route-guard.mjs", payload).hookSpecificOutput.updatedInput.target.model, "gpt-6.1-sol");
-  for (const tool_input of [{ title: "disabled", target: {} }, { role: "implementation", target: {} }, { title: "unknown", target: {} }]) assert.equal(run(f, "subagent-route-guard.mjs", { ...payload, tool_input }), null);
+  for (const tool_input of [{ title: "disabled", target: {} }, { title: "unknown", target: {} }]) assert.equal(run(f, "subagent-route-guard.mjs", { ...payload, tool_input }), null);
+  assert.equal(run(f, "subagent-route-guard.mjs", { ...payload, tool_input: { role: "implementation", target: {} } }).hookSpecificOutput.updatedInput.target.model, "gpt-6.1-sol");
   assert.equal(run(f, "subagent-route-guard.mjs", { ...payload, tool_name: "other" }), null);
 });
 
 test("route: provider effort mappings, role lookup, partial project overrides and no hook writes", t => {
-  const f = fixture(t), file = path.join(f.hubDir, "subagents.json"), projectFile = path.join(f.hubDir, "project-subagents/project.json");
+  const f = fixture(t), file = path.join(f.hubDir, "subagents.json"), projectFile = projectRoutePath(f);
   for (const [providerInstanceId, effort, options] of [["muse", "high", { reasoningEffort: "high" }], ["pi", "max", { thinking: "max" }], ["claudeAgent", "ultrathink", { effort: "ultrathink" }]]) {
     write(file, { items: [agent("helper", { providerInstanceId, effort })] });
-    const out = run(f, "subagent-route-guard.mjs", { tool_name: "delegate_task", tool_input: { role: "implementation", target: {} }, cwd: f.projectRoot });
+    const out = run(f, "subagent-route-guard.mjs", { tool_name: "mcp__t3_code__delegate_task", tool_input: { role: "implementation", target: {} }, cwd: f.projectRoot });
     assert.deepEqual(out.hookSpecificOutput.updatedInput.target.options, options);
   }
   write(file, [agent("helper", { memoryPolicy: "off" })]);
@@ -264,7 +278,7 @@ test("subagents: explicit extra sync targets, default no AGY writes, memory inst
   assert.ok(fs.existsSync(extra)); assert.ok(!fs.existsSync(agy));
   assert.match(res.renderedMarkdownBlock, /子智能体路由与系统提示词 \(T3 Hub Sub-Agents\)/);
   assert.match(res.renderedMarkdownBlock, /派发任何子智能体前，若会话较长或用户刚调整过配置/);
-  assert.match(res.renderedMarkdownBlock, /memory_search/); assert.match(res.renderedMarkdownBlock, /100% 热缓存/); assert.match(res.renderedMarkdownBlock, /memory_write/);
+  assert.match(res.renderedMarkdownBlock, /memory_search/); assert.match(res.renderedMarkdownBlock, /已验证/); assert.match(res.renderedMarkdownBlock, /memory_write/);
   assert.match(fs.readFileSync(path.join(f.homeDir, ".claude/agents/explorer.md"), "utf8"), /只读检索.*不.*写/);
   assert.ok(res.renderedMarkdownBlock.includes("<!-- t3-hub-subagents:start -->"));
   const perCallExtra = path.join(f.dir, "per-call/AGENTS.md");

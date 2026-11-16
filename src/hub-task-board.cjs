@@ -364,15 +364,33 @@ function readT3Plan(db, threadId) {
   if (!db || !threadId || !tableExists(db, "orchestration_v2_projection_plans")) return null;
   let rows = [];
   try {
-    rows = db.prepare(
-      "SELECT payload_json FROM orchestration_v2_projection_plans WHERE thread_id = ? ORDER BY rowid DESC LIMIT 8"
-    ).all(String(threadId));
+    const itemCols = tableExists(db, "orchestration_v2_projection_turn_items")
+      ? tableColumns(db, "orchestration_v2_projection_turn_items") : new Set();
+    const hasItems = ["thread_id", "type", "updated_at", "payload_json"].every(c => itemCols.has(c));
+    // Native plan payloads do not include their modification time. The
+    // corresponding turn item does, and planId is scoped to the same thread.
+    // The JSON guard keeps an unrelated malformed item from breaking a poll.
+    const sql = hasItems ? `
+      SELECT p.rowid AS plan_rowid, p.kind, p.status, p.payload_json,
+             MAX(i.updated_at) AS item_updated_at
+      FROM orchestration_v2_projection_plans p
+      LEFT JOIN orchestration_v2_projection_turn_items i
+        ON i.thread_id = p.thread_id AND i.type = p.kind
+       AND CASE WHEN json_valid(i.payload_json)
+                THEN json_extract(i.payload_json, '$.planId') END = p.plan_id
+      WHERE p.thread_id = ? GROUP BY p.rowid ORDER BY p.rowid DESC
+    ` : `SELECT rowid AS plan_rowid, kind, status, payload_json
+         FROM orchestration_v2_projection_plans WHERE thread_id = ? ORDER BY rowid DESC`;
+    rows = db.prepare(sql).all(String(threadId));
   } catch { return null; }
+  let best = null;
   for (const row of rows) {
     const payload = safeJson(row.payload_json, null);
-    if (!payload) continue;
+    if (!payload || row.status === "superseded" || payload.status === "superseded") continue;
     const rawSteps = Array.isArray(payload.steps) ? payload.steps : [];
-    if (!rawSteps.length) continue;
+    const planMarkdown = row.kind === "proposed_plan" && typeof payload.markdown === "string"
+      ? payload.markdown : "";
+    if (!rawSteps.length && !planMarkdown.trim()) continue;
     const steps = rawSteps.map((s, i) => {
       const step = {
         id: String((s && (s.id || s.stepId)) || `step-${i + 1}`),
@@ -383,16 +401,20 @@ function readT3Plan(db, threadId) {
       if (s && typeof s.note === "string" && s.note.trim()) step.note = s.note;
       return step;
     });
-    const updatedAt =
-      payload.updatedAt || payload.updated_at || payload.createdAt || payload.created_at || "";
-    return {
+    const updatedAt = row.item_updated_at || payload.updatedAt || payload.updated_at || payload.createdAt || payload.created_at || "";
+    const candidate = {
       steps,
+      planMarkdown,
+      planStatus: String(row.status || payload.status || ""),
       background: payload.explanation || payload.background || "",
       updatedAt: updatedAt || "",
       source: "t3-native",
     };
+    // Rows are initially in rowid order, which remains the legacy tie-breaker
+    // when timestamps are unavailable; a known newer timestamp wins otherwise.
+    if (!best || freshnessScore(candidate) > freshnessScore(best)) best = candidate;
   }
-  return null;
+  return best;
 }
 
 function readT3Subagents(db, threadId, nowFn) {
@@ -418,6 +440,7 @@ function readT3Subagents(db, threadId, nowFn) {
           threadId: String(child || r.subagent_id),
           title: String((payload && (payload.title || payload.model)) || child || r.subagent_id),
           status: normalizeStepStatus(r.status === "completed" ? "completed" : r.status === "running" ? "running" : r.status),
+          rawStatus: typeof r.status === "string" && r.status ? r.status : "unknown",
           providerInstanceId: String(r.provider_instance_id || (payload && payload.providerInstanceId) || r.provider || ""),
           model: String((payload && payload.model) || ""),
           createdAt: createdAt || "",
@@ -445,6 +468,7 @@ function readT3Subagents(db, threadId, nowFn) {
             threadId: String(r.thread_id),
             title: String(r.title || ""),
             status: "running",
+            rawStatus: "unknown",
             providerInstanceId: String((payload && (payload.providerInstanceId || payload.driver)) || ""),
             model: String((payload && (payload.model || payload.modelSelection && payload.modelSelection.model)) || ""),
             createdAt: createdAt || "",
@@ -469,6 +493,7 @@ function readT3Subagents(db, threadId, nowFn) {
             threadId: String(r.thread_id),
             title: String(r.title || ""),
             status: "running",
+            rawStatus: "unknown",
             providerInstanceId: "",
             model: "",
             createdAt: String(r.created_at || ""),
@@ -545,16 +570,108 @@ function listSessionDirs(brainRoots) {
   return sessions;
 }
 
-function collectArtifacts(sessionDir) {
+// For a scoped request, only examine its exact verified session IDs. A
+// symlinked session directory must not redirect a plan lookup outside a root.
+function hasBrainPlanEntry(dir) {
+  return ["task.md", "implementation_plan.md"].some((name) => {
+    try { fs.lstatSync(path.join(dir, name)); return true; }
+    catch (error) { return error && error.code !== "ENOENT" && error.code !== "ENOTDIR"; }
+  });
+}
+function captureBrainSession(dir) {
+  try {
+    const stat = fs.lstatSync(dir);
+    if (!stat.isDirectory()) return null;
+    return { dir, realPath: fs.realpathSync(dir), dev: stat.dev, ino: stat.ino };
+  } catch { return null; }
+}
+function sameBrainSession(session) {
+  if (!session) return false;
+  try {
+    const stat = fs.lstatSync(session.dir);
+    return stat.isDirectory() && stat.dev === session.dev && stat.ino === session.ino && fs.realpathSync(session.dir) === session.realPath;
+  } catch { return false; }
+}
+function findScopedBrainSessions(brainRoots, candidateIds) {
+  const sessions = new Map();
+  for (const root of brainRoots) {
+    if (!dirExists(root)) continue;
+    for (const id of candidateIds) {
+      if (!id || id === "." || id === ".." || path.basename(id) !== id || id.includes("\\")) continue;
+      if (path.basename(root) === id && hasBrainPlanEntry(root)) {
+        const session = captureBrainSession(root);
+        if (session) sessions.set(session.realPath, session);
+      }
+      const dir = path.join(root, id);
+      try {
+        if (!fs.lstatSync(dir).isDirectory()) continue;
+        const relative = path.relative(fs.realpathSync(root), fs.realpathSync(dir));
+        if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) continue;
+        if (hasBrainPlanEntry(dir)) {
+          const session = captureBrainSession(dir);
+          if (session) sessions.set(session.realPath, session);
+        }
+      } catch {}
+    }
+  }
+  return [...sessions.values()];
+}
+
+const MAX_AGY_PLAN_BYTES = 512 * 1024;
+function readBrainFile(session, documentName) {
+  if (!session || path.basename(documentName) !== documentName) return null;
+  const file = path.join(session.dir, documentName);
+  let fd, updatedAt = "";
+  try {
+    if (!sameBrainSession(session)) return { error: "unsafe_path", updatedAt };
+    const entry = fs.lstatSync(file);
+    updatedAt = entry.mtime.toISOString();
+    if (entry.isSymbolicLink()) return { error: "unsafe_path", updatedAt };
+    if (!entry.isFile()) return { error: "unreadable", updatedAt };
+    if (fs.realpathSync(file) !== path.join(session.realPath, documentName)) {
+      return { error: "unsafe_path", updatedAt };
+    }
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.dev !== entry.dev || stat.ino !== entry.ino) return { error: "unreadable", updatedAt };
+    updatedAt = stat.mtime.toISOString();
+    if (stat.size > MAX_AGY_PLAN_BYTES) return { error: "too_large", updatedAt: stat.mtime.toISOString() };
+    const buffer = Buffer.allocUnsafe(MAX_AGY_PLAN_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const n = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (!n) break;
+      length += n;
+    }
+    if (length > MAX_AGY_PLAN_BYTES) return { error: "too_large", updatedAt: stat.mtime.toISOString() };
+    if (!sameBrainSession(session)) return { error: "unsafe_path", updatedAt };
+    return { markdown: buffer.subarray(0, length).toString("utf8"), updatedAt: stat.mtime.toISOString() };
+  } catch (error) {
+    if (error && error.code === "ENOENT" && !updatedAt) return null;
+    return { error: error && error.code === "ELOOP" ? "unsafe_path" : "unreadable", updatedAt };
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+}
+function readAgyPlanDocument(session, documentName) {
+  if (documentName !== "task.md" && documentName !== "implementation_plan.md") return null;
+  return readBrainFile(session, documentName);
+}
+
+function collectArtifacts(session) {
   const artifacts = [];
-  if (!sessionDir || !dirExists(sessionDir)) return artifacts;
+  if (!sameBrainSession(session)) return artifacts;
+  const sessionDir = session.dir;
   let entries = [];
   try { entries = fs.readdirSync(sessionDir, { withFileTypes: true }); } catch { return artifacts; }
+  if (!sameBrainSession(session)) return [];
   for (const ent of entries) {
     if (!ent.isFile()) continue;
     const full = path.join(sessionDir, ent.name);
     if (ent.name.endsWith(".metadata.json")) {
-      const meta = safeReadJson(full) || {};
+      const content = readBrainFile(session, ent.name);
+      let meta = {};
+      try { if (content && !content.error) meta = JSON.parse(content.markdown) || {}; } catch {}
       if (meta.userFacing === true) {
         const name = ent.name.replace(/\.metadata\.json$/, "");
         artifacts.push({
@@ -576,13 +693,11 @@ function collectArtifacts(sessionDir) {
     artifacts.push({ name: doc, path: full, summary: "", updatedAt: fileMtimeIso(full) });
   }
   artifacts.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
-  return artifacts;
+  return sameBrainSession(session) ? artifacts : [];
 }
 
 function readAgyBrain(brainRoots, threadOrIds, opts = {}) {
   if (!brainRoots || !brainRoots.length) return null;
-  const sessions = listSessionDirs(brainRoots);
-  if (!sessions.length) return null;
   // 归一化候选集合：支持字符串 / 字符串数组 / Set
   let candidateSet = new Set();
   if (Array.isArray(threadOrIds)) {
@@ -592,39 +707,47 @@ function readAgyBrain(brainRoots, threadOrIds, opts = {}) {
   } else if (threadOrIds != null && String(threadOrIds)) {
     candidateSet.add(String(threadOrIds));
   }
-  let chosen = null;
-  if (candidateSet.size) {
-    const match = sessions.find((d) => candidateSet.has(path.basename(d)));
-    if (match) chosen = match;
+  let sessions;
+  if (opts && opts.strictThreadMatch === true) {
+    sessions = findScopedBrainSessions(brainRoots, candidateSet);
+  } else {
+    sessions = listSessionDirs(brainRoots).map(captureBrainSession).filter(Boolean);
+    const matching = sessions.filter((session) => candidateSet.has(path.basename(session.dir)));
+    if (matching.length) sessions = matching;
   }
-  if (!chosen) {
-    if (opts && opts.strictThreadMatch === true) return null;
-    let best = -Infinity;
-    for (const dir of sessions) {
-      const t = Date.parse(fileMtimeIso(path.join(dir, "task.md"))) || 0;
-      if (t > best) { best = t; chosen = dir; }
+  if (!sessions.length) return null;
+  const candidates = [], artifactsByPath = new Map();
+  // Several provider runs can belong to one verified T3 thread. Compare only
+  // those exact directories, and retain their independently scoped artifacts.
+  for (const session of sessions) {
+    const sessionArtifacts = collectArtifacts(session), sessionPlans = [];
+    for (const name of ["task.md", "implementation_plan.md"]) {
+      const document = readAgyPlanDocument(session, name);
+      if (!document) continue;
+      const raw = document.markdown || "";
+      const steps = name === "task.md" ? parseTaskMd(raw) : [];
+      const heading = raw.split(/\r?\n/).find((line) => /^\s*#\s+(.+?)\s*$/.test(line));
+      const plan = {
+        steps,
+        background: heading ? heading.replace(/^\s*#\s+/, "").trim() : "",
+        planMarkdown: steps.length ? "" : raw,
+        planReadError: document.error || "",
+        updatedAt: document.updatedAt,
+        source: "agy-brain",
+      };
+      if (freshnessScore(plan) !== -Infinity) sessionPlans.push(plan);
     }
+    if (!sameBrainSession(session)) {
+      sessionPlans.length = 0;
+      sessionPlans.push({ steps: [], background: "", planReadError: "unsafe_path", updatedAt: "", source: "agy-brain" });
+    } else {
+      for (const artifact of sessionArtifacts) artifactsByPath.set(artifact.path, artifact);
+    }
+    candidates.push(...sessionPlans);
   }
-  if (!chosen) chosen = sessions[0];
-  const taskMdPath = path.join(chosen, "task.md");
-  if (!fileExists(taskMdPath)) return { steps: [], background: "", updatedAt: "", source: "agy-brain", artifacts: [] };
-  let raw = "";
-  try { raw = fs.readFileSync(taskMdPath, "utf8"); } catch { return null; }
-  const steps = parseTaskMd(raw);
-  const artifacts = collectArtifacts(chosen);
-  // background：取 task.md 一级标题
-  let background = "";
-  for (const line of raw.split(/\r?\n/)) {
-    const m = line.match(/^\s*#\s+(.+?)\s*$/);
-    if (m) { background = m[1].trim(); break; }
-  }
-  return {
-    steps,
-    background,
-    updatedAt: fileMtimeIso(taskMdPath),
-    source: "agy-brain",
-    artifacts,
-  };
+  candidates.sort((a, b) => freshnessScore(b) - freshnessScore(a));
+  const artifacts = [...artifactsByPath.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  return { ...(candidates[0] || { steps: [], background: "", updatedAt: "", source: "agy-brain" }), artifacts };
 }
 
 // ---------------------------------------------------------------------------
@@ -768,7 +891,7 @@ function computeProgress(steps) {
 }
 
 function freshnessScore(plan) {
-  if (!plan || !plan.steps || !plan.steps.length) return -Infinity;
+  if (!plan || (!(plan.steps && plan.steps.length) && !(typeof plan.planMarkdown === "string" && plan.planMarkdown.trim()) && !plan.planReadError)) return -Infinity;
   const t = Date.parse(plan.updatedAt || "");
   return Number.isNaN(t) ? 0 : t;
 }
@@ -831,6 +954,11 @@ function createTaskBoard(opts = {}) {
         title: "",
         background: String(winner.background || ""),
         steps,
+        planMarkdown: "",
+        planStatus: "",
+        planReadError: "",
+        progressKnown: steps.length > 0,
+        ...(!steps.length ? { emptyPlanReason: "no_explicit_plan" } : {}),
         subagents: [],
         artifacts: [],
         source: hub ? winner.source || "hub-mcp" : "t3-native",
@@ -890,6 +1018,11 @@ function createTaskBoard(opts = {}) {
             title: "",
             background: String(winner.background || ""),
             steps: scopedSteps,
+            planMarkdown: "",
+            planStatus: "",
+            planReadError: "",
+            progressKnown: scopedSteps.length > 0,
+            ...(!scopedSteps.length ? { emptyPlanReason: "scope_unverified" } : {}),
             subagents: [],
             artifacts: [],
             artifactScopeError: bound ? "mismatch" : "unknown",
@@ -929,7 +1062,8 @@ function createTaskBoard(opts = {}) {
     const agy = artifactScope.ok ? readAgyBrain(brainRoots, candidateIds, { strictThreadMatch: true }) : null;
     const hub = findHubPlan(hubPlansDir, { threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
 
-    const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) => c.steps && c.steps.length);
+    const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) =>
+      (c.steps && c.steps.length) || (typeof c.planMarkdown === "string" && c.planMarkdown.trim()) || c.planReadError);
     candidates.sort((a, b) => freshnessScore(b) - freshnessScore(a));
     let winner = candidates[0] || null;
     if (!winner && subagents.length && q.excludeSubagentInference !== true) winner = inferStepsFromSubagents(subagents);
@@ -943,6 +1077,11 @@ function createTaskBoard(opts = {}) {
       title: resolved.title || "",
       background: String(winner.background || ""),
       steps,
+      planMarkdown: String(winner.planMarkdown || ""),
+      planStatus: String(winner.planStatus || ""),
+      planReadError: String(winner.planReadError || ""),
+      progressKnown: steps.length > 0,
+      ...(!candidates.length ? { emptyPlanReason: "no_explicit_plan" } : {}),
       subagents,
       artifacts,
       ...(!artifactScope.ok && candidateIds?.length ? { artifactScopeError: artifactScope.reason } : {}),

@@ -17,6 +17,7 @@ const hubHooks = require("./hub-hooks.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
+const { createDreamScheduler, beginDreamRun } = require("./hub-dream-scheduler.cjs");
 
 const execFileAsync = promisify(execFile);
 
@@ -44,37 +45,29 @@ function isTestEnv() {
 }
 
 function getMemoryVault() {
-  try { ensureDreamScheduler(); } catch {}
   try {
     if (memoryVault && typeof memoryVault.getDefaultMemoryVault === "function") return memoryVault.getDefaultMemoryVault();
   } catch {}
   return memoryVault;
 }
 
-let _dreamSchedulerStarted = false;
-let _dreamInterval = null;
-let _dreamWakeTimeout = null;
+const DREAM_SCHEDULER_KEY = Symbol.for("t3.hud.memory.dream-scheduler.v1");
+const priorDreamScheduler = globalThis[DREAM_SCHEDULER_KEY];
+try { if (priorDreamScheduler && typeof priorDreamScheduler.stop === "function") priorDreamScheduler.stop(); } catch {}
+const dreamScheduler = createDreamScheduler({
+  getVault: () => memoryVault && typeof memoryVault.getDefaultMemoryVault === "function"
+    ? memoryVault.getDefaultMemoryVault()
+    : memoryVault,
+});
+globalThis[DREAM_SCHEDULER_KEY] = dreamScheduler;
 function ensureDreamScheduler() {
-  if (_dreamSchedulerStarted) return true;
-  if (process.env.NODE_TEST_CONTEXT) return false;
-  if (process.env.T3_DISABLE_DREAM_SCHEDULER === "1") return false;
-  _dreamSchedulerStarted = true;
-  const tick = () => {
-    try {
-      const v = memoryVault && typeof memoryVault.getDefaultMemoryVault === "function" ? memoryVault.getDefaultMemoryVault() : memoryVault;
-      const p = v.checkAndRunDueDream();
-      if (p && typeof p.catch === "function") p.catch(() => {});
-    } catch {}
-  };
-  try {
-    _dreamInterval = setInterval(tick, 60_000);
-    if (_dreamInterval && typeof _dreamInterval.unref === "function") _dreamInterval.unref();
-  } catch { _dreamInterval = null; }
-  try {
-    _dreamWakeTimeout = setTimeout(tick, 15_000);
-    if (_dreamWakeTimeout && typeof _dreamWakeTimeout.unref === "function") _dreamWakeTimeout.unref();
-  } catch { _dreamWakeTimeout = null; }
-  return true;
+  return dreamScheduler.start();
+}
+function stopDreamScheduler() {
+  return dreamScheduler.stop();
+}
+function getDreamSchedulerStatus() {
+  return dreamScheduler.getStatus();
 }
 
 const HOME_DIR = os.homedir();
@@ -2672,11 +2665,20 @@ async function hubCall(action, payload = {}) {
         return vs;
       }
       case "memory:hygiene": return memoryVault.runHygiene(payload || {});
-      case "memory:dream:get": return getMemoryVault().getDreamOverview ? getMemoryVault().getDreamOverview() : getMemoryVault().getDreamState();
+      case "memory:dream:get": {
+        const vault = getMemoryVault();
+        const overview = vault.getDreamOverview ? vault.getDreamOverview() : vault.getDreamState();
+        const value = overview && typeof overview === "object" && !Array.isArray(overview) ? overview : { state: overview };
+        const runtime = value.runtime && typeof value.runtime === "object" ? value.runtime : {};
+        const dreamRuntime = runtime.scheduler && typeof runtime.scheduler === "object" ? runtime.scheduler : {};
+        return { ...value, runtime: { ...runtime, scheduler: { ...dreamRuntime, ...getDreamSchedulerStatus() } } };
+      }
       case "memory:dream:save":
       case "memory:dream:update": return getMemoryVault().updateDreamConfig(payload || {});
       case "memory:dream:run": {
-        const r = await getMemoryVault().runDreamCycle({ reason: (payload && payload.reason) || "manual", projectRoot: payload && payload.projectRoot, force: !!(payload && payload.force), agentRunner: payload && typeof payload.agentRunner === "function" ? payload.agentRunner : undefined });
+        const lease = beginDreamRun("manual-run", () => getMemoryVault().runDreamCycle({ reason: (payload && payload.reason) || "manual", projectRoot: payload && payload.projectRoot, force: !!(payload && payload.force), agentRunner: payload && typeof payload.agentRunner === "function" ? payload.agentRunner : undefined }));
+        if (!lease.started) return { ok: false, status: "busy", error: "dream_busy" };
+        const r = await lease.promise;
         let journal = [];
         try { journal = (getMemoryVault().getDreamState() || {}).journal || []; } catch {}
         return { ...r, journal };
@@ -2775,7 +2777,7 @@ async function hubCall(action, payload = {}) {
         return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
       }
       case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
-      case "subagents:orchestration:get": return { ...hubSubagents.getOrchestrationConfig(), legacyStatus: hubSubagents.inspectOrchestrationTargets({ additionalHosts: discoverAntigravityRulesPaths() }) };
+      case "subagents:orchestration:get": return hubSubagents.getOrchestrationState({ additionalHosts: discoverAntigravityRulesPaths() });
       case "subagents:orchestration:update": {
         const p = payload || {};
         const patch = p.config || p.patch || p;
@@ -3538,6 +3540,8 @@ module.exports = {
   resolveHubContext,
   hubCall,
   ensureDreamScheduler,
+  stopDreamScheduler,
+  getDreamSchedulerStatus,
   getMemoryVault,
   // Test exposure for leak guards (TDD)
   _fileParseCache: fileParseCache,

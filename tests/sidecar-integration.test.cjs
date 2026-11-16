@@ -328,10 +328,32 @@ describe("backend hubCall via getGitGraph __HUB_RPC__ bridge", () => {
     const plist = await backend.getGitGraph("__HUB_RPC__", "plugins:list", { projectRoot: PROJECT_ROOT });
     assert.equal(plist.ok, true);
     assert.ok(plist.items.some((p) => p.id === "t3-memory-vault" && p.builtin));
+    const globalOffWithProjectContext = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "off", projectRoot: PROJECT_ROOT });
+    assert.equal(globalOffWithProjectContext.ok, true, "global off remains available when the drawer sends its current project root");
+    assert.equal((await backend.getGitGraph("__HUB_RPC__", "plugins:list", { projectRoot: PROJECT_ROOT })).items.find(p => p.id === "t3-memory-vault").scope, "off");
+    const globalEnabledAgain = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "global", projectRoot: PROJECT_ROOT });
+    assert.equal(globalEnabledAgain.ok, true);
     const pset = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "project", projectRoot: PROJECT_ROOT });
     assert.equal(pset.ok, true);
+    const scopeFiles = [
+      path.join(tmpHub, "state.json"),
+      path.join(tmpHub, "hooks-state.json"),
+      path.join(tmpHome, ".claude", "settings.json"),
+      path.join(tmpHome, ".codex", "hooks.json"),
+      path.join(PROJECT_ROOT, ".claude", "settings.local.json"),
+      path.join(PROJECT_ROOT, ".codex", "hooks.json"),
+    ];
+    const projectScopeSnapshot = Object.fromEntries(scopeFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null]));
     const pset2 = await backend.getGitGraph("__HUB_RPC__", "plugins:setScope", { id: "t3-memory-vault", scope: "global", projectRoot: PROJECT_ROOT });
-    assert.equal(pset2.ok, true);
+    assert.equal(pset2.ok, false, "project-owned Hooks are read-only, so unsafe plugin scope migration must be rejected");
+    assert.match(pset2.error, /project-scoped plugin Hooks are read-only/);
+    assert.deepEqual(Object.fromEntries(scopeFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), projectScopeSnapshot, "rejected migration must not partially rewrite plugin, Hook, or host state");
+    const pluginAfterRejectedMigration = await backend.getGitGraph("__HUB_RPC__", "plugins:list", { projectRoot: PROJECT_ROOT });
+    assert.equal(pluginAfterRejectedMigration.items.find(p => p.id === "t3-memory-vault").scope, "project");
+    const hooksAfterRejectedMigration = await backend.getGitGraph("__HUB_RPC__", "hooks:list", { projectRoot: PROJECT_ROOT });
+    const memoryHookAfterRejectedMigration = hooksAfterRejectedMigration.items.find(h => h.id === "memory-stop-guard");
+    assert.equal(memoryHookAfterRejectedMigration.scope, "project");
+    assert.equal(memoryHookAfterRejectedMigration.projectRoot, PROJECT_ROOT);
 
     // MCP probe
     const probe = await backend.getGitGraph("__HUB_RPC__", "mcp:probe", { name: "context7", timeoutMs: 400 });
@@ -352,9 +374,16 @@ describe("backend hubCall via getGitGraph __HUB_RPC__ bridge", () => {
       projectRoot: PROJECT_ROOT,
     });
     assert.equal(hsave.ok, true);
+    const hookConfigFiles = [
+      path.join(PROJECT_ROOT, ".claude", "settings.local.json"),
+      path.join(PROJECT_ROOT, ".codex", "hooks.json"),
+      path.join(tmpHub, "hooks-state.json"),
+    ];
+    const savedProjectHook = Object.fromEntries(hookConfigFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null]));
     const htog = await backend.getGitGraph("__HUB_RPC__", "hooks:toggle", { id: "custom-int-hook", scope: "off", projectRoot: PROJECT_ROOT });
-    assert.equal(htog.ok, true);
-    const hdel = await backend.getGitGraph("__HUB_RPC__", "hooks:delete", { id: "custom-int-hook" });
+    assert.equal(htog.ok, false, "project Hook scope controls are read-only");
+    assert.deepEqual(Object.fromEntries(hookConfigFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), savedProjectHook);
+    const hdel = await backend.getGitGraph("__HUB_RPC__", "hooks:delete", { id: "custom-int-hook", scope: "project", projectRoot: PROJECT_ROOT });
     assert.equal(hdel.ok, true);
 
     // Memory evolution + consolidate + rollback via hubCall
@@ -463,7 +492,7 @@ function extractHubRpc(rendererSrc) {
 }
 
 describe("CSP-free embedded bundle + bridge-first RPC", () => {
-  it("(a) embedded bundle mounts 4-tab v3 Hub and replaces pre-existing Hub without eval", async () => {
+  it("(a) embedded bundle mounts the six-tab Hub and replaces pre-existing Hub without eval", async () => {
     const rendererSrc = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
     const drawerSrc = fs.readFileSync(path.join(REPO, "src", "hub-drawer-ui.js"), "utf8");
     // Embedded guard: no fetch/eval when __t3HubDrawerEmbedded is truthy.
@@ -475,8 +504,8 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     assert.ok(guardIdx < evalIdx, "embedded guard precedes eval");
     // Backward compat: eval branch still exists for non-embedded path.
     assert.ok(rendererSrc.includes("if (!window.__t3HubDrawerEmbedded)"));
-    // Four primary tabs plus the internal plan and shared-rules pages.
-    const expectedTabs = ["memory", "skills", "subagents", "settings", "board", "agents"];
+    // Six primary tabs plus the internal plan and shared-rules pages.
+    const expectedTabs = ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"];
     for (const tab of expectedTabs) {
       assert.ok(drawerSrc.includes(`"${tab}"`), `drawer defines tab ${tab}`);
     }
@@ -524,7 +553,7 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     vm.createContext(sandbox);
     vm.runInContext(drawerSrc, sandbox);
     assert.ok(oldDestroyed, "pre-existing Hub destroyed");
-    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 4-tab Hub mounted");
+    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new Hub mounted");
     assert.equal(typeof sandbox.window.__t3SidecarHub.snapshot, "function");
     assert.equal(typeof sandbox.window.__t3SidecarHub.destroy, "function");
     assert.equal(typeof sandbox.window.__t3MountSidecarHub, "function");

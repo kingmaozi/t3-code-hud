@@ -1043,6 +1043,29 @@ function createMcpRouter(opts = {}) {
     }
     return { state, registry };
   }
+  function readValidatedPluginState() {
+    const state = assertNativeReadable(statePath, readNativeText(statePath));
+    if (!state.exists) return {};
+    const record = value => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+    let value;
+    try {
+      value = JSON.parse(state.raw);
+      if (!record(value)) throw new TypeError("expected a state object");
+      for (const key of ["mcpModes", "pluginMcpOwned", "pluginScopes", "pluginProjectRoots"]) {
+        if (value[key] !== undefined && !record(value[key])) throw new TypeError("expected " + key + " object");
+      }
+      const stringValues = object => Object.values(object).every(item => typeof item === "string");
+      const modes = value.mcpModes;
+      if (modes) {
+        if (modes.global !== undefined && (!record(modes.global) || !stringValues(modes.global))) throw new TypeError("expected global modes object");
+        if (modes.projects !== undefined && (!record(modes.projects) || Object.values(modes.projects).some(project => !record(project) || !stringValues(project)))) throw new TypeError("expected project modes objects");
+      }
+      if (value.pluginMcpOwned && Object.values(value.pluginMcpOwned).some(entries => !Array.isArray(entries) || entries.some(entry => !record(entry) || typeof entry.name !== "string" || !entry.name || (entry.global !== undefined && typeof entry.global !== "string") || (entry.projects !== undefined && (!record(entry.projects) || !stringValues(entry.projects)))))) throw new TypeError("invalid plugin MCP ownership records");
+    } catch (readError) {
+      assertNativeReadable(statePath, { ...state, corrupted: true, readError });
+    }
+    return value;
+  }
   function prepareRegistryAbsorb(def, canonicalName) {
     // Registry absorption participates in the same Prepare/Backup/Commit as hosts.
     // Discovery's tolerant reads must never turn a damaged registry into [].
@@ -1104,6 +1127,32 @@ function createMcpRouter(opts = {}) {
       for (const [name, def] of colliding) map.set(name, { ...def, modeConflict: true, conflictNames: names });
     }
   }
+  function suppressShadowedPluginAliases(map, registry) {
+    // Plugin discovery is a catalog suggestion, not ownership of a separately
+    // configured endpoint with the same normalized name. Never suppress two
+    // independent definitions: those remain an explicit fail-closed conflict.
+    const independent = new Set();
+    for (const def of map.values()) {
+      if (!def.pluginId && def.__source !== "plugin" && def.__source !== "builtin") independent.add(normKey(def.name));
+    }
+    for (const def of registry) if (def && !def.pluginId && typeof def.name === "string") independent.add(normKey(def.name));
+    for (const [name, def] of map) {
+      if (def.pluginId && def.__source === "plugin" && independent.has(normKey(def.name))) map.delete(name);
+    }
+    // Deleting a shadowed catalog alias must clear stale conflict flags, while
+    // preserving conflicts between genuinely independent surviving entries.
+    const groups = new Map();
+    for (const [name, def] of map) {
+      delete def.modeConflict; delete def.conflictNames;
+      const key = normKey(def.name), group = groups.get(key) || [];
+      group.push([name, def]); groups.set(key, group);
+    }
+    for (const group of groups.values()) if (group.length > 1) {
+      const names = group.map(([, def]) => def.name).sort((a, b) => a.localeCompare(b));
+      for (const [, def] of group) { def.modeConflict = true; def.conflictNames = names; }
+    }
+    return map;
+  }
   function discoverDefinitions() {
     const byName = new Map();
     const add = s => mergeDefinition(byName, s);
@@ -1141,15 +1190,16 @@ function createMcpRouter(opts = {}) {
     for (const server of BUILTIN_UPSTREAM_MCPS) {
       add({ ...server, command: server.command?.replace(/^~(?=\/)/, () => homeDir), title: server.title || server.name, groupTitle: "官方上游 MCP", builtin: true, __source: "builtin", __sourceLabel: "builtin" });
     }
-    return byName;
+    return suppressShadowedPluginAliases(byName, readRegistry());
   }
   function discoverServerDefinitions(overrides = {}) {
     if ((overrides.homeDir && overrides.homeDir !== homeDir) || (overrides.hubDir && overrides.hubDir !== hubDir)) {
       return createMcpRouter({ homeDir, ...overrides }).discoverServerDefinitions();
     }
     const definitions = discoverDefinitions();
-    for (const server of readRegistry()) mergeDefinition(definitions, { ...server, pluginId: server.pluginId || null, __source: server.__source || "hub", __sourceLabel: server.__sourceLabel || "hub" }, true, ["hub"]);
-    return definitions;
+    const registry = readRegistry();
+    for (const server of registry) mergeDefinition(definitions, { ...server, pluginId: server.pluginId || null, __source: server.__source || "hub", __sourceLabel: server.__sourceLabel || "hub" }, true, ["hub"]);
+    return suppressShadowedPluginAliases(definitions, registry);
   }
   function modeFor(modes, name) {
     if (!modes || typeof modes !== "object") return undefined;
@@ -1218,9 +1268,11 @@ function createMcpRouter(opts = {}) {
   }
   function probeKey(s, projectRoot) {
     // Bind cache entries to the endpoint and execution context, without storing
-    // credentials. A changed definition must be probed again.
+    // credentials. Resolve the project exactly as listing does so symlinked
+    // paths (including macOS /var) and their real path share one result.
+    const executionRoot = projectRoot ? (canonicalProjectRoot(projectRoot) || projectRoot) : homeDir;
     return normKey(s.name) + ":" + crypto.createHash("sha256")
-      .update(JSON.stringify([s.command, s.args, s.url, s.cwd, s.env, s.headers, s.url ? null : projectRoot || homeDir])).digest("hex");
+      .update(JSON.stringify([s.command, s.args, s.url, s.cwd, s.env, s.headers, s.url ? null : executionRoot])).digest("hex");
   }
   function connectionStatus(s, projectRoot, cache) {
     const cached = cache[probeKey(s, projectRoot)];
@@ -1463,10 +1515,10 @@ function createMcpRouter(opts = {}) {
       .some(mode => mode && mode !== "off");
   }
   function pluginConflict(name, id, state, registry) {
-    const existing = registry.find(s => normKey(s.name) === normKey(name));
-    if (existing && existing.pluginId !== id) return true;
-    const definition = [...discoverDefinitions().values()].find(s => normKey(s.name) === normKey(name));
-    if (!existing && definition && definition.pluginId !== id) return true;
+    const existing = registry.filter(s => normKey(s.name) === normKey(name));
+    if (existing.some(s => s.pluginId !== id)) return true;
+    const definitions = [...discoverDefinitions().values()].filter(s => normKey(s.name) === normKey(name));
+    if (definitions.some(s => s.pluginId !== id && s.__source !== "builtin")) return true;
     // Enabling a discovered server independently does not grant a plugin
     // permission to change its modes, even if the definition came from it.
     return activeModes(state, name);
@@ -1475,7 +1527,9 @@ function createMcpRouter(opts = {}) {
     if (!pluginId || !["off", "global", "project"].includes(scope)) throw new Error("invalid plugin scope");
     if (scope === "project" && (!projectRoot || !path.isAbsolute(projectRoot))) throw new Error("projectRoot required for project scope");
     projectRoot = scope === "project" ? canonicalProjectRoot(projectRoot) : projectRoot;
-    const state = readState(), registry = readRegistry();
+    // These two files jointly own the plugin's endpoints and modes. A damaged
+    // one must not be interpreted as empty and overwritten by this write path.
+    const state = readValidatedPluginState(), { registry } = readValidatedRegistry();
     state.pluginMcpOwned ||= {};
     const owned = state.pluginMcpOwned[pluginId] || [];
     let registryChanged = false;
@@ -1598,18 +1652,19 @@ function createMcpRouter(opts = {}) {
         pluginId: payload.pluginId, installed: payload.installed,
       });
     }
+    const stateBefore = readValidatedPluginState(), { registry: registryBefore } = readValidatedRegistry();
     const regMap = new Map();
-    for (const server of readRegistry()) mergeDefinition(regMap, server, true);
-    const stateBefore = readState(), skippedMcps = [];
+    for (const server of registryBefore) mergeDefinition(regMap, server, true);
+    const skippedMcps = [];
     for (const server of list) {
-      if (server.pluginId && pluginConflict(server.name, server.pluginId, stateBefore, readRegistry())) { skippedMcps.push(server.name); continue; }
+      if (server.pluginId && pluginConflict(server.name, server.pluginId, stateBefore, registryBefore)) { skippedMcps.push(server.name); continue; }
       mergeDefinition(regMap, server, true);
     }
     if (skippedMcps.length === list.length) return { ok: true, items: [], skippedMcps };
     const reg = [...regMap.values()];
     writeRegistry(reg);
     // Keep persisted modes usable by runtime consumers that index exact names.
-    const state = readState();
+    const state = stateBefore;
     const normalizedCounts = new Map();
     for (const server of reg) normalizedCounts.set(normKey(server.name), (normalizedCounts.get(normKey(server.name)) || 0) + 1);
     const ambiguousNames = new Set([...normalizedCounts].filter(([, count]) => count > 1).map(([key]) => key));
@@ -2013,20 +2068,23 @@ function createMcpRouter(opts = {}) {
 
   async function probeMcpServers({ name, projectRoot, timeoutMs = 1800 } = {}) {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000) throw new Error("invalid timeoutMs");
+    // Resolve before execution as well as cache-key generation: a relative
+    // server cwd containing '..' must not depend on the spelling of an alias.
+    const executionRoot = projectRoot ? (canonicalProjectRoot(projectRoot) || projectRoot) : projectRoot;
     const servers = [...discoverServerDefinitions().values()].filter(s => !name || normKey(s.name) === normKey(name));
     const results = {};
     await Promise.all(servers.map(async s => {
       const start = Date.now(); let connected = false;
       try {
         if (s.url) connected = await probeHttpMcp(s, timeoutMs);
-        else if (s.command) connected = await probeStdioMcp(s, projectRoot, timeoutMs);
+        else if (s.command) connected = await probeStdioMcp(s, executionRoot, timeoutMs);
       } catch {}
       results[s.name] = { connected, latencyMs: Date.now() - start, statusText: connected ? "已完成 MCP 握手，服务可用。" : "MCP 握手未通过或服务不可达。" };
     }));
     // Merge after awaiting probes so concurrent single-server probes do not
     // overwrite results saved by another call while this one was in flight.
     const cache = readJsonFile(probeCachePath, {}) || {};
-    for (const server of servers) cache[probeKey(server, projectRoot)] = { ...results[server.name], checkedAt: new Date().toISOString() };
+    for (const server of servers) cache[probeKey(server, executionRoot)] = { ...results[server.name], checkedAt: new Date().toISOString() };
     if (servers.length) writeJsonFileSecure(probeCachePath, cache);
     return { ok: true, results };
   }

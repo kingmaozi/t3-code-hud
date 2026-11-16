@@ -65,7 +65,9 @@ function createHooksManager({ homeDir = process.env.HOME || os.homedir(), hubDir
     if (!Array.isArray(state.hooks) || !Array.isArray(state.projectRoots)) throw new Error("invalid hooks state");
     const hooks = defaults.map(d => {
       const saved = state.hooks.find(h => h.id === d.id);
-      return { ...d, scope: saved?.scope || d.scope, projectRoot: saved?.projectRoot || null };
+      const item = { ...d, scope: saved?.scope || "off", projectRoot: saved?.projectRoot || null };
+      Object.defineProperty(item, "_saved", { value: !!saved });
+      return item;
     });
     hooks.push(...state.hooks.filter(h => !defaults.some(d => d.id === h.id)));
     return { ...state, hooks };
@@ -104,7 +106,9 @@ function createHooksManager({ homeDir = process.env.HOME || os.homedir(), hubDir
   function merge(file, hooks) {
     const original = readJson(file, {}), next = { ...original };
     if (original.hooks != null && (typeof original.hooks !== "object" || Array.isArray(original.hooks))) throw new Error(`Cannot safely merge hooks in ${file}`);
-    const events = { ...(original.hooks || {}) };
+    // Detach nested groups too; otherwise appending to a shared array mutates
+    // `original` and the equality check can suppress a required file write.
+    const events = JSON.parse(JSON.stringify(original.hooks || {}));
     // Strip only our markers, including orphaned entries from removed plugins.
     for (const [event, groups] of Object.entries(events)) {
       if (!Array.isArray(groups)) throw new Error(`Cannot safely merge ${event} hooks in ${file}`);
@@ -130,78 +134,183 @@ function createHooksManager({ homeDir = process.env.HOME || os.homedir(), hubDir
     if (JSON.stringify(original) === JSON.stringify(next)) return null;
     return { file, text };
   }
-  function synchronize(state) {
-    const projects = new Set(state.projectRoots);
-    for (const h of state.hooks) if (h.projectRoot) projects.add(path.resolve(h.projectRoot));
+  function synchronize(state, { global = false, projectRoots = [] } = {}) {
+    const projects = new Set(projectRoots.filter(root => typeof root === "string" && path.isAbsolute(root)).map(root => path.resolve(root)));
     const changes = [];
-    for (const project of [null, ...projects]) {
+    for (const project of [...(global ? [null] : []), ...projects]) {
       const hooks = state.hooks.filter(h => project ? h.scope === "project" && path.resolve(h.projectRoot) === project : h.scope === "global");
       for (const file of files(project)) { const change = merge(file, hooks); if (change) changes.push(change); }
     }
     // Validate every destination before making any changes.
     for (const { file } of changes) backupOnce(file);
     for (const { file, text } of changes) atomic(file, text);
-    for (const project of projects) ensureExclude(project);
-    state.projectRoots = [...projects];
+    for (const project of projects) {
+      if (state.hooks.some(h => h.scope === "project" && h.projectRoot && path.resolve(h.projectRoot) === project)) ensureExclude(project);
+    }
+    state.projectRoots = [...new Set([...(state.projectRoots || []), ...projects])];
     atomic(statePath, JSON.stringify(state, null, 2) + "\n");
   }
   function externalHooks(file, source, scope) {
-    const config = readJson(file, {}), result = [];
+    const config = readJson(file, {}), result = [], managed = new Map();
+    const noteManaged = (id, event, kind) => {
+      if (typeof id !== "string") return;
+      if (!managed.has(id)) managed.set(id, new Map());
+      const byEvent = managed.get(id);
+      if (!byEvent.has(event)) byEvent.set(event, { groups: 0, handlers: 0 });
+      byEvent.get(event)[kind]++;
+    };
     for (const [event, groups] of Object.entries(config.hooks || {})) {
       if (!Array.isArray(groups)) continue;
-      groups.forEach((group, i) => (group.hooks || []).forEach((handler, j) => {
-        if (own(handler, MARK)) return;
-        result.push({ id: `external:${scope}:${source}:${event}:${i}:${j}`, title: handler.statusMessage || handler.command || event, event, events: [event], matcher: group.matcher, command: handler.command, scope, readonly: true, source, file });
-      }));
+      groups.forEach((group, i) => {
+        const groupId = group && typeof group === "object" ? group[MARK] : null;
+        noteManaged(groupId, event, "groups");
+        (group?.hooks || []).forEach((handler, j) => {
+          const handlerId = handler && typeof handler === "object" ? handler[MARK] : null;
+          noteManaged(handlerId, event, "handlers");
+          if (typeof groupId === "string" || typeof handlerId === "string") return;
+          result.push({ id: `external:${scope}:${source}:${event}:${i}:${j}`, title: handler.statusMessage || handler.command || event, event, events: [event], matcher: group.matcher, command: handler.command, scope, readonly: true, source, file, enabled: true, configured: true, configurationStatus: "configured" });
+        });
+      });
     }
-    return result;
+    return { items: result, managed };
   }
   function listHooks({ projectRoot = null } = {}) {
-    const state = load(); synchronize(state);
+    const state = load();
+    const requestedProject = typeof projectRoot === "string" && path.isAbsolute(projectRoot) ? path.resolve(projectRoot) : null;
+    const visible = state.hooks.filter(h => {
+      if (h.projectRoot) return requestedProject !== null && path.resolve(h.projectRoot) === requestedProject;
+      return h.scope !== "project";
+    });
+    const managed = { global: new Map(), project: new Map() }, hostsByScope = { global: [], project: [] };
+    const recordConfiguration = (owner, host, definitions) => {
+      const target = managed[owner];
+      hostsByScope[owner].push({ host, definitions });
+      for (const [id, events] of definitions) {
+        if (!target.has(id)) target.set(id, new Map());
+        const byEvent = target.get(id);
+        for (const [event, counts] of events) {
+          if (!byEvent.has(event)) byEvent.set(event, { groups: 0, handlers: 0 });
+          const total = byEvent.get(event);
+          total.groups += counts.groups;
+          total.handlers += counts.handlers;
+        }
+      }
+    };
     const externals = [];
-    for (const project of [null, ...(projectRoot ? [path.resolve(projectRoot)] : [])]) files(project).forEach((file, i) => externals.push(...externalHooks(file, i ? "codex" : "claude", project ? "project" : "global")));
-    const items = [...state.hooks.map(h => ({ ...h, enabled: h.scope !== "off", readonly: false })), ...externals];
-    return { ok: true, projectRoot, events: [...EVENTS], items, hooks: items };
+    for (const project of [null, ...(requestedProject ? [requestedProject] : [])]) files(project).forEach((file, i) => {
+      const host = i ? "codex" : "claude", owner = project ? "project" : "global";
+      const found = externalHooks(file, host, owner);
+      externals.push(...found.items);
+      recordConfiguration(owner, host, found.managed);
+    });
+    const items = [...visible.map(h => {
+      let scope = h.scope, itemProjectRoot = h.projectRoot || null;
+      // If state predates explicit registration, infer only from files in the
+      // requested visible scopes. A list call never creates or rewrites state.
+      if (h.builtin && !h._saved) {
+        if (managed.global.has(h.id)) scope = "global";
+        else if (requestedProject && managed.project.has(h.id)) { scope = "project"; itemProjectRoot = requestedProject; }
+      }
+      const owner = scope === "project" ? "project" : "global";
+      const checkOwner = scope === "off" ? null : owner;
+      const candidateOwners = checkOwner ? [checkOwner] : ["global", ...(requestedProject ? ["project"] : [])];
+      const events = h.events || [];
+      const expectedHandlers = (h.handlers || [{ command: h.command }]).length;
+      const completeIn = [], partialIn = [];
+      for (const candidateOwner of candidateOwners) for (const { host, definitions } of hostsByScope[candidateOwner]) {
+        const byEvent = definitions.get(h.id) || new Map();
+        const presentEvents = events.map(event => byEvent.get(event)).filter(Boolean);
+        const complete = events.length > 0 && events.every(event => {
+          const counts = byEvent.get(event);
+          return counts && counts.groups > 0 && counts.handlers >= expectedHandlers;
+        });
+        const partial = presentEvents.length > 0 || [...byEvent.values()].some(counts => counts.groups > 0 || counts.handlers > 0);
+        if (complete) completeIn.push(host);
+        else if (partial) partialIn.push(host);
+      }
+      const hosts = [...new Set(completeIn)];
+      const partialHosts = [...new Set(partialIn)];
+      const configurationStatus = hosts.length === 2 ? "configured" : hosts.length || partialHosts.length ? "partial" : "not-configured";
+      const actual = scope === "off" ? hosts.length > 0 : hosts.length > 0;
+      const { _saved, ...item } = h;
+      return { ...item, scope, projectRoot: itemProjectRoot, enabled: actual, configured: hosts.length > 0, configuredIn: hosts, partialIn: partialHosts, configurationStatus, readonly: scope === "project" || h.readonly === true };
+    }), ...externals];
+    return { ok: true, projectRoot: requestedProject, events: [...EVENTS], items, hooks: items };
   }
   function toggleHook(args = {}) {
-    const state = load(), item = state.hooks.find(h => h.id === args.id);
+    const state = load();
+    const requestedRoot = typeof args.projectRoot === "string" && path.isAbsolute(args.projectRoot) ? path.resolve(args.projectRoot) : null;
+    const item = (args.scope === "project" && requestedRoot
+      ? state.hooks.find(h => h.id === args.id && h.projectRoot && path.resolve(h.projectRoot) === requestedRoot)
+      : null) || state.hooks.find(h => h.id === args.id && !h.projectRoot) || state.hooks.find(h => h.id === args.id);
     if (!item) throw new Error("unknown or readonly hook");
     const scope = args.scope || (args.enabled === false || (args.enabled == null && item.scope !== "off") ? "off" : "global");
     const projectRoot = args.projectRoot || item.projectRoot;
     validateScope(scope, projectRoot);
-    if (item.projectRoot && !state.projectRoots.includes(item.projectRoot)) state.projectRoots.push(item.projectRoot);
+    const previousProject = item.projectRoot ? path.resolve(item.projectRoot) : null;
+    const nextProject = scope === "project" ? path.resolve(projectRoot) : null;
+    if (previousProject && (scope !== "project" || nextProject !== previousProject)) throw new Error("project-scoped hook is read-only outside its owning project");
+    if (previousProject && args.projectRoot && path.resolve(args.projectRoot) !== previousProject) throw new Error("project-scoped hook belongs to another project");
+    const affectedProjects = [...new Set([previousProject, nextProject].filter(Boolean))];
+    for (const project of affectedProjects) if (!state.projectRoots.includes(project)) state.projectRoots.push(project);
     item.scope = scope; item.projectRoot = scope === "project" ? path.resolve(projectRoot) : null;
-    synchronize(state); return { ok: true, item, ...listHooks({ projectRoot: args.projectRoot }) };
+    synchronize(state, { global: !previousProject, projectRoots: affectedProjects });
+    return { ok: true, item, ...listHooks({ projectRoot: args.projectRoot || nextProject }) };
   }
   function saveCustomHook(args = {}) {
     const state = load(), input = args.item || args;
     const id = input.id || args.id;
-    const previous = state.hooks.find(h => h.id === id);
+    const requestedRoot = args.projectRoot || input.projectRoot || null;
+    const previous = state.hooks.find(h => h.id === id && (requestedRoot
+      ? h.projectRoot && path.resolve(h.projectRoot) === path.resolve(requestedRoot)
+      : !h.projectRoot)) || state.hooks.find(h => h.id === id);
     if (previous && !previous.custom) throw new Error("cannot replace builtin or plugin hook");
     const item = { ...previous, ...input, id, title: input.title || previous?.title || id, scope: args.scope || input.scope || previous?.scope || "global", projectRoot: args.projectRoot || input.projectRoot || previous?.projectRoot || null, custom: true, builtin: false, source: "custom", readonly: false };
     if (input.event) item.events = [input.event];
     if (!item.events) item.events = ["Stop"];
     validateHook(item);
-    if (previous?.projectRoot) state.projectRoots.push(previous.projectRoot);
+    const previousProject = previous?.projectRoot ? path.resolve(previous.projectRoot) : null;
     if (item.scope !== "project") item.projectRoot = null;
-    state.hooks = state.hooks.filter(h => h.id !== id).concat(item);
-    synchronize(state); return { ok: true, item };
+    const nextProject = item.scope === "project" ? path.resolve(item.projectRoot) : null;
+    if (previousProject && (item.scope !== "project" || nextProject !== previousProject)) throw new Error("project-scoped hook is read-only outside its owning project");
+    const affectedProjects = [...new Set([previousProject, nextProject].filter(Boolean))];
+    for (const project of affectedProjects) if (!state.projectRoots.includes(project)) state.projectRoots.push(project);
+    state.hooks = state.hooks.filter(h => h !== previous).concat(item);
+    synchronize(state, { global: previous ? !previousProject || item.scope === "global" : item.scope === "global", projectRoots: affectedProjects });
+    return { ok: true, item };
   }
-  function deleteCustomHook({ id } = {}) {
-    const state = load(), item = state.hooks.find(h => h.id === id);
+  function deleteCustomHook({ id, scope, projectRoot = null } = {}) {
+    const state = load();
+    const candidates = state.hooks.filter(h => h.id === id);
+    const requestedRoot = typeof projectRoot === "string" && path.isAbsolute(projectRoot) ? path.resolve(projectRoot) : null;
+    if (projectRoot != null && !requestedRoot) throw new Error("invalid projectRoot");
+    if (scope === "project" && !requestedRoot) throw new Error("projectRoot required for project hook");
+    if (scope === "global" && requestedRoot) throw new Error("global hook removal cannot target a project root");
+    const wantsProject = scope === "project" || requestedRoot !== null;
+    let item = wantsProject
+      ? candidates.find(h => h.projectRoot && path.resolve(h.projectRoot) === requestedRoot)
+      : candidates.find(h => !h.projectRoot && h.scope !== "project");
+    if (!item && candidates.some(h => h.projectRoot || h.scope === "project")) throw new Error("project-scoped hook requires its owning project");
     if (item && !item.custom) throw new Error("cannot delete builtin or plugin hook");
     if (!item) return { ok: true, deleted: false };
-    if (item.projectRoot) state.projectRoots.push(item.projectRoot);
-    state.hooks = state.hooks.filter(h => h.id !== id);
-    synchronize(state); return { ok: true, deleted: true };
+    const project = item.projectRoot ? path.resolve(item.projectRoot) : null;
+    if (project && !state.projectRoots.includes(project)) state.projectRoots.push(project);
+    state.hooks = state.hooks.filter(h => h !== item);
+    synchronize(state, { global: !project, projectRoots: project ? [project] : [] }); return { ok: true, deleted: true };
   }
   function setPluginHooks({ pluginId, id, hooks = {}, scope = "global", projectRoot = null, installPath } = {}) {
     pluginId ||= id;
     if (!pluginId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(pluginId)) throw new Error("invalid plugin id");
     validateScope(scope, projectRoot);
     const state = load();
-    for (const old of state.hooks.filter(h => h.pluginId === pluginId)) if (old.projectRoot) state.projectRoots.push(old.projectRoot);
-    state.hooks = state.hooks.filter(h => h.pluginId !== pluginId);
+    const nextProject = scope === "project" || (scope === "off" && projectRoot) ? path.resolve(projectRoot) : null;
+    const matchesTarget = h => h.pluginId === pluginId && (nextProject
+      ? h.scope === "project" && h.projectRoot && path.resolve(h.projectRoot) === nextProject
+      : h.scope !== "project" && !h.projectRoot);
+    const previous = state.hooks.filter(matchesTarget);
+    const oldProjects = [...new Set(previous.map(h => h.projectRoot && path.resolve(h.projectRoot)).filter(Boolean))];
+    for (const project of [...oldProjects, ...(nextProject ? [nextProject] : [])]) if (!state.projectRoots.includes(project)) state.projectRoots.push(project);
+    state.hooks = state.hooks.filter(h => !matchesTarget(h));
     if (scope !== "off") {
       const events = hooks.hooks || hooks;
       for (const [event, groups] of Object.entries(events)) {
@@ -213,7 +322,8 @@ function createHooksManager({ homeDir = process.env.HOME || os.homedir(), hubDir
         });
       }
     }
-    synchronize(state); return { ok: true, pluginId, scope };
+    synchronize(state, { global: !nextProject, projectRoots: [...new Set([...oldProjects, ...(nextProject ? [nextProject] : [])])] });
+    return { ok: true, pluginId, scope };
   }
   return { homeDir, hubDir, binDir, statePath, listHooks, toggleHook, saveCustomHook, deleteCustomHook, setPluginHooks };
 }

@@ -28,7 +28,7 @@ function managers(opts, hooksManager = hooksSpy()) {
 }
 function row(router, name, projectRoot) { return router.listMcpServers({ projectRoot }).items.find(s => s.name === name); }
 
-test("builtin memory plugin has its exact capabilities and persists all scopes with hook linkage", t => {
+test("builtin memory plugin allows global off but refuses project Hook scope migration without writes", t => {
   const f = fixture(t), { manager, hooks } = managers(f);
   const builtin = manager.listPlugins().items[0];
   assert.equal(builtin.id, "t3-memory-vault");
@@ -38,13 +38,86 @@ test("builtin memory plugin has its exact capabilities and persists all scopes w
   assert.equal(builtin.marketplace, "t3-builtin");
   assert.equal(builtin.installed, true);
   assert.deepEqual(builtin.capabilities, { skillsCount: 1, mcpCount: 1, hooksCount: 1, commandsCount: 1, agentsCount: 0, skillNames: ["powercontext-memory"], mcpNames: ["t3_hub"], hookEvents: ["Stop", "SubagentStop"] });
-  for (const scope of ["off", "project", "global"]) {
-    manager.setPluginScope({ id: builtin.id, scope, projectRoot: f.projectRoot });
-    assert.equal(manager.listPlugins({ projectRoot: f.projectRoot }).items[0].scope, scope);
-    assert.equal(hooks.calls.at(-1).id, "memory-stop-guard");
-    assert.equal(hooks.calls.at(-1).scope, scope);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(f.hubDir, "state.json"))).pluginScopes[builtin.id], scope);
+  // Closing a globally scoped plugin is safe and remains supported.
+  manager.setPluginScope({ id: builtin.id, scope: "off", projectRoot: f.projectRoot });
+  assert.equal(manager.listPlugins().items[0].scope, "off");
+  assert.equal(hooks.calls.at(-1).id, "memory-stop-guard");
+  assert.equal(hooks.calls.at(-1).scope, "off");
+  assert.equal(hooks.calls.at(-1).projectRoot, null, "a UI context root does not turn global off into project off");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.hubDir, "state.json"))).pluginScopes[builtin.id], "off");
+
+  manager.setPluginScope({ id: builtin.id, scope: "project", projectRoot: f.projectRoot });
+  assert.equal(manager.listPlugins({ projectRoot: f.projectRoot }).items[0].scope, "project");
+  assert.equal(hooks.calls.at(-1).scope, "project");
+  const pluginStateBeforeRejectedMove = fs.readFileSync(path.join(f.hubDir, "state.json"), "utf8");
+  const hookCallCountBeforeRejectedMove = hooks.calls.length;
+  assert.throws(() => manager.setPluginScope({ id: builtin.id, scope: "global", projectRoot: f.projectRoot }), /project-scoped plugin Hooks are read-only/);
+  assert.equal(fs.readFileSync(path.join(f.hubDir, "state.json"), "utf8"), pluginStateBeforeRejectedMove);
+  assert.equal(hooks.calls.length, hookCallCountBeforeRejectedMove, "rejected migration must not change Hook scope");
+  assert.equal(manager.listPlugins({ projectRoot: f.projectRoot }).items[0].scope, "project");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.hubDir, "state.json"))).pluginScopes[builtin.id], "project");
+});
+
+test("project plugin scope with a missing persisted owner fails closed without touching its Hook", t => {
+  const f = fixture(t);
+  fs.mkdirSync(f.projectRoot, { recursive: true });
+  const root = plugin(path.join(f.hubDir, "plugins", "owned"), "owned");
+  write(path.join(root, "hooks", "hooks.json"), { hooks: { Stop: [{ hooks: [{ type: "command", command: "echo owned" }] }] } });
+  const hooks = require("../src/hub-hooks.cjs").createHooksManager({ homeDir: f.homeDir, hubDir: f.hubDir });
+  const { manager, router } = managers(f, hooks);
+  manager.setPluginScope({ id: "owned", scope: "project", projectRoot: f.projectRoot });
+  const hook = hooks.listHooks({ projectRoot: f.projectRoot }).items.find(item => item.pluginId === "owned");
+  assert.equal(hook.scope, "project");
+  const pluginStatePath = path.join(f.hubDir, "state.json");
+  const corruptedState = JSON.parse(fs.readFileSync(pluginStatePath, "utf8"));
+  delete corruptedState.pluginProjectRoots.owned;
+  write(pluginStatePath, corruptedState);
+  const protectedFiles = [
+    pluginStatePath,
+    path.join(f.hubDir, "hooks-state.json"),
+    router.registryPath,
+    router.statePath,
+    path.join(f.homeDir, ".claude", "settings.json"),
+    path.join(f.homeDir, ".codex", "hooks.json"),
+    path.join(f.projectRoot, ".claude", "settings.local.json"),
+    path.join(f.projectRoot, ".codex", "hooks.json"),
+  ];
+  const before = Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null]));
+
+  assert.throws(() => manager.setPluginScope({ id: "owned", scope: "off", projectRoot: f.projectRoot }), /project-scoped plugin owner is missing/);
+
+  assert.deepEqual(Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), before);
+  assert.equal(JSON.parse(fs.readFileSync(pluginStatePath, "utf8")).pluginScopes.owned, "project");
+  assert.equal(hooks.listHooks({ projectRoot: f.projectRoot }).items.find(item => item.pluginId === "owned").scope, "project");
+});
+
+test("invalid or non-object plugin scope state refuses before Hook or host writes", t => {
+  const f = fixture(t);
+  const hooks = require("../src/hub-hooks.cjs").createHooksManager({ homeDir: f.homeDir, hubDir: f.hubDir });
+  hooks.toggleHook({ id: "memory-stop-guard", scope: "global" });
+  const manager = createPluginsManager({ ...f, hooksManager: hooks });
+  const statePath = path.join(f.hubDir, "state.json");
+  const protectedFiles = [
+    statePath,
+    path.join(f.hubDir, "hooks-state.json"),
+    path.join(f.homeDir, ".claude", "settings.json"),
+    path.join(f.homeDir, ".codex", "hooks.json"),
+  ];
+
+  for (const invalidState of ["{broken", "[]", "null", "42"]) {
+    fs.writeFileSync(statePath, invalidState);
+    const before = Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null]));
+    assert.throws(
+      () => manager.setPluginScope({ id: "t3-memory-vault", scope: "off", projectRoot: f.projectRoot }),
+      /state/i,
+      `invalid plugin state must reject safely: ${invalidState}`,
+    );
+    assert.deepEqual(Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), before);
   }
+
+  fs.rmSync(statePath);
+  const initialState = manager.setPluginScope({ id: "t3-memory-vault", scope: "off", projectRoot: f.projectRoot });
+  assert.equal(initialState.ok, true, "a genuinely missing state file is treated as a fresh installation");
 });
 
 test("composite plugins enable and disable skills, lazy MCP and expanded hooks across scopes", t => {
@@ -68,21 +141,38 @@ test("composite plugins enable and disable skills, lazy MCP and expanded hooks a
   assert.equal(row(router, "demo").mode, "global-lazy");
   assert.equal(row(router, "demo").pluginId, "example");
   assert.equal(hooks.calls.at(-1).hooks.hooks.Stop[0].hooks[0].command, "node " + path.join(root, "stop.js"));
+  manager.setPluginScope({ id: "example", scope: "off", projectRoot: f.projectRoot });
+  assert.equal(row(router, "demo").mode, "off", "global plugin off still applies when the UI sends a project context");
+  assert.equal(hooks.calls.at(-1).scope, "off");
+  assert.equal(hooks.calls.at(-1).projectRoot, null);
+  manager.setPluginScope({ id: "example", scope: "global", projectRoot: f.projectRoot });
+  assert.equal(row(router, "demo").mode, "global-lazy");
   manager.setPluginScope({ id: "example", scope: "project", projectRoot: f.projectRoot });
   assert.equal(row(router, "demo", f.projectRoot).mode, "project-lazy");
   assert.equal(row(router, "demo").mode, "off");
   assert.ok(fs.lstatSync(path.join(f.projectRoot, ".agents", "skills", "bundle")).isSymbolicLink());
-  manager.setPluginScope({ id: "example", scope: "global", projectRoot: f.projectRoot });
-  assert.equal(row(router, "demo", f.projectRoot).mode, "global-lazy");
-  manager.setPluginScope({ id: "example", scope: "off", projectRoot: f.projectRoot });
-  assert.equal(row(router, "demo", f.projectRoot).mode, "off");
+  const protectedFiles = [path.join(f.hubDir, "state.json"), router.registryPath, router.statePath];
+  const protectedBefore = Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null]));
+  const projectSkillLink = path.join(f.projectRoot, ".agents", "skills", "bundle");
+  const projectSkillLinkBefore = fs.readlinkSync(projectSkillLink);
+  const hookCallsBefore = hooks.calls.length;
+  assert.throws(() => manager.setPluginScope({ id: "example", scope: "global", projectRoot: f.projectRoot }), /project-scoped plugin Hooks are read-only/);
+  assert.deepEqual(Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), protectedBefore);
+  assert.equal(fs.readlinkSync(projectSkillLink), projectSkillLinkBefore);
+  assert.equal(row(router, "demo", f.projectRoot).mode, "project-lazy");
+  assert.equal(skills.listAssets({ projectRoot: f.projectRoot }).items.find(s => s.id === "bundle").scope, "project");
+  assert.equal(hooks.calls.length, hookCallsBefore, "preflight rejection occurs before Hook or plugin writes");
+  assert.throws(() => manager.setPluginScope({ id: "example", scope: "off", projectRoot: f.projectRoot }), /project-scoped plugin Hooks are read-only/);
+  assert.deepEqual(Object.fromEntries(protectedFiles.map(file => [file, fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null])), protectedBefore);
+  assert.equal(fs.readlinkSync(projectSkillLink), projectSkillLinkBefore);
+  assert.equal(row(router, "demo", f.projectRoot).mode, "project-lazy");
   assert.equal(row(router, "demo").mode, "off");
-  assert.equal(hooks.calls.at(-1).scope, "off");
-  assert.equal(skills.listAssets({ projectRoot: f.projectRoot }).items.some(s => s.id === "bundle"), false);
+  assert.equal(hooks.calls.at(-1).scope, "project");
+  assert.equal(skills.listAssets({ projectRoot: f.projectRoot }).items.some(s => s.id === "bundle"), true);
   assert.equal(skills.listAssets({ includePluginBundled: true }).items.find(s => s.id === "bundle").fromCompositePlugin, true);
   assert.ok(fs.existsSync(path.join(f.hubDir, "skills", "bundle", "SKILL.md")));
   const state = JSON.parse(fs.readFileSync(path.join(f.hubDir, "state.json")));
-  assert.equal(state.skills.bundle.scope, "off"); assert.equal(state.pluginScopes.example, "off");
+  assert.equal(state.skills.bundle.scope, "project"); assert.equal(state.pluginScopes.example, "project");
 });
 
 test("project changes remove the previous project's skill links and MCP modes", t => {
@@ -202,20 +292,24 @@ test("direct catalog supplies all seven upstream templates without Magpie and ex
   }
 });
 
-test("name aliases deduplicate discovery/registry and retain scopes and registry precedence", t => {
+test("independent normalized aliases remain visible and cannot be enabled until resolved", t => {
   const f = fixture(t);
   write(path.join(f.homeDir, ".pi", "agent", "mcp.json"), { mcpServers: { briking_agent_reach: { command: "old-command" }, T3_HUB: { command: "never" } } });
   write(path.join(f.hubDir, "state.json"), { pluginScopes: { keep: "off" }, mcpModes: { global: { briking_agent_reach: "global-lazy" }, projects: {} } });
   const router = createMcpRouter(f); router.upsertMcpServer({ name: "briking-agent-reach", command: process.execPath });
   const items = router.listMcpServers().items.filter(x => x.name.toLowerCase().replace(/_/g, "-") === "briking-agent-reach");
-  assert.equal(items.length, 1); assert.equal(items[0].command, process.execPath); assert.equal(items[0].mode, "global-lazy");
+  assert.deepEqual(items.map(x => x.name).sort(), ["briking-agent-reach", "briking_agent_reach"]);
+  assert.equal(items.find(x => x.name === "briking-agent-reach").command, process.execPath);
+  assert.equal(items.find(x => x.name === "briking_agent_reach").command, "old-command");
+  assert.ok(items.every(x => x.modeConflict && x.mode === "off" && !x.enabled));
   assert.ok(!router.listMcpServers().items.some(x => /t3[_-]hub/i.test(x.name)));
-  router.setMcpMode({ name: "BRIKING_AGENT_REACH", mode: "project-lazy", projectRoot: f.projectRoot });
-  assert.equal(row(router, "briking-agent-reach", f.projectRoot).mode, "project-lazy");
-  router.upsertMcpServer({ name: "BRIKING_AGENT_REACH", command: process.execPath });
-  const raw = JSON.parse(fs.readFileSync(router.registryPath)); assert.equal(raw.length, 1);
+  const stateBefore = fs.readFileSync(router.statePath, "utf8");
+  assert.throws(() => router.setMcpMode({ name: "BRIKING_AGENT_REACH", mode: "project-lazy", projectRoot: f.projectRoot }), /normalized MCP name conflict/);
+  assert.throws(() => router.toggleServerForAgent({ name: "briking-agent-reach", agent: "codex", enabled: true }), /normalized MCP name conflict/);
+  assert.equal(fs.readFileSync(router.statePath, "utf8"), stateBefore);
   router.removeMcpServer({ name: "briking-agent-reach" });
-  const state = JSON.parse(fs.readFileSync(router.statePath)); assert.deepEqual(state.mcpModes.global, {}); assert.deepEqual(state.mcpModes.projects[f.projectRoot], {}); assert.equal(state.pluginScopes.keep, "off");
+  assert.equal(row(router, "briking_agent_reach").command, "old-command", "removing the registry entry preserves the independent native entry");
+  const state = JSON.parse(fs.readFileSync(router.statePath)); assert.equal(state.pluginScopes.keep, "off");
 });
 
 test("registry and returned argument/url/summary fields preserve permission and redaction guarantees", t => {
@@ -366,9 +460,9 @@ test("lazy hooks factory uses isolated home for real memory and composite plugin
   const globalFile = path.join(f.homeDir, ".claude", "settings.json");
   const global = JSON.parse(fs.readFileSync(globalFile));
   assert.ok(global.hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.endsWith("node " + path.join(root, "check.js")))));
-  manager.setPluginScope({ id: "hooked", scope: "off" });
+  manager.setPluginScope({ id: "hooked", scope: "off", projectRoot: f.projectRoot });
   const off = JSON.parse(fs.readFileSync(globalFile));
-  assert.ok(!off.hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.endsWith("node " + path.join(root, "check.js")))));
+  assert.ok(!(off.hooks.PreToolUse || []).some(group => group.hooks.some(hook => hook.command.endsWith("node " + path.join(root, "check.js")))));
 });
 
 
@@ -484,13 +578,13 @@ test("MCP drawer renders only confirmed connections as available", () => {
     return rest.slice(0, rest.slice(1).search(/\n    (?:async )?function /) + 1);
   };
   const servers = [
-    { name: "unknown", connected: null }, { name: "good", connected: true },
-    { name: "bad", connected: false, statusText: "不可访问" },
+    { name: "unknown", connected: null, probed: false }, { name: "good", connected: true, probed: true },
+    { name: "bad", connected: false, probed: true, statusText: "不可访问" },
   ];
   const node = { innerHTML: "" };
   // Hub v3 前端并发：renderMcpList 现依赖 resourceMatches/resourceFilter 等，提供桩避免耦合
   const dependencies = {
-    root: { querySelector: () => node }, state: { tab: "skills", libraryView: "mcp", mcpQuery: "", freshModes: {}, resourceFilters: {} },
+    root: { querySelector: () => node }, state: { tab: "skills", libraryView: "mcp", mcpQuery: "", mcpFilter: "all", freshModes: {}, resourceFilters: {} },
     disposed: false, errors: {}, cache: { mcp: {} }, mcpServers: () => servers,
     tr: zh => zh, esc: String, icon: () => "", redact: String,
     items: (item, keys) => item[keys[0]] || [], mcpMode: s => s.mode || "off",
@@ -499,6 +593,8 @@ test("MCP drawer renders only confirmed connections as available", () => {
     resourceFilter: () => ({ agent: "all", status: "all" }),
     resourceMatches: () => true,
     resourceFilters: () => "",
+    mcpSourceMatchesFilter: () => true, renderMcpSourceFilters: () => {}, mcpSourceLabels: () => [],
+    hubModeLabel: () => "", agentStatusLabel: () => "", renderMcpModeControls: () => "", launchReasonLabel: () => "",
     agentToggleRow: () => "",
     agentHosts: [], agentEnabled: () => true, agentMark: () => "",
   };
@@ -515,10 +611,11 @@ test("MCP drawer renders only confirmed connections as available", () => {
     const article = node.innerHTML.match(new RegExp(`<article[^>]*data-mcp-name="${server.name}"[\\s\\S]*?</article>`))?.[0];
     assert.ok(article, server.name);
     assert.equal(article.includes("is-connected"), server.connected === true);
-    // is-available 在前端并发中已移除，以 badge 文案为准（已连接/按需唤醒/未连接）
+    // is-available 已移除，以探测状态文案为准。
     if (article.includes("is-available")) { assert.equal(article.includes("is-available"), server.connected === true); }
-    if (server.connected === null) { assert.match(article, /按需唤醒/); assert.doesNotMatch(article, /已连接并可用/); }
-    if (server.connected === false) assert.match(article, /不可访问|未连接/);
+    if (server.connected === null) { assert.match(article, /连通性未检测/); assert.doesNotMatch(article, /探测成功/); }
+    if (server.connected === true) assert.match(article, /探测成功/);
+    if (server.connected === false) assert.match(article, /探测未通/);
   }
 });
 

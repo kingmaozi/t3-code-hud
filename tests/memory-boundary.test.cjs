@@ -93,7 +93,7 @@ test("embedding status preserves a statistics error instead of reporting zero", 
 
 test("memory summary distinguishes unavailable statistics from an empty vault", () => {
   const source = fs.readFileSync(path.join(__dirname, "../src/hub-drawer-ui.js"), "utf8");
-  const start = source.indexOf("    function renderDream() {"), end = source.indexOf("    async function saveDream(", start);
+  const start = source.indexOf("    function dreamEngineDraft() {"), end = source.indexOf("    async function saveDreamEngine(", start);
   assert.ok(start > 0 && end > start);
   function render(embed) {
     const target = { innerHTML: "" };

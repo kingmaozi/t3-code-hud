@@ -15,10 +15,10 @@ test('drawer retains actual swarm mode and concurrency when saving', () => {
  vm.runInNewContext(src.slice(start,end)+'\nresult=orchestrationValues();',ctx);
  assert.equal(ctx.result.swarmMode,'on'); assert.equal(ctx.result.maxParallelAgents,11); assert.equal(ctx.result.strictCommanderOnly,false);
 });
-test('strict commander setting changes directive rather than merely changing its displayed value', () => {
- const loose=buildOrchestrationDirective({orchestratorMode:'carbon',strictCommanderOnly:false});
- const strict=buildOrchestrationDirective({orchestratorMode:'carbon',strictCommanderOnly:true});
- assert.doesNotMatch(loose,/严禁亲自改业务代码/); assert.match(strict,/严禁亲自改业务代码/);
+test('normal and commander modes generate different and compatible instructions', () => {
+ const loose=buildOrchestrationDirective({swarmMode:'off'});
+ const strict=buildOrchestrationDirective({swarmMode:'on'});
+ assert.match(loose,/小任务、短任务/); assert.match(strict,/决策、拆解、派单/); assert.match(strict,/主会话亲自兜底/);
 });
 test('disabling old orchestration removes its managed block and legacy stop headers',t=>{
  const home=fixture(t), hub=path.join(home,'.t3/hub'), host=path.join(home,'AGENTS.md'); fs.mkdirSync(hub,{recursive:true}); fs.writeFileSync(host,'# User private rule\n');
@@ -26,9 +26,9 @@ test('disabling old orchestration removes its managed block and legacy stop head
  const directive=buildOrchestrationDirective({orchestratorMode:'carbon',swarmMode:'on'});
  const header=directive.slice(directive.indexOf('<SUBAGENT-STOP>'),directive.indexOf('</SUBAGENT-STOP>')+'</SUBAGENT-STOP>'.length);
  fs.appendFileSync(host,header+'\n'+header+'\n'+directive);
- mgr.updateOrchestrationConfig({orchestratorMode:'off',swarmMode:'off'},{hostRulePaths:[host]}); const disabled=fs.readFileSync(host,'utf8');
- assert.doesNotMatch(disabled,/<SUBAGENT-STOP>|T3_HUB_ORCHESTRATOR_START/); assert.match(disabled,/# User private rule/);
- mgr.updateOrchestrationConfig({orchestratorMode:'off',swarmMode:'off'},{hostRulePaths:[host]}); assert.equal(fs.readFileSync(host,'utf8'),disabled);
+ let rev=mgr.getOrchestrationState({hosts:[host]}).modeRevision; mgr.updateOrchestrationConfig({swarmMode:'off',expectedRevision:rev},{hostRulePaths:[host]}); const disabled=fs.readFileSync(host,'utf8');
+ assert.equal((disabled.match(/<SUBAGENT-STOP>/g)||[]).length,1); assert.match(disabled,/# User private rule/); assert.match(disabled,/常规协作/);
+ rev=mgr.getOrchestrationState({hosts:[host]}).modeRevision; mgr.updateOrchestrationConfig({swarmMode:'off',expectedRevision:rev},{hostRulePaths:[host]}); assert.equal(fs.readFileSync(host,'utf8'),disabled);
 });
 test('global rule sync preserves independent host content, replaces only its block, refuses malformed blocks and reports partial failure',t=>{
  const home=fixture(t), hub=path.join(home,'.t3/hub'), codex=path.join(home,'.codex/AGENTS.md'),pi=path.join(home,'.pi/agent/AGENTS.md');
@@ -47,7 +47,8 @@ test('invalid or deliberately empty route configuration is never overwritten on 
 test('legacy mode updates cannot activate a second orchestration ruleset', t => {
  const home=fixture(t),hub=path.join(home,'.t3/hub'),host=path.join(home,'AGENTS.md'); fs.mkdirSync(hub,{recursive:true}); fs.writeFileSync(host,'# User rule\n');
  const mgr=createSubagentsManager({homeDir:home,hubDir:hub});
- assert.throws(()=>mgr.updateOrchestrationConfig({orchestratorMode:'carbon'}, {hostRulePaths:[host]}), /旧|legacy/i);
+ const rev=mgr.getOrchestrationState({hosts:[host]}).modeRevision;
+ assert.throws(()=>mgr.updateOrchestrationConfig({orchestratorMode:'carbon',swarmMode:'on',expectedRevision:rev}, {hostRulePaths:[host]}), /请选择/);
  assert.equal(fs.readFileSync(host,'utf8'),'# User rule\n');
  for(const mode of ['swarm','carbon','argon','plan']) assert.doesNotMatch(mgr.buildSlashCommandPrompt(mode),/严禁亲自改业务代码/);
 });
@@ -94,7 +95,7 @@ test('shared global rules do not duplicate nested subagent managed blocks',t=>{
 test('failed cleanup retains the active legacy state so the user can retry',t=>{
  const home=fixture(t),hub=path.join(home,'.t3/hub'),file=path.join(home,'bad.md');fs.mkdirSync(hub,{recursive:true});fs.writeFileSync(file,'<!-- T3_HUB_ORCHESTRATOR_START -->\nmissing end\n');
  fs.writeFileSync(path.join(hub,'orchestration-config.json'),JSON.stringify({orchestratorMode:'carbon',swarmMode:'on'}));
- const mgr=createSubagentsManager({homeDir:home,hubDir:hub});const result=mgr.updateOrchestrationConfig({orchestratorMode:'off',swarmMode:'off'},{hostRulePaths:[file]});
+ const mgr=createSubagentsManager({homeDir:home,hubDir:hub}),rev=mgr.getOrchestrationState({hosts:[file]}).modeRevision;const result=mgr.updateOrchestrationConfig({swarmMode:'off',expectedRevision:rev},{hostRulePaths:[file]});
  assert.equal(result.ok,false);assert.equal(mgr.getOrchestrationConfig().orchestratorMode,'carbon');assert.match(fs.readFileSync(file,'utf8'),/missing end/);
 });
 test('project rule screen loads actual AGENTS data for the selected project',async()=>{
@@ -141,7 +142,7 @@ test('legacy detection distinguishes clean, residual and damaged host markers wi
  assert.equal(mgr.inspectOrchestrationTargets({hosts:[file]}).state,'clear');
  const residual='# user\n'+buildOrchestrationDirective({orchestratorMode:'carbon'});fs.writeFileSync(file,residual);assert.equal(mgr.getOrchestrationConfig().orchestratorMode,'off');assert.equal(mgr.inspectOrchestrationTargets({hosts:[file]}).state,'present');assert.equal(fs.readFileSync(file,'utf8'),residual);
  fs.writeFileSync(file,'# user\n<!-- T3_HUB_ORCHESTRATOR_START -->\n');assert.equal(mgr.inspectOrchestrationTargets({hosts:[file]}).state,'unknown');
- const before=fs.readFileSync(file,'utf8');const out=mgr.updateOrchestrationConfig({orchestratorMode:'off',swarmMode:'off'},{hostRulePaths:[file]});assert.equal(out.ok,false);assert.equal(fs.readFileSync(file,'utf8'),before);
+ const before=fs.readFileSync(file,'utf8'),rev=mgr.getOrchestrationState({hosts:[file]}).modeRevision;const out=mgr.updateOrchestrationConfig({swarmMode:'off',expectedRevision:rev},{hostRulePaths:[file]});assert.equal(out.ok,false);assert.equal(fs.readFileSync(file,'utf8'),before);
 });
 test('soft memory route preserves the exact existing project text and role block',t=>{
  const home=fixture(t),hub=path.join(home,'.t3/hub'),project=path.join(home,'project');fs.mkdirSync(project,{recursive:true});const file=path.join(project,'AGENTS.md');

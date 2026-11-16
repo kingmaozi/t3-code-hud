@@ -252,9 +252,10 @@ describe("backend hubCall v3 integration", () => {
   });
 
   it("subagents:orchestration update and get", async () => {
-    const upd = await backend.hubCall("subagents:orchestration:update", { orchestratorMode: "carbon", swarmMode: "on", maxParallelAgents: 7 });
+    const initial = await backend.hubCall("subagents:orchestration:get", {});
+    const upd = await backend.hubCall("subagents:orchestration:update", { orchestratorMode: "carbon", swarmMode: "on", expectedRevision: initial.modeRevision });
     assert.equal(upd.ok, false, JSON.stringify(upd));
-    assert.match(upd.error, /旧|legacy/i);
+    assert.match(upd.error, /请选择/);
     const got = await backend.hubCall("subagents:orchestration:get", {});
     const gotCfg = got.config || got;
     assert.equal(gotCfg.orchestratorMode, "off");

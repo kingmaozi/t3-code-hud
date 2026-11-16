@@ -159,6 +159,10 @@ describe("hub-task-board: AGY brain 解析与产物", () => {
     fs.mkdirSync(session, { recursive: true });
     fs.writeFileSync(path.join(session, "task.md"), TASK_MD, "utf8");
     fs.writeFileSync(path.join(session, "implementation_plan.md"), "# 实施方案\n", "utf8");
+    // This fixture tests the latest checklist, independently of filesystem
+    // timestamp resolution and parallel test scheduling.
+    fs.utimesSync(path.join(session, "implementation_plan.md"), new Date("2026-11-15T08:00:00Z"), new Date("2026-11-15T08:00:00Z"));
+    fs.utimesSync(path.join(session, "task.md"), new Date("2026-11-15T09:00:00Z"), new Date("2026-11-15T09:00:00Z"));
     fs.writeFileSync(
       path.join(session, "implementation_plan.md.metadata.json"),
       JSON.stringify({ summary: "实施方案已同步", updatedAt: "2026-11-15T08:00:00.000Z", userFacing: true }),

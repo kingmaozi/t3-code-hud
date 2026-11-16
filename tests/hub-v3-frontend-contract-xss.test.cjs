@@ -50,11 +50,11 @@ function harness(rpc = async () => ({}), environment = {}) {
     handle = root.querySelector("#t3-hub-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board"); palette = root.querySelector("#t3-hub-slash-palette");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings,
-      onInput, onClick, onEditorKeydown, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
-      renderSubagents, renderCommander, boardMarkup, brandIcon, request, esc, agentHosts,
+      onInput, onChange, onClick, onEditorKeydown, renderMemoryList, renderHooks, renderSkillList, renderMcpList, renderDream, saveDream, saveDreamEngine, runDream,
+      renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab,
       composerToken, composerSurface, positionSlash, closeSlash, selectSlash, onComposerInput, onComposerKeydown,
-      findSessionRelationsCard, positionConversationTools, formatExactTime, renderMemoryHistory, renderDream,
+      findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory, renderDream,
       ready: () => { contextLoading = false; },
       setCurrentRoute: () => { lastRoute = routeKey(); },
       setSlash: (session) => { slashSession = session; }, getSlash: () => slashSession,
@@ -591,13 +591,84 @@ test("AutoDream run consumes the backend journal while preserving presets and it
   const cache = { dream: { config: { enabled: true }, presets: [{ id: "keep" }], journal: [{ id: "old" }] }, overview: {} };
   const context = {
     cache, state: { projectRoot: "/fixture", tab: "board" }, errors: {}, disposed: false, contextVersion: 1,
-    dreamConfig: () => cache.dream.config, request: async () => ({ config: { enabled: true }, journal: [{ id: "new" }], report: { merged: 1 } }),
+    dreamConfig: () => cache.dream.config, hubRpc: async () => ({ config: { enabled: true }, journal: [{ id: "new" }], report: { merged: 1 } }),
     renderDream() {}, refreshMemoryOverview() {}, refreshEmbed() {}, loadMemories() {}, toast() {}, tr: (zh) => zh,
   };
   await vm.runInNewContext(source + ";runDream()", context);
   assert.equal(cache.dream.journal[0].id, "new");
   assert.equal(cache.dream.presets[0].id, "keep");
   assert.equal(cache.dream.config.lastReport.merged, 1);
+});
+
+test("AutoDream edits Agent, custom model and effort as a single read-back-confirmed setting", async () => {
+  const calls = [];
+  let config = { enabled: false, dreamTime: "03:30", catchUpOnWake: true, dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium" };
+  const runtime = { providers: [{ id: "local", status: "available", efforts: [] }, { id: "muse", status: "available", efforts: ["medium", "max"] }, { id: "codex", status: "available", efforts: ["low", "medium", "high"] }, { id: "antigravity", status: "unsupported", efforts: [] }], selected: { id: "muse", status: "available" }, scheduler: { nextDueAt: "2026-11-17T03:30:00Z", timeZone: "Asia/Singapore" } };
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") { config = { ...config, ...payload }; return { config }; } return { config, runtime }; });
+  ui.cache.dream = { config, runtime, presets: [{ id: "codex", providerInstanceId: "codex", model: "gpt-6.1-terra" }] };
+  ui.onChange({ target: { name: "dream-provider", value: "codex" } });
+  ui.onInput({ target: { name: "dream-model", value: "custom-model" } });
+  ui.onChange({ target: { name: "dream-effort", value: "high" } });
+  assert.equal(calls.length, 0, "draft selection must not write partial provider/model values");
+  await ui.saveDreamEngine();
+  assert.equal(calls.length, 2); assert.equal(calls[0].action, "memory:dream:save");
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamMode: "agent", providerInstanceId: "codex", model: "custom-model", reasoningEffort: "high" });
+  assert.equal(calls[1].action, "memory:dream:get"); assert.equal(ui.cache.dream.config.model, "custom-model");
+  assert.equal(ui.state.dreamEngineDraft, null);
+});
+
+test("an unsaved AutoDream engine draft can be discarded without writing or running", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return {}; });
+  ui.cache.dream = { config: { enabled: false, dreamMode: "agent", providerInstanceId: "muse", model: "old", reasoningEffort: "medium", dreamTime: "03:30" } };
+  ui.onInput({ target: { name: "dream-model", value: "new" } });
+  await ui.runDream(); assert.equal(calls.length, 0);
+  const button = node(); button.dataset = { action: "cancel-dream-engine" };
+  ui.root.contains = (target) => target === button;
+  ui.onClick({ target: { closest: () => button } });
+  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
+});
+
+test("AutoDream shows next check and separate local/agent outcomes without hiding partial errors", () => {
+  const ui = harness();
+  ui.cache.dream = { config: { enabled: true, dreamMode: "agent", providerInstanceId: "muse", model: "m", dreamTime: "03:30", lastReport: { local: { status: "success" }, agent: { status: "failed", error: "failure & <bad>" } } }, runtime: { providers: [{ id: "muse", status: "available", efforts: ["medium", "max"] }], scheduler: { started: false, nextDueAt: "2026-11-17T03:30:00Z", timeZone: "Asia/Singapore" } } };
+  ui.renderDream();
+  const html = ui.nodes.get("#t3-hub-dream").innerHTML;
+  assert.match(html, /下次计划/); assert.match(html, /定时器未运行/); assert.match(html, /Asia\/Singapore/);
+  assert.match(html, /本地整理.*完成/); assert.match(html, /Agent 整理.*失败/);
+  assert.match(html, /failure &amp; &lt;bad&gt;/); assert.doesNotMatch(html, /failure & <bad>/);
+  ui.cache.dream.runtime.scheduler.started = true; ui.cache.dream.runtime.scheduler.running = false;
+  ui.renderDream(); assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /定时器运行中/);
+});
+
+test("historical AGY config can change schedule but cannot start or newly select AGY", async () => {
+  const calls = [];
+  let config = { enabled: false, dreamTime: "03:00", dreamMode: "agent", providerInstanceId: "antigravity", model: "old-agy", reasoningEffort: "medium" };
+  const runtime = { providers: [{ id: "antigravity", status: "unsupported", efforts: [] }], selected: { id: "antigravity", status: "unsupported" }, scheduler: {} };
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") config = { ...config, ...payload }; return { config, runtime }; });
+  ui.cache.dream = { config, runtime };
+  ui.renderDream();
+  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /value="antigravity" selected disabled/);
+  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /当前 Agent 暂不可执行/);
+  await ui.runDream(); assert.equal(calls.length, 0);
+  ui.state.dreamEngineDraft = { providerInstanceId: "antigravity", model: "old-agy", reasoningEffort: "medium" };
+  await ui.saveDreamEngine(); assert.equal(calls.length, 0);
+  ui.state.dreamEngineDraft = null;
+  await ui.saveDream({ dreamTime: "03:30" });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamTime: "03:30" });
+  assert.equal(ui.cache.dream.config.providerInstanceId, "antigravity");
+});
+
+test("partial AutoDream failure keeps the completed local report and reports the agent failure", async () => {
+  const config = { enabled: true, dreamMode: "agent", providerInstanceId: "muse", model: "m", dreamTime: "03:30" };
+  const report = { local: { status: "success" }, agent: { status: "failed", error: "agent_unavailable" } };
+  const ui = harness(async (action) => action === "memory:dream:run" ? { ok: false, status: "partial", error: "agent_unavailable", config, report } : { items: [] });
+  ui.cache.dream = { config, runtime: { selected: { id: "muse", status: "available" } } };
+  Object.assign(ui.state, { projectRoot: "/fixture", tab: "board" });
+  await ui.runDream();
+  assert.equal(ui.cache.dream.config.lastReport.local.status, "success");
+  assert.equal(ui.cache.dream.config.lastReport.agent.status, "failed");
+  assert.match(String(ui.errors.dream), /agent_unavailable/);
+  assert.doesNotMatch(ui.root.querySelector(".hub-toast").innerHTML, /整理周期已结束/);
 });
 
 test("edits made during a settings save, including reverting to the old value, remain unsaved drafts", async (t) => {
@@ -782,7 +853,7 @@ test("core tabs and their literal/dynamic RPC actions have backend dispatch case
   const actions = new Set([...drawerSource.matchAll(/"((?:hub|plugins|hooks|skills|subagents|mcp|memory|board|settings|agentsMd|embed|slash):[\w:]+)"/g)].map((m) => m[1]));
   for (const domain of ["skills", "mcp"]) for (const op of ["list", "toggleAgent"]) actions.add(`${domain}:${op}`);
   for (const action of actions) assert.ok(cases.has(action), `missing backend RPC: ${action}`);
-  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory", "skills", "subagents", "settings", "board", "agents"]);
+  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"]);
 });
 
 test("renderer escapes both quote types and file change counts, and tolerates a missing detail hash", () => {
@@ -870,56 +941,19 @@ function relationFixture() {
   return { ui, card, section, label, sidebar };
 }
 
-test("plan stays outside React card and follows its geometry, hiding when disconnected", () => {
-  const { ui, card, section, label } = relationFixture();
-  const anchor = ui.findSessionRelationsCard();
-  assert.equal(anchor.card, card);
+test("dashboard is independent of the native inspector and remains inside the Hub root", () => {
+  const { ui, card, sidebar } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
   ui.positionConversationTools();
   assert.equal(board.parentElement, ui.root);
-  assert.equal(card.children[1], section);
-  assert.equal(board.style.left, "930px");
-  assert.equal(board.style.width, "320px");
-  assert.equal(board.style.top, "509px");
   assert.equal(board.hidden, false);
-  for (const title of ["Session relationships", "之前的智能体", "Previous agents"]) {
-    label.textContent = title;
-    assert.equal(ui.findSessionRelationsCard().card, card);
-  }
-  label.textContent = "unrelated";
-  card.isConnected = false;
-  ui.positionConversationTools();
-  assert.equal(board.hidden, true);
-  assert.equal(board.parentElement, ui.root);
-  label.textContent = "会话关系";
-  label.closest = () => node();
-  assert.equal(ui.findSessionRelationsCard(), null);
-  const css = drawerSource.match(/#t3-hub-live-board\{([^}]+)\}/)[1];
-  assert.match(css, /position:fixed/);
-  assert.doesNotMatch(drawerSource, /anchor\.card\.appendChild\(liveBoard\)/);
-});
-
-test("missing or hidden inspector exposes a direct plan entry with the current session's status", () => {
-  const { ui, card, sidebar } = relationFixture();
-  const entry = ui.root.querySelector("#t3-hub-plan-handle");
-  ui.ready();
-  Object.assign(ui.state, { connected: true, threadId: "thread-a", context: { threadId: "thread-a" } });
-  ui.cache.board = { steps: [{ text: "当前任务", status: "pending" }] };
-  ui.renderLiveBoard();
-  assert.equal(ui.nodes.get("#t3-hub-live-board").hidden, false);
-  assert.equal(entry.hidden, true, "do not duplicate a visible inline panel");
+  assert.equal(board.style.width, "320px");
   card.isConnected = false;
   sidebar.querySelectorAll = () => [];
   ui.positionConversationTools();
-  assert.equal(entry.hidden, false);
-  assert.match(entry.textContent, /计划.*0\/1/);
-  assert.match(entry.title, /详情|侧栏/);
-  Object.assign(entry, { dataset: { action: "open-board-studio" }, closest: () => entry });
-  ui.root.contains = (target) => target === entry;
-  ui.onClick({ target: entry });
-  assert.equal(ui.state.open, true);
-  assert.equal(ui.state.tab, "board");
-  assert.match(ui.content.innerHTML, /当前任务/);
+  assert.equal(board.hidden, false, "a missing inspector does not hide the floating dashboard");
+  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true);
+  assert.doesNotMatch(drawerSource, /anchor\.card\.appendChild\(liveBoard\)/);
 });
 
 test("plan entry distinguishes no plan, loading, read failure, and a mismatched session", async () => {
@@ -934,7 +968,7 @@ test("plan entry distinguishes no plan, loading, read failure, and a mismatched 
   ui.renderLiveBoard();
   assert.match(entry.textContent, /暂无计划/);
   ui.renderBoardTab();
-  assert.match(ui.content.innerHTML, /当前没有计划步骤|暂无计划/);
+  assert.match(ui.content.innerHTML, /当前没有计划步骤|暂无计划|暂无主计划/);
   ui.errors.board = new Error("unavailable");
   ui.renderLiveBoard();
   assert.match(entry.textContent, /读取失败/);
@@ -974,7 +1008,7 @@ test("draft plan read/write needs the current route's verified project", async (
   let board = { threadId: "__NEW__", steps: [] };
   const ui = harness(async (action, payload) => {
     calls.push({ action, payload });
-    if (action === "board:update") board = { threadId: "__NEW__", steps: payload.steps };
+    if (action === "board:update") board = { threadId: "__NEW__", source: "hub-mcp", steps: payload.steps };
     if (action === "board:clear") board = { threadId: "__NEW__", steps: [] };
     return action === "board:get" ? board : {};
   });
@@ -1077,72 +1111,42 @@ test("unknown environment routes cannot reuse the previous local thread context"
   assert.equal(calls[0].payload.threadId, thread);
 });
 
-test("low space uses the plan entry; settings and native dialogs do not add floating controls", () => {
-  const { ui, card } = relationFixture();
-  const entry = ui.root.querySelector("#t3-hub-plan-handle");
-  ui.ready();
-  Object.assign(ui.state, { connected: true, threadId: "thread-a", context: { threadId: "thread-a" } });
-  ui.cache.board = { steps: [] };
-  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom: 790, width: 320, height: 390 });
-  ui.positionConversationTools();
-  assert.equal(entry.hidden, false);
-  assert.match(entry.title, /空间不足/);
-  ui.root.classList.add("is-occluded");
-  ui.positionConversationTools();
-  assert.equal(entry.hidden, true);
-  ui.root.classList.remove("is-occluded");
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: "", href: "https://fixture.test/" });
-  ui.positionConversationTools();
-  assert.equal(entry.hidden, true, "the home page must not suggest another thread's plan");
-  Object.assign(ui.sandbox.location, { pathname: "/settings", hash: "", href: "https://fixture.test/settings" });
-  ui.positionConversationTools();
-  assert.equal(entry.hidden, true);
-});
-
-test("plan board stays in place near the window bottom and never shifts beside the card", () => {
-  const { ui, card } = relationFixture();
+test("floating dashboard clamps to viewport and hides for dialogs and settings", () => {
+  const { ui } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
-  let bottom = 730;
-  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom, width: 320, height: bottom - 400 });
-  ui.state.boardExpanded = false;
+  ui.sandbox.innerWidth = 390; ui.sandbox.innerHeight = 260;
   ui.positionConversationTools();
   assert.equal(board.hidden, false);
-  assert.equal(board.style.left, "930px");
-  assert.equal(board.style.top, "729px");
-  assert.equal(board.style.maxHeight, "63px");
-  ui.state.boardExpanded = true;
-  ui.positionConversationTools();
-  assert.equal(board.style.top, "729px", "expanding must not move the header");
-  assert.equal(board.style.left, "930px");
-  bottom = 790;
-  ui.positionConversationTools();
-  assert.equal(board.hidden, true, "with no room for its toolbar, the board must not cover native controls");
-  assert.equal(board.parentElement, ui.root);
+  assert.equal(board.style.width, "320px");
+  assert.ok(parseFloat(board.style.left) >= 8);
+  assert.ok(parseFloat(board.style.top) + parseFloat(board.style.maxHeight) <= 252);
+  ui.root.classList.add("is-occluded"); ui.positionConversationTools();
+  assert.equal(board.hidden, true);
+  ui.root.classList.remove("is-occluded");
+  Object.assign(ui.sandbox.location, { pathname: "/settings", hash: "", href: "https://fixture.test/settings" });
+  ui.positionConversationTools(); assert.equal(board.hidden, true);
 });
 
-test("a short viewport shows the full-plan link instead of a nearly invisible expanded step", () => {
-  const { ui, card } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board"), toggle = node();
-  board.querySelector = (selector) => selector === ".hub-board-toggle" ? toggle : null;
-  let bottom = 730;
-  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom, width: 320, height: bottom - 400 });
-  ui.state.boardExpanded = true;
-  for (const edge of [730, 713]) {
-    bottom = edge;
-    ui.positionConversationTools();
-    assert.equal(board.hidden, false);
-    assert.equal(board.classList.contains("is-space-limited"), true);
-    assert.equal(toggle.getAttribute("aria-expanded"), "false");
-    assert.equal(ui.state.boardExpanded, true, "space restrictions must not change the saved preference");
-  }
-  bottom = 650;
+test("dragging persists a clamped position, supports cancel and preserves viewport bounds", () => {
+  const data = new Map(), storage = { getItem: (key) => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) };
+  const ui = harness(undefined, { localStorage: storage });
+  const board = ui.nodes.get("#t3-hub-live-board");
+  board.getBoundingClientRect = () => ({ left: parseFloat(board.style.left), top: parseFloat(board.style.top) });
   ui.positionConversationTools();
-  assert.equal(board.classList.contains("is-space-limited"), false);
-  assert.equal(toggle.getAttribute("aria-expanded"), "true", "expansion resumes when space returns");
-  assert.equal(ui.state.boardExpanded, true);
-  ui.renderLiveBoard();
-  assert.match(board.innerHTML, /在 Hub 查看完整计划/);
-  assert.match(drawerSource, /is-space-limited \.hub-board-content\{display:none/);
+  const target = { closest: () => target };
+  ui.startBoardDrag({ button: 0, pointerId: 1, clientX: 950, clientY: 100, target });
+  ui.moveBoardDrag({ pointerId: 1, clientX: 20, clientY: 900, preventDefault() {} });
+  ui.endBoardDrag({ pointerId: 1 });
+  const saved = JSON.parse(data.get("t3-hub-dashboard-position-v1"));
+  assert.equal(saved.x, 8); assert.equal(saved.y, 642);
+  const next = harness(undefined, { localStorage: storage });
+  next.positionConversationTools();
+  assert.equal(next.nodes.get("#t3-hub-live-board").style.left, "8px");
+  assert.equal(next.nodes.get("#t3-hub-live-board").style.top, "642px");
+  next.sandbox.innerWidth = 240; next.sandbox.innerHeight = 200;
+  next.positionConversationTools();
+  assert.equal(next.nodes.get("#t3-hub-live-board").style.width, "224px");
+  assert.equal(next.nodes.get("#t3-hub-live-board").style.top, "42px");
 });
 
 test("narrow inspector can be found without accepting an unscoped left-side title", () => {
@@ -1156,23 +1160,13 @@ test("narrow inspector can be found without accepting an unscoped left-side titl
   assert.equal(ui.findSessionRelationsCard(), null);
 });
 
-test("plan opens downwards below a content-sized inspector without moving its header", () => {
-  const { ui, card } = relationFixture();
+test("dashboard grows downward and has a bounded scrolling content area", () => {
+  const { ui } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
-  const viewport = node();
-  ui.sandbox.innerHeight = 998;
-  viewport.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 100, bottom: 501, width: 320, height: 401 });
-  card.closest = (selector) => selector.startsWith("aside,") ? viewport : null;
-  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 140, bottom: 477, width: 320, height: 337 });
-  ui.state.boardExpanded = false;
-  ui.positionConversationTools();
-  assert.equal(board.hidden, false);
-  assert.equal(board.style.top, "476px");
-  assert.equal(board.style.maxHeight, "514px");
-  ui.state.boardExpanded = true;
-  ui.positionConversationTools();
-  assert.equal(board.style.top, "476px", "expanding must only grow downwards");
-  assert.equal(board.style.maxHeight, "514px");
+  ui.state.boardExpanded = false; ui.positionConversationTools();
+  const left = board.style.left, top = board.style.top;
+  ui.state.boardExpanded = true; ui.positionConversationTools();
+  assert.equal(board.style.left, left); assert.equal(board.style.top, top);
   assert.equal(board.parentElement, ui.root);
   assert.match(drawerSource, /#t3-hub-live-board\{[^}]*display:flex[^}]*flex-direction:column/);
   assert.match(drawerSource, /#t3-hub-live-board \.hub-board-content\{[^}]*min-height:0[^}]*overflow:auto/);
@@ -1182,7 +1176,7 @@ test("progress defaults to open even after the old version saved it collapsed", 
   const legacy = { getItem: (key) => key === "t3-hub-board-expanded" ? "false" : null, setItem() {} };
   const oldUi = { snapshot: () => ({ boardExpanded: false }), destroy() {} };
   assert.equal(harness(undefined, { localStorage: legacy, window: { __t3SidecarHub: oldUi } }).state.boardExpanded, true);
-  const migrated = { getItem: (key) => key === "t3-hub-board-expanded-v2" ? "false" : null, setItem() {} };
+  const migrated = { getItem: (key) => key === "t3-hub-dashboard-expanded-v1" ? "false" : null, setItem() {} };
   assert.equal(harness(undefined, { localStorage: migrated }).state.boardExpanded, false, "a new explicit collapse is remembered");
 });
 
@@ -1191,6 +1185,7 @@ test("plan scrolling survives polling and geometry updates but resets for a new 
   const board = ui.nodes.get("#t3-hub-live-board");
   let scroll = { scrollTop: 220 }, html = "";
   board.dataset.threadId = "thread-a";
+  board.dataset.projectRoot = "";
   board.querySelector = (selector) => selector === ".hub-board-content" ? scroll : null;
   Object.defineProperty(board, "innerHTML", { get: () => html, set: (value) => { html = value; scroll = { scrollTop: 0 }; } });
   Object.defineProperty(board.style, "maxHeight", { set: (value) => { if (value === "none") scroll.scrollTop = Math.min(scroll.scrollTop, 180); } });
@@ -1200,27 +1195,30 @@ test("plan scrolling survives polling and geometry updates but resets for a new 
   assert.equal(scroll.scrollTop, 220, "poll redraw must retain the user's scroll position");
   ui.positionConversationTools();
   assert.equal(scroll.scrollTop, 220, "resizing must retain the user's scroll position");
+  ui.state.projectRoot = "/another-project";
+  ui.renderLiveBoard();
+  assert.equal(scroll.scrollTop, 0, "the same thread ID in another project cannot inherit scroll state");
+  scroll.scrollTop = 220;
   ui.state.threadId = "thread-b";
   ui.renderLiveBoard();
   assert.equal(scroll.scrollTop, 0, "new threads start at the top");
 });
 
-test("empty plans stay visible, inline plan supports check/add/Studio/theme actions, and subagent lists never repeat", () => {
-  const { ui } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board");
-  ui.ready();
-  Object.assign(ui.state, { connected: true, threadId: "thread-a" });
-  ui.cache.board = { steps: [] };
-  ui.renderLiveBoard();
-  assert.equal(board.hidden, false);
-  assert.match(board.innerHTML, /计划进度 暂无计划/);
-  ui.cache.board = { steps: [{ text: "核对页面", status: "pending" }], subagents: [{ name: "duplicate-agent", status: "running" }] };
-  ui.state.boardExpanded = true;
-  ui.renderLiveBoard();
-  assert.match(board.innerHTML, /计划进度 0\/1/);
-  for (const action of ["board-step", "board-add", "open-board-studio", "set-theme"]) assert.ok(board.innerHTML.includes(`data-action="${action}"`));
-  assert.ok(board.innerHTML.includes("+ 添加本会话步骤"));
-  assert.doesNotMatch(board.innerHTML + ui.boardMarkup(true), /hub-board-subagent|子代理运行中|duplicate-agent/);
+test("dashboard shows real plan, read-only native text and honest subagent fallback", () => {
+  const { ui } = relationFixture(), board = ui.nodes.get("#t3-hub-live-board");
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
+  ui.cache.board = { source: "t3-native", steps: [] }; ui.renderLiveBoard();
+  assert.equal(board.hidden, false); assert.match(board.innerHTML, /暂无主计划/);
+  for (const name of ["open-board-studio", "toggle-board", "reset-dashboard-position", "dashboard-tab"]) assert.ok(board.innerHTML.includes(`data-action="${name}"`));
+  ui.cache.board = { source: "t3-native", steps: [{ text: "核对页面", status: "pending" }] }; ui.renderLiveBoard();
+  assert.match(board.innerHTML, /0\/1/); assert.match(board.innerHTML, /role="progressbar"/);
+  assert.doesNotMatch(board.innerHTML, /data-action="board-step"/);
+  ui.cache.board = { source: "t3-native", planMarkdown: "# 真实计划\n<img src=x>", steps: [] }; ui.renderLiveBoard();
+  assert.match(board.innerHTML, /计划原文/); assert.match(board.innerHTML, /&lt;img src=x&gt;/);
+  assert.doesNotMatch(board.innerHTML, /暂无主计划|role="progressbar"/);
+  ui.cache.board = { steps: [], subagents: [{ title: "任务一", rawStatus: "failed" }, { title: "任务二", rawStatus: "completed" }, { title: "任务三", rawStatus: "unknown" }] }; ui.renderLiveBoard();
+  assert.match(board.innerHTML, /本会话子任务/); assert.match(board.innerHTML, /失败 1/); assert.match(board.innerHTML, /已完成 1/); assert.match(board.innerHTML, /状态未知 1/);
+  assert.doesNotMatch(board.innerHTML, /role="progressbar"/);
 });
 
 test("thread IDs follow threads, _chat, hash, UUID, then current context", () => {
@@ -1273,7 +1271,7 @@ test("route changes clear old plans and artifacts synchronously, request the new
   assert.equal(ui.state.threadId, "thread-b");
   assert.equal(ui.cache.board, null);
   assert.equal(ui.state.artifact, null);
-  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划进度 读取中/);
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划进度<[^>]*><span[^>]*>读取中/);
   await new Promise(setImmediate);
   assert.ok(calls.some((x) => x.action === "board:get" && x.threadId === "thread-b" && x.excludeSubagentInference === true));
   replies.get("thread-b")({ steps: [{ text: "new plan" }] });
@@ -1288,7 +1286,7 @@ test("inline add, check and clear send the captured current thread on every muta
   let data = { steps: [] };
   const ui = harness(async (action, payload) => {
     calls.push({ action, payload });
-    if (action === "board:update") data = { steps: payload.steps };
+    if (action === "board:update") data = { source: "hub-mcp", steps: payload.steps };
     if (action === "board:clear") data = { steps: [] };
     return action === "board:get" ? data : {};
   });
@@ -1414,7 +1412,7 @@ test("a plan mutation invalidates a pre-write poll so its late reply cannot reve
     return {};
   });
   Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a" });
-  ui.cache.board = { steps: [{ id: "step", text: "checked", status: "pending" }] };
+  ui.cache.board = { source: "hub-mcp", steps: [{ id: "step", text: "checked", status: "pending" }] };
   const old = ui.pollBoard();
   await ui.updateBoard(null, "toggle", 0);
   release({ steps: [{ id: "step", text: "old poll", status: "pending" }] });
@@ -1450,7 +1448,7 @@ test("[P1] unscoped drafts are blocked; verified project drafts stay strictly is
   const ui = harness(async (action, payload) => {
     calls.push({ action, payload });
     if (action === "board:get") return boardData;
-    if (action === "board:update") { boardData = { steps: payload.steps }; return {}; }
+    if (action === "board:update") { boardData = { source: "hub-mcp", steps: payload.steps }; return {}; }
     if (action === "board:clear") { boardData = { steps: [] }; return {}; }
     return {};
   });
@@ -1492,7 +1490,7 @@ test("[P1] clear on thread-a sends only that threadId, never a bare projectRoot 
     return action === "board:get" ? { steps: [] } : {};
   });
   Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a" });
-  ui.cache.board = { steps: [{ id: "1", text: "a", status: "pending" }] };
+  ui.cache.board = { source: "hub-mcp", steps: [{ id: "1", text: "a", status: "pending" }] };
   await ui.updateBoard(null, "clear");
   const clearCall = calls.find((x) => x.action === "board:clear");
   assert.equal(clearCall.payload.threadId, "thread-a", "clear carries the exact thread, not undefined/project-only");
@@ -1502,10 +1500,11 @@ test("[P1] clear on thread-a sends only that threadId, never a bare projectRoot 
 });
 
 
-test("four core navigation entries exclude the plugin market and shortcuts", () => {
+test("navigation exposes plugins and Hooks without adding a plugin market", () => {
   const tabs = drawerSource.match(/const tabs = (\[\["memory"[^;]+);/)[1];
-  assert.deepEqual([...tabs.matchAll(/\["(memory|skills|subagents|settings)"/g)].map(x => x[1]), ["memory", "skills", "subagents", "settings"]);
-  assert.doesNotMatch(drawerSource, /function (?:renderPlugins|renderPluginList|installMarketplace|pluginItems)\b/);
+  assert.deepEqual([...tabs.matchAll(/\["(memory|skills|plugins|subagents|hooks|settings)"/g)].map(x => x[1]), ["memory", "skills", "plugins", "subagents", "hooks", "settings"]);
+  assert.match(drawerSource, /function renderPlugins\b/);
+  assert.doesNotMatch(drawerSource, /function installMarketplace\b/);
   const slash = drawerSource.slice(drawerSource.indexOf("function scopedSlashItems"), drawerSource.indexOf("function nativeSlashMenu"));
   assert.doesNotMatch(slash, /type: "plugin"/);
   const palette = drawerSource.slice(drawerSource.indexOf("function renderSlash"), drawerSource.indexOf("function setSlashActive"));
@@ -1513,7 +1512,193 @@ test("four core navigation entries exclude the plugin market and shortcuts", () 
   // The approved card catalog, scoped artifact preview and host/rules controls
   // expand the former 300 KB navigation-only budget. Keep a bounded allowance
   // without minifying maintained source or weakening the behavioral checks.
-  assert.ok(Buffer.byteLength(drawerSource) < 350000);
+  assert.ok(Buffer.byteLength(drawerSource) < 380000);
+});
+
+test("project tier edits start with effective inherited values and save only that project item", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { item: payload.item }; });
+  const globalItem = { id: "worker", name: "worker", role: "implementation", providerInstanceId: "muse", model: "global-model", effort: "max", systemPrompt: "global prompt", enabled: true };
+  const projectItem = { id: "worker", overridesGlobal: true, model: "project-model" };
+  const effective = { ...globalItem, ...projectItem };
+  ui.cache.subagents = { globalItems: [globalItem], projectItems: [projectItem], tierGroups: [{ id: "work", levels: [{ level: 1, id: "worker", kind: "agent", globalItem, projectItem, item: effective, source: "project", configured: true }] }] };
+  ui.ready(); ui.setCurrentRoute();
+  Object.assign(ui.state, { connected: true, tab: "subagents", subagentScope: "project", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a", projectRoot: "/fixture" } });
+  assert.equal(ui.subagentItems()[0].systemPrompt, "global prompt");
+  await ui.persistSubagent("worker", { model: "new-model" });
+  const save = calls.find((call) => call.action === "subagents:update");
+  assert.equal(save.payload.scope, "project"); assert.equal(save.payload.projectRoot, "/fixture");
+  assert.equal(save.payload.item.model, "new-model"); assert.equal(save.payload.item.systemPrompt, "global prompt");
+  assert.equal(save.payload.item.overridesGlobal, true); assert.equal(ui.cache.subagents.projectItems.length, 1);
+  assert.equal(ui.cache.subagents.globalItems[0].model, "global-model");
+});
+
+test("mode changes use the observed revision and re-read after a rejected update", async () => {
+  const calls = [], ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    return action === "subagents:orchestration:update" ? { ok: false, error: "revision changed" } : { policyVersion: 2, swarmMode: "off", modeRevision: "new", modeApplied: false };
+  });
+  ui.cache.orchestration = { policyVersion: 2, swarmMode: "off", modeRevision: "old", modeApplied: true };
+  await ui.setCooperationMode(null, "on");
+  assert.equal(calls[0].payload.expectedRevision, "old"); assert.equal(calls[0].payload.swarmMode, "on");
+  assert.equal(calls[1].action, "subagents:orchestration:get"); assert.equal(ui.cache.orchestration.modeRevision, "new");
+  assert.match(ui.renderCommander(), /待同步/);
+});
+
+test("a concurrent mode reversal reports the actual readback instead of claiming success", async () => {
+  const ui = harness(async (action) => action === "subagents:orchestration:update" ? { ok: true } : { policyVersion: 2, swarmMode: "off", modeRevision: "new", modeApplied: true });
+  ui.cache.orchestration = { policyVersion: 2, swarmMode: "off", modeRevision: "old", modeApplied: true };
+  await ui.setCooperationMode(null, "on");
+  assert.equal(ui.cache.orchestration.swarmMode, "off");
+  const message = ui.root.querySelector(".hub-toast").innerHTML;
+  assert.match(message, /其他操作改为常规分工/); assert.doesNotMatch(message, /已保存并同步/);
+});
+
+test("T3 collaboration mode exposes a clear selected style for the verified choice", () => {
+  const ui = harness();
+  for (const selected of ["off", "on"]) {
+    ui.cache.orchestration = { policyVersion: 2, swarmMode: selected, modeApplied: true, modeRevision: "revision" };
+    const html = ui.renderCommander();
+    for (const mode of ["off", "on"]) assert.match(html, new RegExp(`data-mode="${mode}" aria-pressed="${mode === selected}"`));
+  }
+  ui.cache.orchestration = { policyVersion: 1, swarmMode: "off" };
+  assert.doesNotMatch(ui.renderCommander(), /aria-pressed="true"/, "an unverified mode is not marked selected");
+  assert.match(drawerSource, /\.hub-commander \.hub-segments>button\[aria-pressed=true\][^{]*\{[^}]*background:var\(--hub-active\)[^}]*color:var\(--hub-on-active\)/);
+});
+
+test("incomplete mode rollback warns that rule files need inspection", async () => {
+  const ui = harness(async (action) => action === "subagents:orchestration:update" ? { ok: false, error: "write_failed", rolledBack: false, rollbackFailures: [{ path: "/fixture/rules" }] } : { policyVersion: 2, swarmMode: "off", modeRevision: "new", modeApplied: false });
+  ui.cache.orchestration = { policyVersion: 2, swarmMode: "off", modeRevision: "old", modeApplied: true };
+  await ui.setCooperationMode(null, "on");
+  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /1 个规则文件未能自动恢复/);
+  assert.match(ui.renderCommander(), /待同步/);
+});
+
+test("polling unchanged data preserves focus, and changed data restores focus only within the same thread", async () => {
+  let data = { threadId: "thread-a", source: "hub-mcp", steps: [{ text: "one", status: "pending" }] };
+  const ui = harness(async () => data), board = ui.nodes.get("#t3-hub-live-board");
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
+  let html = "", redraws = 0, focusCalls = 0;
+  Object.defineProperty(board, "innerHTML", { get: () => html, set: (value) => { html = value; redraws++; } });
+  const focusNode = (drag, index) => ({ dataset: drag ? {} : { action: "board-step", index: String(index), stepId: "hub-1", stepText: "one" }, matches: (selector) => selector === "[data-board-drag],button[data-action]" || drag && selector === "[data-board-drag]", focus: () => { focusCalls++; } });
+  let restored = focusNode(true);
+  board.contains = (element) => !!element;
+  board.querySelector = (selector) => selector === "[data-board-drag]" ? restored : null;
+  board.querySelectorAll = (selector) => selector === 'button[data-action="board-step"]' ? [restored] : [];
+  await ui.pollBoard();
+  ui.sandbox.document.activeElement = focusNode(true);
+  const before = redraws; await ui.pollBoard();
+  assert.equal(redraws, before); assert.equal(focusCalls, 0);
+  data = { ...data, steps: [{ text: "one", status: "completed" }] }; await ui.pollBoard();
+  assert.equal(redraws, before + 1); assert.equal(focusCalls, 1, "drag handle regains focus after a real change");
+  ui.sandbox.document.activeElement = focusNode(false, 0); restored = focusNode(false, 0);
+  data = { ...data, steps: [{ text: "one", status: "pending" }] }; await ui.pollBoard();
+  assert.equal(focusCalls, 2, "the matching step button regains focus");
+  ui.state.threadId = "thread-b"; ui.renderLiveBoard();
+  assert.equal(focusCalls, 2, "focus must not move into a different thread");
+});
+
+test("changed task lists never move keyboard focus to a different step", async () => {
+  let data = { threadId: "thread-a", source: "hub-mcp", steps: [{ id: "hub-a", text: "A" }, { id: "hub-b", text: "B" }, { id: "hub-c", text: "C" }] };
+  const ui = harness(async () => data), board = ui.nodes.get("#t3-hub-live-board");
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
+  const focused = [];
+  const button = (id, text, index) => ({ dataset: { action: "board-step", stepId: id, stepText: text, index: String(index) }, matches: (sel) => sel === "[data-board-drag],button[data-action]", focus() { focused.push(id); } });
+  const header = { focus() { focused.push("header"); } };
+  let buttons = [];
+  board.contains = (element) => !!element;
+  board.querySelector = (selector) => selector === "[data-board-drag]" ? header : null;
+  board.querySelectorAll = (selector) => selector === 'button[data-action="board-step"]' ? buttons : [];
+  await ui.pollBoard();
+  ui.sandbox.document.activeElement = button("hub-b", "B", 1);
+  buttons = [button("hub-c", "C", 0), button("hub-b", "B", 1)];
+  data = { ...data, steps: [{ id: "hub-c", text: "C" }, { id: "hub-b", text: "B" }] };
+  await ui.pollBoard(); assert.equal(focused.pop(), "hub-b", "same stable step regains focus after reordering");
+  ui.sandbox.document.activeElement = button("hub-b", "B", 1);
+  buttons = [button("hub-a", "A", 0), button("hub-c", "C", 1)];
+  data = { ...data, steps: [{ id: "hub-a", text: "A" }, { id: "hub-c", text: "C" }] };
+  await ui.pollBoard(); assert.equal(focused.pop(), "header", "removed B must never focus C at B's former index");
+  ui.sandbox.document.activeElement = button("step-2", "B", 1);
+  buttons = [button("step-2", "B", 1)]; data = { ...data, steps: [{ id: "step-2", text: "B" }] };
+  await ui.pollBoard(); assert.equal(focused.pop(), "header", "positional synthetic IDs are not trusted");
+  ui.sandbox.document.activeElement = { dataset: { action: "read-artifact", index: "1" }, matches: (sel) => sel === "[data-board-drag],button[data-action]" };
+  data = { ...data, artifacts: [{ path: "first.md" }, { path: "second.md" }] };
+  await ui.pollBoard(); assert.equal(focused.pop(), "header", "artifact focus cannot jump to the first of several files");
+});
+
+test("a native plan is read-only and plan read failures never claim it is absent", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return {}; });
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture", boardDraft: "manual" });
+  ui.cache.board = { source: "t3-native", steps: [{ text: "native", status: "pending" }] };
+  await ui.updateBoard(null, "toggle", 0); await ui.updateBoard(null, "clear"); await ui.updateBoard(null, "add");
+  assert.equal(calls.length, 0);
+  ui.cache.board = { planReadError: "too_large", steps: [] }; ui.renderLiveBoard();
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划文件过大/);
+  assert.doesNotMatch(ui.nodes.get("#t3-hub-live-board").innerHTML, /暂无主计划/);
+});
+
+test("hook project writes require the resolved current project and exclude other project hooks", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return action === "hooks:list" ? { items: [{ id: "global", scope: "off", configured: false, configurationStatus: "not-configured" }] } : { item: { scope: payload.scope } }; });
+  const hooks = [{ id: "global", title: "Global", scope: "global" }, { id: "project-a", title: "A", scope: "project", projectRoot: "/project-a", custom: true }, { id: "project-b", title: "B", scope: "project", projectRoot: "/project-b", custom: true }];
+  ui.cache.hooks = { items: hooks };
+  ui.ready(); ui.setCurrentRoute();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", projectRoot: "/project-a" }, hookDraft: { title: "new", command: "true", scope: "project" } });
+  assert.deepEqual(Array.from(ui.hookItems(), (item) => item.id), ["global", "project-a"]);
+  await ui.setDomainScope("hooks", "global", "project", null);
+  await ui.setDomainScope("hooks", "project-a", "off", null);
+  await ui.saveHook(null); await ui.deleteHook("project-a", null);
+  assert.equal(calls.length, 0, "project hooks are read-only even when the project is verified");
+  Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
+  await ui.setDomainScope("hooks", "global", "project", null);
+  await ui.setDomainScope("hooks", "project-a", "off", null);
+  await ui.saveHook(null); await ui.deleteHook("project-a", null);
+  assert.equal(calls.length, 0, "stale A cannot be written while B is resolving");
+  assert.deepEqual(Array.from(ui.hookItems(), (item) => item.id), ["global"]);
+  await ui.setDomainScope("hooks", "global", "off", null);
+  assert.equal(calls.length, 2, "explicit global operation remains available and is read back");
+  assert.equal(calls[0].payload.projectRoot, null);
+});
+
+test("Hook cards distinguish saved scope from missing, partial and actual host configuration", () => {
+  const ui = harness();
+  ui.cache.hooks = { items: [
+    { id: "missing", title: "Missing", scope: "global", configured: false, configuredIn: [], configurationStatus: "not-configured" },
+    { id: "partial", title: "Partial", scope: "global", configured: true, configuredIn: ["codex"], configurationStatus: "partial" },
+    { id: "missing-handler", title: "Missing handler", scope: "global", configured: false, configuredIn: [], partialIn: ["codex"], configurationStatus: "partial" },
+    { id: "both", title: "Both", scope: "global", configured: true, configuredIn: ["codex", "claude"], configurationStatus: "configured" },
+  ] };
+  ui.renderHooks(); const html = ui.content.innerHTML;
+  assert.match(html, /未检测到配置/); assert.match(html, /部分宿主已配置 · Codex/);
+  assert.match(html, /配置不完整 · 未完整: Codex/);
+  assert.match(html, /已检测到配置 · Codex \/ Claude/); assert.match(html, /保存范围（实际配置状态见上方）/);
+});
+
+test("partial Hook readback does not claim that both hosts are configured", async () => {
+  const ui = harness(async (action) => action === "hooks:list" ? { items: [{ id: "h", title: "H", scope: "global", configured: true, configuredIn: ["codex"], configurationStatus: "partial" }] } : { ok: true });
+  ui.cache.hooks = { items: [{ id: "h", title: "H", scope: "off", configured: false }] };
+  await ui.setDomainScope("hooks", "h", "global", null);
+  assert.equal(ui.cache.hooks.items[0].configurationStatus, "partial");
+  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /尚未全部确认/);
+});
+
+test("partially remaining Hook entries do not count as fully disabled", async () => {
+  const ui = harness(async (action) => action === "hooks:list" ? { items: [{ id: "h", title: "H", scope: "off", configured: false, partialIn: ["codex"], configurationStatus: "partial" }] } : { ok: true });
+  ui.cache.hooks = { items: [{ id: "h", title: "H", scope: "global", configured: true }] };
+  await ui.setDomainScope("hooks", "h", "off", null);
+  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /尚未全部确认/);
+});
+
+test("late global hook update cannot update another session's visible cache", async () => {
+  let resolve;
+  const ui = harness(async () => new Promise((done) => { resolve = done; }));
+  ui.cache.hooks = { items: [{ id: "h", title: "H", scope: "global" }] };
+  ui.ready(); ui.setCurrentRoute();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", projectRoot: "/project-a" } });
+  const pending = ui.setDomainScope("hooks", "h", "off", null);
+  Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
+  resolve({ item: { id: "h", scope: "off" } });
+  await pending;
+  assert.equal(ui.cache.hooks.items[0].scope, "global");
+  assert.equal(ui.root.querySelector(".hub-toast").innerHTML, "", "a stale save does not report success in the new route");
 });
 
 test('project rule and role writes stay blocked while a new route is resolving', async () => {

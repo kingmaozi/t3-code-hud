@@ -241,7 +241,8 @@ describe("1. 梦境系统 Agent/Model 自选 + 两层 Token 漏斗", () => {
     vault2.updateDreamConfig({ dreamMode: "agent", minDeltaMemories: 1, maxClustersPerDream: 8, maxInputTokens: 8000 });
     const badRunner = () => { throw new Error("CLI down"); };
     const res2 = await vault2.runDreamCycle({ reason: "manual", projectRoot: tmpProject, agentRunner: badRunner });
-    assert.equal(res2.ok, true, "fallback should not throw");
+    assert.equal(res2.ok, false, "agent failure must be reported");
+    assert.equal(res2.status, "partial");
     assert.ok(res2.report.agentFallbackReason || res2.report.agentUsed === null || res2.report.agentMergedCount === 0);
     // minDelta 门槛：delta 不足且非 force 时应跳过 agent，0 Token
     const vault3Dir = path.join(tmpRoot, "vault-gray-gate");
@@ -403,8 +404,9 @@ describe("3. 蜂窝仅顶层主会话生效，子智能体严禁变蜂窝", () =
   it("syncOrchestrationDirectiveToHosts 绝不写入子代理目录，仅顶层规则文件", async () => {
     const mgr = subMod.createSubagentsManager({ homeDir: tmpHome, hubDir: tmpHub });
     // 旧模式已退役；仅允许清理旧规则，不能注入到子代理目录。
-    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on" }, { hostRulePaths: [] }), /旧|legacy/i);
-    const upd = mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off" }, { hostRulePaths: [] });
+    const rev = mgr.getOrchestrationState().modeRevision;
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on", expectedRevision: rev }, { hostRulePaths: [] }), /请选择/);
+    const upd = mgr.updateOrchestrationConfig({ swarmMode: "off", expectedRevision: rev }, { hostRulePaths: [] });
     assert.equal(upd.ok, true);
     // 构造尝试把子代理目录作为 hosts 混入，验证实现会过滤或不写 agents/
     const fakeClaudeAgentDir = path.join(tmpHome, ".claude", "agents");
@@ -422,7 +424,8 @@ describe("3. 蜂窝仅顶层主会话生效，子智能体严禁变蜂窝", () =
     const res = mgr.syncOrchestrationDirectiveToHosts({ hosts: [topRule, hostRule, fakeClaudeAgentDir + "/evil.md", fakeHubSubagentsDir + "/evil2.md"] });
     assert.equal(res.ok, false);
     const topContent = fs.readFileSync(topRule, "utf8");
-    assert.doesNotMatch(topContent, /<SUBAGENT-STOP>|T3_HUB_ORCHESTRATOR_START/);
+    assert.match(topContent, /T3_HUB_ORCHESTRATOR_START/);
+    assert.match(topContent, /常规协作/);
     // 子代理目录不应被写入
     const evil1 = fakeClaudeAgentDir + "/evil.md";
     const evil2 = fakeHubSubagentsDir + "/evil2.md";
@@ -854,7 +857,8 @@ describe("6. Dream P1 回归：Token 硬闸门 / 异步 CLI / Agent 水位隔离
     const before = v.getDreamState().config.lastAgentDreamAt ?? null;
     const boom = () => { throw new Error("CLI down"); };
     const res = await v.runDreamCycle({ reason: "manual", force: true, projectRoot: proj, agentRunner: boom });
-    assert.equal(res.ok, true, "fallback must not throw");
+    assert.equal(res.ok, false, "agent failure must be reported");
+    assert.equal(res.status, "partial");
     assert.ok(res.report.agentFallbackReason, "must record fallback reason");
     assert.equal(res.report.agentUsed, null, "failed agent must not set agentUsed");
     const cfg = v.getDreamState().config;
@@ -951,7 +955,8 @@ describe("7. Dream P1/P2 回归：零丢失熔断 / 分批 deferred 去重 / CLI
         return { merges: [{ keepId, mergeIds: [mergeId], title: "merged title", summary: "merged summary", content: "merged content" }] };
       };
       const res = await v.runDreamCycle({ reason: "manual", force: true, projectRoot: proj, agentRunner: runner });
-      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal(res.ok, false, JSON.stringify(res));
+      assert.equal(res.status, "partial");
       assert.equal(res.report.agentMergedCount, 0, "archive failure must not count as merged");
       assert.ok(Number(res.report.mergeErrors) > 0, "archive failure must increment mergeErrors, got " + res.report.mergeErrors);
       const list = v.listMemories({ projectSlug: slug });
@@ -993,7 +998,8 @@ describe("7. Dream P1/P2 回归：零丢失熔断 / 分批 deferred 去重 / CLI
         return { merges: [{ keepId, mergeIds: [mergeId], title: "merged title", summary: "merged summary", content: "merged content" }] };
       };
       const res = await v.runDreamCycle({ reason: "manual", force: true, projectRoot: proj, agentRunner: runner });
-      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal(res.ok, false, JSON.stringify(res));
+      assert.equal(res.status, "partial");
       assert.equal(res.report.agentMergedCount, 0, "update failure must not count as merged");
       assert.ok(Number(res.report.mergeErrors) > 0, "update failure must increment mergeErrors, got " + res.report.mergeErrors);
       const list = v.listMemories({ projectSlug: slug });
@@ -1161,7 +1167,8 @@ describe("8. AutoDream 状态机不变量：CAS / 真实完成 / 单簇预算 / 
     return { keepId: cl.items[0].id, mergeIds: [cl.items[1].id], title: "精炼结果", content: "Agent 合并后的新内容" };
   }
   function assertDeferred(f, res) {
-    assert.equal(res.ok, true);
+    assert.equal(res.ok, false);
+    assert.equal(res.status, "partial");
     assert.ok(res.report.deferredClusterCount > 0, "失败簇必须保留待审");
     assert.equal(f.v.getDreamState().config.hasDeferredClusters, true);
     assert.equal(f.v.getDreamState().config.lastAgentDreamAt ?? null, null, "失败不得推进水位");

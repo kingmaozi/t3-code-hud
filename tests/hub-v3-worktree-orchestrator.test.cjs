@@ -260,7 +260,7 @@ describe("hub-subagents orchestration Carbon/Argon + /swarm", () => {
     // 7 role defaults
     const list = mgr.listSubagents({});
     const ids = list.globalItems.map((i) => i.id).sort();
-    assert.deepEqual(ids, ["code-review", "default", "explorer", "frontend", "qa", "worker", "worker-pro"]);
+    assert.deepEqual(ids, ["code-review", "default", "explorer", "frontend", "qa", "review-fast", "review-pro", "worker", "worker-pro"]);
     const explorer = list.globalItems.find((i) => i.id === "explorer");
     assert.equal(explorer.providerInstanceId, "muse");
     assert.equal(explorer.model, "muse-ember-1.0");
@@ -272,7 +272,7 @@ describe("hub-subagents orchestration Carbon/Argon + /swarm", () => {
     const codeReview = list.globalItems.find((i) => i.id === "code-review");
     assert.equal(codeReview.providerInstanceId, "codex");
     assert.equal(codeReview.model, "gpt-6.1-terra");
-    assert.equal(codeReview.effort, "high");
+    assert.equal(codeReview.effort, "max");
 
     // Custom override for one role
     mgr.saveSubagent({ scope: "global", item: { id: "explorer", role: "research", providerInstanceId: "codex", model: "gpt-6.1-sol", effort: "high", description: "custom explorer", systemPrompt: "custom", enabled: true } });
@@ -290,17 +290,19 @@ describe("hub-subagents orchestration Carbon/Argon + /swarm", () => {
     const fakeAgents = path.join(tmpRoot, "fake-AGENTS.md");
     const original = "# My Rules\n\nHello world\n";
     fs.writeFileSync(fakeAgents, original);
-    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on" }, { hostRulePaths: [fakeAgents] }), /旧|legacy/i);
+    const rev = mgr.getOrchestrationState({ hosts: [fakeAgents] }).modeRevision;
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on", expectedRevision: rev }, { hostRulePaths: [fakeAgents] }), /请选择/);
     assert.equal(fs.readFileSync(fakeAgents, "utf8"), original);
-    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "argon" }, { hostRulePaths: [fakeAgents] }), /旧|legacy/i);
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "argon", swarmMode: "on", expectedRevision: rev }, { hostRulePaths: [fakeAgents] }), /请选择/);
     for (const mode of ["swarm", "carbon", "argon", "plan"]) {
       const prompt = mgr.buildSlashCommandPrompt(mode);
       assert.match(prompt, /角色/);
       assert.doesNotMatch(prompt, /严禁亲自改业务代码/);
     }
-    const disabled = mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off" }, { hostRulePaths: [fakeAgents] });
+    const disabled = mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off", expectedRevision: rev }, { hostRulePaths: [fakeAgents] });
     assert.equal(disabled.ok, true);
-    assert.equal(fs.readFileSync(fakeAgents, "utf8"), original);
+    assert.ok(fs.readFileSync(fakeAgents, "utf8").startsWith(original));
+    assert.match(fs.readFileSync(fakeAgents, "utf8"), /常规协作/);
 
   });
 });

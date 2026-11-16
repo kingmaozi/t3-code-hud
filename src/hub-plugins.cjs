@@ -884,33 +884,61 @@ function createPluginsManager({ homeDir = process.env.HOME || os.homedir(), hubD
   function setPluginScope({ id, scope, projectRoot } = {}) {
     assertSafeId(id); validateScope(scope, projectRoot);
     assertHubPath(statePath);
+    // Scope changes need an authoritative owner. A damaged shared state must
+    // never be interpreted as an empty registry and overwritten by a child.
+    function readScopeState() {
+      let value;
+      try { value = JSON.parse(fs.readFileSync(statePath, "utf8")); }
+      catch (error) {
+        if (error.code === "ENOENT") return {};
+        throw new Error("plugin scope state is unreadable; scope change was rejected");
+      }
+      const isRecord = v => v !== null && typeof v === "object" && !Array.isArray(v);
+      if (!isRecord(value) || ["pluginScopes", "pluginProjectRoots"].some(key => value[key] !== undefined && !isRecord(value[key]))) {
+        throw new Error("plugin scope state is invalid; scope change was rejected");
+      }
+      return value;
+    }
+    const previous = readScopeState();
     const plugin = listPlugins().items.find(i => i.id === id); if (!plugin) throw new Error("plugin not found");
-    const previous = readJson(statePath);
-    const oldProject = previous.pluginProjectRoots?.[id];
+    const previousScope = previous.pluginScopes?.[id];
+    if (previousScope !== undefined && !SCOPES.includes(previousScope)) throw new Error("plugin scope state is invalid; scope change was rejected");
+    const recordedProject = previous.pluginProjectRoots?.[id];
+    const oldProject = typeof recordedProject === "string" && path.isAbsolute(recordedProject) ? path.resolve(recordedProject) : null;
+    if (previousScope === "project" && !oldProject) throw new Error("project-scoped plugin owner is missing; scope change was rejected without applying changes");
+    const targetProject = scope === "project" ? (projectRoot || oldProject || null) : scope === "off" ? (oldProject || null) : null;
     const hooks = getHooksManager();
+    const movesProjectScope = !!oldProject && (scope !== "project" || path.resolve(targetProject || "") !== path.resolve(oldProject));
+    const pluginDetailsForScope = id === "t3-memory-vault" ? null : pluginDetails(plugin.installPath);
+    const hasProjectHookRegistration = !!oldProject && hooks?.listHooks?.({ projectRoot: oldProject })?.items?.some(item => item.scope === "project" && item.pluginId === id);
+    const hasProjectHooks = id === "t3-memory-vault" || !!pluginDetailsForScope?.hookEvents?.length || hasProjectHookRegistration;
+    // The Hook manager intentionally keeps project-owned Hook registrations
+    // read-only. Reject a plugin scope move before any skill/MCP writes so the
+    // plugin and its Hook scope cannot be left half-migrated.
+    if (movesProjectScope && hasProjectHooks) throw new Error("project-scoped plugin Hooks are read-only; scope change was rejected without applying partial changes");
     let skippedMcps = [];
     if (id === "t3-memory-vault") {
-      if (oldProject && oldProject !== projectRoot) hooks?.toggleHook?.({ id: "memory-stop-guard", scope: "off", projectRoot: oldProject });
-      hooks?.toggleHook?.({ id: "memory-stop-guard", scope, projectRoot: projectRoot || oldProject });
+      if (oldProject && scope !== "off" && path.resolve(targetProject || "") !== path.resolve(oldProject)) hooks?.toggleHook?.({ id: "memory-stop-guard", scope: "off", projectRoot: oldProject });
+      hooks?.toggleHook?.({ id: "memory-stop-guard", scope, projectRoot: targetProject });
     } else {
-      const d = pluginDetails(plugin.installPath);
+      const d = pluginDetailsForScope;
       // Validate the entire skill set before changing any host configuration.
       d.skillDirs.forEach(sd => assertSafeId(path.basename(sd)));
-      if (oldProject && oldProject !== projectRoot) {
+      if (oldProject && scope !== "off" && path.resolve(targetProject || "") !== path.resolve(oldProject)) {
         for (const sd of d.skillDirs) skillsManager.setSkillScope({ id: path.basename(sd), scope: "off", projectRoot: oldProject, sourceDir: sd });
         hooks?.setPluginHooks?.({ id, pluginId: id, scope: "off", projectRoot: oldProject, installPath: plugin.installPath, hooks: expandPluginRoot(d.hooks, plugin.installPath) });
       }
-      for (const sd of d.skillDirs) skillsManager.setSkillScope({ id: path.basename(sd), scope, projectRoot: projectRoot || oldProject, sourceDir: sd });
+      for (const sd of d.skillDirs) skillsManager.setSkillScope({ id: path.basename(sd), scope, projectRoot: targetProject, sourceDir: sd });
       ({ skippedMcps } = mcpRouter.setPluginMcpScope({
-        pluginId: id, scope, projectRoot: projectRoot || oldProject,
+        pluginId: id, scope, projectRoot: targetProject,
         servers: Object.entries(d.servers).map(([name, config]) => ({
           ...expandPluginRoot(config, plugin.installPath), name, groupTitle: plugin.title, icon: plugin.icon, installed: true,
         })),
       }));
-      if (exists(d.hookFile)) hooks?.setPluginHooks?.({ id, pluginId: id, scope, projectRoot: projectRoot || oldProject, installPath: plugin.installPath, hooks: expandPluginRoot(d.hooks, plugin.installPath) });
+      if (exists(d.hookFile)) hooks?.setPluginHooks?.({ id, pluginId: id, scope, projectRoot: targetProject, installPath: plugin.installPath, hooks: expandPluginRoot(d.hooks, plugin.installPath) });
     }
     // Re-read after the child managers have written their own state sections.
-    const state = readJson(statePath); state.pluginScopes ||= {}; state.pluginScopes[id] = scope;
+    const state = readScopeState(); state.pluginScopes ||= {}; state.pluginScopes[id] = scope;
     state.pluginProjectRoots ||= {};
     if (scope === "project") state.pluginProjectRoots[id] = projectRoot; else delete state.pluginProjectRoots[id];
     fs.mkdirSync(hubDir, { recursive: true });
