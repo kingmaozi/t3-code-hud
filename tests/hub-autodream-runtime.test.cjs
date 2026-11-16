@@ -70,7 +70,7 @@ test("existing AGY setting stays visible but fails before any runner call", asyn
 
 test("Muse receives the selected model and effort through noninteractive stub CLI", async t => {
   const f = fixture(t), argsFile = path.join(f.base, "args"), promptFile = path.join(f.base, "prompt");
-  fakeCli(f, "muse", `printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\ncat > ${JSON.stringify(promptFile)}\nprintf '%s\\n' '{"merges":[]}'`);
+  fakeCli(f, "muse", `printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\nwhile [ "$#" -gt 0 ]; do if [ "$1" = '--prompt-file' ]; then shift; cat "$1" > ${JSON.stringify(promptFile)}; break; fi; shift; done\nprintf '%s\\n' '{"merges":[]}'`);
   seedGray(f);
   const up = f.vault.updateDreamConfig({ dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "max", minDeltaMemories: 1 });
   assert.equal(up.ok, true);

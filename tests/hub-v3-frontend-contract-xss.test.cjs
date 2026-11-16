@@ -1204,12 +1204,14 @@ test("plan scrolling survives polling and geometry updates but resets for a new 
   assert.equal(scroll.scrollTop, 0, "new threads start at the top");
 });
 
-test("dashboard shows real plan, read-only native text and honest subagent fallback", () => {
+test("dashboard shows only the main plan while the full task panel keeps all subagents", () => {
   const { ui } = relationFixture(), board = ui.nodes.get("#t3-hub-live-board");
   ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
   ui.cache.board = { source: "t3-native", steps: [] }; ui.renderLiveBoard();
   assert.equal(board.hidden, false); assert.match(board.innerHTML, /暂无主计划/);
-  for (const name of ["open-board-studio", "toggle-board", "reset-dashboard-position", "dashboard-tab"]) assert.ok(board.innerHTML.includes(`data-action="${name}"`));
+  for (const name of ["open-board-studio", "toggle-board", "reset-dashboard-position"]) assert.ok(board.innerHTML.includes(`data-action="${name}"`));
+  assert.match(board.innerHTML, /任务面板/);
+  assert.doesNotMatch(board.innerHTML, /计划进度|子代理任务进度|hub-dashboard-links|data-action="dashboard-tab"/);
   ui.cache.board = { source: "t3-native", steps: [{ text: "核对页面", status: "pending" }] }; ui.renderLiveBoard();
   assert.match(board.innerHTML, /0\/1/); assert.match(board.innerHTML, /role="progressbar"/);
   assert.doesNotMatch(board.innerHTML, /data-action="board-step"/);
@@ -1217,8 +1219,164 @@ test("dashboard shows real plan, read-only native text and honest subagent fallb
   assert.match(board.innerHTML, /计划原文/); assert.match(board.innerHTML, /&lt;img src=x&gt;/);
   assert.doesNotMatch(board.innerHTML, /暂无主计划|role="progressbar"/);
   ui.cache.board = { steps: [], subagents: [{ title: "任务一", rawStatus: "failed" }, { title: "任务二", rawStatus: "completed" }, { title: "任务三", rawStatus: "unknown" }] }; ui.renderLiveBoard();
-  assert.match(board.innerHTML, /本会话子任务/); assert.match(board.innerHTML, /失败 1/); assert.match(board.innerHTML, /已完成 1/); assert.match(board.innerHTML, /状态未知 1/);
+  assert.match(board.innerHTML, /暂无计划/); assert.match(board.innerHTML, /暂无主计划/);
+  assert.doesNotMatch(board.innerHTML, /子代理任务进度|本会话子任务|任务一|任务二|任务三|data-tab="subagents"/);
+  assert.doesNotMatch(board.innerHTML, /data-tab="hooks"|data-tab="plugins"/);
   assert.doesNotMatch(board.innerHTML, /role="progressbar"/);
+  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /任务面板/);
+  for (const expected of ["本会话子任务", "任务一", "任务二", "任务三", "失败 1", "已完成 1", "状态未知 1"]) assert.ok(ui.content.innerHTML.includes(expected));
+  ui.cache.board = { source: "t3-native", steps: [{ text: "主计划步骤", status: "pending" }], subagents: [{ title: "计划下的子任务", rawStatus: "running" }] };
+  ui.renderLiveBoard(); assert.match(board.innerHTML, /主计划步骤/); assert.doesNotMatch(board.innerHTML, /计划下的子任务/);
+  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /主计划步骤/); assert.match(ui.content.innerHTML, /计划下的子任务/);
+});
+
+test("floating dashboard retains document access and original artifact indices", () => {
+  const { ui } = relationFixture(), board = ui.nodes.get("#t3-hub-live-board");
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [{ name: "report.md", path: "/session/report.md" }, { name: "implementation_plan.md", path: "/session/implementation_plan.md" }, { name: "task.md", path: "/session/task.md" }] };
+  ui.renderLiveBoard();
+  assert.match(board.innerHTML, /data-action="read-artifact" data-index="0"[^>]*report\.md/);
+  assert.match(board.innerHTML, /data-action="read-artifact" data-index="1"[^>]*implementation_plan\.md/);
+  assert.match(board.innerHTML, /data-action="read-artifact" data-index="2"[^>]*task\.md/);
+  assert.equal((board.innerHTML.match(/class="hub-artifact-card"/g) || []).length, 3);
+  assert.match(board.innerHTML, /hub-artifact-icon/);
+  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /report\.md/);
+});
+
+test("floating artifact cards reveal the verified file while the full panel still previews Markdown", async () => {
+  const calls = [];
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "board:openArtifact") return payload.operation === "reveal" ? { kind: "revealed" } : { kind: "markdown", name: "A.md", content: "预览正文" };
+    return {};
+  });
+  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+  const board = ui.nodes.get("#t3-hub-live-board"), target = node();
+  target.dataset = { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" }; target.closest = () => target; target.isConnected = true;
+  ui.root.contains = (item) => item === target;
+  let floating = true;
+  board.contains = (item) => floating && item === target;
+  ui.content.contains = (item) => !floating && item === target;
+  const a = { path: "/fixture/A.md", name: "A.md" }, c = { path: "/fixture/C.md", name: "C.md" };
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.renderLiveBoard();
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [c, a] };
+  ui.onClick({ target }); await new Promise(setImmediate);
+  let opens = calls.filter((call) => call.action === "board:openArtifact");
+  assert.equal(opens.length, 1); assert.equal(opens[0].payload.path, "/fixture/A.md"); assert.equal(opens[0].payload.operation, "reveal");
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [c] };
+  ui.onClick({ target }); await new Promise(setImmediate);
+  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "a removed file cannot reveal its replacement");
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a, a] };
+  ui.onClick({ target }); await new Promise(setImmediate);
+  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "ambiguous paths cannot reveal a file");
+  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.state.projectRoot = "/another-project";
+  ui.onClick({ target }); await new Promise(setImmediate);
+  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "another project cannot reveal an old file");
+  ui.state.projectRoot = "/fixture"; ui.sandbox.location.pathname = "/threads/thread-b"; ui.sandbox.location.href = "https://fixture.test/threads/thread-b";
+  ui.onClick({ target }); await new Promise(setImmediate);
+  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "another session cannot reveal an old file");
+  ui.sandbox.location.pathname = "/threads/thread-a"; ui.sandbox.location.href = "https://fixture.test/threads/thread-a";
+  floating = false; ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.renderBoardTab();
+  ui.onClick({ target }); await new Promise(setImmediate);
+  opens = calls.filter((call) => call.action === "board:openArtifact");
+  assert.equal(opens.length, 2); assert.equal(opens[1].payload.path, "/fixture/A.md");
+  assert.notEqual(opens[1].payload.operation, "reveal"); assert.equal(ui.state.artifact.content, "预览正文");
+});
+
+test("Hub steps containing CRLF and CR can be toggled without losing identity", async () => {
+  for (const text of ["第一行\r\n第二行", "第一行\r第二行", "第一行\n第二行"]) {
+    const calls = [], snapshot = { source: "hub-mcp", steps: [{ id: "hub-a", text, status: "pending" }] };
+    const ui = harness(async (action, payload) => { calls.push({ action, payload }); return action === "board:get" ? snapshot : {}; });
+    ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+    ui.cache.board = snapshot; ui.renderBoardTab();
+    const htmlValue = ui.content.innerHTML.match(/data-step-text="([^"]*)"/)[1];
+    // HTML tokenization normalizes raw CR / CRLF before resolving character references.
+    const datasetValue = htmlValue.replace(/\r\n?/g, "\n").replace(/&#13;/g, "\r");
+    const target = node(); target.dataset = { action: "board-step", index: "0", stepId: "hub-a", stepText: datasetValue }; target.closest = () => target;
+    ui.root.contains = (item) => item === target; ui.content.contains = (item) => item === target;
+    ui.onClick({ target }); await new Promise(setImmediate);
+    const update = calls.find((call) => call.action === "board:update");
+    assert.ok(update, `unchanged ${JSON.stringify(text)} should remain clickable`);
+    assert.equal(update.payload.steps[0].text, text); assert.equal(update.payload.steps[0].status, "completed");
+  }
+});
+
+test("the full task panel applies the latest snapshot after the user leaves its focused editor", async () => {
+  const ui = harness(async () => ({ threadId: "thread-a", source: "t3-native", steps: [{ text: "最新主计划", status: "pending" }], subagents: [{ title: "最新子任务", rawStatus: "running" }] }));
+  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+  let editing = true; ui.content.contains = () => editing;
+  ui.content.innerHTML = "用户正在编辑的内容";
+  await ui.pollBoard();
+  assert.equal(ui.content.innerHTML, "用户正在编辑的内容", "polling must not replace a focused editor");
+  editing = false;
+  await ui.pollBoard();
+  assert.match(ui.content.innerHTML, /最新主计划/);
+  assert.match(ui.content.innerHTML, /最新子任务/);
+});
+
+test("a task-panel read failure preserves focused editing and displays the error after blur", async () => {
+  const ui = harness(async () => { throw new Error("temporary failure"); });
+  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+  let editing = true; ui.content.contains = () => editing; ui.content.innerHTML = "用户正在编辑的内容";
+  await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
+  editing = false; await ui.pollBoard(); assert.match(ui.content.innerHTML, /读取失败/);
+});
+
+test("a task-panel failure recovering while focused renders fresh data after blur", async () => {
+  let fail = true;
+  const ui = harness(async () => { if (fail) throw new Error("temporary failure"); return { threadId: "thread-a", source: "t3-native", steps: [{ text: "恢复后的计划", status: "pending" }] }; });
+  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+  let editing = true; ui.content.contains = () => editing; ui.content.innerHTML = "用户正在编辑的内容";
+  await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
+  fail = false; await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
+  editing = false; await ui.pollBoard(); assert.match(ui.content.innerHTML, /恢复后的计划/);
+});
+
+test("stale task-panel buttons never target a different step or artifact", async () => {
+  async function scenario(oldBoard, newBoard, dataset, beforeClick = () => {}) {
+    const calls = [];
+    const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "board:get") return newBoard; if (action === "board:openArtifact") return { kind: "revealed" }; return {}; });
+    ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+    const editor = node(), target = node(); target.dataset = dataset; target.closest = () => target;
+    ui.content.contains = (item) => item === editor || item === target;
+    ui.root.contains = (item) => item === target;
+    ui.sandbox.document.activeElement = editor; ui.cache.board = oldBoard; ui.renderBoardTab();
+    const displayed = ui.content.innerHTML;
+    await ui.pollBoard(); assert.equal(ui.content.innerHTML, displayed, "focused editor keeps its old DOM");
+    beforeClick(ui); ui.onClick({ target }); await new Promise(setImmediate);
+    return { calls, ui };
+  }
+  const oldSteps = { source: "hub-mcp", steps: [{ id: "hub-a", text: "A", status: "pending" }], artifacts: [] };
+  const newSteps = { threadId: "thread-a", source: "hub-mcp", steps: [{ id: "hub-c", text: "C", status: "pending" }], artifacts: [] };
+  const step = await scenario(oldSteps, newSteps, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
+  assert.equal(step.calls.filter((call) => call.action === "board:update").length, 0, "old A must never toggle new C");
+  const oldArtifacts = { source: "t3-native", steps: [], artifacts: [{ path: "/fixture/A.md", name: "A.md" }] };
+  const newArtifacts = { threadId: "thread-a", source: "t3-native", steps: [], artifacts: [{ path: "/fixture/C.md", name: "C.md" }] };
+  const artifact = await scenario(oldArtifacts, newArtifacts, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
+  assert.equal(artifact.calls.filter((call) => call.action === "board:openArtifact").length, 0, "old A.md must never open C.md");
+  const reordered = await scenario(oldSteps, { ...newSteps, steps: [newSteps.steps[0], oldSteps.steps[0]] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
+  const update = reordered.calls.find((call) => call.action === "board:update");
+  assert.equal(update.payload.steps[0].status, "pending"); assert.equal(update.payload.steps[1].status, "completed", "unique stable A may follow a reorder");
+  const changedStatus = await scenario(oldSteps, { ...newSteps, steps: [{ ...oldSteps.steps[0], status: "completed" }] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
+  assert.equal(changedStatus.calls.filter((call) => call.action === "board:update").length, 0, "a changed status cannot reverse an unseen update");
+  const duplicate = await scenario({ ...oldSteps, steps: [oldSteps.steps[0], oldSteps.steps[0]] }, { ...newSteps, steps: [oldSteps.steps[0]] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
+  assert.equal(duplicate.calls.filter((call) => call.action === "board:update").length, 0, "duplicate IDs are ambiguous");
+  const synthetic = { ...oldSteps, steps: [{ id: "step-1", text: "A", status: "pending" }, { id: "step-2", text: "B", status: "pending" }] };
+  const positional = await scenario(synthetic, { ...newSteps, steps: [synthetic.steps[0], { id: "step-2", text: "C", status: "pending" }] }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
+  assert.equal(positional.calls.filter((call) => call.action === "board:update").length, 0, "a positional ID cannot establish identity after list changes");
+  const unchanged = await scenario(synthetic, { ...newSteps, steps: synthetic.steps }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
+  assert.equal(unchanged.calls.filter((call) => call.action === "board:update").length, 1, "an unchanged unique positional plan remains editable");
+  const repeatedSynthetic = { ...synthetic, steps: [synthetic.steps[0], { id: "step-2", text: "A", status: "pending" }] };
+  const ambiguousSynthetic = await scenario(repeatedSynthetic, { ...newSteps, steps: repeatedSynthetic.steps }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
+  assert.equal(ambiguousSynthetic.calls.filter((call) => call.action === "board:update").length, 0, "duplicate positional rows remain ambiguous even before a reorder");
+  const movedArtifact = await scenario(oldArtifacts, { ...newArtifacts, artifacts: [newArtifacts.artifacts[0], oldArtifacts.artifacts[0]] }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
+  assert.equal(movedArtifact.calls.find((call) => call.action === "board:openArtifact").payload.path, "/fixture/A.md");
+  const duplicateArtifact = await scenario(oldArtifacts, { ...newArtifacts, artifacts: [oldArtifacts.artifacts[0], oldArtifacts.artifacts[0]] }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
+  assert.equal(duplicateArtifact.calls.filter((call) => call.action === "board:openArtifact").length, 0, "duplicate artifact paths are ambiguous");
+  const otherProject = await scenario(oldSteps, { ...newSteps, steps: oldSteps.steps }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" }, (ui) => { ui.state.projectRoot = "/another-project"; });
+  assert.equal(otherProject.calls.filter((call) => call.action === "board:update").length, 0, "a different project cannot reuse the old view");
+  const otherThread = await scenario(oldArtifacts, { ...newArtifacts, artifacts: oldArtifacts.artifacts }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" }, (ui) => { ui.sandbox.location.pathname = "/threads/thread-b"; ui.sandbox.location.href = "https://fixture.test/threads/thread-b"; });
+  assert.equal(otherThread.calls.filter((call) => call.action === "board:openArtifact").length, 0, "a different route cannot reuse the old view");
 });
 
 test("thread IDs follow threads, _chat, hash, UUID, then current context", () => {
@@ -1271,7 +1429,7 @@ test("route changes clear old plans and artifacts synchronously, request the new
   assert.equal(ui.state.threadId, "thread-b");
   assert.equal(ui.cache.board, null);
   assert.equal(ui.state.artifact, null);
-  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划进度<[^>]*><span[^>]*>读取中/);
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /任务面板<[^>]*><span[^>]*>读取中/);
   await new Promise(setImmediate);
   assert.ok(calls.some((x) => x.action === "board:get" && x.threadId === "thread-b" && x.excludeSubagentInference === true));
   replies.get("thread-b")({ steps: [{ text: "new plan" }] });

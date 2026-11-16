@@ -442,6 +442,7 @@ function createMemoryVault(opts = {}) {
   const healthFn = opts._healthFn || opts.healthFn || null;
   const embedHealthUrl = opts.embeddingHealthUrl || embedUrl.replace(/\/v1\/embeddings\/?$/, "/health");
   const vaultAutoConsolidateThreshold = opts.autoConsolidateThreshold != null ? Number(opts.autoConsolidateThreshold) : 60;
+  const dreamPromptTempRoot = opts._dreamPromptTempRoot || os.tmpdir();
   let _healthCache = { modelId: null, dim: null, at: 0 };
   let _reindexing = false;
 
@@ -3302,14 +3303,58 @@ function createMemoryVault(opts = {}) {
     const text = String(error && error.message || error || "");
     const exit = /^cli-exit-(\d+)/.exec(text);
     if (exit) return "cli-exit-" + exit[1];
-    for (const code of ["cli-timeout", "cli-output-overflow", "cli-unavailable", "cli-spawn-failed", "executable-not-found", "unsupported-provider", "unsupported-effort", "invalid-model", "json-parse-failed", "invalid-agent-result", "prompt-over-budget", "gate-skip-delta"]) {
+    for (const code of ["cli-timeout", "cli-output-overflow", "cli-unavailable", "cli-spawn-failed", "cli-temp-cleanup-failed", "executable-not-found", "unsupported-provider", "unsupported-effort", "invalid-model", "json-parse-failed", "invalid-agent-result", "prompt-over-budget", "gate-skip-delta"]) {
       if (text === code || text.startsWith(code + ":")) return code;
     }
     return "agent-run-failed";
   }
+  // Muse requires a regular prompt file. The directory and file are private,
+  // exclusive to this invocation, and never cleaned recursively.
+  async function runDreamAgentWithPromptFile(options) {
+    const args = Array.isArray(options.args) ? [...options.args] : [];
+    const flag = args.indexOf("--prompt-file");
+    if (flag < 0 || flag + 1 >= args.length || args.lastIndexOf("--prompt-file") !== flag) throw new Error("cli-spawn-failed:invalid-prompt-file-option");
+    let dir, file, dirIdentity, fileIdentity, fd;
+    const sameFile = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+    try {
+      dir = fs.mkdtempSync(path.join(dreamPromptTempRoot, "t3-dream-prompt-"));
+      dirIdentity = fs.lstatSync(dir, { bigint: true });
+      if (!dirIdentity.isDirectory() || dirIdentity.isSymbolicLink()) throw new Error("cli-spawn-failed:unsafe-temp-directory");
+      fs.chmodSync(dir, 0o700);
+      file = path.join(dir, "prompt.txt");
+      fd = fs.openSync(file, "wx", 0o600);
+      fileIdentity = fs.fstatSync(fd, { bigint: true });
+      fs.fchmodSync(fd, 0o600);
+      fs.writeFileSync(fd, String(options.prompt || ""), "utf8");
+      fs.closeSync(fd); fd = undefined;
+      args[flag + 1] = file;
+      return await runDreamAgentCli({ ...options, args, prompt: "", promptFile: false });
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+      if (dir) {
+        try {
+          let currentDir;
+          try { currentDir = fs.lstatSync(dir, { bigint: true }); } catch (e) { if (e.code !== "ENOENT") throw e; }
+          if (currentDir) {
+            if (!sameFile(currentDir, dirIdentity) || !currentDir.isDirectory() || currentDir.isSymbolicLink()) throw new Error("directory-replaced");
+            if (file && fileIdentity) {
+              let currentFile;
+              try { currentFile = fs.lstatSync(file, { bigint: true }); } catch (e) { if (e.code !== "ENOENT") throw e; }
+              if (currentFile) {
+                if (!sameFile(currentFile, fileIdentity) || !currentFile.isFile() || currentFile.isSymbolicLink()) throw new Error("file-replaced");
+                fs.unlinkSync(file);
+              }
+            }
+            fs.rmdirSync(dir);
+          }
+        } catch { throw new Error("cli-temp-cleanup-failed"); }
+      }
+    }
+  }
   // 梦境 CLI 纯异步非阻塞执行：child_process.spawn + stdin，stdout/stderr 流式收集（512KB 封顶），
   // 60s 超时先 SIGTERM、100ms 后 SIGKILL，超时/溢出/非零退出均经 Promise 拒绝优雅降级。
   function runDreamAgentCli(opts = {}) {
+    if (opts.promptFile === true) return runDreamAgentWithPromptFile(opts);
     const cmd = opts.cmd;
     const args = Array.isArray(opts.args) ? opts.args : [];
     const prompt = String(opts.prompt || "");
@@ -4022,10 +4067,10 @@ function createMemoryVault(opts = {}) {
                 if (prov !== "muse") throw new Error("unsupported-provider");
                 const cmd = findDreamExecutable(prov);
                 if (!cmd) throw new Error("executable-not-found");
-                const args = ["exec", "--model", model, "--reasoning-effort", reasoningEffort, "--preset", "empty", "--prompt-file", "/dev/stdin", "--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--disable-request-user-input", "--no-foreign-personal-context", "--no-session-log", "--approval-mode", "never"];
+                const args = ["exec", "--model", model, "--reasoning-effort", reasoningEffort, "--preset", "empty", "--prompt-file", "", "--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--disable-request-user-input", "--no-foreign-personal-context", "--no-session-log", "--approval-mode", "never"];
                 try {
                   // 纯异步非阻塞执行：await 让出事件循环，深睡等待期间 Node 仍可并发响应。
-                  const res = await runDreamAgentCli({ cmd, args, prompt, timeoutMs: 60000, maxOutputBytes: 512 * 1024 });
+                  const res = await runDreamAgentCli({ cmd, args, prompt, promptFile: true, timeoutMs: 60000, maxOutputBytes: 512 * 1024 });
                   const txt = String(res.stdout || "").trim();
                   // 截取首个 JSON
                   const m = txt.match(/\{[\s\S]*\}/);

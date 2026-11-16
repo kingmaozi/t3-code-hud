@@ -35,6 +35,7 @@
     let resizeDrag = null;
     let lastComposer = null;
     let boardSignature = "";
+    let boardRenderedSignature = "";
     let focusReturn = null;
     let requestVersion = 0;
     let contextVersion = 0;
@@ -56,6 +57,7 @@
     let slashSession = null;
     const slashCache = new Map();
     const subagentSaves = new Map();
+    const boardViewSnapshots = new WeakMap();
     const tabKeys = ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"];
     const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, overview: null, memory: null, worktree: null, dream: null, health: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
     const errors = {};
@@ -117,6 +119,9 @@
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
+    // HTML normalizes literal CR in attributes; a character reference keeps
+    // the exact identity used to validate a previously rendered button.
+    function escIdentity(value) { return esc(value).replace(/\r/g, "&#13;"); }
     function items(value, keys = ["items"]) {
       if (Array.isArray(value)) return value;
       for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
@@ -158,6 +163,7 @@
       plug: '<path d="M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0V8Zm6 10v3"/>',
       memory: '<path d="M9 4a3 3 0 0 0-5 3 4 4 0 0 0-1 7 4 4 0 0 0 6 5V4Zm6 0a3 3 0 0 1 5 3 4 4 0 0 1 1 7 4 4 0 0 1-6 5V4Z"/><path d="M5 9h4m6 5h4M6 16h3m6-9h3"/>',
       edit: '<path d="m15 4 5 5M4 20l5-1L21 7a2 2 0 0 0-5-5L4 14v6Z"/>',
+      file: '<path d="M6 3h8l5 5v13H6zM14 3v5h5M9 13h7M9 17h7"/>',
       folder: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
       github: '<path d="M9 20c-4 1-4-2-6-2m12 4v-4a3 3 0 0 0-1-2c3 0 6-2 6-5a5 5 0 0 0-1-3 5 5 0 0 0 0-4s-2-1-4 1a13 13 0 0 0-6 0C7 3 5 4 5 4a5 5 0 0 0 0 4 5 5 0 0 0-1 3c0 3 3 5 6 5a3 3 0 0 0-1 2v4"/>',
       globe: '<circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/>',
@@ -294,6 +300,7 @@
         .hub-resource-grid{align-items:stretch;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.hub-resource-card{display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:14px;margin:0;min-width:0}.hub-resource-card .hub-card-top{align-items:flex-start;min-width:0}.hub-resource-card .hub-grow{min-width:0}.hub-resource-card .hub-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:6px;min-width:0}.hub-resource-card .hub-card-description{margin:0;min-height:42px}.hub-resource-card .hub-resource-toggle{width:100%;max-width:none;align-items:flex-start;margin-top:auto;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-resource-card .hub-agent-toggle{width:100%;justify-content:flex-start}.hub-resource-controls-label{font-size:9px;color:var(--hub-secondary);margin-top:2px}.hub-resource-card .hub-mcp-mode-controls{grid-column:auto;width:100%;grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:0;padding:9px}.hub-resource-card .hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}.hub-unavailable-hint{color:var(--hub-secondary);font-size:9px}.hub-unavailable{border-color:color-mix(in srgb,var(--hud-amber) 45%,var(--hub-border));color:var(--hub-secondary)}.hub-route-status{white-space:normal;text-overflow:clip}
         @media(max-width:639px){.hub-mcp-mode-controls{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}}
         #t3-hub-live-board{border-radius:14px;padding:0;box-shadow:0 12px 36px #0f172a24,0 2px 8px #0f172a12;max-width:calc(100vw - 16px)}
+        #t3-hub-live-board .hub-artifacts{display:grid;grid-template-columns:minmax(0,1fr);gap:7px}#t3-hub-live-board .hub-artifact-card{display:flex;align-items:center;gap:10px;min-width:0;width:100%;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle);color:var(--hub-ink);text-align:left;font-size:11px;cursor:pointer}#t3-hub-live-board .hub-artifact-card:hover{border-color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-icon{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:7px;background:var(--hub-bg);color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .hub-board-toolbar{gap:4px;flex-wrap:nowrap;padding:10px 10px 8px;border-bottom:1px solid var(--hub-border)}
         .hub-board-drag{display:flex;align-items:center;gap:7px;min-width:0;flex:1;cursor:grab;user-select:none;touch-action:none;-webkit-app-region:no-drag}.hub-board-drag:active{cursor:grabbing}.hub-board-grip{font-size:15px;letter-spacing:-3px;color:var(--hub-muted);padding-right:4px}.hub-board-drag strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.hub-board-drag .hub-board-status{font-size:10px;color:var(--hub-secondary);white-space:nowrap}
         .hub-board-toolbar .hub-icon-btn{width:25px;height:25px;flex:none}.hub-board-content{padding:10px 12px 12px}.hub-board-source{display:flex;justify-content:space-between;gap:6px;font-size:10px;color:var(--hub-secondary);margin-bottom:8px}.hub-board-meter{height:5px;border-radius:10px;background:var(--hub-border);overflow:hidden;margin:0 0 12px}.hub-board-meter>i{display:block;height:100%;border-radius:inherit;background:var(--hub-accent)}.hub-dashboard-links{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--hub-border);margin-top:12px;padding-top:10px}.hub-dashboard-links button{border:0;border-radius:7px;background:var(--hub-bg-subtle);padding:4px 7px;color:var(--hub-secondary);font-size:10px!important}.hub-dashboard-links button:hover{color:var(--hub-ink)}
@@ -304,7 +311,7 @@
       document.head.appendChild(style);
       root = document.createElement("div");
       root.id = "t3-sidecar-hub-root";
-      root.innerHTML = `<button type="button" id="t3-hub-handle" aria-controls="t3-hub-drawer" aria-expanded="false">${icon("hub", 15)}<span class="hub-handle-label">HUB</span><span class="hub-handle-count" hidden></span></button><button type="button" id="t3-hub-plan-handle" data-action="open-board-studio" aria-controls="t3-hub-drawer" hidden></button><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="实时任务进度" hidden></section>`;
+      root.innerHTML = `<button type="button" id="t3-hub-handle" aria-controls="t3-hub-drawer" aria-expanded="false">${icon("hub", 15)}<span class="hub-handle-label">HUB</span><span class="hub-handle-count" hidden></span></button><button type="button" id="t3-hub-plan-handle" data-action="open-board-studio" aria-controls="t3-hub-drawer" hidden></button><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="任务面板" hidden></section>`;
       document.body.appendChild(root);
       drawer = root.querySelector("#t3-hub-drawer");
       handle = root.querySelector("#t3-hub-handle");
@@ -1633,7 +1640,6 @@
       const board = boardData(), progress = board.progress;
       if (progress.total) return `${progress.completed}/${progress.total} ${tr("完成", "complete")}`;
       if (board.planMarkdown) return tr("计划文档", "Plan document");
-      if (board.subagents.length) return tr(`${board.subagents.length} 项`, `${board.subagents.length} tasks`);
       return tr("暂无计划", "No plan");
     }
     function boardData() {
@@ -1663,6 +1669,42 @@
     }
     function hasActualPlan(board = boardData()) { return board.steps.length > 0 || !!String(board.planMarkdown || "").trim(); }
     function isManualBoard(board = boardData()) { return /^(hub|hub-mcp)$/i.test(String(board.source || "")); }
+    function artifactIdentity(artifact) {
+      const value = typeof artifact === "string" ? artifact : artifact?.path || artifact?.id || artifact?.name;
+      return typeof value === "string" ? value : "";
+    }
+    function boardStepIdentity(step) { return { id: String(step.id ?? ""), text: String(step.text ?? ""), status: String(step.status ?? "") }; }
+    function rememberBoardView(surface) {
+      const board = boardData();
+      boardViewSnapshots.set(surface, { projectRoot: state.projectRoot || "", threadId: state.threadId || "", route: routeKey(), source: String(board.source || ""), steps: board.steps.map(boardStepIdentity), artifacts: board.artifacts.map(artifactIdentity) });
+    }
+    function resolveBoardClick(target, type) {
+      const surface = liveBoard?.contains(target) ? liveBoard : content?.contains(target) ? content : null;
+      const view = surface && boardViewSnapshots.get(surface);
+      const index = Number(target.dataset.index), board = boardData();
+      if (!view || !Number.isInteger(index) || index < 0 || view.projectRoot !== (state.projectRoot || "") || view.threadId !== (state.threadId || "") || view.route !== routeKey() || boardProblem()) return null;
+      if (type === "step") {
+        const shown = view.steps[index], current = board.steps.map(boardStepIdentity);
+        if (!shown || !shown.id || target.dataset.stepId !== shown.id || target.dataset.stepText !== shown.text || !isManualBoard(board) || view.source !== String(board.source || "")) return null;
+        const oldMatches = view.steps.filter((step) => step.id === shown.id);
+        const newMatches = current.map((step, position) => ({ step, position })).filter(({ step }) => step.id === shown.id);
+        if (oldMatches.length !== 1 || newMatches.length !== 1) return null;
+        const match = newMatches[0];
+        if (match.step.text !== shown.text || match.step.status !== shown.status) return null;
+        // Positional IDs are trustworthy only while the entire ordered list
+        // is unchanged, and duplicate displayed rows remain ambiguous.
+        if (/^(?:step[-_])?\d+$/i.test(shown.id) && (JSON.stringify(view.steps) !== JSON.stringify(current) || view.steps.filter((step) => step.text === shown.text && step.status === shown.status).length !== 1)) return null;
+        return match.position;
+      }
+      const shown = view.artifacts[index];
+      if (!shown || target.dataset.artifactPath !== shown || view.artifacts.filter((path) => path === shown).length !== 1) return null;
+      const matches = board.artifacts.map(artifactIdentity).map((path, position) => ({ path, position })).filter((item) => item.path === shown);
+      return matches.length === 1 ? matches[0].position : null;
+    }
+    function rejectStaleBoardClick() {
+      boardRenderedSignature = "";
+      toast(tr("计划或产物已变化，请刷新后重试", "The plan or artifact changed; refresh and try again"), true);
+    }
     function runCategory(run) {
       const raw = String(run.rawStatus || "").trim().toLowerCase().replace(/[- ]/g, "_");
       if (["completed", "succeeded", "success", "done"].includes(raw)) return "completed";
@@ -1687,13 +1729,15 @@
       manual = manual && isManualBoard(board);
       const artifactButtons = board.artifacts.map((artifact, index) => {
         const file = typeof artifact === "string" ? artifact : artifact.name || artifact.title || artifact.path || artifact.id;
-        return `<button type="button" class="hub-artifact-chip" data-action="read-artifact" data-index="${index}" title="${esc(file)}">${icon("edit", 11)} ${esc(String(file || "document.md").split(/[\\/]/).pop())}</button>`;
+        const name = String(file || "document.md").split(/[\\/]/).pop();
+        const label = compact ? `${tr("在 Finder 中显示", "Show in Finder")} · ${name}` : name;
+        return `<button type="button" class="${compact ? "hub-artifact-card" : "hub-artifact-chip"}" data-action="read-artifact" data-index="${index}" data-artifact-path="${escIdentity(artifactIdentity(artifact))}" title="${esc(label)}" aria-label="${esc(label)}">${compact ? `<span class="hub-artifact-icon">${icon("file", 16)}</span><span class="hub-artifact-name">${esc(name)}</span>` : `${icon("edit", 11)} ${esc(name)}`}</button>`;
       }).join("");
       const markdown = String(board.planMarkdown || "").trim();
       const markdownLimit = compact ? 1800 : 40000;
       const markdownHtml = markdown && !board.steps.length ? `<p class="hub-hint">${esc(tr("计划原文 · 暂无可计算的步骤进度", "Plan text · no countable step progress"))}</p><div class="hub-board-background">${esc(markdown.slice(0, markdownLimit))}${markdown.length > markdownLimit ? esc(tr("\n…内容较长，打开完整计划查看更多", "\n…Open the full plan to see more")) : ""}</div>` : "";
       const hasPlan = hasActualPlan(board);
-      return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${esc(step.id)}" data-step-text="${esc(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!hasPlan ? subagentSummary(board, !compact) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
+      return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${escIdentity(step.id)}" data-step-text="${escIdentity(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!compact ? subagentSummary(board, true) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
     function renderLiveBoard() {
       if (!liveBoard) return;
@@ -1710,9 +1754,10 @@
       liveBoard.dataset.projectRoot = state.projectRoot || "";
       liveBoard.classList.toggle("is-collapsed", !state.boardExpanded);
       const board = boardData(), hasPlan = hasActualPlan(board);
-      const heading = !problem && !hasPlan && board.subagents.length ? tr("子代理任务进度", "Subagent tasks") : tr("计划进度", "Plan progress");
+      const heading = tr("任务面板", "Task board");
       const percent = board.progress.total > 0 ? Math.max(0, Math.min(100, board.progress.completed / board.progress.total * 100)) : 0;
-      liveBoard.innerHTML = `<div class="hub-board-toolbar"><div class="hub-board-drag" data-board-drag tabindex="0" aria-label="${esc(tr("拖动仪表盘；方向键可移动", "Drag dashboard; use arrow keys to move"))}" title="${esc(tr("拖动到窗口任意位置", "Drag anywhere in the window"))}"><span class="hub-board-grip" aria-hidden="true">⋮⋮</span><strong>${esc(heading)}</strong>${board.progress.total ? `<svg class="hub-progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-border)" stroke-width="3"></circle><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-accent)" stroke-width="3" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="${44 * (1 - percent / 100)}"></circle></svg>` : ""}<span class="hub-board-status">${esc(status)}</span></div><button type="button" class="hub-icon-btn" data-action="reset-dashboard-position" aria-label="${esc(tr("重置悬浮位置", "Reset dashboard position"))}" title="${esc(tr("重置悬浮位置", "Reset dashboard position"))}">${icon("refresh", 12)}</button><button type="button" class="hub-icon-btn" data-action="toggle-board" aria-expanded="${state.boardExpanded}" aria-label="${esc(state.boardExpanded ? tr("收起仪表盘", "Collapse dashboard") : tr("展开仪表盘", "Expand dashboard"))}">${state.boardExpanded ? "−" : "+"}</button><button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 14)}</button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${hasPlan ? `<div class="hub-board-source"><span>${esc(planSourceSummary(board))}</span><span>${esc(board.progress.total ? status : tr("进度未量化", "Progress not quantified"))}</span></div>${board.progress.total ? `<div class="hub-board-meter" role="progressbar" aria-label="${esc(tr("计划完成进度", "Plan completion"))}" aria-valuemin="0" aria-valuemax="${board.progress.total}" aria-valuenow="${board.progress.completed}"><i style="width:${percent}%"></i></div>` : ""}` : ""}${boardMarkup(true, true)}`}<nav class="hub-dashboard-links" aria-label="${esc(tr("仪表盘快捷入口", "Dashboard shortcuts"))}"><button type="button" data-action="dashboard-tab" data-tab="subagents">${esc(tr("子代理", "Agents"))}</button><button type="button" data-action="dashboard-tab" data-tab="hooks">Hooks</button><button type="button" data-action="dashboard-tab" data-tab="plugins">${esc(tr("插件", "Plugins"))}</button></nav></div>` : ""}`;
+      liveBoard.innerHTML = `<div class="hub-board-toolbar"><div class="hub-board-drag" data-board-drag tabindex="0" aria-label="${esc(tr("拖动仪表盘；方向键可移动", "Drag dashboard; use arrow keys to move"))}" title="${esc(tr("拖动到窗口任意位置", "Drag anywhere in the window"))}"><span class="hub-board-grip" aria-hidden="true">⋮⋮</span><strong>${esc(heading)}</strong>${board.progress.total ? `<svg class="hub-progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-border)" stroke-width="3"></circle><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-accent)" stroke-width="3" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="${44 * (1 - percent / 100)}"></circle></svg>` : ""}<span class="hub-board-status">${esc(status)}</span></div><button type="button" class="hub-icon-btn" data-action="reset-dashboard-position" aria-label="${esc(tr("重置悬浮位置", "Reset dashboard position"))}" title="${esc(tr("重置悬浮位置", "Reset dashboard position"))}">${icon("refresh", 12)}</button><button type="button" class="hub-icon-btn" data-action="toggle-board" aria-expanded="${state.boardExpanded}" aria-label="${esc(state.boardExpanded ? tr("收起仪表盘", "Collapse dashboard") : tr("展开仪表盘", "Expand dashboard"))}">${state.boardExpanded ? "−" : "+"}</button><button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 14)}</button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${hasPlan ? `<div class="hub-board-source"><span>${esc(planSourceSummary(board))}</span><span>${esc(board.progress.total ? status : tr("进度未量化", "Progress not quantified"))}</span></div>${board.progress.total ? `<div class="hub-board-meter" role="progressbar" aria-label="${esc(tr("计划完成进度", "Plan completion"))}" aria-valuemin="0" aria-valuemax="${board.progress.total}" aria-valuenow="${board.progress.completed}"><i style="width:${percent}%"></i></div>` : ""}` : ""}${boardMarkup(true, true)}`}</div>` : ""}`;
+      rememberBoardView(liveBoard);
       applyTheme();
       positionConversationTools();
       const scroller = liveBoard.querySelector(".hub-board-content");
@@ -1742,9 +1787,10 @@
     }
     function renderBoardTab() {
       const problem = boardProblem();
-      if (problem) { content.innerHTML = `<p class="hub-hint">${esc(problem)} · ${esc(tr("可点右上角刷新连接", "Use refresh to reconnect"))}</p>`; return; }
+      if (problem) { boardViewSnapshots.delete(content); content.innerHTML = `<p class="hub-hint">${esc(problem)} · ${esc(tr("可点右上角刷新连接", "Use refresh to reconnect"))}</p>`; return; }
       const board = boardData(), editable = isManualBoard(board), canCreate = !hasActualPlan(board);
-      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务进度", "Task progress"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划与产物，随会话实时同步。Agent 原生计划为只读。", "Plans and artifacts in this conversation are synced. Agent-native plans are read-only."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio">${boardMarkup(true)}${editable || canCreate ? `<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("添加手动计划步骤…", "Add a manual step…"))}" aria-label="${esc(tr("手动计划步骤", "Manual plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus" })}</div>${editable ? `<div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}</div>` : ""}` : ""}<p class="hub-hint">${esc(tr("约每 3.5 秒同步", "Synced every 3.5s"))}</p></section>`}${artifactMarkup()}`;
+      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务面板", "Task board"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划与产物，随会话实时同步。Agent 原生计划为只读。", "Plans and artifacts in this conversation are synced. Agent-native plans are read-only."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio">${boardMarkup(true)}${editable || canCreate ? `<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("添加手动计划步骤…", "Add a manual step…"))}" aria-label="${esc(tr("手动计划步骤", "Manual plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus" })}</div>${editable ? `<div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}</div>` : ""}` : ""}<p class="hub-hint">${esc(tr("约每 3.5 秒同步", "Synced every 3.5s"))}</p></section>`}${artifactMarkup()}`;
+      rememberBoardView(content);
     }
     async function pollBoard() {
       if (disposed || document.hidden || !state.connected || boardLoading) return;
@@ -1762,10 +1808,18 @@
         const signature = JSON.stringify(data);
         if (recovered || signature !== boardSignature) {
           boardSignature = signature; renderLiveBoard(); renderChrome();
-          if (state.open && state.tab === "board" && !content.contains(document.activeElement)) renderBoardTab();
+        }
+        // A focused editor must not be replaced. Remember the last rendered
+        // snapshot separately so the newest data appears after focus leaves.
+        if (state.open && state.tab === "board" && !content.contains(document.activeElement) && (recovered || signature !== boardRenderedSignature)) {
+          renderBoardTab();
+          boardRenderedSignature = signature;
         }
       } catch (error) {
-        if (!disposed && version === boardVersion && context === contextVersion) { errors.board = error; renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab(); }
+        if (!disposed && version === boardVersion && context === contextVersion) {
+          errors.board = error; boardRenderedSignature = ""; renderLiveBoard();
+          if (state.open && state.tab === "board" && !content.contains(document.activeElement)) renderBoardTab();
+        }
       } finally { if (version === boardVersion) boardLoading = false; }
     }
     function scheduleBoardPoll() {
@@ -1796,14 +1850,14 @@
         if (!disposed && version === contextVersion && threadId === state.threadId && state.tab === "board") renderBoardTab();
       });
     }
-    async function readArtifact(index, element) {
+    async function readArtifact(index, element, operation = "open") {
       const artifact = boardData().artifacts[index];
       if (!artifact) return;
       const path = typeof artifact === "string" ? artifact : artifact.path || artifact.id || artifact.name;
       const projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", version = contextVersion, selection = ++artifactVersion;
       await busy(`artifact:${selection}`, element, async () => {
         let data;
-        try { data = await request("board:openArtifact", { projectRoot, threadId, path }); }
+        try { data = await request("board:openArtifact", { projectRoot, threadId, path, ...(operation === "reveal" ? { operation } : {}) }); }
         catch (error) {
           if (!disposed && version === contextVersion && threadId === state.threadId && selection === artifactVersion) throw error;
           return;
@@ -2464,7 +2518,7 @@
       artifactVersion++;
       cache.board = null; state.artifact = null; state.boardDraft = "";
       delete errors.board;
-      boardVersion++; boardLoading = false; boardSignature = "";
+      boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = "";
       renderLiveBoard();
       if (state.open && state.tab === "board") renderBoardTab();
       return true;
@@ -2508,7 +2562,7 @@
         state.agentsTarget = defaultScope();
         state.memoryProject = state.projectRoot && state.memoryScope !== "global" ? "current" : "global";
         state.artifact = null; state.orchestrationDraft = null; state.settingsDirty = false; state.settingsDraft = {}; state.clearedHostFields.clear(); state.settingsRuleDirty = false; state.settingsRule = ""; settingsSelectionVersion++;
-        boardVersion++; boardLoading = false; boardSignature = ""; renderLiveBoard();
+        boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; renderLiveBoard();
         state.hookDraft = null;
         state.supersedeItems = [];
         state.selectedMemory = null;
@@ -2799,9 +2853,9 @@
       else if (action === "toggle-board") { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-dashboard-expanded-v1", state.boardExpanded); renderLiveBoard(); }
       else if (action === "board-background") { state.boardBackground = !state.boardBackground; renderLiveBoard(); if (state.tab === "board") renderBoardTab(); }
       else if (action === "board-add") updateBoard(target, "add");
-      else if (action === "board-step") updateBoard(target, "toggle", Number(target.dataset.index));
+      else if (action === "board-step") { const index = resolveBoardClick(target, "step"); if (index === null) rejectStaleBoardClick(); else updateBoard(target, "toggle", index); }
       else if (action === "board-clear") updateBoard(target, "clear");
-      else if (action === "read-artifact") readArtifact(Number(target.dataset.index), target);
+      else if (action === "read-artifact") { const index = resolveBoardClick(target, "artifact"); if (index === null) rejectStaleBoardClick(); else readArtifact(index, target, liveBoard?.contains(target) ? "reveal" : "open"); }
       else if (action === "reveal-artifact") revealArtifact(target);
       else if (action === "artifact-folder") revealArtifact(target, "folder");
       else if (action === "close-artifact") { artifactVersion++; state.artifact = null; renderBoardTab(); }
