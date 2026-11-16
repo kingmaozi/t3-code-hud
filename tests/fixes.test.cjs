@@ -143,25 +143,48 @@ describe("Fix 2: whole-session average speed + newer-provider override", () => {
     assert.equal(s.telemetrySource, "native");
     // (300 muse + 20 codex + 200 uncovered) / (4s + 2s + 4s) = 52.0 t/s
     assert.equal(s.speed.tokPerSec, 53.3);
-    // lastDecodeTps stays the newest native part's own last-step speed.
-    assert.equal(s.speed.lastDecodeTps, 10);
+    // The newest uncovered turn uses its own 200 tokens / 4 effective seconds.
+    assert.equal(s.speed.lastDecodeTps, 50);
     assert.equal(s.provider, "claudeAgent");
     assert.equal(s.model, "claude-opus-4-test");
     assert.equal(s.tokens.contextUsed, 12345);
     assert.equal(s.tokens.contextMax, 200000);
+    assert.equal(s.cache.turnRate, 0, "latest provider turn cache wins even when native parts belong to older providers");
+    assert.equal(s.cache.lastCallRate, null, "a newer statev2 turn without a native call record does not relabel the previous native call");
+    assert.equal(s.cache.mainSessionRate, 0.16);
+    assert.ok(Math.abs(s.cache.withSubagentsSessionRate - 800 / 5100) < 1e-12);
+    assert.equal(s.cache.sessionRate, s.cache.withSubagentsSessionRate);
     // 530 proves the covered Muse turn (9999) was not double-counted.
     assert.equal(s.tokens.output, 580); // 530 main + 50 subagent (covered Muse 9999 not double-counted!)
   });
 
-  it("older uncovered turn: no override, same whole-session average", () => {
+  it("older uncovered turn keeps provider and average; newer same-provider context wins", () => {
     const s = backend.getThreadStats(THREAD_B);
     assert.equal(s.ok, true, JSON.stringify(s.error || s));
     assert.equal(s.telemetrySource, "native");
     assert.equal(s.speed.tokPerSec, 53.3);
     assert.equal(s.provider, "codex");
     assert.equal(s.model, "codex-model-b");
-    assert.equal(s.tokens.contextMax, 999000);
-    assert.equal(s.tokens.contextUsed, 2030);
+    // The Codex projection (June 2) is newer than its native sample (June 1).
+    assert.equal(s.tokens.contextMax, 888);
+    assert.equal(s.tokens.contextUsed, 777);
+  });
+
+  it("latest completed turn without cache usage cannot inherit a previous provider's rate", () => {
+    const db = new DatabaseSync(path.join(tmpUserdata, "statev2.sqlite"));
+    const update = db.prepare("UPDATE orchestration_v2_projection_provider_turns SET payload_json = ? WHERE provider_turn_id = 'a-unc'");
+    for (const usage of [null, { inputTokens: 0, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 0 }]) {
+      const payload = { nativeTurnRef: { driver: "claudeAgent", nativeId: "x" } };
+      if (usage) payload.turnTokenUsage = usage;
+      update.run(JSON.stringify(payload));
+      const s = backend.getThreadStats(THREAD_A);
+      assert.equal(s.ok, true);
+      assert.equal(s.cache.turnRate, null);
+      assert.equal(s.cache.lastTurnRate, null);
+      assert.ok(s.cache.sessionRate > 0, "cumulative cache statistics stay available as a separate field");
+      assert.equal(s.cache.lastCallRate, null);
+    }
+    db.close();
   });
 });
 

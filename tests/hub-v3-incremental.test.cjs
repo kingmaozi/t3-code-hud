@@ -402,8 +402,9 @@ describe("3. 蜂窝仅顶层主会话生效，子智能体严禁变蜂窝", () =
 
   it("syncOrchestrationDirectiveToHosts 绝不写入子代理目录，仅顶层规则文件", async () => {
     const mgr = subMod.createSubagentsManager({ homeDir: tmpHome, hubDir: tmpHub });
-    // 启用编排
-    const upd = mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on", maxParallelAgents: 6 }, { hostRulePaths: [] });
+    // 旧模式已退役；仅允许清理旧规则，不能注入到子代理目录。
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on" }, { hostRulePaths: [] }), /旧|legacy/i);
+    const upd = mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off" }, { hostRulePaths: [] });
     assert.equal(upd.ok, true);
     // 构造尝试把子代理目录作为 hosts 混入，验证实现会过滤或不写 agents/
     const fakeClaudeAgentDir = path.join(tmpHome, ".claude", "agents");
@@ -415,13 +416,13 @@ describe("3. 蜂窝仅顶层主会话生效，子智能体严禁变蜂窝", () =
     const hostRule = path.join(tmpHome, ".codex", "AGENTS.md");
     fs.mkdirSync(path.dirname(topRule), { recursive: true });
     fs.mkdirSync(path.dirname(hostRule), { recursive: true });
-    writeFile(topRule, "# existing\n");
+    writeFile(topRule, "# existing\n" + subMod.buildOrchestrationDirective({ orchestratorMode: "carbon" }));
     writeFile(hostRule, "# existing\n");
     // 尝试把 agents 目录当作 hosts 注入
     const res = mgr.syncOrchestrationDirectiveToHosts({ hosts: [topRule, hostRule, fakeClaudeAgentDir + "/evil.md", fakeHubSubagentsDir + "/evil2.md"] });
-    assert.equal(res.ok, true);
+    assert.equal(res.ok, false);
     const topContent = fs.readFileSync(topRule, "utf8");
-    assert.ok(topContent.includes("<SUBAGENT-STOP>") || topContent.includes("T3_HUB_ORCHESTRATOR_START"), "top-level should have directive");
+    assert.doesNotMatch(topContent, /<SUBAGENT-STOP>|T3_HUB_ORCHESTRATOR_START/);
     // 子代理目录不应被写入
     const evil1 = fakeClaudeAgentDir + "/evil.md";
     const evil2 = fakeHubSubagentsDir + "/evil2.md";

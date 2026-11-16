@@ -945,10 +945,10 @@ function createMcpRouter(opts = {}) {
     if (state.raw === after) return null;
     return { file, text: after, state };
   }
-  function prepareCodexHostWrite(serverName, definitionOrNull) {
+  function prepareCodexHostWrite(serverName, definitionOrNull, exactNameOnly = false) {
     const file = codexConfigPath();
     const state = assertNativeReadable(file, readNativeText(file));
-    const matches = p => p.length >= 2 && p[0] === "mcp_servers" && normKey(p[1]) === normKey(serverName);
+    const matches = p => p.length >= 2 && p[0] === "mcp_servers" && (exactNameOnly ? p[1] === serverName : normKey(p[1]) === normKey(serverName));
     const updated = rewriteCodexToml(state.raw, matches, definitionOrNull === null ? "" : formatCodexMcpEntry(serverName, definitionOrNull));
     if (updated === null) throw new Error("malformed or unsupported native MCP config: " + file);
     validateTomlDocument(updated);
@@ -1082,20 +1082,27 @@ function createMcpRouter(opts = {}) {
     return out;
   }
 
-  function mergeDefinition(map, server, replace = false) {
+  function mergeDefinition(map, server, replace = false, additionalSources = []) {
     if (!server || typeof server.name !== "string" || !server.name || isHubName(server.name)) return;
-    const key = [...map.keys()].find(k => normKey(k) === normKey(server.name));
-    const previous = key ? map.get(key) : null;
-    const sources = [...new Set([...(previous?.sources || []), server.__source || "hub"])];
+    const key = server.name;
+    const previous = map.has(key) ? { ...map.get(key) } : null;
+    if (previous) { delete previous.modeConflict; delete previous.conflictNames; }
+    const sources = [...new Set([...(previous?.sources || []), server.__source || "hub", ...additionalSources])];
     if (previous && !replace) {
-      map.set(key, { ...previous, builtin: !!(previous.builtin || server.builtin), sources }); return;
+      map.set(key, { ...previous, builtin: !!(previous.builtin || server.builtin), sources });
+    } else {
+      const merged = { ...previous, ...server, sources };
+      // A replacement endpoint must not inherit the old endpoint's transport.
+      if (replace && server.command && !server.url) { merged.url = null; merged.transport = server.transport || "stdio"; }
+      else if (replace && server.url && !server.command) { merged.command = null; merged.transport = server.transport || "http"; }
+      delete merged.modeConflict; delete merged.conflictNames;
+      map.set(key, merged);
     }
-    if (key) map.delete(key);
-    const merged = { ...previous, ...server, sources };
-    // A replacement endpoint must not inherit the old endpoint's transport.
-    if (replace && server.command && !server.url) { merged.url = null; merged.transport = server.transport || "stdio"; }
-    else if (replace && server.url && !server.command) { merged.command = null; merged.transport = server.transport || "http"; }
-    map.set(server.name, merged);
+    const colliding = [...map.entries()].filter(([, def]) => normKey(def.name) === normKey(server.name));
+    if (colliding.length > 1) {
+      const names = colliding.map(([, def]) => def.name).sort((a, b) => a.localeCompare(b));
+      for (const [name, def] of colliding) map.set(name, { ...def, modeConflict: true, conflictNames: names });
+    }
   }
   function discoverDefinitions() {
     const byName = new Map();
@@ -1141,11 +1148,44 @@ function createMcpRouter(opts = {}) {
       return createMcpRouter({ homeDir, ...overrides }).discoverServerDefinitions();
     }
     const definitions = discoverDefinitions();
-    for (const server of readRegistry()) mergeDefinition(definitions, { ...server, pluginId: server.pluginId || null, __source: server.__source || "hub", __sourceLabel: server.__sourceLabel || "hub" }, true);
+    for (const server of readRegistry()) mergeDefinition(definitions, { ...server, pluginId: server.pluginId || null, __source: server.__source || "hub", __sourceLabel: server.__sourceLabel || "hub" }, true, ["hub"]);
     return definitions;
   }
   function modeFor(modes, name) {
-    return modes[name] || Object.entries(modes).find(([key]) => normKey(key) === normKey(name))?.[1];
+    if (!modes || typeof modes !== "object") return undefined;
+    if (Object.prototype.hasOwnProperty.call(modes, name)) return modes[name];
+    const matches = Object.keys(modes).filter(key => normKey(key) === normKey(name));
+    return matches.length === 1 ? modes[matches[0]] : undefined;
+  }
+  function canonicalProjectRoot(root) {
+    if (typeof root !== "string" || !root || !path.isAbsolute(root)) return null;
+    const absolute = path.resolve(root);
+    try { return fs.realpathSync(absolute); } catch { return absolute; }
+  }
+  function hasSymlinkComponent(root) {
+    if (typeof root !== "string" || !path.isAbsolute(root)) return true;
+    const absolute = path.resolve(root), parsed = path.parse(absolute);
+    let current = parsed.root;
+    for (const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      try { if (fs.lstatSync(current).isSymbolicLink()) return true; }
+      catch (error) { if (error?.code !== "ENOENT") return true; break; }
+    }
+    return false;
+  }
+  function projectModeKeys(projects, root, originalRoot = root) {
+    const canonical = canonicalProjectRoot(root);
+    if (!canonical) return [];
+    const raw = !hasSymlinkComponent(originalRoot) ? path.resolve(originalRoot) : null;
+    const aliases = Object.keys(projects || {}).filter((key) => !hasSymlinkComponent(key) && canonicalProjectRoot(key) === canonical).sort();
+    return [...new Set([canonical, raw, ...aliases].filter(Boolean))];
+  }
+  function projectModeFor(projects, root, originalRoot, name) {
+    for (const key of projectModeKeys(projects, root, originalRoot)) {
+      const mode = modeFor(projects?.[key] || {}, name);
+      if (mode !== undefined) return mode;
+    }
+    return undefined;
   }
   function clearAliases(modes, name) {
     for (const key of Object.keys(modes)) if (normKey(key) === normKey(name)) delete modes[key];
@@ -1158,6 +1198,23 @@ function createMcpRouter(opts = {}) {
     const cmd = expandHome(s.command);
     const paths = cmd.includes("/") ? [path.resolve(cwd, cmd)] : String(s.env?.PATH || process.env.PATH || "").split(path.delimiter).map(p => path.resolve(cwd, expandHome(p), cmd));
     return paths.some(p => { try { fs.accessSync(p, fs.constants.X_OK); return fileExists(p); } catch { return false; } });
+  }
+  function launchAvailability(s, projectRoot) {
+    if (s.url) {
+      try {
+        const url = new URL(s.url);
+        if (["http:", "https:"].includes(url.protocol)) return { launchable: true, launchReason: null };
+        return { launchable: false, launchReason: "invalid-url" };
+      } catch { return { launchable: false, launchReason: "invalid-url" }; }
+    }
+    if (typeof s.command !== "string" || !s.command.trim()) return { launchable: false, launchReason: "missing-endpoint" };
+    const expandHome = value => String(value).replace(/^~(?=\/)/, () => homeDir);
+    const cwd = path.resolve(projectRoot || homeDir, expandHome(s.cwd || "."));
+    try { if (!fs.statSync(cwd).isDirectory()) return { launchable: false, launchReason: "invalid-cwd" }; }
+    catch { return { launchable: false, launchReason: "invalid-cwd" }; }
+    return commandAvailable(s, projectRoot)
+      ? { launchable: true, launchReason: null }
+      : { launchable: false, launchReason: "command-unavailable" };
   }
   function probeKey(s, projectRoot) {
     // Bind cache entries to the endpoint and execution context, without storing
@@ -1173,25 +1230,31 @@ function createMcpRouter(opts = {}) {
   }
 
   function listMcpServers(args = {}) {
-    const projectRoot = args.projectRoot || null;
+    const originalProjectRoot = args.projectRoot || null;
+    const projectRoot = canonicalProjectRoot(originalProjectRoot) || null;
     const cache = readJsonFile(probeCachePath, {}) || {};
     const byName = discoverServerDefinitions();
     const registryNames = new Set(readRegistry().map(s => normKey(s.name)));
     const nativeStates = collectNativeMcpStates();
     const state = readState();
     const globalModes = state.mcpModes?.global || {};
-    const projModes = projectRoot ? (state.mcpModes?.projects?.[projectRoot] || {}) : {};
+    const projects = state.mcpModes?.projects || {};
     const items = [...byName.values()].map((s) => {
-      const mode = modeFor(projModes, s.name) || modeFor(globalModes, s.name) || "off";
+      const modeConflict = s.modeConflict === true;
+      const projectMode = projectRoot ? projectModeFor(projects, projectRoot, originalProjectRoot, s.name) : undefined;
+      const globalMode = modeFor(globalModes, s.name);
+      const mode = modeConflict ? "off" : projectMode !== undefined ? projectMode : globalMode !== undefined ? globalMode : "off";
       const env = s.env && typeof s.env === "object" ? Object.keys(s.env) : [];
       const hasSecrets = env.some((k) => isSecretKey(k));
       const norm = normKey(s.name);
-      const nativeEntry = nativeStates.get(norm);
+      const nativeEntry = modeConflict ? null : nativeStates.get(norm);
       const inRegistry = registryNames.has(norm);
       const inNative = !!nativeEntry;
-      const agentStates = nativeEntry ? { ...nativeEntry.agents } : { antigravity: false, muse: false, codex: false, pi: false, claude: false };
+      const agentStates = modeConflict
+        ? { antigravity: null, muse: null, codex: null, pi: null, claude: null }
+        : nativeEntry ? { ...nativeEntry.agents } : { antigravity: false, muse: false, codex: false, pi: false, claude: false };
       const enabledCount = Object.values(agentStates).filter(Boolean).length;
-      const enabled = enabledCount > 0 || mode !== "off";
+      const enabled = !modeConflict && (enabledCount > 0 || mode !== "off");
       const legacySource = s.__source || "hub";
       let mappedSource;
       if (legacySource === "magpie") mappedSource = "magpie";
@@ -1208,7 +1271,8 @@ function createMcpRouter(opts = {}) {
         title: s.title || s.name, groupTitle: s.groupTitle || s.__sourceLabel || "MCP",
         icon: s.icon || null, builtin: !!s.builtin, pluginId: s.pluginId || null,
         installed: !!s.installed || registryNames.has(normKey(s.name)) || mode !== "off",
-        ...connectionStatus(s, projectRoot, cache),
+        ...launchAvailability(s, projectRoot),
+        ...(modeConflict ? { connected: null, probed: false, statusText: "MCP 名称归一化冲突；已暂停自动启用。" } : connectionStatus(s, projectRoot, cache)),
         transport: s.transport || (s.url ? "http" : "stdio"),
         command: s.command ? redactCommand(s.command) : null,
         args: redactArgs(Array.isArray(s.args) ? s.args : []),
@@ -1216,10 +1280,16 @@ function createMcpRouter(opts = {}) {
         agents: s.agents || null,
         source: mappedSource,
         sourceLabel: s.__sourceLabel || "hub",
+        sources: Array.isArray(s.sources) ? [...new Set(s.sources.filter(source => ["plugin", "pi", "muse", "claude", "zcode", "codex", "agy", "magpie", "builtin", "hub"].includes(source)))] : [],
         agentStates,
         enabledCount,
         enabled,
+        modeConflict,
+        conflictNames: modeConflict ? [...(s.conflictNames || [])] : [],
         mode: ALLOWED_MODES.includes(mode) ? mode : "off",
+        modeScope: projectMode !== undefined ? "project" : "global",
+        modeProject: projectMode ?? null,
+        modeGlobal: globalMode ?? null,
         hasSecrets,
         summary: redactSummary(s),
       };
@@ -1244,12 +1314,22 @@ function createMcpRouter(opts = {}) {
   }
   const listServers = listMcpServers;
 
-  function resolveServerDefinition(identifier) {
+  function matchingServerDefinitions(identifier) {
     if (typeof identifier !== "string" || !identifier) return null;
     const byName = discoverServerDefinitions();
     const norm = normKey(identifier);
-    for (const s of byName.values()) if (normKey(s.name) === norm) return s;
-    return null;
+    const matches = [...byName.values()].filter((server) => normKey(server.name) === norm);
+    if (matches.length > 1) {
+      const error = new Error("normalized MCP name conflict: " + matches.map((server) => server.name).sort().join(", "));
+      error.code = "ERR_MCP_NORMALIZED_NAME_CONFLICT";
+      throw error;
+    }
+    return matches;
+  }
+  function resolveServerDefinition(identifier) {
+    const matches = matchingServerDefinitions(identifier);
+    if (!matches?.length) return null;
+    return matches.find((server) => server.name === identifier) || matches[0];
   }
   function resolveDefinitionForToggle({ id, name } = {}) {
     const ident = name || id;
@@ -1288,8 +1368,22 @@ function createMcpRouter(opts = {}) {
     const canonicalAgent = normalizeAgentHost(agent);
     if (!canonicalAgent) throw new Error("invalid agent");
     if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
-    const def = resolveDefinitionForToggle({ id, name });
+    // Corrupt or unreadable registry errors must never be mistaken for the
+    // special name-conflict case that permits an exact-name disable.
+    readValidatedRegistry();
+    let def;
+    try { def = resolveDefinitionForToggle({ id, name }); }
+    catch (error) {
+      if (enabled !== false || error?.code !== "ERR_MCP_NORMALIZED_NAME_CONFLICT") throw error;
+      const ident = name || id;
+      let exact = null;
+      try { exact = typeof ident === "string" ? discoverServerDefinitions().get(ident) : null; }
+      catch { throw error; }
+      if (!exact?.modeConflict) throw error;
+      def = exact;
+    }
     const canonicalName = def.name;
+    const exactConflictDisable = def.modeConflict === true && enabled === false;
     {
       // Single-host and all-host toggles share the registry transaction boundary.
       const prepared = [];
@@ -1304,7 +1398,7 @@ function createMcpRouter(opts = {}) {
       if (toWrite.transport) jsonEntry.transport = toWrite.transport;
       for (const a of canonicalAgent === "all" ? CANONICAL_HOSTS : [canonicalAgent]) {
         if (a === "codex") {
-          prepared.push(enabled ? prepareCodexHostWrite(canonicalName, toWrite) : prepareCodexHostWrite(canonicalName, null));
+          prepared.push(enabled ? prepareCodexHostWrite(canonicalName, toWrite) : prepareCodexHostWrite(canonicalName, null, exactConflictDisable));
         } else {
           prepared.push(enabled ? prepareJsonHostWrite(a, canonicalName, jsonEntry) : prepareJsonHostWrite(a, canonicalName, null));
         }
@@ -1380,6 +1474,7 @@ function createMcpRouter(opts = {}) {
   function setPluginMcpScope({ pluginId, servers = [], scope, projectRoot } = {}) {
     if (!pluginId || !["off", "global", "project"].includes(scope)) throw new Error("invalid plugin scope");
     if (scope === "project" && (!projectRoot || !path.isAbsolute(projectRoot))) throw new Error("projectRoot required for project scope");
+    projectRoot = scope === "project" ? canonicalProjectRoot(projectRoot) : projectRoot;
     const state = readState(), registry = readRegistry();
     state.pluginMcpOwned ||= {};
     const owned = state.pluginMcpOwned[pluginId] || [];
@@ -1415,14 +1510,43 @@ function createMcpRouter(opts = {}) {
   function setMcpMode(args = {}) {
     const { mode } = args;
     let { name } = args;
-    const projectRoot = args.projectRoot || null;
-    if (typeof name !== "string" || !name || !ALLOWED_MODES.includes(mode)) throw new Error("invalid name or mode");
+    const rawProjectRoot = args.projectRoot || null;
+    const projectRoot = rawProjectRoot ? canonicalProjectRoot(rawProjectRoot) : null;
+    if (typeof name !== "string" || !name || (!ALLOWED_MODES.includes(mode) && mode !== "inherit")) throw new Error("invalid name or mode");
     if (mode.startsWith("project-") && !projectRoot) throw new Error("projectRoot required for project mode");
-    if (projectRoot && !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be absolute");
-    const discovered = [...discoverServerDefinitions().values()].find(s => normKey(s.name) === normKey(name));
+    if (mode === "inherit" && !projectRoot) throw new Error("projectRoot required for inherit mode");
+    if (rawProjectRoot && !projectRoot) throw new Error("projectRoot must be absolute");
+    const candidates = [...discoverServerDefinitions().values()].filter(server => normKey(server.name) === normKey(name));
+    const modeConflict = candidates.length > 1;
+    if (modeConflict && mode !== "off") throw new Error("normalized MCP name conflict: " + candidates.map(server => server.name).sort().join(", "));
+    if (modeConflict && !candidates.some(server => server.name === name)) throw new Error("normalized MCP name conflict requires an exact server name");
+    const discovered = modeConflict ? candidates.find(server => server.name === name) : resolveServerDefinition(name);
     name = discovered?.name || name;
     const state = readState();
     state.mcpModes ||= {}; state.mcpModes.global ||= {}; state.mcpModes.projects ||= {};
+    if (modeConflict) {
+      const modes = mode.startsWith("project-") || (mode === "off" && projectRoot)
+        ? (state.mcpModes.projects[projectRoot] ||= {})
+        : state.mcpModes.global;
+      modes[name] = mode;
+      writeState(state);
+      return { ok: true, name, mode };
+    }
+    if (mode === "inherit") {
+      const keys = projectModeKeys(state.mcpModes.projects, projectRoot, rawProjectRoot);
+      for (const root of keys) {
+        const modes = state.mcpModes.projects[root];
+        if (!modes) continue;
+        clearAliases(modes, name);
+        if (!Object.keys(modes).length) delete state.mcpModes.projects[root];
+      }
+      for (const records of Object.values(state.pluginMcpOwned || {})) for (const record of records) {
+        if (normKey(record.name) !== normKey(name)) continue;
+        for (const root of keys) delete record.projects?.[root];
+      }
+      writeState(state);
+      return { ok: true, name, mode };
+    }
     if (mode.startsWith("project-") || (mode === "off" && projectRoot)) {
       const modes = state.mcpModes.projects[projectRoot] ||= {};
       clearAliases(modes, name); modes[name] = mode;
@@ -1486,8 +1610,14 @@ function createMcpRouter(opts = {}) {
     writeRegistry(reg);
     // Keep persisted modes usable by runtime consumers that index exact names.
     const state = readState();
+    const normalizedCounts = new Map();
+    for (const server of reg) normalizedCounts.set(normKey(server.name), (normalizedCounts.get(normKey(server.name)) || 0) + 1);
+    const ambiguousNames = new Set([...normalizedCounts].filter(([, count]) => count > 1).map(([key]) => key));
     for (const modes of [state.mcpModes?.global, ...Object.values(state.mcpModes?.projects || {})].filter(Boolean)) {
-      for (const server of reg) { const mode = modeFor(modes, server.name); clearAliases(modes, server.name); if (mode) modes[server.name] = mode; }
+      for (const server of reg) {
+        if (ambiguousNames.has(normKey(server.name))) continue;
+        const mode = modeFor(modes, server.name); clearAliases(modes, server.name); if (mode) modes[server.name] = mode;
+      }
     }
     if (state.mcpModes) writeState(state);
     const names = new Set(reg.map(s => normKey(s.name)));
@@ -1496,10 +1626,21 @@ function createMcpRouter(opts = {}) {
 
   function removeMcpServer({ name } = {}) {
     if (!name) throw new Error("name required");
-    writeRegistry(readRegistry().filter(e => normKey(e.name) !== normKey(name)));
+    let conflicted = false;
+    try { matchingServerDefinitions(name); }
+    catch (error) {
+      const exactRegistryEntry = readRegistry().some(entry => entry.name === name);
+      if (!exactRegistryEntry) throw error;
+      conflicted = true;
+    }
+    writeRegistry(readRegistry().filter(e => conflicted ? e.name !== name : normKey(e.name) !== normKey(name)));
     const state = readState();
-    if (state.mcpModes?.global) clearAliases(state.mcpModes.global, name);
-    for (const modes of Object.values(state.mcpModes?.projects || {})) clearAliases(modes, name);
+    const removeMode = modes => {
+      if (conflicted) delete modes[name];
+      else clearAliases(modes, name);
+    };
+    if (state.mcpModes?.global) removeMode(state.mcpModes.global);
+    for (const modes of Object.values(state.mcpModes?.projects || {})) removeMode(modes);
     writeState(state);
     return { ok: true, name };
   }

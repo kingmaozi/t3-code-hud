@@ -207,9 +207,9 @@ describe("backend hubCall via getGitGraph __HUB_RPC__ bridge", () => {
     const get = await backend.getGitGraph("__HUB_RPC__", "agentsMd:get", { projectRoot: PROJECT_ROOT });
     assert.equal(get.ok, true);
     assert.ok(typeof get.globalContent === "string");
-    const saveG = await backend.getGitGraph("__HUB_RPC__", "agentsMd:save", { target: "global", content: "# Sidecar global\n" });
+    const saveG = await backend.getGitGraph("__HUB_RPC__", "agentsMd:save", { target: "global", content: "# Sidecar global\n", expectedContent: get.globalContent });
     assert.equal(saveG.ok, true);
-    const saveP = await backend.getGitGraph("__HUB_RPC__", "agentsMd:save", { target: "project", projectRoot: PROJECT_ROOT, content: "# Sidecar proj\n" });
+    const saveP = await backend.getGitGraph("__HUB_RPC__", "agentsMd:save", { target: "project", projectRoot: PROJECT_ROOT, content: "# Sidecar proj\n", expectedContent: get.projectContent });
     assert.equal(saveP.ok, true);
     const inject = await backend.getGitGraph("__HUB_RPC__", "agentsMd:injectSoftRoute", { projectRoot: PROJECT_ROOT });
     assert.equal(inject.ok, true);
@@ -475,8 +475,8 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     assert.ok(guardIdx < evalIdx, "embedded guard precedes eval");
     // Backward compat: eval branch still exists for non-embedded path.
     assert.ok(rendererSrc.includes("if (!window.__t3HubDrawerEmbedded)"));
-    // Keep the complete top-level navigation in its intended order.
-    const expectedTabs = ["memory", "skills", "subagents", "settings", "board"];
+    // Four primary tabs plus the internal plan and shared-rules pages.
+    const expectedTabs = ["memory", "skills", "subagents", "settings", "board", "agents"];
     for (const tab of expectedTabs) {
       assert.ok(drawerSrc.includes(`"${tab}"`), `drawer defines tab ${tab}`);
     }

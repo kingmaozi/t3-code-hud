@@ -47,15 +47,16 @@ function harness(rpc = async () => ({}), environment = {}) {
   };
   const expose = `if (opts.__testHarness) {
     root = opts.root; content = opts.content;
-    handle = root.querySelector("#t3-hub-handle"); liveBoard = root.querySelector("#t3-hub-live-board"); palette = root.querySelector("#t3-hub-slash-palette");
+    handle = root.querySelector("#t3-hub-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board"); palette = root.querySelector("#t3-hub-slash-palette");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings,
       onInput, onClick, onEditorKeydown, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
       renderSubagents, renderCommander, boardMarkup, brandIcon, request, esc, agentHosts,
-      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard,
+      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab,
       composerToken, composerSurface, positionSlash, closeSlash, selectSlash, onComposerInput, onComposerKeydown,
       findSessionRelationsCard, positionConversationTools, formatExactTime, renderMemoryHistory, renderDream,
       ready: () => { contextLoading = false; },
+      setCurrentRoute: () => { lastRoute = routeKey(); },
       setSlash: (session) => { slashSession = session; }, getSlash: () => slashSession,
       setStyle: (fn) => { getComputedStyle = fn; }};
   }`;
@@ -80,7 +81,7 @@ function fixture(t) {
       if (action === "settings:get") return manager.getSettingsSnapshot();
       if (action === "settings:update") return manager.updateHostSetting(payload);
       if (action === "settings:getRule") return manager.getRuleContent(payload.host);
-      if (action === "settings:saveRule") return manager.saveRuleContent(payload.host, payload.content);
+      if (action === "settings:saveRule") return manager.saveRuleContent(payload.host, payload.content, payload.expectedContent, payload.expectedTarget);
       throw new Error(`Unexpected RPC: ${action}`);
     } catch (error) { return { ok: false, error: error.message }; }
   };
@@ -514,7 +515,7 @@ test("backend rejection is shown accurately and partial saves refresh the baseli
   assert.equal(ui.state.settingsDirty, false);
 });
 
-test("rule writes use {host,content} and keep unsaved configuration changes", async (t) => {
+test("rule writes include the read version and keep unsaved configuration changes", async (t) => {
   const f = fixture(t), ui = harness(f.rpc);
   await ui.loadSettings();
   change(ui, "model", "unsaved-model");
@@ -522,7 +523,8 @@ test("rule writes use {host,content} and keep unsaved configuration changes", as
   ui.state.settingsRuleDirty = true;
   await ui.saveNativeSettings(undefined, true);
   assert.equal(fs.readFileSync(path.join(f.homeDir, ".codex/AGENTS.md"), "utf8"), "# Verified rule\n");
-  assert.deepEqual(f.calls.find((x) => x.action === "settings:saveRule").payload, { host: "codex", content: "# Verified rule\n" });
+  const request = f.calls.find((x) => x.action === "settings:saveRule").payload;
+  assert.equal(request.host, "codex"); assert.equal(request.content, "# Verified rule\n"); assert.equal(typeof request.expectedContent, "string"); assert.ok(request.expectedTarget.endsWith("/.codex/AGENTS.md"));
   assert.equal(ui.state.settingsDraft.model, "unsaved-model");
   assert.equal(ui.state.settingsDirty, true);
   assert.equal(ui.state.settingsRuleDirty, false);
@@ -780,7 +782,7 @@ test("core tabs and their literal/dynamic RPC actions have backend dispatch case
   const actions = new Set([...drawerSource.matchAll(/"((?:hub|plugins|hooks|skills|subagents|mcp|memory|board|settings|agentsMd|embed|slash):[\w:]+)"/g)].map((m) => m[1]));
   for (const domain of ["skills", "mcp"]) for (const op of ["list", "toggleAgent"]) actions.add(`${domain}:${op}`);
   for (const action of actions) assert.ok(cases.has(action), `missing backend RPC: ${action}`);
-  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory", "skills", "subagents", "settings", "board"]);
+  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory", "skills", "subagents", "settings", "board", "agents"]);
 });
 
 test("renderer escapes both quote types and file change counts, and tolerates a missing detail hash", () => {
@@ -897,6 +899,206 @@ test("plan stays outside React card and follows its geometry, hiding when discon
   assert.doesNotMatch(drawerSource, /anchor\.card\.appendChild\(liveBoard\)/);
 });
 
+test("missing or hidden inspector exposes a direct plan entry with the current session's status", () => {
+  const { ui, card, sidebar } = relationFixture();
+  const entry = ui.root.querySelector("#t3-hub-plan-handle");
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", context: { threadId: "thread-a" } });
+  ui.cache.board = { steps: [{ text: "当前任务", status: "pending" }] };
+  ui.renderLiveBoard();
+  assert.equal(ui.nodes.get("#t3-hub-live-board").hidden, false);
+  assert.equal(entry.hidden, true, "do not duplicate a visible inline panel");
+  card.isConnected = false;
+  sidebar.querySelectorAll = () => [];
+  ui.positionConversationTools();
+  assert.equal(entry.hidden, false);
+  assert.match(entry.textContent, /计划.*0\/1/);
+  assert.match(entry.title, /详情|侧栏/);
+  Object.assign(entry, { dataset: { action: "open-board-studio" }, closest: () => entry });
+  ui.root.contains = (target) => target === entry;
+  ui.onClick({ target: entry });
+  assert.equal(ui.state.open, true);
+  assert.equal(ui.state.tab, "board");
+  assert.match(ui.content.innerHTML, /当前任务/);
+});
+
+test("plan entry distinguishes no plan, loading, read failure, and a mismatched session", async () => {
+  const calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { steps: [] }; });
+  const entry = ui.root.querySelector("#t3-hub-plan-handle");
+  ui.ready();
+  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a", context: { threadId: "thread-a" } });
+  ui.renderLiveBoard();
+  assert.match(entry.textContent, /读取中/);
+  ui.cache.board = { steps: [] };
+  ui.renderLiveBoard();
+  assert.match(entry.textContent, /暂无计划/);
+  ui.renderBoardTab();
+  assert.match(ui.content.innerHTML, /当前没有计划步骤|暂无计划/);
+  ui.errors.board = new Error("unavailable");
+  ui.renderLiveBoard();
+  assert.match(entry.textContent, /读取失败/);
+  ui.state.context = { threadId: "other-thread" };
+  ui.renderLiveBoard();
+  assert.match(entry.textContent, /会话未匹配/);
+  await ui.pollBoard();
+  assert.equal(calls.filter((item) => item.action === "board:get").length, 0);
+  ui.state.boardDraft = "must not be saved";
+  await ui.updateBoard(null, "add");
+  assert.equal(calls.filter((item) => item.action === "board:update").length, 0);
+  const draftProject = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${draftProject}/new`, href: `t3code://app/#/projects/${draftProject}/new` });
+  ui.state.threadId = "__NEW__";
+  ui.state.context = { threadId: "__NEW__", projectId: draftProject, projectRoot: "/fixture", draftProjectVerified: true };
+  delete ui.errors.board;
+  ui.renderLiveBoard();
+  assert.match(entry.textContent, /暂无计划/);
+});
+
+test("a mismatched or unresolved board response never claims there is no plan", async () => {
+  for (const returnedThread of ["another-thread", ""]) {
+    const ui = harness(async () => ({ threadId: returnedThread, steps: [] }));
+    const entry = ui.root.querySelector("#t3-hub-plan-handle");
+    ui.ready();
+    Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture" });
+    await ui.pollBoard();
+    assert.equal(ui.cache.board, null);
+    assert.match(entry.textContent, /会话未匹配/);
+    ui.renderBoardTab();
+    assert.match(ui.content.innerHTML, /会话未匹配/);
+  }
+});
+
+test("draft plan read/write needs the current route's verified project", async () => {
+  const projectA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", calls = [];
+  let board = { threadId: "__NEW__", steps: [] };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "board:update") board = { threadId: "__NEW__", steps: payload.steps };
+    if (action === "board:clear") board = { threadId: "__NEW__", steps: [] };
+    return action === "board:get" ? board : {};
+  });
+  ui.ready();
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${projectB}/new`, href: `t3code://app/#/projects/${projectB}/new` });
+  Object.assign(ui.state, { connected: true, threadId: "__NEW__", projectRoot: "/tmp/project-a", context: { threadId: "__NEW__", projectId: projectA, projectRoot: "/tmp/project-a", draftProjectVerified: true }, boardDraft: "draft" });
+  ui.cache.board = { steps: [] };
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.filter((entry) => /^board:/.test(entry.action)).length, 0, "a stale project must never be read or written");
+  ui.state.context = { threadId: "__NEW__", projectId: projectB, projectRoot: "/tmp/project-b", draftProjectVerified: true };
+  ui.state.projectRoot = "/tmp/project-b";
+  for (const hash of [`#/draft/${projectB}`, `#/${projectB}/new`]) {
+    Object.assign(ui.sandbox.location, { hash, href: `t3code://app/${hash}` });
+    calls.length = 0;
+    await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+    assert.equal(calls.length, 0, `${hash} cannot prove project ownership even when the UUID matches`);
+  }
+  Object.assign(ui.sandbox.location, { hash: `#/projects/${projectB}/new`, href: `t3code://app/#/projects/${projectB}/new` });
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  const requests = calls.filter((entry) => /^board:/.test(entry.action));
+  assert.ok(requests.some((entry) => entry.action === "board:update"));
+  assert.ok(requests.some((entry) => entry.action === "board:clear"));
+  for (const entry of requests) { assert.equal(entry.payload.threadId, "__NEW__"); assert.equal(entry.payload.projectRoot, "/tmp/project-b"); }
+  ui.state.context.draftProjectVerified = false;
+  calls.length = 0;
+  await ui.pollBoard(); await ui.updateBoard(null, "add");
+  assert.equal(calls.length, 0, "legacy unverified contexts must not write a draft");
+  ui.state.connected = false;
+  ui.state.contextError = "无法确认新会话所属项目，请先选择项目";
+  ui.renderLiveBoard();
+  assert.match(ui.root.querySelector("#t3-hub-plan-handle").textContent, /未确认所属项目/);
+});
+
+test("native thread routes bind the environment and thread rather than the project UUID", async () => {
+  const project = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", environment = "11111111-1111-4111-8111-111111111111", otherEnvironment = "22222222-2222-4222-8222-222222222222", tid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc", calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { threadId: tid, steps: [] }; });
+  ui.ready();
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${environment}/${tid}`, href: `t3code://app/#/${environment}/${tid}` });
+  Object.assign(ui.state, { connected: true, threadId: tid, projectRoot: "/tmp/a", context: { threadId: tid, projectId: project, projectRoot: "/tmp/a", environmentId: environment }, boardDraft: "test" });
+  ui.cache.board = { steps: [] };
+  await ui.pollBoard();
+  assert.equal(calls.length, 1, "the environment ID need not equal the thread's project ID");
+  assert.equal(calls[0].payload.threadId, tid);
+  assert.equal(calls[0].payload.projectRoot, "/tmp/a");
+  calls.length = 0;
+  ui.state.context.environmentId = otherEnvironment;
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0, "a different environment must not use the local context");
+  assert.match(ui.root.querySelector("#t3-hub-plan-handle").textContent, /会话未匹配/);
+  delete ui.state.context.environmentId;
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0, "an unverified environment must fail closed");
+  ui.state.context.environmentId = environment;
+  ui.state.context.projectRoot = "/tmp/other-project";
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0, "a stale project root must fail closed");
+});
+
+test("non-UUID thread routes cannot use a stale local context from another environment", async () => {
+  const local = "11111111-1111-4111-8111-111111111111", remote = "22222222-2222-4222-8222-222222222222", calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { threadId: payload.threadId, steps: [] }; });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread:local", projectRoot: "/tmp/a", context: { threadId: "thread:local", projectId: "project-a", projectRoot: "/tmp/a", environmentId: local }, boardDraft: "do not write" });
+  ui.cache.board = { steps: [] };
+  for (const id of ["thread:local", "thread%3Alocal", "thread%3alocal"]) {
+    Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${remote}/${id}`, href: `t3code://app/#/${remote}/${id}` });
+    await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+    assert.equal(calls.length, 0, `${id} must not read or write the previous local context`);
+  }
+  Object.assign(ui.sandbox.location, { hash: `#/${local}/thread%3Alocal`, href: `t3code://app/#/${local}/thread%3Alocal` });
+  assert.equal(ui.currentThreadId(), "thread:local", "the native route decodes the actual thread ID");
+  await ui.pollBoard();
+  assert.equal(calls.length, 1, "the matching local environment can read its thread");
+  assert.equal(calls[0].payload.threadId, "thread:local");
+  calls.length = 0;
+  ui.state.threadId = "thread-a";
+  ui.state.context.threadId = "thread-a";
+  Object.assign(ui.sandbox.location, { hash: `#/${remote}/thread-a`, href: `t3code://app/#/${remote}/thread-a` });
+  assert.equal(ui.currentThreadId(), "thread-a");
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0, "plain string thread IDs still require the matching environment");
+  Object.assign(ui.sandbox.location, { hash: `#/${local}/thread-a`, href: `t3code://app/#/${local}/thread-a` });
+  await ui.pollBoard();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.threadId, "thread-a");
+});
+
+test("unknown environment routes cannot reuse the previous local thread context", async () => {
+  const environment = "11111111-1111-4111-8111-111111111111", thread = "cccccccc-cccc-4ccc-8ccc-cccccccccccc", calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { threadId: payload.threadId, steps: [] }; });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: thread, projectRoot: "/tmp/a", context: { threadId: thread, projectId: "project-a", projectRoot: "/tmp/a", environmentId: environment }, boardDraft: "do not write" });
+  ui.cache.board = { steps: [] };
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/remote-host/${thread}`, href: `t3code://app/#/remote-host/${thread}` });
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0);
+  Object.assign(ui.sandbox.location, { pathname: `/threads/${thread}`, hash: "", href: `https://fixture.test/threads/${thread}` });
+  await ui.pollBoard();
+  assert.equal(calls.length, 1, "the supported legacy thread route remains available");
+  assert.equal(calls[0].payload.threadId, thread);
+});
+
+test("low space uses the plan entry; settings and native dialogs do not add floating controls", () => {
+  const { ui, card } = relationFixture();
+  const entry = ui.root.querySelector("#t3-hub-plan-handle");
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", context: { threadId: "thread-a" } });
+  ui.cache.board = { steps: [] };
+  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom: 790, width: 320, height: 390 });
+  ui.positionConversationTools();
+  assert.equal(entry.hidden, false);
+  assert.match(entry.title, /空间不足/);
+  ui.root.classList.add("is-occluded");
+  ui.positionConversationTools();
+  assert.equal(entry.hidden, true);
+  ui.root.classList.remove("is-occluded");
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: "", href: "https://fixture.test/" });
+  ui.positionConversationTools();
+  assert.equal(entry.hidden, true, "the home page must not suggest another thread's plan");
+  Object.assign(ui.sandbox.location, { pathname: "/settings", hash: "", href: "https://fixture.test/settings" });
+  ui.positionConversationTools();
+  assert.equal(entry.hidden, true);
+});
+
 test("plan board stays in place near the window bottom and never shifts beside the card", () => {
   const { ui, card } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
@@ -1003,13 +1205,15 @@ test("plan scrolling survives polling and geometry updates but resets for a new 
   assert.equal(scroll.scrollTop, 0, "new threads start at the top");
 });
 
-test("0/0 stays visible, inline plan supports check/add/Studio/theme actions, and subagent lists never repeat", () => {
+test("empty plans stay visible, inline plan supports check/add/Studio/theme actions, and subagent lists never repeat", () => {
   const { ui } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
-  ui.state.threadId = "thread-a";
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a" });
+  ui.cache.board = { steps: [] };
   ui.renderLiveBoard();
   assert.equal(board.hidden, false);
-  assert.match(board.innerHTML, /计划进度 0\/0/);
+  assert.match(board.innerHTML, /计划进度 暂无计划/);
   ui.cache.board = { steps: [{ text: "核对页面", status: "pending" }], subagents: [{ name: "duplicate-agent", status: "running" }] };
   ui.state.boardExpanded = true;
   ui.renderLiveBoard();
@@ -1034,11 +1238,13 @@ test("thread IDs follow threads, _chat, hash, UUID, then current context", () =>
 test("native two-UUID routes use the thread UUID; drafts and project-only routes never reuse stale context", async () => {
   const calls = [];
   const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { steps: [] }; });
-  const project = "6ee0c274-d218-41d6-b277-cbfc803dfbc0";
+  const environment = "6ee0c274-d218-41d6-b277-cbfc803dfbc0";
+  const project = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const thread = "3972c780-3288-4f8b-9990-c6cd999f70ba";
   ui.state.context = { threadId: "stale-thread" };
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${project}/${thread}`, href: `t3code://app/#/${project}/${thread}` });
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${environment}/${thread}`, href: `t3code://app/#/${environment}/${thread}` });
   assert.equal(ui.currentThreadId(), thread);
+  ui.state.context = { threadId: thread, projectId: project, projectRoot: "/fixture", environmentId: environment };
   Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: ui.currentThreadId() });
   await ui.pollBoard();
   const call = calls.find((entry) => entry.action === "board:get");
@@ -1067,7 +1273,7 @@ test("route changes clear old plans and artifacts synchronously, request the new
   assert.equal(ui.state.threadId, "thread-b");
   assert.equal(ui.cache.board, null);
   assert.equal(ui.state.artifact, null);
-  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划进度 0\/0/);
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划进度 读取中/);
   await new Promise(setImmediate);
   assert.ok(calls.some((x) => x.action === "board:get" && x.threadId === "thread-b" && x.excludeSubagentInference === true));
   replies.get("thread-b")({ steps: [{ text: "new plan" }] });
@@ -1238,7 +1444,7 @@ test("native card lookup falls back past unrelated asides and accepts shadow-dra
   assert.equal(ui.findSessionRelationsCard().card, card);
 });
 
-test("[P1] /threads/new maps to __NEW__ and poll/update/clear stay strictly isolated", async () => {
+test("[P1] unscoped drafts are blocked; verified project drafts stay strictly isolated", async () => {
   const calls = [];
   let boardData = { steps: [] };
   const ui = harness(async (action, payload) => {
@@ -1255,6 +1461,11 @@ test("[P1] /threads/new maps to __NEW__ and poll/update/clear stay strictly isol
   Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "__NEW__", boardDraft: "草稿步骤" });
   ui.cache.board = { steps: [] };
   calls.length = 0;
+  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  assert.equal(calls.length, 0, "unscoped drafts must not use a fallback project");
+  const projectId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${projectId}/new`, href: `t3code://app/#/projects/${projectId}/new` });
+  ui.state.context = { threadId: "__NEW__", projectId, projectRoot: "/fixture", draftProjectVerified: true };
   await ui.pollBoard();
   const pollCall = calls.find((x) => x.action === "board:get");
   assert.equal(pollCall.payload.threadId, "__NEW__");
@@ -1299,5 +1510,70 @@ test("four core navigation entries exclude the plugin market and shortcuts", () 
   assert.doesNotMatch(slash, /type: "plugin"/);
   const palette = drawerSource.slice(drawerSource.indexOf("function renderSlash"), drawerSource.indexOf("function setSlashActive"));
   assert.doesNotMatch(palette, /\["plugin"/);
-  assert.ok(Buffer.byteLength(drawerSource) < 300000);
+  // The approved card catalog, scoped artifact preview and host/rules controls
+  // expand the former 300 KB navigation-only budget. Keep a bounded allowance
+  // without minifying maintained source or weakening the behavioral checks.
+  assert.ok(Buffer.byteLength(drawerSource) < 350000);
+});
+
+test('project rule and role writes stay blocked while a new route is resolving', async () => {
+  const writes = [];
+  const ui = harness(async (action, payload) => {
+    if (action === 'hub:getContext') return new Promise(() => {});
+    if (/^(agentsMd:(save|injectSoftRoute|syncProjectReference)|subagents:(update|delete))$/.test(action)) writes.push({ action, payload });
+    return { ok: true, items: [] };
+  });
+  ui.ready(); ui.state.open = true; ui.state.connected = true; ui.state.projectRoot = '/tmp/project-a'; ui.state.threadId = 'thread-a';
+  ui.state.context = { projectRoot: '/tmp/project-a', threadId: 'thread-a' }; ui.setCurrentRoute();
+  ui.state.agentsTarget = 'project'; ui.state.agentDrafts['project:/tmp/project-a'] = { content: 'edit', saved: 'old', syncedTargets: [] };
+  ui.state.subagentScope = 'project';
+  const item = { id: 'explorer', model: 'model-a', providerInstanceId: 'codex', effort: 'high', role: 'research' };
+  ui.cache.subagents = { globalItems: [item], projectItems: [item] };
+  ui.sandbox.location.href = 'https://fixture.test/threads/thread-b'; ui.sandbox.location.pathname = '/threads/thread-b'; ui.state.tab = 'agents';
+  ui.checkRoute();
+  for (const action of ['save-agents', 'inject-soft-route', 'sync-project-rule-reference', 'save-subagent', 'clone-subagent', 'confirm-delete-subagent']) clickSettingsAction(ui, { action, id: 'explorer' });
+  await new Promise(setImmediate);
+  assert.deepEqual(writes, []);
+});
+
+test('late project rule save does not mark a stale draft saved or alter another project', async () => {
+  let release; const writes = [];
+  const ui = harness(async (action, payload) => {
+    if (action === 'agentsMd:save') { writes.push(payload); return new Promise(resolve => { release = resolve; }); }
+    if (action === 'hub:getContext') return new Promise(() => {});
+    return { ok: true, projectContent: 'saved', items: [] };
+  });
+  ui.ready(); ui.state.open = true; ui.state.connected = true; ui.state.tab = 'agents'; ui.state.projectRoot = '/tmp/project-a'; ui.state.threadId = 'thread-a';
+  ui.state.context = { projectRoot: '/tmp/project-a', threadId: 'thread-a' }; ui.setCurrentRoute(); ui.state.agentsTarget = 'project';
+  const draft = { content: 'new-a', saved: 'old-a', syncedTargets: [] }; ui.state.agentDrafts['project:/tmp/project-a'] = draft;
+  clickSettingsAction(ui, { action: 'save-agents' }); await new Promise(setImmediate);
+  assert.equal(writes.length, 1); assert.equal(writes[0].expectedContent, 'old-a');
+  ui.sandbox.location.href = 'https://fixture.test/threads/thread-b'; ui.sandbox.location.pathname = '/threads/thread-b'; ui.checkRoute();
+  ui.state.projectRoot = '/tmp/project-b'; ui.state.agentDrafts['project:/tmp/project-b'] = { content: 'b', saved: 'b', syncedTargets: [] };
+  release({ ok: true, sourceSaved: true }); await new Promise(setImmediate);
+  assert.equal(draft.saved, 'old-a'); assert.equal(ui.state.agentDrafts['project:/tmp/project-b'].content, 'b');
+});
+
+test('global rule saves remain available while the project route is resolving', async () => {
+  const writes=[];
+  const ui=harness(async (action,payload)=>{
+    if(action==='hub:getContext') return new Promise(()=>{});
+    if(action==='agentsMd:save'){writes.push(payload);return {ok:true,sourceSaved:true,syncedTargets:[]};}
+    if(action==='agentsMd:get') return {ok:true,globalContent:'new global',projectContent:''};
+    return {ok:true,items:[]};
+  });
+  ui.ready();ui.state.open=true;ui.state.connected=true;ui.state.tab='agents';ui.state.projectRoot='/tmp/a';ui.state.threadId='thread-a';ui.state.context={projectRoot:'/tmp/a',threadId:'thread-a'};ui.setCurrentRoute();
+  ui.state.agentsTarget='global';ui.state.agentDrafts.global={content:'new global',saved:'old global',syncedTargets:[]};
+  ui.sandbox.location.href='https://fixture.test/threads/thread-b';ui.sandbox.location.pathname='/threads/thread-b';ui.checkRoute();
+  clickSettingsAction(ui,{action:'save-agents'});await new Promise(setImmediate);
+  assert.equal(writes.length,1);assert.equal(writes[0].target,'global');assert.equal(writes[0].expectedContent,'old global');assert.equal(ui.state.agentDrafts.global.saved,'new global');
+});
+
+test('stale host rule editor refuses to overwrite a newly injected role block', async (t) => {
+  const f=fixture(t),ui=harness(f.rpc),file=path.join(f.homeDir,'.codex/AGENTS.md');fs.writeFileSync(file,'# old host rules\n');await ui.loadSettings();
+  const before=fs.readFileSync(file,'utf8');
+  const block='<!-- t3-hub-subagents:start -->\nnew routing\n<!-- t3-hub-subagents:end -->\n';fs.appendFileSync(file,block);
+  ui.state.settingsRule='# stale editor text\n';ui.state.settingsRuleDirty=true;await ui.saveNativeSettings(undefined,true);
+  assert.equal(fs.readFileSync(file,'utf8'),before+block);assert.equal(ui.state.settingsRuleDirty,true);
+  assert.match(ui.nodes.get('.hub-toast').innerHTML,/变更|重新读取/);
 });

@@ -620,11 +620,25 @@ function createHostSettingsManager(opts = {}) {
   const museSettingsPath = expandTilde(opts.museSettingsPath || path.join(homeDir, ".config", "muse", "settings.json"));
   const piSettingsPath = expandTilde(opts.piSettingsPath || path.join(homeDir, ".pi", "agent", "settings.json"));
   const agyConfigDir = expandTilde(opts.agyConfigDir || path.join(homeDir, ".gemini", "antigravity"));
+  const agyProvidersDir = path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
+  const agyProviderRules = () => {
+    try { return fs.readdirSync(agyProvidersDir, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => path.join(agyProvidersDir, e.name, "config", "rules", "AGENTS.md")).filter(p => !probeTextSnapshot(p).missing).sort(); }
+    catch { return []; }
+  };
+  const existingOr = (primary, legacy) => !probeTextSnapshot(primary).missing ? primary : !probeTextSnapshot(legacy).missing ? legacy : primary;
+  const agyRulePath = () => {
+    if (opts.agyAgentsPath) return expandTilde(opts.agyAgentsPath);
+    if (opts.agyConfigDir) return path.join(agyConfigDir, "rules", "AGENTS.md");
+    const provider = agyProviderRules();
+    if (provider.length === 1) return provider[0];
+    if (provider.length > 1) return null;
+    return existingOr(path.join(agyConfigDir, "rules", "AGENTS.md"), path.join(homeDir, ".gemini", "GEMINI.md"));
+  };
   const rulesPaths = {
     codex: opts.codexAgentsPath ? expandTilde(opts.codexAgentsPath) : path.join(homeDir, ".codex", "AGENTS.md"),
-    antigravity: opts.agyAgentsPath ? expandTilde(opts.agyAgentsPath) : path.join(agyConfigDir, "rules", "AGENTS.md"),
-    muse: opts.museAgentsPath ? expandTilde(opts.museAgentsPath) : path.join(homeDir, "AGENTS.md"),
-    pi: opts.piAgentsPath ? expandTilde(opts.piAgentsPath) : path.join(homeDir, ".pi", "AGENTS.md"),
+    get antigravity() { return agyRulePath(); },
+    get muse() { return opts.museAgentsPath ? expandTilde(opts.museAgentsPath) : existingOr(path.join(homeDir, ".config", "muse", "AGENTS.md"), path.join(homeDir, "AGENTS.md")); },
+    get pi() { return opts.piAgentsPath ? expandTilde(opts.piAgentsPath) : existingOr(path.join(homeDir, ".pi", "agent", "AGENTS.md"), path.join(homeDir, ".pi", "AGENTS.md")); },
   };
 
   function getCodexSnapshot() {
@@ -676,7 +690,7 @@ function createHostSettingsManager(opts = {}) {
     const rulesDir = path.join(agyConfigDir, "rules");
     const agentsPath = rulesPaths.antigravity;
     const geminiPath = path.join(agyConfigDir, "GEMINI.md");
-    let rulePath = agentsPath, probe = probeTextSnapshot(agentsPath);
+    let rulePath = agentsPath, probe = agentsPath ? probeTextSnapshot(agentsPath) : { missing: true, content: "", error: null, corrupted: false };
     if (probe.missing) {
       const fallback = probeTextSnapshot(geminiPath);
       if (!fallback.missing) { rulePath = geminiPath; probe = fallback; }
@@ -704,6 +718,9 @@ function createHostSettingsManager(opts = {}) {
       preview: content.slice(0, 600),
       mcpCount,
       skillsCount,
+      ruleCandidates: [...new Set([...agyProviderRules(), path.join(homeDir, ".gemini", "GEMINI.md"), path.join(agyConfigDir, "rules", "AGENTS.md")])].map(p => ({ path: p, exists: !probeTextSnapshot(p).missing })),
+      ruleSelectionAmbiguous: !agentsPath,
+      loadedByAcp: null,
       error: probe.error,
       corrupted: probe.corrupted,
     };
@@ -717,7 +734,7 @@ function createHostSettingsManager(opts = {}) {
     const globalRules = {};
     for (const host of Object.keys(rulesPaths)) {
       const p = rulesPaths[host];
-      const probe = probeTextSnapshot(p);
+      const probe = p ? probeTextSnapshot(p) : { missing: true, content: "", error: "存在多个 AGY 规则文件，请先确认当前实例。", corrupted: false };
       globalRules[host] = { path: p, exists: !probe.missing, chars: probe.content.length, error: probe.error, corrupted: probe.corrupted };
     }
     return { codex, antigravity, muse, pi, globalRules };
@@ -725,17 +742,34 @@ function createHostSettingsManager(opts = {}) {
 
   function getRuleContent(host) {
     const p = rulesPaths[host];
-    if (!p) throw new Error(`unknown host: ${host}`);
+    if (!p) throw new Error(host === "antigravity" ? "存在多个 AGY 规则文件，无法确定当前实例" : `unknown host: ${host}`);
     const { content, missing } = readTextFileStrict(p);
-    return { path: p, exists: !missing, content };
+    return { path: p, targetPath: canonicalRuleTarget(p), exists: !missing, content };
   }
 
-  function saveRuleContent(host, content) {
+  function canonicalRuleTarget(file) {
+    let target = path.resolve(resolveRegularFile(file).target), suffix = [];
+    while (true) {
+      try { return path.join(fs.realpathSync(target), ...suffix); }
+      catch (e) {
+        if (e.code !== "ENOENT") throw e;
+        const parent = path.dirname(target);
+        if (parent === target) throw e;
+        suffix.unshift(path.basename(target)); target = parent;
+      }
+    }
+  }
+
+  function saveRuleContent(host, content, expectedContent, expectedTarget) {
     const p = rulesPaths[host];
-    if (!p) throw new Error(`unknown host: ${host}`);
+    if (!p) throw new Error(host === "antigravity" ? "存在多个 AGY 规则文件，无法确定当前实例" : `unknown host: ${host}`);
     if (typeof content !== "string") throw new Error("content must be string");
+    const target = canonicalRuleTarget(p);
+    if (typeof expectedContent !== "string" || typeof expectedTarget !== "string" || target !== expectedTarget) throw new Error("规则文件或目标已变更，请重新读取后保存");
     backupOnce(p);
-    writeTextAtomic(p, content);
+    const writer = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir: opts.hubDir || path.join(homeDir, ".t3", "hub") });
+    writer.replaceRuleDocument(target, content, expectedContent);
+    if (canonicalRuleTarget(p) !== target || readTextFileStrict(p).content !== content) throw new Error("保存后规则目标已变更，请重新读取");
     return { path: p, chars: content.length };
   }
 

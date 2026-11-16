@@ -2,6 +2,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 // Refuse links at both the leaf and any parent before reading, creating,
 // replacing or deleting. The OS temp root itself may be a system alias.
@@ -921,17 +922,23 @@ function buildOrchestrationDirective(cfg) {
   const active = c.orchestratorMode !== "off" || c.swarmMode === "on";
   const modeLabel = c.orchestratorMode === "carbon" ? "Orchestrator (Carbon) · gemini-4-carbon" : c.orchestratorMode === "argon" ? "Orchestrator (Argon) · gemini-4-argon" : c.swarmMode === "on" ? "蜂群并发 /swarm" : "未启用";
   const lines = [];
-  lines.push(SUBAGENT_STOP_HEADER);
   lines.push(ORCHESTRATOR_START);
+  lines.push(SUBAGENT_STOP_HEADER);
   lines.push("## 主帅总控与蜂群并发 (T3 Hub Orchestrator)");
   lines.push("");
   lines.push("当前模式：" + modeLabel + " / swarmMode=" + c.swarmMode + " / maxParallelAgents=" + c.maxParallelAgents + " / strictCommanderOnly=" + (c.strictCommanderOnly ? "true" : "false") + " / autoWorktreeIsolation=" + (c.autoWorktreeIsolation ? "true" : "false"));
   lines.push("");
-  lines.push("主帅军规（严格纯主帅模式）：");
+  lines.push(c.strictCommanderOnly ? "主帅军规（严格纯主帅模式）：" : "协作建议（允许主会话直接处理任务）：");
   lines.push("1. 先输出/更新进度清单：主会话必须先输出并持续更新任务进度清单（TODO/看板），拆单明确、拍板决策后再派发。");
-  lines.push("2. 严禁亲自改业务代码，全部通过 `delegate_task` 按 7 角色（explorer / worker / default / worker-pro / frontend / qa / code-review）派单；蜂群模式（swarmMode=on）下将独立子任务一次性并行派发，最大并行 " + c.maxParallelAgents + " 个。");
-  lines.push("3. 仅当 worker -> worker-pro 均失败时主帅才亲自兜底；主帅只做排版规划、拍板决策、拆解任务单、更新进度看板与结果验收。");
-  if (c.autoWorktreeIsolation) lines.push("- 多路并发写不同模块或同仓冲突风险时，自动启用工作树隔离（autoWorktreeIsolation=true）。");
+  if (c.strictCommanderOnly) {
+    lines.push("2. 严禁亲自改业务代码，全部通过 `delegate_task` 按 7 角色（explorer / worker / default / worker-pro / frontend / qa / code-review）派单；蜂群模式（swarmMode=on）下将独立子任务一次性并行派发，最大并行 " + c.maxParallelAgents + " 个。");
+    lines.push("3. 仅当 worker -> worker-pro 均失败时主帅才亲自兜底；主帅只做排版规划、拍板决策、拆解任务单、更新进度看板与结果验收。");
+  } else {
+    lines.push("2. 根据任务规模和宿主能力决定是否通过 `delegate_task` 派单；主会话可以直接执行。");
+    lines.push("3. 并行建议：" + c.swarmMode + "，建议最多 " + c.maxParallelAgents + " 路；实际由宿主能力及任务依赖决定。");
+  }
+  if (c.autoWorktreeIsolation) lines.push("- 有并发写入冲突风险时，建议使用工作树隔离（实际创建由宿主执行）。");
+  lines.push("- 以上是协作提示，不会自动切换模型、强制并发或创建工作树；宿主和项目规则优先级由各宿主决定。");
   lines.push("");
   lines.push("AGY 主脑档位：");
   lines.push("- Carbon: Orchestrator (Carbon) · gemini-4-carbon · New · 极速敏锐总控主帅 · 低延迟拆单调度与全局把控");
@@ -941,21 +948,9 @@ function buildOrchestrationDirective(cfg) {
   return lines.join("\n") + "\n";
 }
 function buildSlashCommandPrompt(mode) {
-  const cfg = normalizeOrchestrationConfig({});
   const m = String(mode || "").toLowerCase();
   const header = SUBAGENT_STOP_HEADER + "\n";
-  if (m === "swarm" || m === "/swarm") {
-    return header + "/swarm\n[蜂群并发] 启用 /swarm 全火力蜂群并发：独立子任务一次性并行派发（maxParallelAgents=" + cfg.maxParallelAgents + "）。主会话只做排版规划、拍板决策、拆解任务单、更新进度看板与结果验收；严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅当 worker -> worker-pro 均失败时主帅才亲自兜底。";
-  }
-  if (m === "carbon" || m === "orchestrator-carbon" || m === "[orchestrator carbon 纯主帅模式]") {
-    return header + "[Orchestrator Carbon 纯主帅模式]\n启用 Orchestrator (Carbon) · gemini-4-carbon：“极速敏锐总控主帅”。主会话先输出/更新进度清单，严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅 worker -> worker-pro 均失败时主帅兜底。";
-  }
-  if (m === "argon" || m === "orchestrator-argon" || m === "[orchestrator argon 纯主帅模式]") {
-    return header + "[Orchestrator Argon 纯主帅模式]\n启用 Orchestrator (Argon) · gemini-4-argon：“深谋远虑总控主帅”。主会话先输出/更新进度清单，严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅 worker -> worker-pro 均失败时主帅兜底。";
-  }
-  if (m === "plan" || m === "/plan") {
-    return header + "/plan 输出/更新进度清单并拆解任务单；主会话严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单，蜂群模式下独立子任务一次性并行派发。";
-  }
+  if (["swarm", "/swarm", "carbon", "orchestrator-carbon", "[orchestrator carbon 纯主帅模式]", "argon", "orchestrator-argon", "[orchestrator argon 纯主帅模式]", "plan", "/plan"].includes(m)) return header + "遵守当前宿主与项目的统一协作规则，按已配置角色分工；独立任务可按需并行。极小修改或子代理连续两次未解决时，主会话可直接处理。";
   return header + String(mode || "");
 }
 
@@ -982,7 +977,9 @@ function createSubagentsManager(opts = {}) {
       writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
       return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
     }
-    const raw = readJsonFile(globalPath, null);
+    let raw;
+    try { raw = JSON.parse(fs.readFileSync(globalPath, "utf8")); }
+    catch { throw new Error("全局子代理路由配置无法读取或解析，原文件未改动"); }
     if (Array.isArray(raw)) {
       // Normalize to ensure id/name alignment.
       const norm = raw.map((it) => {
@@ -991,10 +988,7 @@ function createSubagentsManager(opts = {}) {
         if (!id) return null;
         return { ...it, id: String(id), name: String(it.name || id), builtin: Boolean(it.builtin), enabled: it.enabled !== false };
       }).filter(Boolean);
-      if (norm.length === 0) {
-        writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
-        return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
-      }
+      if (norm.length !== raw.length) throw new Error("全局子代理路由配置包含无效项目，原文件未改动");
       return norm.map(normalizeMemory);
     }
     if (raw && typeof raw === "object") {
@@ -1006,21 +1000,30 @@ function createSubagentsManager(opts = {}) {
           if (!id) return null;
           return { ...it, id: String(id), name: String(it.name || id), builtin: Boolean(it.builtin), enabled: it.enabled !== false };
         }).filter(Boolean);
-        if (norm.length) return norm.map(normalizeMemory);
-      }
-      if (Object.keys(raw).length === 0) {
-        writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
-        return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
+        if (norm.length !== arr.length) throw new Error("全局子代理路由配置包含无效项目，原文件未改动");
+        return norm.map(normalizeMemory);
       }
     }
-    writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
-    return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
+    throw new Error("全局子代理路由配置格式无效，原文件未改动");
   }
   function writeGlobal(items) {
     writeJsonFileAtomic(globalPath, items);
   }
   function projectPathFor(projectRoot) {
-    const p = path.join(projectDir, slugFromProjectRoot(projectRoot) + ".json");
+    if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be an absolute path");
+    let canonical = path.resolve(projectRoot);
+    const suffix = [];
+    while (true) {
+      try { canonical = path.join(fs.realpathSync(canonical), ...suffix); break; }
+      catch (e) {
+        if (e.code !== "ENOENT") throw e;
+        const parent = path.dirname(canonical);
+        if (parent === canonical) throw e;
+        suffix.unshift(path.basename(canonical)); canonical = parent;
+      }
+    }
+    const hash = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 20);
+    const p = path.join(projectDir, slugFromProjectRoot(canonical) + "-" + hash + ".json");
     assertContained(projectDir, p);
     return p;
   }
@@ -1028,19 +1031,25 @@ function createSubagentsManager(opts = {}) {
     if (!projectRoot) return [];
     const p = projectPathFor(projectRoot);
     if (!fileExists(p)) return [];
-    const raw = readJsonFile(p, []);
+    let raw;
+    try { raw = JSON.parse(fs.readFileSync(p, "utf8")); }
+    catch { throw new Error("项目子代理路由配置无法读取或解析，原文件未改动"); }
     if (Array.isArray(raw)) {
-      return raw.map((it) => {
+      const items = raw.map((it) => {
         if (!it || typeof it !== "object") return null;
         const id = it.id || it.name;
         if (!id) return null;
         return { ...it, id: String(id), name: String(it.name || id), enabled: it.enabled !== false, overridesGlobal: it.overridesGlobal !== false };
       }).filter(Boolean).map(normalizeMemory);
+      if (items.length !== raw.length) throw new Error("项目子代理路由配置包含无效项目，原文件未改动");
+      return items;
     }
     if (raw && typeof raw === "object" && Array.isArray(raw.items)) {
-      return configItems(raw).map(it => ({ ...it, enabled: it.enabled !== false, overridesGlobal: it.overridesGlobal !== false }));
+      const items = configItems(raw).map(it => ({ ...it, enabled: it.enabled !== false, overridesGlobal: it.overridesGlobal !== false }));
+      if (items.length !== raw.items.length) throw new Error("项目子代理路由配置包含无效项目，原文件未改动");
+      return items;
     }
-    return [];
+    throw new Error("项目子代理路由配置格式无效，原文件未改动");
   }
   function writeProject(projectRoot, items) {
     const p = projectPathFor(projectRoot);
@@ -1117,40 +1126,72 @@ function createSubagentsManager(opts = {}) {
 
   const orchestrationConfigPath = () => path.join(hubDir, "orchestration-config.json");
   const activeOrchestrationPath = () => path.join(hubDir, "ACTIVE_ORCHESTRATION_MODE.md");
+  const defaultOrchestrationHosts = () => [
+    path.join(homeDir, ".codex", "AGENTS.md"), path.join(homeDir, ".pi", "agent", "AGENTS.md"),
+    path.join(homeDir, ".config", "muse", "AGENTS.md"), path.join(homeDir, ".claude", "CLAUDE.md"),
+    path.join(hubDir, "global-AGENTS.md"),
+  ];
+  function inspectOrchestrationTargets(args = {}) {
+    const hosts = Array.isArray(args.hosts) ? args.hosts : [...defaultOrchestrationHosts(), ...(Array.isArray(args.additionalHosts) ? args.additionalHosts : [])];
+    const items = [];
+    for (const file of new Set(hosts)) {
+      if (typeof file !== "string" || !path.isAbsolute(file)) continue;
+      try {
+        assertNoSymlinkPath(file);
+        const st = lstatSafe(file);
+        if (!st) continue;
+        if (!st.isFile() || !(st.mode & 0o444) || st.size > 2 * 1024 * 1024) { items.push({ path: file, state: "unknown" }); continue; }
+        const text = fs.readFileSync(file, "utf8"), s = text.indexOf(ORCHESTRATOR_START), e = text.indexOf(ORCHESTRATOR_END);
+        if (s < 0 && e < 0 && !text.includes(SUBAGENT_STOP_HEADER)) continue;
+        if (s < 0 || e < s || text.indexOf(ORCHESTRATOR_START, s + 1) >= 0 || text.indexOf(ORCHESTRATOR_END, e + 1) >= 0) items.push({ path: file, state: "unknown" });
+        else items.push({ path: file, state: "present" });
+      } catch { items.push({ path: file, state: "unknown" }); }
+    }
+    return { state: items.some(item => item.state === "present") ? "present" : items.length ? "unknown" : "clear", items };
+  }
   function getOrchestrationConfig() {
     const pfile = orchestrationConfigPath();
     if (!fileExists(pfile)) {
       return normalizeOrchestrationConfig(null);
     }
     const raw = readJsonFile(pfile, null);
-    if (!raw || typeof raw !== "object") return normalizeOrchestrationConfig(null);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("旧编排配置损坏，无法确认其状态；原文件未改动");
     return normalizeOrchestrationConfig(raw);
   }
-  function removeOrchestratorBlockFromFile(filePath) {
+  function writeOrchestratorBlock(filePath, directive) {
     return transformTextFileAtomic(filePath, (existing) => {
       const sIdx = existing.indexOf(ORCHESTRATOR_START);
       const eIdx = existing.indexOf(ORCHESTRATOR_END);
-      if (sIdx === -1 || eIdx === -1 || eIdx < sIdx) return null;
-      const before = existing.slice(0, sIdx);
+      if ((sIdx === -1) !== (eIdx === -1) || (sIdx !== -1 && (eIdx < sIdx || existing.indexOf(ORCHESTRATOR_START, sIdx + 1) !== -1 || existing.indexOf(ORCHESTRATOR_END, eIdx + 1) !== -1))) throw new Error("orchestration markers are incomplete or duplicated");
+      if (sIdx === -1) {
+        if (!directive && existing.includes(SUBAGENT_STOP_HEADER)) throw new Error("发现没有边界标记的旧提示，请先手动检查");
+        return directive ? (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + directive : null;
+      }
+      let before = existing.slice(0, sIdx);
+      // Older releases put our exact STOP header outside the managed markers.
+      // Remove only copies immediately adjacent to our own block.
+      while (before.endsWith(SUBAGENT_STOP_HEADER + "\n")) before = before.slice(0, -(SUBAGENT_STOP_HEADER.length + 1));
       let after = existing.slice(eIdx + ORCHESTRATOR_END.length);
       if (after.startsWith("\r\n")) after = after.slice(2);
       else if (after.startsWith("\n")) after = after.slice(1);
-      const next = before + after;
+      const next = before + (directive || "") + after;
       return next === existing ? null : next;
-    }, { createIfMissing: false });
+    }, { backup: Boolean(directive), createIfMissing: Boolean(directive) });
   }
   function syncOrchestrationDirectiveToHosts(args = {}) {
-    const cfg = getOrchestrationConfig();
+    const cfg = args.configOverride ? normalizeOrchestrationConfig(args.configOverride) : getOrchestrationConfig();
     const active = cfg.orchestratorMode !== "off" || cfg.swarmMode === "on";
+    if (active) throw new Error("旧编排指引已退役，请先关闭旧配置并使用统一角色路由");
     const directive = buildOrchestrationDirective(cfg);
     // Always update hub managed file ACTIVE_ORCHESTRATION_MODE.md
+    const results = [];
     try {
       safeMkdir(path.dirname(activeOrchestrationPath()));
       const content = active ? "# Orchestration Mode\n\n" + directive : "# Orchestration Mode (disabled)\n\nOrchestrator 未启用（orchestratorMode=off, swarmMode=" + cfg.swarmMode + "）。启用 Orchestrator (Carbon/Argon) 或 /swarm 时此处将同步军规指令。\n";
       let existingActive = "";
       try { if (fileExists(activeOrchestrationPath())) existingActive = fs.readFileSync(activeOrchestrationPath(), "utf8"); } catch {}
       if (existingActive !== content) writeTextAtomic(activeOrchestrationPath(), content);
-    } catch {}
+    } catch (e) { results.push({ path: activeOrchestrationPath(), ok: false, error: String(e?.message || e) }); }
     // Hosts: allow args.hosts or args.hostRulePaths or args.extraSyncPaths
     let hosts = null;
     if (Array.isArray(args.hosts)) hosts = args.hosts;
@@ -1169,45 +1210,39 @@ function createSubagentsManager(opts = {}) {
       if (/\/agents\/[^\/]+\.md$/.test(norm) && norm.includes(".claude")) return true;
       return false;
     };
+    const applyToHost = (fp) => {
+      if (seen.has(fp)) return;
+      seen.add(fp);
+      if (isSubagentDir(fp)) { results.push({ path: fp, ok: false, error: "子代理规则目录不接受总控指引" }); return; }
+      try {
+        const changed = writeOrchestratorBlock(fp, active ? directive : null);
+        results.push({ path: fp, ok: true, changed: Boolean(changed?.changed) });
+      } catch (e) { results.push({ path: fp, ok: false, error: String(e?.message || e) }); }
+    };
     for (const h of hosts) {
       if (typeof h !== "string") continue;
       const fp = path.isAbsolute(h) ? h : path.resolve(String(h));
-      if (seen.has(fp)) continue;
-      seen.add(fp);
-      // 严防：绝不向子代理目录写入蜂窝/指挥官指令
-      if (isSubagentDir(fp)) continue;
-      safeMkdir(path.dirname(fp));
-      if (active) {
-        // Inject idempotently; also avoid recreating if file does not exist? Still create to ensure marker present.
-        injectIntoFile(fp, directive, ORCHESTRATOR_START, ORCHESTRATOR_END);
-      } else {
-        removeOrchestratorBlockFromFile(fp);
-      }
+      applyToHost(fp);
     }
     // If no explicit hosts provided, sync to default CLI global files inside homeDir/hubDir if they exist or hub dir already exists, but only when not isolating via test hostRulePaths.
     // To avoid polluting real HOME in unit tests, we only sync defaults when hosts length ===0 and no isolated flag? Tests that pass hostRulePaths will have hosts non-empty, so this branch not taken.
     // When hosts empty (production update via updateOrchestrationConfig without explicit hosts), sync to default CLI targets if they exist or are already present in tmp home/hub.
     if (hosts.length === 0) {
-      const defaults = [
-        path.join(homeDir, ".codex", "AGENTS.md"),
-        path.join(homeDir, ".pi", "agent", "AGENTS.md"),
-        path.join(homeDir, ".config", "muse", "AGENTS.md"),
-        path.join(homeDir, ".claude", "CLAUDE.md"),
-        path.join(hubDir, "global-AGENTS.md"),
-      ];
+      const defaults = defaultOrchestrationHosts();
       for (const t of defaults) {
         // Only sync if file already exists or parent dir exists (avoid stray creation)
-        if (fileExists(t) || dirExists(path.dirname(t))) {
-          if (active) injectIntoFile(t, directive, ORCHESTRATOR_START, ORCHESTRATOR_END);
-          else removeOrchestratorBlockFromFile(t);
-        }
+        try { if (fileExists(t) || dirExists(path.dirname(t))) applyToHost(t); }
+        catch (e) { results.push({ path: t, ok: false, error: String(e?.message || e) }); }
       }
     }
-    return { ok: true, config: cfg, active, directive };
+    for (const fp of Array.isArray(args.additionalHosts) ? args.additionalHosts : []) {
+      if (typeof fp === "string" && path.isAbsolute(fp)) applyToHost(fp);
+    }
+    return { ok: results.every((item) => item.ok), config: cfg, active, directive, hostResults: results };
   }
   function updateOrchestrationConfig(patch = {}, opts = {}) {
     const pfile = orchestrationConfigPath();
-    const current = fileExists(pfile) ? readJsonFile(pfile, {}) : {};
+    const current = getOrchestrationConfig();
     const merged = { ...current, ...(patch || {}) };
     // Remove hostRulePaths/hosts from merged before persisting
     const hostRulePaths = opts.hostRulePaths || opts.hosts || opts.extraSyncPaths || merged.hostRulePaths || merged.hosts || null;
@@ -1216,15 +1251,19 @@ function createSubagentsManager(opts = {}) {
     delete merged.host;
     // Also remove nested hostRulePaths key if present
     const normalized = normalizeOrchestrationConfig(merged);
-    writeJsonFileAtomic(pfile, normalized);
+    if (normalized.orchestratorMode !== "off" || normalized.swarmMode === "on") throw new Error("旧编排指引已退役，请使用统一角色路由");
     // Sync respecting explicit hosts; do not pollute defaults if hostRulePaths were provided
     const syncArgs = {};
+    syncArgs.configOverride = normalized;
+    if (Array.isArray(opts.additionalHosts)) syncArgs.additionalHosts = opts.additionalHosts;
     if (Array.isArray(hostRulePaths)) syncArgs.hosts = hostRulePaths;
     else if (Array.isArray(patch?.hostRulePaths)) syncArgs.hosts = patch.hostRulePaths;
     else if (Array.isArray(opts.hosts)) syncArgs.hosts = opts.hosts;
     // Call sync; if no explicit hosts, sync will handle default existing files
     const syncResult = syncOrchestrationDirectiveToHosts(syncArgs);
-    return { ok: true, config: normalized, ...syncResult };
+    if (!syncResult.ok) return { ...syncResult, config: current, desiredConfig: normalized };
+    writeJsonFileAtomic(pfile, normalized);
+    return { ...syncResult, config: normalized };
   }
 
   function renderBlock(items, isProject) {
@@ -1503,6 +1542,44 @@ function createSubagentsManager(opts = {}) {
     }, { backup: true, createIfMissing: true });
   }
 
+  // Shared global rules are a bounded block inside each host's own file. The
+  // same CAS/backup path used by subagent updates protects unrelated content.
+  function syncManagedRuleBlock(filePath, content, scope = "global") {
+    if (!["global", "project"].includes(scope)) throw new Error("invalid rule sync scope");
+    const start = `<!-- t3-hub-${scope}-rules:start -->`, end = `<!-- t3-hub-${scope}-rules:end -->`;
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath) || typeof content !== "string") throw new Error("invalid rule sync input");
+    if (content.includes(start) || content.includes(end)) throw new Error("shared rules contain reserved markers");
+    return transformTextFileAtomic(filePath, (existing) => {
+      const s = existing.indexOf(start), e = existing.indexOf(end);
+      if ((s < 0) !== (e < 0) || (s >= 0 && (e < s || existing.indexOf(start, s + start.length) >= 0 || existing.indexOf(end, e + end.length) >= 0))) throw new Error("shared rule markers are incomplete or duplicated");
+      const block = content ? start + "\n" + content.replace(/\n?$/, "\n") + end + "\n" : "";
+      if (s < 0) return block ? existing + (existing && !existing.endsWith("\n") ? "\n" : "") + (existing ? "\n" : "") + block : null;
+      let after = existing.slice(e + end.length);
+      if (after.startsWith("\r\n")) after = after.slice(2); else if (after.startsWith("\n")) after = after.slice(1);
+      return existing.slice(0, s) + block + after;
+    }, { backup: true, createIfMissing: Boolean(content) });
+  }
+
+  function replaceRuleDocument(filePath, content, expectedContent) {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath) || typeof content !== "string" || typeof expectedContent !== "string") throw new Error("请先重新读取规则，再保存修改");
+    for (const [start, end] of [["<!-- t3-hub-subagents:start -->", "<!-- t3-hub-subagents:end -->"], ["<!-- t3-hub-project-subagents:start -->", "<!-- t3-hub-project-subagents:end -->"], ["<!-- t3-hub-global-rules:start -->", "<!-- t3-hub-global-rules:end -->"], ["<!-- t3-hub-project-rules:start -->", "<!-- t3-hub-project-rules:end -->"], [ORCHESTRATOR_START, ORCHESTRATOR_END]]) {
+      const section = (text) => {
+        const s = text.indexOf(start), e = text.indexOf(end);
+        if ((s < 0) !== (e < 0) || (s >= 0 && (e < s || text.indexOf(start, s + start.length) >= 0 || text.indexOf(end, e + end.length) >= 0))) throw new Error("托管区块不完整或重复，请先修复");
+        return s < 0 ? "" : text.slice(s, e + end.length);
+      };
+      if (section(expectedContent) !== section(content)) throw new Error("托管区块请在对应页面修改");
+    }
+    return transformTextFileAtomic(filePath, (existing) => {
+      if (existing !== expectedContent) throw new Error("规则文件已发生变更，请重新读取后合并修改");
+      return content;
+    }, { backup: true, createIfMissing: true });
+  }
+  function transformRuleDocument(filePath, transform) {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath) || typeof transform !== "function") throw new Error("invalid rule transform");
+    return transformTextFileAtomic(filePath, transform, { backup: true, createIfMissing: true });
+  }
+
   function resolveExcludePath(projectRoot) {
     if (!projectRoot || !dirExists(projectRoot)) return null;
     const gitPath = path.join(projectRoot, ".git");
@@ -1714,7 +1791,10 @@ function createSubagentsManager(opts = {}) {
     const globalItems = readGlobal();
     const projectItems = projectRoot ? readProject(projectRoot) : [];
     const effectiveItems = buildEffective(globalItems, projectItems);
-    return { ok: true, projectRoot, catalog, globalItems, projectItems, effectiveItems };
+    const legacyPath = projectRoot ? path.join(projectDir, slugFromProjectRoot(projectRoot) + ".json") : null;
+    const legacyProjectConfig = Boolean(legacyPath && fileExists(legacyPath));
+    const sourceById = Object.fromEntries(effectiveItems.map(item => [item.id, projectItems.some(p => p.enabled !== false && p.id === item.id && (p.overridesGlobal || !globalItems.some(g => g.enabled !== false && g.id === item.id))) ? "project" : "global"]));
+    return { ok: true, projectRoot, catalog, globalItems, projectItems, effectiveItems, sourceById, legacyProjectConfig };
   }
 
   function saveSubagent(args = {}) {
@@ -1845,14 +1925,15 @@ function createSubagentsManager(opts = {}) {
 
   // Read on every call and never seed/synchronize configuration from a hook invocation.
   function resolveSubagentRoute({ idOrTitle, role, projectRoot } = {}) {
-    const globals = configItems(readJsonFile(globalPath, []));
+    const globals = fileExists(globalPath) ? readGlobal() : [];
     let projects = [];
     if (projectRoot) {
       let current = path.resolve(projectRoot);
+      try { current = fs.realpathSync(current); } catch (e) { if (e.code !== "ENOENT") throw e; }
       // A tool may run below the project root. The closest project config wins.
       while (true) {
         const file = projectPathFor(current);
-        if (fileExists(file)) { projects = configItems(readJsonFile(file, []), false).map(i => ({ ...i, overridesGlobal: i.overridesGlobal !== false })); break; }
+        if (fileExists(file)) { projects = readProject(current); break; }
         if (fileExists(path.join(current, ".git")) || dirExists(path.join(current, ".git"))) break;
         const parent = path.dirname(current);
         if (parent === current) break;
@@ -1883,7 +1964,7 @@ function createSubagentsManager(opts = {}) {
     return { ok: true, matched: true, item, target: { providerInstanceId: item.providerInstanceId, model: item.model, options: optionsForSubagent(item) } };
   }
 
-  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, getOrchestrationConfig, updateOrchestrationConfig, syncOrchestrationDirectiveToHosts, buildOrchestrationDirective, buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode), listModelCatalog: () => listModelCatalog(homeDir) };
+  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, getOrchestrationConfig, inspectOrchestrationTargets, updateOrchestrationConfig, syncOrchestrationDirectiveToHosts, syncManagedRuleBlock, replaceRuleDocument, transformRuleDocument, buildOrchestrationDirective, buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode), listModelCatalog: () => listModelCatalog(homeDir) };
 }
 
 let _singleton = null;
@@ -1909,6 +1990,7 @@ module.exports = {
   saveSubagent,
   deleteSubagent,
   getOrchestrationConfig: getOrchestrationConfigExport,
+  inspectOrchestrationTargets: (args) => getDefaultSubagentsManager().inspectOrchestrationTargets(args || {}),
   updateOrchestrationConfig: updateOrchestrationConfigExport,
   syncOrchestrationDirectiveToHosts: syncOrchestrationDirectiveToHostsExport,
   buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode),

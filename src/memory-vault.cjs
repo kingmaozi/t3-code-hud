@@ -1883,16 +1883,15 @@ function createMemoryVault(opts = {}) {
       const ctxForFilter = args.projectRoot ? resolveWorktreeContext(String(args.projectRoot)) : null;
       const worktreeIdForFilter = ctxForFilter && ctxForFilter.worktreeId ? ctxForFilter.worktreeId : "";
       const isLinkedForFilter = !!(ctxForFilter && ctxForFilter.isLinkedWorktree);
-      const effectiveIncludeGlobal = scopeFilter === "global" || scopeFilter === "all" || (scopeFilter === "auto" && (isLinkedForFilter || args.includeGlobal === true)) || (scopeFilter === "auto" && args.includeGlobal === true) || args.includeGlobal === true && scopeFilter === "auto" ? (scopeFilter === "shared" || scopeFilter === "worktree" ? false : (isLinkedForFilter || args.includeGlobal === true || scopeFilter === "all" || scopeFilter === "global")) : false;
-      // Simpler: determine includeGlobalEffective for auto case.
-      const autoIncludeGlobal = isLinkedForFilter || args.includeGlobal === true;
       let slug = null;
       if (scopeFilter === "global") slug = GLOBAL_SLUG;
       else slug = resolveSlug(args.projectSlug ? String(args.projectSlug) : null, args.projectRoot ? String(args.projectRoot) : null);
+      const autoIncludeGlobal = args.includeGlobal === true || (args.includeGlobal !== false && (isLinkedForFilter || !slug));
+      const syncGlobal = scopeFilter === "global" || scopeFilter === "all" || (scopeFilter === "auto" && (slug === GLOBAL_SLUG || autoIncludeGlobal));
       // Auto-sync Markdown edits before reading.
       try {
-        if (slug) syncFromMarkdownIfChanged(slug);
-        if (args.includeGlobal || scopeFilter === "global" || scopeFilter === "all" || (scopeFilter === "auto" && isLinkedForFilter)) syncFromMarkdownIfChanged(GLOBAL_SLUG);
+        if (slug && (slug !== GLOBAL_SLUG || syncGlobal)) syncFromMarkdownIfChanged(slug);
+        if (syncGlobal && slug !== GLOBAL_SLUG) syncFromMarkdownIfChanged(GLOBAL_SLUG);
       } catch {}
       const db = openDb();
       try {
@@ -1941,11 +1940,7 @@ function createMemoryVault(opts = {}) {
                   params.push(slug, worktreeIdForFilter);
                 }
               }
-            } else if (args.includeGlobal) {
-              // No slug: everything
-            } else {
-              // No slug and no global: filter by scope shared+global? For auto with no project, show all.
-            }
+            } else if (!autoIncludeGlobal) { conds.push("project_slug != ?"); params.push(GLOBAL_SLUG); }
           }
           if (module !== "all") {
             conds.push("module = ?");
@@ -1978,6 +1973,7 @@ function createMemoryVault(opts = {}) {
             if (ps === GLOBAL_SLUG) return true;
             return false;
           }
+          if (!slugVal) return ps !== GLOBAL_SLUG || filterInfo.autoIncludeGlobal;
           if (ps === GLOBAL_SLUG) return filterInfo.autoIncludeGlobal;
           if (ps === slugVal) {
             if (ms === "shared" || ms === "" || ms == null) return true;
@@ -4405,7 +4401,9 @@ function createMemoryVault(opts = {}) {
       } finally {
         db.close();
       }
-    } catch {}
+    } catch {
+      return { ok: false, error: "记忆库统计不可用，请检查索引数据库" };
+    }
     return { ok: true, vectorStats: { totalMemories, syncedVectors, activeModelId, reindexing: _reindexing } };
   }
   // P1-B: vault 初始化时恢复遗留意图日志

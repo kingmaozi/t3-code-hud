@@ -401,12 +401,12 @@ describe("review #6 AGENTS.md backup", () => {
     fs.mkdirSync(path.join(proj, ".git", "info"), { recursive: true });
     fs.writeFileSync(path.join(proj, ".git", "info", "exclude"), "", "utf8");
     fs.writeFileSync(path.join(proj, "AGENTS.md"), "ORIGINAL-PROJ\n", "utf8");
-    mgr.saveAgentsMd({ target: "project", content: "# New\n", projectRoot: proj });
+    mgr.saveAgentsMd({ target: "project", content: "# New\n", expectedContent: "ORIGINAL-PROJ\n", projectRoot: proj });
     assert.equal(fs.readFileSync(path.join(proj, "AGENTS.md"), "utf8"), "# New\n");
     assert.equal(fs.readFileSync(path.join(proj, "AGENTS.md.bak-t3hub"), "utf8"), "ORIGINAL-PROJ\n");
     const excl = fs.readFileSync(path.join(proj, ".git", "info", "exclude"), "utf8");
     assert.ok(excl.includes("AGENTS.md.bak-t3hub"), "exclude must contain backup name");
-    mgr.saveAgentsMd({ target: "project", content: "# New2\n", projectRoot: proj });
+    mgr.saveAgentsMd({ target: "project", content: "# New2\n", expectedContent: "# New\n", projectRoot: proj });
     assert.equal(fs.readFileSync(path.join(proj, "AGENTS.md.bak-t3hub"), "utf8"), "ORIGINAL-PROJ\n", "backup must remain one-time original");
   });
 
@@ -889,7 +889,7 @@ describe("sidecar-code-review-2 #5 global mode clears stale project off", () => 
     listed = r.listMcpServers({ projectRoot: proj });
     assert.equal(listed.items.find((i) => i.name === "srvlazy").mode, "global-lazy", "global-lazy must take effect immediately, not masked by stale project off");
     const state = JSON.parse(fs.readFileSync(path.join(hub, "state.json"), "utf8"));
-    assert.ok(!state.mcpModes?.projects?.[proj]?.srvlazy, "stale project off entry must be deleted");
+    assert.ok(!state.mcpModes?.projects?.[normRoot(proj)]?.srvlazy, "stale project off entry must be deleted");
     assert.equal(state.mcpModes?.global?.srvlazy, "global-lazy");
     assert.equal(r.listMcpServers({}).items.find((i) => i.name === "srvlazy").mode, "global-lazy");
   });
@@ -905,7 +905,7 @@ describe("sidecar-code-review-2 #5 global mode clears stale project off", () => 
     r.setMcpMode({ name: "srvdir", mode: "global-direct", projectRoot: proj });
     assert.equal(r.listMcpServers({ projectRoot: proj }).items.find((i) => i.name === "srvdir").mode, "global-direct");
     const state = JSON.parse(fs.readFileSync(path.join(hub, "state.json"), "utf8"));
-    assert.ok(!state.mcpModes?.projects?.[proj]?.srvdir);
+    assert.ok(!state.mcpModes?.projects?.[normRoot(proj)]?.srvdir);
   });
 
   it("global switch without projectRoot does not clear other project off entries", () => {
@@ -917,7 +917,7 @@ describe("sidecar-code-review-2 #5 global mode clears stale project off", () => 
     r.setMcpMode({ name: "srvkeep", mode: "off", projectRoot: proj });
     r.setMcpMode({ name: "srvkeep", mode: "global-lazy" });
     const state = JSON.parse(fs.readFileSync(path.join(hub, "state.json"), "utf8"));
-    assert.equal(state.mcpModes?.projects?.[proj]?.srvkeep, "off", "no projectRoot => keep project override");
+    assert.equal(state.mcpModes?.projects?.[normRoot(proj)]?.srvkeep, "off", "no projectRoot => keep canonical project override");
     assert.equal(r.listMcpServers({ projectRoot: proj }).items.find((i) => i.name === "srvkeep").mode, "off");
     assert.equal(r.listMcpServers({}).items.find((i) => i.name === "srvkeep").mode, "global-lazy");
   });

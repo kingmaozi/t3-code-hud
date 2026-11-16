@@ -175,8 +175,12 @@ describe("hub-task-board: AGY brain 解析与产物", () => {
   it("解析 completed / in_progress / pending 步骤", () => {
     const { root } = brainDir();
     const dir = makeTmp("board-agy");
-    const board = createTaskBoard({ t3DbPath: path.join(dir, "missing.sqlite"), agyBrainDirs: [root], hubPlansDir: path.join(dir, "plans") });
-    const snap = board.getBoardSnapshot({});
+    const dbPath = buildT3Db(dir, (db) => {
+      db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)").run("proj-1", "p", dir, "{}", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00Z");
+      insertThread(db, { threadId: "sess-1", title: "session", updatedAt: "2026-11-15T09:00:00Z" });
+    });
+    const board = createTaskBoard({ t3DbPath: dbPath, agyBrainDirs: [root], hubPlansDir: path.join(dir, "plans") });
+    const snap = board.getBoardSnapshot({ threadId: "sess-1", projectRoot: dir });
     assert.equal(snap.source, "agy-brain");
     assert.deepEqual(snap.progress, { completed: 1, inProgress: 3, pending: 2, total: 6, label: "1/6", percent: 17 });
     assert.equal(snap.background, "Making 总控进度看板");
@@ -185,8 +189,12 @@ describe("hub-task-board: AGY brain 解析与产物", () => {
   it("收集 userFacing: true 产物并过滤内部产物", () => {
     const { root } = brainDir();
     const dir = makeTmp("board-agy2");
-    const board = createTaskBoard({ t3DbPath: path.join(dir, "missing.sqlite"), agyBrainDirs: [root], hubPlansDir: path.join(dir, "plans") });
-    const snap = board.getBoardSnapshot({});
+    const dbPath = buildT3Db(dir, (db) => {
+      db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)").run("proj-1", "p", dir, "{}", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00Z");
+      insertThread(db, { threadId: "sess-1", title: "session", updatedAt: "2026-11-15T09:00:00Z" });
+    });
+    const board = createTaskBoard({ t3DbPath: dbPath, agyBrainDirs: [root], hubPlansDir: path.join(dir, "plans") });
+    const snap = board.getBoardSnapshot({ threadId: "sess-1", projectRoot: dir });
     const names = snap.artifacts.map((a) => a.name);
     assert.ok(names.includes("implementation_plan.md"));
     assert.ok(names.includes("task.md"));
@@ -230,7 +238,7 @@ describe("hub-task-board: Hub MCP 打卡（Pi 通用保底）", () => {
     assert.equal(rec.steps[0].status, "completed");
     assert.equal(rec.steps[2].status, "in_progress");
     assert.equal(rec.updatedAt, "2026-11-15T12:00:00.000Z");
-    const snap = board.getBoardSnapshot({ threadId: "pi-thread" });
+    const snap = board.getBoardSnapshot({ threadId: "pi-thread", projectRoot: "/tmp/pi-proj" });
     assert.equal(snap.source, "hub-mcp");
     assert.equal(snap.background, "Pi 背景");
     assert.deepEqual(snap.progress, { completed: 2, inProgress: 1, pending: 0, total: 3, label: "2/3", percent: 67 });
@@ -258,6 +266,7 @@ describe("hub-task-board: Hub MCP 打卡（Pi 通用保底）", () => {
     fs.writeFileSync(path.join(session, "implementation_plan.md.metadata.json"), JSON.stringify({ summary: "脑产物", userFacing: true, updatedAt: "2026-11-14T00:00:00.000Z" }), "utf8");
     const dbPath = buildT3Db(dir, (db) => {
       db.exec(`CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, provider_session_id TEXT, payload_json TEXT)`);
+      db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)").run("proj-1", "p", dir, "{}", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00Z");
       insertThread(db, { threadId: "thread-m", title: "合并", updatedAt: "2026-11-15T00:00:00Z" });
       db.prepare("INSERT INTO orchestration_v2_projection_provider_threads (thread_id, provider_session_id, payload_json) VALUES (?,?,?)").run("thread-m", "sess-merge", JSON.stringify({ nativeThreadRef: { nativeId: "sess-merge" } }));
       insertSubagent(db, { subId: "s1", parentThread: "thread-m", status: "running", provider: "muse", child: "c1", title: "实况子代理", model: "m", startedAt: "2026-11-15T00:00:00Z", completedAt: null, updatedAt: "2026-11-15T00:30:00Z" });
@@ -270,8 +279,8 @@ describe("hub-task-board: Hub MCP 打卡（Pi 通用保底）", () => {
       hubPlansDir: path.join(dir, "plans"),
       now: () => Date.parse("2026-11-15T13:00:00.000Z"),
     });
-    board.updatePlan({ threadId: "thread-m", title: "Hub 新计划", background: "Hub 背景", steps: [{ text: "hub 新步骤", status: "pending" }] });
-    const snap = board.getBoardSnapshot({ threadId: "thread-m" });
+    board.updatePlan({ threadId: "thread-m", projectRoot: dir, title: "Hub 新计划", background: "Hub 背景", steps: [{ text: "hub 新步骤", status: "pending" }] });
+    const snap = board.getBoardSnapshot({ threadId: "thread-m", projectRoot: dir });
     assert.equal(snap.source, "hub-mcp");
     assert.equal(snap.steps[0].text, "hub 新步骤");
     assert.equal(snap.subagents.length, 1);
@@ -431,7 +440,8 @@ describe("hub-host-settings: Codex TOML 行级精准修改", () => {
     const before = mgr.getRuleContent("antigravity");
     assert.equal(before.exists, true);
     assert.ok(before.content.includes("保持中文回复"));
-    mgr.saveRuleContent("codex", "# new rules\n- 中文\n");
+    const codexBefore = mgr.getRuleContent("codex");
+    mgr.saveRuleContent("codex", "# new rules\n- 中文\n", codexBefore.content, codexBefore.targetPath);
     const after = mgr.getRuleContent("codex");
     assert.equal(after.content, "# new rules\n- 中文\n");
     assert.ok(fs.existsSync(path.join(home, ".codex", "AGENTS.md.t3hub.bak")) || after.exists);
@@ -472,7 +482,7 @@ describe("hub-host-settings: symlink preservation and unsafe path guards", () =>
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const mgr = createHostSettingsManager({ homeDir: home });
-    const save = () => rule ? mgr.saveRuleContent(host, "# after\n") : mgr.updateHostSetting({ host, key: "model", value: "after" });
+    const save = () => { if (!rule) return mgr.updateHostSetting({ host, key: "model", value: "after" }); const before = mgr.getRuleContent(host); return mgr.saveRuleContent(host, "# after\n", before.content, before.targetPath); };
     return { home, file, target, mgr, save, before, rule, host };
   }
   function assertCorrupted(f, pattern) {
@@ -622,7 +632,8 @@ describe("hub-host-settings: symlink preservation and unsafe path guards", () =>
     fs.symlinkSync("dotfiles", path.join(home, ".config"));
     const mgr = createHostSettingsManager({ homeDir: home });
     for (const host of ["codex", "muse", "pi"]) mgr.updateHostSetting({ host, key: "model", value: "after" });
-    mgr.saveRuleContent("codex", "# after\n");
+    const before = mgr.getRuleContent("codex");
+    mgr.saveRuleContent("codex", "# after\n", before.content, before.targetPath);
     const snapshot = mgr.getSettingsSnapshot();
     for (const host of ["codex", "muse", "pi"]) {
       assert.equal(snapshot[host].corrupted, false);
@@ -729,6 +740,7 @@ describe("hub-task-board: per-thread native mapping + strict isolation", () => {
     fs.mkdirSync(dbDir, { recursive: true });
     const dbPath = buildT3Db(dbDir, (db) => {
       db.exec(`CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, provider_session_id TEXT, payload_json TEXT)`);
+      db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)").run("proj-1", "p", dir, "{}", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00Z");
       insertThread(db, { threadId: threadA, title: "Agy 会话", updatedAt: "2026-11-15T08:00:00.000Z" });
       insertThread(db, { threadId: threadB, title: "Codex 会话", updatedAt: "2026-11-15T09:00:00.000Z" });
       insertThread(db, { threadId: threadC, title: "空新会话", updatedAt: "2026-11-15T10:00:00.000Z" });
@@ -743,21 +755,21 @@ describe("hub-task-board: per-thread native mapping + strict isolation", () => {
     const hubPlansDir = path.join(dir, "plans");
     const board = createTaskBoard({ t3DbPath: dbPath, agyBrainDirs: [brainRoot], hubPlansDir, now: () => Date.parse("2026-11-15T11:00:00.000Z") });
     // B 的独立 Hub 计划 2 步
-    board.updatePlan({ threadId: threadB, title: "Codex 计划", background: "B 背景", steps: [{ text: "B 步骤一", status: "completed" }, { text: "B 步骤二", status: "pending" }] });
+    board.updatePlan({ threadId: threadB, projectRoot: dir, title: "Codex 计划", background: "B 背景", steps: [{ text: "B 步骤一", status: "completed" }, { text: "B 步骤二", status: "pending" }] });
 
-    const snapA = board.getBoardSnapshot({ threadId: threadA });
+    const snapA = board.getBoardSnapshot({ threadId: threadA, projectRoot: dir });
     assert.equal(snapA.source, "agy-brain");
     assert.equal(snapA.steps.length, 3);
     assert.equal(snapA.progress.label, "1/3");
 
-    const snapB = board.getBoardSnapshot({ threadId: threadB });
+    const snapB = board.getBoardSnapshot({ threadId: threadB, projectRoot: dir });
     assert.equal(snapB.source, "hub-mcp");
     assert.equal(snapB.steps.length, 2);
     assert.equal(snapB.steps[0].text, "B 步骤一");
     // 绝不串台拿到 A 的 task.md
     assert.ok(!snapB.steps.some((s) => s.text && s.text.startsWith("AGY")), "B must not cross-talk to A agy-brain");
 
-    const snapC = board.getBoardSnapshot({ threadId: threadC, excludeSubagentInference: true });
+    const snapC = board.getBoardSnapshot({ threadId: threadC, projectRoot: dir, excludeSubagentInference: true });
     assert.equal(snapC.steps.length, 0);
     assert.equal(snapC.progress.label, "0/0");
     assert.equal(snapC.source, "t3-native");
@@ -766,10 +778,10 @@ describe("hub-task-board: per-thread native mapping + strict isolation", () => {
     assert.equal(snapC.subagents.length, 2, "subagents should still be listed even when inference excluded");
     assert.equal(snapC.steps.length, 0, "inference excluded keeps 0 steps");
 
-    // 无参回退保持兼容：getBoardSnapshot({}) 仍可回退到最新 mtime 的 agy
+    // 缺少项目上下文时不应读取全局最新的 AGY brain。
     const snapNoArg = board.getBoardSnapshot({});
     assert.ok(["agy-brain", "hub-mcp", "t3-native", "subagents-inferred"].includes(snapNoArg.source));
-    // 至少在无参时不抛错，且能拿到某个计划（agy 为最新 fallback）
+    assert.notEqual(snapNoArg.source, "agy-brain");
     assert.ok(snapNoArg.steps.length >= 0);
   });
 
@@ -894,16 +906,28 @@ describe("hub-task-board: project and draft isolation regressions", () => {
     assert.deepEqual(board.clearPlan(queryB), { deleted: 1 });
   });
 
-  it("普通会话计划同时按项目隔离，旧无项目记录仍兼容", (t) => {
+  it("普通会话计划按项目隔离，无项目的旧记录只由无项目查询访问", (t) => {
     const { dir, board, hubPlansDir } = fixture(t, "thread-project-isolation");
     const a = path.join(dir, "a"), b = path.join(dir, "b");
     writeFile(hubPlansDir, "foreign.json", JSON.stringify({ threadId: "same", projectRoot: b, steps: [{ text: "B" }], updatedAt: "2026-11-16" }));
     assertEmpty(board.getBoardSnapshot({ threadId: "same", projectRoot: a }));
     assert.deepEqual(board.clearPlan({ threadId: "same", projectRoot: a }), { deleted: 0 });
     assert.equal(board.getBoardSnapshot({ threadId: "same", projectRoot: b + "/" }).steps[0].text, "B");
+    assertEmpty(board.getBoardSnapshot({ threadId: "same" }));
+    assert.deepEqual(board.clearPlan({ threadId: "same" }), { deleted: 0 }, "unscoped clear must not remove project B's plan");
+    assert.equal(board.getBoardSnapshot({ threadId: "same", projectRoot: b }).steps[0].text, "B");
+    writeFile(hubPlansDir, "same-legacy.json", JSON.stringify({ threadId: "same", steps: [{ text: "无项目旧记录" }] }));
+    assert.equal(board.getBoardSnapshot({ threadId: "same" }).steps[0].text, "无项目旧记录");
+    assert.equal(board.getBoardSnapshot({ threadId: "same", projectRoot: b }).steps[0].text, "B");
+    assert.deepEqual(board.clearPlan({ threadId: "same" }), { deleted: 1 }, "unscoped clear must remove only the unscoped plan");
+    assert.equal(board.getBoardSnapshot({ threadId: "same", projectRoot: b }).steps[0].text, "B");
     writeFile(hubPlansDir, "legacy.json", JSON.stringify({ threadId: "legacy", steps: [{ text: "旧记录" }] }));
-    assert.equal(board.getBoardSnapshot({ threadId: "legacy", projectRoot: a }).steps[0].text, "旧记录");
-    assert.deepEqual(board.clearPlan({ threadId: "legacy", projectRoot: a }), { deleted: 1 });
+    assertEmpty(board.getBoardSnapshot({ threadId: "legacy", projectRoot: a }));
+    assertEmpty(board.getBoardSnapshot({ threadId: "legacy", projectRoot: b }));
+    assert.deepEqual(board.clearPlan({ threadId: "legacy", projectRoot: a }), { deleted: 0 }, "project A must not delete an unscoped legacy plan");
+    assert.deepEqual(board.clearPlan({ threadId: "legacy", projectRoot: b }), { deleted: 0 }, "project B must not delete an unscoped legacy plan");
+    assert.equal(board.getBoardSnapshot({ threadId: "legacy" }).steps[0].text, "旧记录");
+    assert.deepEqual(board.clearPlan({ threadId: "legacy" }), { deleted: 1 });
     assert.deepEqual(board.clearPlan({ threadId: "same", projectRoot: b }), { deleted: 1 });
   });
 
@@ -1084,6 +1108,8 @@ describe("hub-task-board: dual-scope thread+project isolation regressions", () =
     const foreignClear = board.clearPlan({ threadId: "t-foreign", projectRoot: "/tmp/proj-b" });
     assert.equal(foreignClear.deleted, 0, "foreign projectRoot must not clear owner project unscoped plan");
     const ownerClear = board.clearPlan({ threadId: "t-foreign", projectRoot: "/tmp/proj-a" });
-    assert.equal(ownerClear.deleted, 1, "owner projectRoot can clear its unscoped plan");
+    assert.equal(ownerClear.deleted, 0, "a scoped clear must not delete an unscoped legacy plan");
+    const unscopedClear = board.clearPlan({ threadId: "t-foreign" });
+    assert.equal(unscopedClear.deleted, 1, "only an unscoped clear removes the legacy plan");
   });
 });

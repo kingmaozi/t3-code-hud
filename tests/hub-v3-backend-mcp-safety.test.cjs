@@ -648,6 +648,26 @@ for (const operation of ["toggle-all", "set-agents"]) test(`${operation}: write 
   });
 });
 
+test("a damaged registry cannot unlock exact conflict-disable writes", t => {
+  const f = fixture(t, "codex");
+  const museFile = path.join(f.homeDir, ".config/muse/settings.json");
+  const codexFile = path.join(f.homeDir, ".codex/config.toml");
+  const museRaw = JSON.stringify({ mcpServers: { echo_server: { command: "node", args: ["underscore.cjs"] } } }, null, 2) + "\n";
+  const codexRaw = '[mcp_servers."echo-server"]\ncommand = "node"\nargs = ["hyphen.cjs"]\n';
+  put(museFile, museRaw);
+  put(codexFile, codexRaw);
+  put(f.router.registryPath, '{"mcpServers":{"broken":null}}\n');
+
+  assert.throws(
+    () => f.router.toggleServerForAgent({ name: "echo_server", agent: "codex", enabled: false }),
+    /registry|MCP config/i,
+  );
+  assert.equal(fs.readFileSync(museFile, "utf8"), museRaw);
+  assert.equal(fs.readFileSync(codexFile, "utf8"), codexRaw);
+  assert.ok(!fs.existsSync(museFile + ".t3hub.bak"));
+  assert.ok(!fs.existsSync(codexFile + ".t3hub.bak"));
+});
+
 test("disable operations reject damaged or unreadable registry before touching host configs", t => {
   const f = fixture(t, "codex");
   const museFile = path.join(f.homeDir, ".config/muse/settings.json");

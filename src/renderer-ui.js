@@ -595,19 +595,33 @@
     let lastTurnDecodeTps = null;
     let lastStreamSec = null;
     let lastPromptTotal = null;
-    let lastTurnCacheRate = null;
+    let turnCacheRate = null;
     let lastTurnDriver = null;
     let lastTurnModel = null;
     const byModel = {};
     const decodeByModel = {};
     for (const t of turns) {
       const u = t?.usage;
-      if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") continue;
+      turnCacheRate = null;
+      lastTurnTps = null;
+      lastTurnNetSec = null;
+      lastTurnDecodeTps = null;
+      lastStreamSec = null;
+      lastTurnDriver = t?.driver || payload.provider || "unknown";
+      lastTurnModel = u?.models?.[0] || t?.model || payload.model || null;
+      if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") {
+        continue;
+      }
+      lastTurnTps = null;
+      lastTurnNetSec = null;
+      lastTurnDecodeTps = null;
+      lastStreamSec = null;
       const driver = t.driver || payload.provider || "unknown";
       let inp = Math.max(0, u.inputTokens || 0);
       const cr = Math.max(0, u.cachedInputTokens || 0);
       const cw = Math.max(0, u.cacheCreationTokens || 0);
       if (driver === "antigravity" && inp >= cr * 2) inp = inp - cr;
+      if (inp > 0 && Number.isFinite(u.cachedInputTokens)) turnCacheRate = Math.min(inp, cr) / inp;
       const unc = Math.max(0, inp - cr - cw);
       const out = Math.max(0, u.outputTokens || 0);
       const reas = Math.min(out, Math.max(0, u.reasoningTokens || 0));
@@ -622,7 +636,6 @@
       sumReasoning += reas;
       pricedTurns++;
       lastPromptTotal = inp + out;
-      lastTurnCacheRate = inp > 0 ? cr / inp : null;
       lastTurnDriver = driver;
       lastTurnModel = turnModel;
       if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs && out > 0) {
@@ -671,7 +684,7 @@
     const effModel = lastTurnModel || payload.model || null;
     let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
     if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
-      const agyCacheRatio = lastTurnCacheRate ?? sessionCacheRate ?? 0;
+      const agyCacheRatio = turnCacheRate ?? sessionCacheRate ?? 0;
       const deduped =
         agyCacheRatio > 0.01
           ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
@@ -681,7 +694,18 @@
         contextUsed = lastPromptTotal;
       }
     }
-    let contextMax = payload.contextUsage?.maxTokens || (effDriver === "antigravity" ? (/opus|sonnet|haiku|claude/i.test(String(effModel || "")) ? 1000000 : 1048576) : effDriver === "muse" ? 1007997 : null);
+    let contextMax = Number.isFinite(payload.contextUsage?.maxTokens) && payload.contextUsage.maxTokens > 0
+      ? payload.contextUsage.maxTokens
+      : null;
+    let contextMaxSource = contextMax != null ? "reported" : null;
+    if (contextMax == null && effDriver === "antigravity") {
+      contextMax = /opus|sonnet|haiku|claude/i.test(String(effModel || "")) ? 1000000 : 1048576;
+      contextMaxSource = "estimated";
+    }
+    if (contextMax == null && effDriver === "muse") {
+      contextMax = 1007997;
+      contextMaxSource = "estimated";
+    }
     if (pricedTurns === 0 && Number.isFinite(contextUsed) && contextUsed > 0) {
       promptTotal = contextUsed;
       uncachedOut = contextUsed;
@@ -699,8 +723,8 @@
         .filter(([, v]) => v.sec > 0.1)
         .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
     );
-    const lastDecodeTps = hasDecode ? lastTurnDecodeTps : lastTurnTps;
-    const lastDurationSec = hasDecode ? lastStreamSec : lastTurnNetSec;
+    const lastDecodeTps = lastTurnDecodeTps ?? lastTurnTps;
+    const lastDurationSec = lastStreamSec ?? lastTurnNetSec;
     return {
       ok: true,
       telemetrySource: "remote-projection",
@@ -737,13 +761,20 @@
         total: promptTotal + outputOut,
         contextUsed: contextUsed ?? null,
         contextMax: contextMax ?? null,
+        contextMaxSource,
       },
       cache: {
         cachedTokens: sumCached,
+        mainCachedTokens: sumCached,
+        withSubagentsCachedTokens: sumCached,
         cacheWriteTokens: sumCacheWrite,
         sessionRate: sessionCacheRate,
-        lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
-        displayRate: lastTurnCacheRate ?? sessionCacheRate,
+        mainSessionRate: sessionCacheRate,
+        withSubagentsSessionRate: sessionCacheRate,
+        turnRate: turnCacheRate,
+        lastTurnRate: turnCacheRate,
+        lastCallRate: null,
+        displayRate: turnCacheRate ?? sessionCacheRate,
         savedUsd: totalSavedUsd,
       },
       cost: {
@@ -870,8 +901,14 @@
       newSession: "新会话",
       streaming: "生成中...",
       contextCapacity: "上下文容量",
-      avgCacheHitRate: "平均缓存命中率",
-      agyNote: "AGY 约 26万 自动滑动压缩",
+      contextMaxLabel: "模型/上报容量",
+      contextMaxSourceLabel: "容量来源",
+      contextSourceReported: "T3 / ACP 上报",
+      contextSourceLocalCatalog: "本地模型目录",
+      contextSourceEstimated: "模型族估算",
+      contextSourceUnknown: "未知",
+      avgCacheHitRate: "含子代理累计缓存命中率",
+      agyNote: "自动压缩阈值：未知（HUD 未取得可靠上报）",
       newSessionTitle: "新会话 / 待发消息",
       newSessionDesc: "发送首条消息后将实时显示该会话的速度、累计缓存命中率、会话 Token 与等效费用。",
       currentEngineQuota: "当前引擎额度剩余",
@@ -879,14 +916,19 @@
       otherEngineQuota: "其他引擎额度速览",
       remaining: "剩余",
       engineModel: "引擎 / 模型",
-      streamSpeed: "流式输出速度",
+      streamSpeed: "流式估算速度",
+      approxSpeedPrefix: "≈",
+      turnSpeedPrefix: "本轮",
       avgSpeed: "均速",
       avgDecodeSpeed: "会话均速",
       lastTurnSpeed: "末轮速度",
       e2eSpeed: "端到端速度 (含首字预填充)",
-      cumCacheRound: "累计缓存 / 本轮缓存",
+      turnCacheRate: "本轮缓存命中率",
+      lastCallCacheRate: "最近模型调用（原生记录）",
+      mainSessionCacheRate: "主会话累计",
+      inclusiveSessionCacheRate: "含子代理累计",
       cacheSaved: "缓存节省费用",
-      contextRatio: "上下文容量占比",
+      contextRatio: "模型/上报容量占比",
       totalTokensWithSub: "本会话总 Token (含子智能体)",
       mainSubPrefix: "↳ 主会话 / 子智能体",
       inpCacheRead: "↳ 输入 / 缓存读取",
@@ -933,8 +975,14 @@
       newSession: "New",
       streaming: "Streaming...",
       contextCapacity: "Context Capacity",
-      avgCacheHitRate: "Avg Cache Hit Rate",
-      agyNote: "AGY auto-slides around ~260k",
+      contextMaxLabel: "Model / reported capacity",
+      contextMaxSourceLabel: "Source",
+      contextSourceReported: "T3 / ACP reported",
+      contextSourceLocalCatalog: "Local model catalog",
+      contextSourceEstimated: "Model-family estimate",
+      contextSourceUnknown: "Unknown",
+      avgCacheHitRate: "Cumulative cache hit rate (incl. subagents)",
+      agyNote: "Auto-compaction threshold: unknown (no reliable HUD report)",
       newSessionTitle: "New session / awaiting message",
       newSessionDesc: "After the first message, speed, cache hit rate, session tokens and cost will show live.",
       currentEngineQuota: "Current engine quota",
@@ -942,14 +990,19 @@
       otherEngineQuota: "Other engines at a glance",
       remaining: "Left",
       engineModel: "Engine / Model",
-      streamSpeed: "Stream speed",
+      streamSpeed: "Estimated live speed",
+      approxSpeedPrefix: "≈",
+      turnSpeedPrefix: "Turn",
       avgSpeed: "Avg",
       avgDecodeSpeed: "Avg Decode Speed",
       lastTurnSpeed: "Last Turn Speed",
       e2eSpeed: "End-to-end (incl. prefill)",
-      cumCacheRound: "Cache total / this turn",
+      turnCacheRate: "This-turn cache hit rate",
+      lastCallCacheRate: "Latest model call (native record)",
+      mainSessionCacheRate: "Main session total",
+      inclusiveSessionCacheRate: "Total incl. subagents",
       cacheSaved: "Saved via cache",
-      contextRatio: "Context usage",
+      contextRatio: "Model / reported capacity usage",
       totalTokensWithSub: "Total tokens (incl. subagents)",
       mainSubPrefix: "↳ Main / subagents",
       inpCacheRead: "↳ Input / cache read",
@@ -2032,19 +2085,182 @@
   const commitMetaEl = document.getElementById("t3-commit-meta");
   const commitBodyEl = document.getElementById("t3-commit-body");
 
+  let currentPathHint = getRouteHint();
   let latestStats = null;
   let lastRemotePayload = null;
   let liveStreamTps = null;
+  let turnSpeedState = createHudTurnSpeedState(currentPathHint);
   let latestGraph = null;
   let drawerOpen = false;
   let selectedCommitHash = null;
   let selectedCommitDetail = null;
-  let currentPathHint = getRouteHint();
   let lastLoadedGraphThreadId = null;
   let customDrawerPos = null;
   let spacedComposerStack = null;
   let currentPopoverMode = "stats";
   let popoverHideTimer = null;
+
+  function createHudTurnSpeedState(routeKey) {
+    return {
+      route: String(routeKey || ""),
+      active: false,
+      awaitingFreshSample: false,
+      baselineStepCount: null,
+      lastIdleStepCount: null,
+    };
+  }
+
+  function resolveHudTurnSpeed(state, stats, liveTps, routeKey) {
+    const route = String(routeKey ?? stats?.threadId ?? stats?.nonThreadRoute ?? "");
+    const routeChanged = state.route !== route;
+    if (routeChanged) {
+      state.route = route;
+      state.active = false;
+      state.awaitingFreshSample = false;
+      state.baselineStepCount = null;
+      state.lastIdleStepCount = null;
+    }
+
+    const stepCount = Number.isFinite(stats?.stepCount) ? stats.stepCount : null;
+    const running = Boolean(stats?.ok && stats.isRunning);
+    const liveRate = !routeChanged && Number.isFinite(liveTps) && liveTps > 0 ? liveTps : null;
+    let started = false;
+
+    if (running && !state.active) {
+      state.active = true;
+      state.awaitingFreshSample = false;
+      state.baselineStepCount = state.lastIdleStepCount ?? stepCount;
+      started = true;
+    }
+    if (!running && state.active) {
+      state.active = false;
+      state.awaitingFreshSample = true;
+    }
+
+    if (running) {
+      return liveRate != null && !started
+        ? { kind: "estimated", value: liveRate, routeChanged, started }
+        : { kind: "waiting", value: null, routeChanged, started };
+    }
+
+    if (liveRate != null) {
+      if (!state.active && !state.awaitingFreshSample) {
+        state.active = true;
+        state.baselineStepCount = state.lastIdleStepCount ?? stepCount;
+        started = true;
+      }
+      return { kind: "estimated", value: liveRate, routeChanged, started };
+    }
+
+    if (state.awaitingFreshSample) {
+      const freshTurn = stepCount != null && state.baselineStepCount != null && stepCount > state.baselineStepCount;
+      if (!freshTurn) return { kind: "none", value: null, routeChanged, started };
+      state.awaitingFreshSample = false;
+    }
+
+    const lastTurnTps = Number(stats?.speed?.lastDecodeTps);
+    const view = Number.isFinite(lastTurnTps) && lastTurnTps > 0
+      ? { kind: "turn", value: lastTurnTps, routeChanged, started }
+      : { kind: "none", value: null, routeChanged, started };
+    if (!state.active && !state.awaitingFreshSample && stepCount != null) state.lastIdleStepCount = stepCount;
+    return view;
+  }
+
+  function formatHudTurnSpeed(view, labels) {
+    if (view?.kind === "estimated") return `${labels.approx}${view.value.toFixed(1)} tok/s`;
+    if (view?.kind === "turn") return `${labels.turn} ${view.value.toFixed(1)} tok/s`;
+    if (view?.kind === "waiting") return labels.waiting;
+    return "-- tok/s";
+  }
+
+  function isCurrentStatsSnapshot(requestId, latestRequestId, requestedRoute, currentRoute) {
+    return requestId === latestRequestId && String(requestedRoute ?? "") === String(currentRoute ?? "");
+  }
+
+  function getAssistantStreamSnapshot(chatCol) {
+    if (!chatCol || typeof chatCol.querySelectorAll !== "function") return null;
+    let nodes;
+    try {
+      nodes = chatCol.querySelectorAll('[data-message-role]');
+    } catch {
+      return null;
+    }
+    const node = nodes?.[nodes.length - 1];
+    if (!node) return null;
+    const role = node.getAttribute?.("data-message-role") || node.dataset?.messageRole;
+    // Until the current user message is followed by an assistant message, old
+    // assistant expansion/re-rendering is not generation for this turn.
+    if (role !== "assistant") return null;
+    let text = "";
+    try {
+      // innerText excludes hidden controls and only measures what the user sees.
+      text = typeof node.innerText === "string" ? node.innerText : String(node.textContent || "");
+    } catch {}
+    let messageId = "";
+    try {
+      messageId = String(node.getAttribute?.("data-message-id") || node.dataset?.messageId || "");
+    } catch {}
+    return { messageId, text };
+  }
+
+  function canSampleHudStream(stats, snapshot) {
+    return stats?.ok === true && stats.isRunning === true && Boolean(snapshot);
+  }
+
+  function createHudStreamSampler() {
+    return { samples: [], messageId: "", lastGrowthAt: 0, liveTps: null };
+  }
+
+  function advanceHudStreamSampler(sampler, snapshot, now, enabled, estimateTokens) {
+    const previousRate = sampler.liveTps;
+    const clear = (stalled = false) => {
+      const changed = sampler.liveTps != null || sampler.samples.length > 0;
+      sampler.samples = [];
+      sampler.messageId = "";
+      sampler.lastGrowthAt = 0;
+      sampler.liveTps = null;
+      return { liveTps: null, changed, stalled };
+    };
+    if (!enabled || !snapshot) return clear();
+
+    const messageId = String(snapshot.messageId || "");
+    if (sampler.messageId && messageId && sampler.messageId !== messageId) {
+      sampler.samples = [];
+      sampler.lastGrowthAt = 0;
+      sampler.liveTps = null;
+    }
+    if (messageId) sampler.messageId = messageId;
+
+    const estTok = estimateTokens(snapshot.text);
+    if (sampler.samples.length > 0) {
+      const prev = sampler.samples[sampler.samples.length - 1];
+      if (estTok > prev.tok + 1.2) {
+        sampler.lastGrowthAt = now;
+      } else if (estTok < prev.tok - 20) {
+        sampler.samples = [{ t: now, tok: estTok }];
+        sampler.lastGrowthAt = 0;
+        sampler.liveTps = null;
+        return { liveTps: null, changed: previousRate != null, stalled: false };
+      }
+    }
+    sampler.samples.push({ t: now, tok: estTok });
+    while (sampler.samples.length > 1 && now - sampler.samples[0].t > 1600) sampler.samples.shift();
+
+    if (sampler.lastGrowthAt > 0 && now - sampler.lastGrowthAt <= 1300 && sampler.samples.length >= 2) {
+      const first = sampler.samples[0];
+      const last = sampler.samples[sampler.samples.length - 1];
+      const dt = (last.t - first.t) / 1000;
+      const dTok = last.tok - first.tok;
+      if (dt >= 0.22 && dTok >= 3) {
+        const inst = Math.min(950, dTok / dt);
+        sampler.liveTps = sampler.liveTps != null ? sampler.liveTps * 0.55 + inst * 0.45 : inst;
+      }
+    } else if (sampler.liveTps != null && now - sampler.lastGrowthAt > 1400) {
+      return clear(true);
+    }
+
+    return { liveTps: sampler.liveTps, changed: sampler.liveTps !== previousRate, stalled: false };
+  }
 
   let lastLayoutState = { hidden: null, top: "", left: "", right: "" };
   let observedHeader = null;
@@ -2380,16 +2596,19 @@
     };
     let ctxUsed;
     let ctxMax;
+    let ctxMaxSource = null;
     let ctxPct;
     if (!stats || !stats.ok) {
       if (!stats?.nonThreadRoute && stats?.tokens?.contextUsed == null && liveContext && liveContext.usedTokens > 0) {
         ctxUsed = dedupeLiveAgy(liveContext.usedTokens, stats?.cache?.displayRate);
         ctxMax = stats?.tokens?.contextMax ?? liveContext.maxTokens ?? null;
+        ctxMaxSource = stats?.tokens?.contextMaxSource || (liveContext.maxTokens > 0 ? "reported" : null);
         ctxPct =
           ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
       } else {
         ctxUsed = 0;
         ctxMax = stats?.tokens?.contextMax ?? null;
+        ctxMaxSource = stats?.tokens?.contextMaxSource || null;
         ctxPct = 0;
       }
     } else {
@@ -2398,6 +2617,7 @@
         ? dedupeLiveAgy(rawUsed, stats?.cache?.displayRate)
         : rawUsed;
       ctxMax = stats?.tokens?.contextMax ?? liveContext?.maxTokens ?? null;
+      ctxMaxSource = stats?.tokens?.contextMaxSource || (liveContext?.maxTokens > 0 ? "reported" : null);
       ctxPct =
         ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
     }
@@ -2409,6 +2629,7 @@
         otherWindows: [],
         ctxUsed,
         ctxMax,
+        ctxMaxSource: ctxMaxSource || "unknown",
         ctxPct,
         activeModelRaw,
         activeProviderRaw,
@@ -2476,6 +2697,7 @@
       otherWindows,
       ctxUsed,
       ctxMax,
+      ctxMaxSource: ctxMaxSource || "unknown",
       ctxPct,
       activeModelRaw,
       activeProviderRaw,
@@ -2554,15 +2776,21 @@
     const pctNum = qInfo.ctxPct != null ? qInfo.ctxPct : 0;
     const pctTxt = qInfo.ctxPct != null ? `${qInfo.ctxPct.toFixed(1)}%` : "0.0%";
     const barTone = contextTone(pctNum);
-    const avgCacheRate = s?.cache.sessionRate;
+    const contextSourceKey = {
+      reported: "contextSourceReported",
+      "local-catalog": "contextSourceLocalCatalog",
+      estimated: "contextSourceEstimated",
+      unknown: "contextSourceUnknown",
+    }[qInfo.ctxMaxSource] || "contextSourceUnknown";
+    const contextCapacityText = qInfo.ctxMax != null
+      ? `${formatCompactTokens(qInfo.ctxMax)} · ${t(contextSourceKey)}`
+      : `-- · ${t("contextSourceUnknown")}`;
+    const avgCacheRate = s?.cache.withSubagentsSessionRate ?? s?.cache.sessionRate;
     const cachePct = Number.isFinite(avgCacheRate) ? Math.min(100, Math.max(0, avgCacheRate * 100)) : 0;
     const cacheTone = avgCacheRate >= 0.75 ? "" : avgCacheRate >= 0.45 ? "mid" : "low";
     const avgCacheTxt =
-      s && s.cache.sessionRate != null ? `${(s.cache.sessionRate * 100).toFixed(1)}%` : "--";
-    const showAgyNote =
-      (qInfo.activeProviderRaw === "antigravity" || s?.provider === "antigravity") &&
-      qInfo.ctxUsed != null &&
-      qInfo.ctxUsed > 180000;
+      s && avgCacheRate != null ? `${(avgCacheRate * 100).toFixed(1)}%` : "--";
+    const showAgyNote = qInfo.activeProviderRaw === "antigravity" || s?.provider === "antigravity";
 
     popover.style.width = "268px";
     popover.innerHTML = `
@@ -2573,6 +2801,10 @@
       <div class="t3-ctx-summary">
         <span>${escapeHtml(usedTxt)}</span>
         <span style="color:${contextColor(pctNum)}">${escapeHtml(pctTxt)}</span>
+      </div>
+      <div class="t3-ctx-heading">
+        <span>${escapeHtml(t("contextMaxLabel"))}</span>
+        <span style="font-weight:600;color:var(--hud-fg)">${escapeHtml(contextCapacityText)}</span>
       </div>
       <div class="t3-ctx-bar-track">
         <div class="t3-ctx-bar-fill ${barTone}" style="width:${Math.min(100, Math.max(0, pctNum)).toFixed(1)}%"></div>
@@ -2644,13 +2876,16 @@
         ? `${formatContextPair(qInfo.ctxUsed, qInfo.ctxMax)}${qInfo.ctxPct != null ? ` (${qInfo.ctxPct.toFixed(1)}%)` : ""}`
         : "--";
 
-    const lastCache = s.cache.lastTurnRate != null ? (s.cache.lastTurnRate * 100).toFixed(1) + "%" : "--";
-    const sessCache = s.cache.sessionRate != null ? (s.cache.sessionRate * 100).toFixed(1) + "%" : "--";
+    const cacheText = (rate) => rate != null ? `${(rate * 100).toFixed(1)}%` : "--";
+    const turnCache = cacheText(s.cache.turnRate);
+    const lastCallCache = cacheText(s.cache.lastCallRate);
+    const mainSessionCache = cacheText(s.cache.mainSessionRate);
+    const inclusiveSessionCache = cacheText(s.cache.withSubagentsSessionRate ?? s.cache.sessionRate);
     const avgSpeed = resolveModelAvgSpeed(s, qInfo.activeModelRaw);
     const speedColor = (value) => value >= 150 ? "var(--hud-cyan)" : "var(--hud-fg)";
     const formatSpeed = (value) => value != null ? `${value.toFixed(1)} tok/s` : "--";
     const liveSpeedLine = liveStreamTps != null
-      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span style="color:var(--hud-blue)">${formatSpeed(liveStreamTps)}</span></div>`
+      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span style="color:var(--hud-blue)">≈${formatSpeed(liveStreamTps)}</span></div>`
       : "";
     const e2eLine =
       s.speed.e2eTokPerSec != null
@@ -2674,7 +2909,10 @@
       <div class="t3-pop-row"><span>${escapeHtml(t("lastTurnSpeed"))}</span><span style="color:${speedColor(s.speed.lastDecodeTps)}">${formatSpeed(s.speed.lastDecodeTps)}</span></div>
       ${liveSpeedLine}
       ${e2eLine}
-      <div class="t3-pop-row"><span>${escapeHtml(t("cumCacheRound"))}</span><span><span style="color:${cacheColor(s.cache.sessionRate)}">${sessCache}</span> / <span style="color:${cacheColor(s.cache.lastTurnRate)}">${lastCache}</span></span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("turnCacheRate"))}</span><span style="color:${cacheColor(s.cache.turnRate)}">${turnCache}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("lastCallCacheRate"))}</span><span style="color:${cacheColor(s.cache.lastCallRate)}">${lastCallCache}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("mainSessionCacheRate"))}</span><span style="color:${cacheColor(s.cache.mainSessionRate)}">${mainSessionCache}</span></div>
+      <div class="t3-pop-row"><span>${escapeHtml(t("inclusiveSessionCacheRate"))}</span><span style="color:${cacheColor(s.cache.withSubagentsSessionRate ?? s.cache.sessionRate)}">${inclusiveSessionCache}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("cacheSaved"))}</span><span style="color:var(--hud-emerald)">${formatUsd(s.cache.savedUsd)}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("contextRatio"))}</span><span style="color:${contextColor(qInfo.ctxPct)}">${ctxLine}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("totalTokensWithSub"))}</span><span style="font-weight:600">${formatCompactTokens(s.tokens.total)} tok</span></div>
@@ -2745,6 +2983,10 @@
   let lastTopbarSig = "";
   function renderTopbarStats(stats) {
     latestStats = stats;
+    const speedView = resolveHudTurnSpeed(turnSpeedState, stats, liveStreamTps, currentPathHint);
+    if (speedView.routeChanged || (speedView.started && stats?.isRunning)) {
+      resetLiveStreamSampler(currentPathHint);
+    }
     const qInfo = computeQuotaAndContext(stats);
     const wk = qInfo.primaryWeekly;
     topbar.classList.toggle("has-quota", !!wk);
@@ -2772,17 +3014,14 @@
       nextCost = "$0.00";
       hideDirty = true;
     } else {
-      const activelyStreaming = liveStreamTps != null;
+      const activelyStreaming = Boolean(stats.isRunning) || speedView.kind === "estimated";
       nextDotClass = "t3-hud-dot " + (activelyStreaming ? "running" : "ready");
-      const primarySpd = liveStreamTps ?? resolveModelAvgSpeed(stats, qInfo.activeModelRaw);
-      if (primarySpd != null) {
-        nextSpeed = `${activelyStreaming ? "" : t("avgSpeed") + " "}${primarySpd.toFixed(1)} tok/s`;
-      } else if (stats.isRunning) {
-        nextSpeed = t("streaming");
-      } else {
-        nextSpeed = "-- tok/s";
-      }
-      const rate = stats.cache.lastTurnRate ?? stats.cache.displayRate;
+      nextSpeed = formatHudTurnSpeed(speedView, {
+        approx: t("approxSpeedPrefix"),
+        turn: t("turnSpeedPrefix"),
+        waiting: t("streaming"),
+      });
+      const rate = stats.cache.turnRate ?? null;
       nextCache = rate != null ? `${Math.round(rate * 100)}%` : "--%";
       nextCacheColor = cacheColor(rate);
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
@@ -3234,16 +3473,27 @@
   }
 
   let statsInFlight = false;
+  let statsRequestSeq = 0;
   async function refreshStats(routeChanged = false) {
     if (statsInFlight && !routeChanged) return;
     statsInFlight = true;
+    const requestId = ++statsRequestSeq;
+    const hint = getRouteHint();
+    if (routeChanged) {
+      resetLiveStreamSampler(hint);
+      resolveHudTurnSpeed(turnSpeedState, { ok: false }, null, hint);
+      latestStats = null;
+      lastRemotePayload = null;
+      lastTopbarSig = "";
+      renderTopbarStats({ ok: false });
+    }
     try {
-      const hint = getRouteHint();
       let stats = await callBackend("getThreadStats", hint);
+      let remotePayloadCandidate = null;
       if (!stats?.ok && !stats?.nonThreadRoute) {
         try {
           const proj = readFiberThreadProjection(hint);
-          lastRemotePayload = proj;
+          remotePayloadCandidate = proj;
           if (proj) {
             if (proj.isServerThread === false || (!proj.isRunning && !(proj.contextUsage?.usedTokens > 0) && Array.isArray(proj.turns) && proj.turns.length === 0)) {
               stats = { ok: false, nonThreadRoute: "new", isDraftThread: true };
@@ -3256,9 +3506,9 @@
         } catch {
           // Keep original stats on fiber read failure
         }
-      } else {
-        lastRemotePayload = null;
       }
+      if (!isCurrentStatsSnapshot(requestId, statsRequestSeq, hint, getRouteHint())) return;
+      lastRemotePayload = remotePayloadCandidate;
       renderTopbarStats(stats);
 
       // Sync Git Graph only if drawer is open; clear stale hidden graph when switching threads while closed
@@ -3273,7 +3523,7 @@
     } catch {
       // Ignore transient query errors
     } finally {
-      statsInFlight = false;
+      if (requestId === statsRequestSeq) statsInFlight = false;
     }
   }
 
@@ -3403,9 +3653,14 @@
   });
 
   // Real-time streaming speed sampler (ticks live every 260ms while text/thinking streams into chat!)
-  let streamSamples = [];
+  let streamSampler = createHudStreamSampler();
   let streamRouteSnap = currentPathHint;
-  let lastGrowthAt = 0;
+
+  function resetLiveStreamSampler(route = currentPathHint) {
+    streamSampler = createHudStreamSampler();
+    streamRouteSnap = route;
+    liveStreamTps = null;
+  }
 
   function estimateRenderedTokens(str) {
     if (!str) return 0;
@@ -3421,61 +3676,28 @@
     if (disposed || document.hidden) return;
     const routeNow = getRouteHint();
     if (routeNow !== streamRouteSnap) {
-      streamRouteSnap = routeNow;
-      streamSamples = [];
-      if (liveStreamTps != null) {
-        liveStreamTps = null;
-        if (latestStats) renderTopbarStats(latestStats);
-      }
+      currentPathHint = routeNow;
+      resetLiveStreamSampler(routeNow);
+      latestStats = null;
+      lastTopbarSig = "";
+      renderTopbarStats({ ok: false });
+      refreshStats(true);
       return;
     }
 
     const chatCol = document.querySelector("[data-chat-column]");
-    if (!chatCol) return;
-    const listRoot =
-      chatCol.querySelector('[data-slot="scroll-area-viewport"]') ||
-      chatCol.querySelector('[class*="overflow-y-auto"]') ||
-      chatCol;
-    const contentWrap = listRoot.firstElementChild || listRoot;
-    const kids = contentWrap.children;
-    let tailText = "";
-    for (let i = Math.max(0, kids.length - 2); i < kids.length; i++) {
-      tailText += kids[i].textContent || "";
-    }
-
+    const assistantSnapshot = getAssistantStreamSnapshot(chatCol);
     const now = performance.now();
-    const estTok = estimateRenderedTokens(tailText);
-
-    if (streamSamples.length > 0) {
-      const prev = streamSamples[streamSamples.length - 1];
-      if (estTok > prev.tok + 1.2) {
-        lastGrowthAt = now;
-      } else if (estTok < prev.tok - 20) {
-        // Turn switched or collapsed
-        streamSamples = [{ t: now, tok: estTok }];
-        return;
-      }
-    }
-    streamSamples.push({ t: now, tok: estTok });
-    while (streamSamples.length > 1 && now - streamSamples[0].t > 1600) {
-      streamSamples.shift();
-    }
-
-    if (lastGrowthAt > 0 && now - lastGrowthAt <= 1300 && streamSamples.length >= 2) {
-      const first = streamSamples[0];
-      const last = streamSamples[streamSamples.length - 1];
-      const dt = (last.t - first.t) / 1000;
-      const dTok = last.tok - first.tok;
-      if (dt >= 0.22 && dTok >= 3) {
-        const inst = Math.min(950, dTok / dt);
-        liveStreamTps = liveStreamTps != null ? liveStreamTps * 0.55 + inst * 0.45 : inst;
-        if (latestStats) renderTopbarStats(latestStats);
-      }
-    } else if (liveStreamTps != null && now - lastGrowthAt > 1400) {
-      liveStreamTps = null;
-      streamSamples = [];
-      refreshStats(false);
-    }
+    const sample = advanceHudStreamSampler(
+      streamSampler,
+      assistantSnapshot,
+      now,
+      canSampleHudStream(latestStats, assistantSnapshot),
+      estimateRenderedTokens
+    );
+    liveStreamTps = sample.liveTps;
+    if (sample.changed && latestStats) renderTopbarStats(latestStats);
+    if (sample.stalled) refreshStats(false);
   }, 260);
 
   let disposed = false;

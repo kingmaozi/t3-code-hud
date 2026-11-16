@@ -24,7 +24,7 @@ Stock T3 misreports telemetry in four ways. `t3-code-hud` corrects each at the s
 Additional telemetry correctness:
 
 - **True context window** — `contextUsed` is the last per-call prompt (`promptTotal + output`, deduplicated). Muse inherits `1007997` from `statev2`; Codex reads `model_context_window` from `token_count` events; Antigravity falls back to `1048576` (Gemini) / `1000000` (Claude).
-- **Streaming speed** — pure decode window (`response_created → completed` for Muse, `t6 → t7` for Antigravity, `reasoning → token_usage` for Codex), stripping tool-wait and prefill time. Live 260 ms sampler shows real-time `tok/s`.
+- **Turn speed** — uses the latest completed turn's decode sample, or that turn's effective output duration where available. During streaming, visible-text increments provide an approximate live rate marked `≈`; this is not an exact tokenizer count.
 - **OAuth pricing** — reuses T3's official `usage-model-rates.json` (5,900+ models + tiered rates) via `resolveModelRate`.
 
 ---
@@ -32,7 +32,7 @@ Additional telemetry correctness:
 ## Features
 
 - **Minimal hover capsule above the composer** (auto-spaced, never blocks the message stream, Light/Dark aware):
-  - ⚡ Session average decode speed (`Avg XX.X tok/s`) at rest; live `tok/s` with a pulsing blue dot while text streams. Hover shows **Avg Decode Speed** and **Last Turn Speed** separately.
+  - ⚡ The topbar shows the current turn: an approximate visible-text rate (`≈XX.X tok/s`) while text streams, `Streaming...` before the first token, and the completed turn's sample when ready. If fresh turn data is not ready, it shows `-- tok/s` rather than reusing the previous turn or session average. Hover keeps **Avg Decode Speed** and **Last Turn Speed**; the session average is shown there.
   - ♻️ Real session cache hit rate.
   - 🧮 Full-tree token total including recursive subagents (supports `B` billions, e.g. `2.34B tok`, warm query `< 8 ms`).
   - 💰 Official-rate equivalent cost with subagent breakdown (`$XX.XX (+N sub)`).

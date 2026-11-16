@@ -286,83 +286,21 @@ describe("hub-subagents orchestration Carbon/Argon + /swarm", () => {
     // Keep override for further asserts but clean later not required.
     mgr.saveSubagent({ scope: "global", item: { id: "explorer", role: "research", providerInstanceId: "muse", model: "muse-ember-1.0", effort: "max", description: "只读阅读、查找代码、梳理调用链与排查故障证据，不修改代码", systemPrompt: "你作为只读调查子代理（explorer），专注于阅读源码、检索调用链、核查日志与配置证据。严格只读，不修改业务代码；汇报时明确区分“已确认事实”与“待验证假设”。", enabled: true } });
 
-    // Orchestrator config with hostRulePaths isolation
+    // Legacy commander/swarm can be read but cannot be reactivated.
     const fakeAgents = path.join(tmpRoot, "fake-AGENTS.md");
     const original = "# My Rules\n\nHello world\n";
     fs.writeFileSync(fakeAgents, original);
-    const updated = mgr.updateOrchestrationConfig(
-      { orchestratorMode: "carbon", swarmMode: "on", maxParallelAgents: 8 },
-      { hostRulePaths: [fakeAgents] }
-    );
-    assert.equal(updated.ok, true);
-    const cfg = mgr.getOrchestrationConfig();
-    assert.equal(cfg.orchestratorMode, "carbon");
-    assert.equal(cfg.swarmMode, "on");
-    assert.equal(cfg.maxParallelAgents, 8);
-    assert.equal(cfg.strictCommanderOnly, true);
-    // Persist file exists
-    assert.ok(fs.existsSync(path.join(subHub, "orchestration-config.json")));
-    const persisted = JSON.parse(fs.readFileSync(path.join(subHub, "orchestration-config.json"), "utf8"));
-    assert.equal(persisted.orchestratorMode, "carbon");
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on" }, { hostRulePaths: [fakeAgents] }), /旧|legacy/i);
+    assert.equal(fs.readFileSync(fakeAgents, "utf8"), original);
+    assert.throws(() => mgr.updateOrchestrationConfig({ orchestratorMode: "argon" }, { hostRulePaths: [fakeAgents] }), /旧|legacy/i);
+    for (const mode of ["swarm", "carbon", "argon", "plan"]) {
+      const prompt = mgr.buildSlashCommandPrompt(mode);
+      assert.match(prompt, /角色/);
+      assert.doesNotMatch(prompt, /严禁亲自改业务代码/);
+    }
+    const disabled = mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off" }, { hostRulePaths: [fakeAgents] });
+    assert.equal(disabled.ok, true);
+    assert.equal(fs.readFileSync(fakeAgents, "utf8"), original);
 
-    const afterEnable = fs.readFileSync(fakeAgents, "utf8");
-    assert.ok(afterEnable.includes(original), "original preserved");
-    assert.ok(afterEnable.includes("<!-- T3_HUB_ORCHESTRATOR_START -->"));
-    assert.ok(afterEnable.includes("<!-- T3_HUB_ORCHESTRATOR_END -->"));
-    assert.ok(afterEnable.includes("Orchestrator (Carbon)"));
-    assert.ok(afterEnable.includes("1. 先输出/更新进度清单"));
-    assert.ok(afterEnable.includes("严禁亲自改业务代码"));
-    assert.ok(afterEnable.includes("worker -> worker-pro"));
-
-    // ACTIVE_ORCHESTRATION_MODE.md updated
-    const activeFile = path.join(subHub, "ACTIVE_ORCHESTRATION_MODE.md");
-    assert.ok(fs.existsSync(activeFile));
-    const activeContent = fs.readFileSync(activeFile, "utf8");
-    assert.ok(activeContent.includes("<!-- T3_HUB_ORCHESTRATOR_START -->"));
-
-    // Idempotent: call again same config
-    mgr.updateOrchestrationConfig({ orchestratorMode: "carbon", swarmMode: "on", maxParallelAgents: 8 }, { hostRulePaths: [fakeAgents] });
-    const afterIdempotent = fs.readFileSync(fakeAgents, "utf8");
-    assert.equal((afterIdempotent.match(/T3_HUB_ORCHESTRATOR_START/g) || []).length, 1);
-    assert.ok(afterIdempotent.includes(original));
-
-    // Build slash prompts
-    const swarmPrompt = mgr.buildSlashCommandPrompt("swarm");
-    assert.ok(swarmPrompt.includes("/swarm"));
-    assert.ok(swarmPrompt.includes("蜂群"));
-    const carbonPrompt = mgr.buildSlashCommandPrompt("carbon");
-    assert.ok(carbonPrompt.includes("Carbon"));
-    const argonPrompt = mgr.buildSlashCommandPrompt("argon");
-    assert.ok(argonPrompt.includes("Argon"));
-
-    // syncOrchestrationDirectiveToHosts direct
-    const fake2 = path.join(tmpRoot, "fake2.md");
-    fs.writeFileSync(fake2, "USER CONTENT\n");
-    mgr.syncOrchestrationDirectiveToHosts({ hosts: [fake2] });
-    assert.ok(fs.readFileSync(fake2, "utf8").includes("T3_HUB_ORCHESTRATOR_START"));
-    // Also test hostRulePaths param name
-    const fake3 = path.join(tmpRoot, "fake3.md");
-    fs.writeFileSync(fake3, "HELLO\n");
-    mgr.syncOrchestrationDirectiveToHosts({ hostRulePaths: [fake3] });
-    assert.ok(fs.readFileSync(fake3, "utf8").includes("T3_HUB_ORCHESTRATOR_START"));
-
-    // Turn off should clean up preserving original
-    mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "off" }, { hostRulePaths: [fakeAgents] });
-    const afterOff = fs.readFileSync(fakeAgents, "utf8");
-    assert.ok(afterOff.includes(original), "original still there after off");
-    assert.ok(afterOff.includes("Hello world"));
-    assert.ok(!afterOff.includes("T3_HUB_ORCHESTRATOR_START"), "block removed when off");
-    assert.ok(!afterOff.includes("T3_HUB_ORCHESTRATOR_END"));
-    // Ensure strictCommanderOnly becomes false when off? default after off not auto true; spec says when off, strict may be false
-    const offCfg = mgr.getOrchestrationConfig();
-    assert.equal(offCfg.orchestratorMode, "off");
-
-    // Argon mode quick check
-    const argonUpdated = mgr.updateOrchestrationConfig({ orchestratorMode: "argon", swarmMode: "auto" }, { hostRulePaths: [fakeAgents] });
-    assert.equal(argonUpdated.ok, true);
-    const argonContent = fs.readFileSync(fakeAgents, "utf8");
-    assert.ok(argonContent.includes("Orchestrator (Argon)"));
-    // Clean up to off for hygiene
-    mgr.updateOrchestrationConfig({ orchestratorMode: "off", swarmMode: "auto" }, { hostRulePaths: [fakeAgents] });
   });
 });

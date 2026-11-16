@@ -556,9 +556,10 @@ function collectArtifacts(sessionDir) {
     if (ent.name.endsWith(".metadata.json")) {
       const meta = safeReadJson(full) || {};
       if (meta.userFacing === true) {
+        const name = ent.name.replace(/\.metadata\.json$/, "");
         artifacts.push({
-          name: ent.name.replace(/\.metadata\.json$/, ""),
-          path: full,
+          name,
+          path: path.join(sessionDir, name),
           summary: String(meta.summary || ""),
           updatedAt: String(meta.updatedAt || meta.updated_at || fileMtimeIso(full)),
         });
@@ -713,7 +714,7 @@ function findHubPlan(hubPlansDir, opts) {
       // only empty) so concurrent projects' drafts stay scoped.
       matched = plans.filter((p) => p.data.threadId === tid && (hasRoot ? sameProject(p.data.projectRoot, opts.projectRoot) : !p.data.projectRoot));
     } else {
-      matched = plans.filter((p) => String(p.data.threadId || "") === tid && (!hasRoot || !p.data.projectRoot || sameProject(p.data.projectRoot, opts.projectRoot)));
+      matched = plans.filter((p) => String(p.data.threadId || "") === tid && (hasRoot ? p.data.projectRoot && sameProject(p.data.projectRoot, opts.projectRoot) : !p.data.projectRoot));
     }
   } else if (hasRoot) {
     // Project-level lookup only matches thread-less (project-scoped) plans;
@@ -788,6 +789,20 @@ function createTaskBoard(opts = {}) {
     else assertPlansStore(hubPlansDir);
   }
 
+  // Artifact access needs an authoritative thread-to-project binding; a
+  // matching brain directory name is not evidence of project ownership.
+  function verifyArtifactScope({ threadId, projectRoot } = {}) {
+    if (typeof threadId !== "string" || !threadId || threadId === "__NEW__" || typeof projectRoot !== "string" || !path.isAbsolute(projectRoot)) return { ok: false, reason: "unknown" };
+    const db = openDbReadOnly(t3DbPath);
+    if (!db) return { ok: false, reason: "unknown" };
+    try {
+      const bound = lookupThreadWorkspaceRoot(db, pickThreadsTable(db), threadId);
+      if (!bound) return { ok: false, reason: "unknown" };
+      return sameProject(bound, projectRoot) ? { ok: true } : { ok: false, reason: "mismatch" };
+    } catch { return { ok: false, reason: "unknown" }; }
+    finally { try { db.close(); } catch {} }
+  }
+
   function getBoardSnapshot(query = {}) {
     const q = query || {};
     validatePlanInput(q);
@@ -831,13 +846,13 @@ function createTaskBoard(opts = {}) {
     try {
       if (db) resolved = resolveCurrentThread(db, { threadId: q.threadId, projectRoot: q.projectRoot }) || { threadId: "", title: "" };
       const tid = resolved.threadId || (q.threadId ? String(q.threadId) : "");
-      // Foreign SQLite thread ownership: when both threadId (non-__NEW__) and
-      // projectRoot are supplied and SQLite proves the thread is bound to a
-      // different workspace, block all foreign SQLite/AGY/unscoped reads.
-      if (db && q.threadId && q.projectRoot && String(q.threadId) !== "__NEW__") {
-        const picked = pickThreadsTable(db);
+      // Scoped native reads require proven ownership. Missing database/project
+      // rows are not permission to borrow native plans or subagents. Only an
+      // explicitly matching Hub-authored plan can survive this boundary.
+      if (q.threadId && q.projectRoot && String(q.threadId) !== "__NEW__") {
+        const picked = db ? pickThreadsTable(db) : null;
         const bound = picked ? lookupThreadWorkspaceRoot(db, picked, tid) : null;
-        if (bound && String(bound).trim() && !sameProject(bound, String(q.projectRoot))) {
+        if (!bound || !String(bound).trim() || !sameProject(bound, String(q.projectRoot))) {
           try { if (db) db.close(); } catch {}
           let scopedHub = null;
           try {
@@ -877,6 +892,7 @@ function createTaskBoard(opts = {}) {
             steps: scopedSteps,
             subagents: [],
             artifacts: [],
+            artifactScopeError: bound ? "mismatch" : "unknown",
             source: winner.source || "t3-native",
             progress: computeProgress(scopedSteps),
             updatedAt: String(winner.updatedAt || new Date(nowFn()).toISOString()),
@@ -906,7 +922,11 @@ function createTaskBoard(opts = {}) {
       try { if (db) db.close(); } catch {}
     }
 
-    const agy = readAgyBrain(brainRoots, candidateIds, { strictThreadMatch });
+    // A brain directory name alone cannot prove workspace ownership. Verify
+    // before reading any of it: task.md contains private plan text just as
+    // artifacts do. Hub-authored plans retain their own explicit scope.
+    const artifactScope = verifyArtifactScope({ projectRoot: q.projectRoot, threadId: requestedThreadId || resolved.threadId });
+    const agy = artifactScope.ok ? readAgyBrain(brainRoots, candidateIds, { strictThreadMatch: true }) : null;
     const hub = findHubPlan(hubPlansDir, { threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
 
     const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) => c.steps && c.steps.length);
@@ -925,6 +945,7 @@ function createTaskBoard(opts = {}) {
       steps,
       subagents,
       artifacts,
+      ...(!artifactScope.ok && candidateIds?.length ? { artifactScopeError: artifactScope.reason } : {}),
       source: winner.source || "t3-native",
       progress: computeProgress(steps),
       updatedAt: String(winner.updatedAt || new Date(nowFn()).toISOString()),
@@ -982,21 +1003,6 @@ function createTaskBoard(opts = {}) {
     } catch { plansAnchor = undefined; }
     const hasThread = o.threadId != null && String(o.threadId) !== "";
     const hasRoot = o.projectRoot != null && String(o.projectRoot) !== "";
-    let foreignThreadMismatch = false;
-    if (hasThread && hasRoot && String(o.threadId) !== "__NEW__") {
-      const db = openDbReadOnly(t3DbPath);
-      try {
-        if (db) {
-          const picked = pickThreadsTable(db);
-          const bound = picked ? lookupThreadWorkspaceRoot(db, picked, String(o.threadId)) : null;
-          if (bound && String(bound).trim() && !sameProject(bound, String(o.projectRoot))) {
-            foreignThreadMismatch = true;
-          }
-        }
-      } finally {
-        try { if (db) db.close(); } catch {}
-      }
-    }
     for (const p of listHubPlans(hubPlansDir, undefined, plansAnchor)) {
       const d = p.data;
       const dThread = String(d.threadId || "");
@@ -1010,7 +1016,9 @@ function createTaskBoard(opts = {}) {
         // Strict thread isolation: when a threadId is supplied, only that
         // thread's plans are removed. Never cross-delete other threads that
         // merely share the same projectRoot.
-        shouldDelete = dThread === String(o.threadId) && (!hasRoot || (dRoot ? sameProject(dRoot, o.projectRoot) : !foreignThreadMismatch));
+        // Missing scope is only compatible with old unscoped records; it is
+        // never permission to clear another project's scoped plan.
+        shouldDelete = dThread === String(o.threadId) && (hasRoot ? dRoot && sameProject(dRoot, o.projectRoot) : !dRoot);
       } else if (hasRoot) {
         // Project-level clear only removes plans without an explicit
         // threadId (project-scoped drafts), never other sessions' plans.
@@ -1023,7 +1031,7 @@ function createTaskBoard(opts = {}) {
     return { deleted };
   }
 
-  return { getBoardSnapshot, updatePlan, clearPlan };
+  return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope };
 }
 
 module.exports = {

@@ -15,6 +15,7 @@ const hubSubagents = require("./hub-subagents.cjs");
 const hubPlugins = require("./hub-plugins.cjs");
 const hubHooks = require("./hub-hooks.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
+const { createArtifactAccess } = require("./hub-artifact-access.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
 
 const execFileAsync = promisify(execFile);
@@ -563,7 +564,16 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
 
     if (evt.kind === "model_response_created") {
       pendingResponseCreatedUs = typeof rec.recorded_at === "number" ? rec.recorded_at : null;
-    } else if (evt.kind === "model_completed" && evt.usage) {
+    } else if (evt.kind === "model_completed") {
+      // A completed response supersedes the previous turn even when it did not
+      // yield enough visible output for a valid decode-rate sample.
+      lastDecodeTps = null;
+      lastDecodeSec = null;
+      lastStepCacheRate = null;
+      if (!evt.usage) {
+        pendingResponseCreatedUs = null;
+        return;
+      }
       const u = evt.usage;
       const inputTotal = Math.max(0, Number(u.input_tokens) || 0);
       const cacheRead = Math.min(
@@ -641,7 +651,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     decodeSecSum,
     byModelDecode,
     e2eTokPerSec: avgE2eTps,
-    durationSec: lastDecodeSec ?? (decodeSecSum > 0 ? decodeSecSum : null),
+    durationSec: lastDecodeSec,
   };
 
   lruSet(fileParseCache, jsonlPath, { sig, data });
@@ -801,9 +811,23 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
         if (probeTotal === 0) continue;
       }
       const f = parseProtoSimple(Buffer.from(r.metadata));
-      if (!f[9]?.[0]) continue;
+      if (!f[9]?.[0]) {
+        // With the typed schema, a new inference row is a new model call even
+        // if its usage submessage is absent. Do not label the previous call's
+        // cache rate as the latest one.
+        if (r.step_type != null && Number(r.step_type) === 15) {
+          lastStreamTps = null;
+          lastStreamSec = null;
+          lastStepCacheRate = null;
+        }
+        continue;
+      }
 
       const u = parseProtoSimple(f[9][0]);
+      // Do not carry the previous inference step's rate into this step when
+      // the newest step has no valid visible-output/decode window.
+      lastStreamTps = null;
+      lastStreamSec = null;
       const uncached = Math.max(0, Number(u[2]?.[0]) || 0);
       const cacheRead = Math.max(0, Number(u[5]?.[0]) || 0);
       const cacheWrite = Math.max(0, Number(u[4]?.[0]) || 0);
@@ -891,7 +915,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       decodeSecSum: streamSecSum,
       byModelDecode,
       e2eTokPerSec: avgE2eTps,
-      durationSec: lastStreamSec ?? (e2eSecSum > 0 ? e2eSecSum : null),
+      durationSec: lastStreamSec,
     };
 
     lruSet(fileParseCache, dbFile, { sig, data });
@@ -968,6 +992,8 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
   let e2eTokensSum = 0;
   let e2eSecSum = 0;
   let lastDecodeTps = null;
+  let lastDecodeSec = null;
+  let lastE2eSec = null;
   let lastStepCacheRate = null;
   let lastContextPrompt = null;
   let codexContextMax = null;
@@ -1006,7 +1032,19 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       reasoningDoneMs = null;
     } else if (rec.type === "response_item" && p?.type === "reasoning") {
       reasoningDoneMs = tsMs;
-    } else if (rec.type === "token_usage_record" && p?.usage) {
+    } else if (rec.type === "token_usage_record") {
+      // Each usage record closes a turn/step. Clear the prior sample first so
+      // an empty, zero-duration, or too-small latest turn cannot inherit it.
+      lastDecodeTps = null;
+      lastDecodeSec = null;
+      lastE2eSec = null;
+      lastStepCacheRate = null;
+      if (!p?.usage) {
+        stepCount++;
+        stepInputReadyMs = tsMs;
+        reasoningDoneMs = null;
+        return;
+      }
       const u = p.usage;
       const inp = Math.max(0, Number(u.input_tokens) || 0);
       const cr = Math.min(inp, Math.max(0, Number(u.cached_input_tokens) || 0));
@@ -1015,7 +1053,12 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       const out = Math.max(0, Number(u.output_tokens) || 0);
       const reas = Math.min(out, Math.max(0, Number(u.reasoning_output_tokens) || 0));
 
-      if (inp + out === 0) return;
+      if (inp + out === 0) {
+        stepCount++;
+        stepInputReadyMs = tsMs;
+        reasoningDoneMs = null;
+        return;
+      }
       stepCount++;
 
       sumUncached += uncached;
@@ -1036,6 +1079,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       if (tsMs && stepInputReadyMs && tsMs > stepInputReadyMs + 50 && out > 0) {
         e2eTokensSum += out;
         e2eSecSum += (tsMs - stepInputReadyMs) / 1000;
+        lastE2eSec = (tsMs - stepInputReadyMs) / 1000;
       }
       const visOut = Math.max(0, out - reas);
       if (tsMs && reasoningDoneMs && tsMs > reasoningDoneMs + 80 && visOut >= 15) {
@@ -1043,6 +1087,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
         if (visOut / dSec <= 1500) {
           decodeTokensSum += visOut;
           decodeSecSum += dSec;
+          lastDecodeSec = dSec;
           if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += visOut; bm.sec += dSec; }
           lastDecodeTps = visOut / dSec;
         }
@@ -1068,13 +1113,14 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     lastStepCacheRate,
     lastContextPrompt,
     contextMax: codexContextMax,
+    contextMaxSource: codexContextMax != null ? "reported" : null,
     tokPerSec: avgDecodeTps ?? lastDecodeTps ?? avgE2eTps,
     lastDecodeTps,
     avgDecodeTps,
     decodeTokensSum,
     decodeSecSum,
     e2eTokPerSec: avgE2eTps,
-    durationSec: decodeSecSum > 0 ? decodeSecSum : e2eSecSum > 0 ? e2eSecSum : null,
+    durationSec: lastDecodeSec ?? lastE2eSec,
   };
 
   lruSet(fileParseCache, jsonlPath, { sig, data });
@@ -1093,13 +1139,38 @@ function safeJsonParse(str) {
   }
 }
 
+function cacheRateForTurnUsage(usage, driver) {
+  if (!usage || usage.usageStatus === "unavailable" || !Number.isFinite(usage.inputTokens) || !Number.isFinite(usage.cachedInputTokens)) return null;
+  let input = Math.max(0, usage.inputTokens || 0);
+  const cached = Math.max(0, Number(usage.cachedInputTokens) || 0);
+  if (driver === "antigravity" && input >= cached * 2) {
+    // statev2's Antigravity prompt usage double-counts cachedInputTokens.
+    // Native SQLite protobuf usage is handled separately and is never deduped.
+    input -= cached;
+  }
+  return input > 0 ? Math.min(input, cached) / input : null;
+}
+
+function latestProviderTurnCacheRate(turnRows, fallbackDriver) {
+  const latest = turnRows?.[turnRows.length - 1];
+  if (!latest) return null;
+  const payload = safeJsonParse(latest.payload_json);
+  return cacheRateForTurnUsage(payload?.turnTokenUsage, payload?.nativeTurnRef?.driver || payload?.driver || fallbackDriver);
+}
+
 function extractThreadId(hint) {
   if (!hint || typeof hint !== "string") return null;
-  const trimmed = hint.trim();
+  const trimmed = normalizeT3RouteHint(hint);
   if (trimmed === "/new" || trimmed.endsWith("/new")) return "__NEW__";
   if (trimmed.startsWith("thread:")) return trimmed;
 
   const segments = trimmed.split("/").filter(Boolean);
+  // Native routes carry the exact thread identity in the second segment;
+  // older/imported thread IDs are not necessarily UUIDs.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segments[0] || "") && segments.length === 2) {
+    if (["new", "draft"].includes(segments[1].toLowerCase())) return "__NEW__";
+    try { return decodeURIComponent(segments[1]); } catch { return null; }
+  }
   for (let i = segments.length - 1; i >= 0; i--) {
     let seg = segments[i];
     if (seg.startsWith("thread%3A") || seg.startsWith("thread%3a")) {
@@ -1116,6 +1187,14 @@ function extractThreadId(hint) {
   return null;
 }
 
+function normalizeT3RouteHint(hint) {
+  let route = String(hint || "").trim();
+  if (/^[a-z][\w+.-]*:\/\//i.test(route)) {
+    try { const url = new URL(route); route = url.hash.startsWith("#/") ? url.hash.slice(1) : url.pathname; } catch {}
+  } else if (route.startsWith("#")) route = route.slice(1);
+  return route.split(/[?#]/, 1)[0];
+}
+
 function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackProvider) {
   const pThreadRows = db
     .prepare(
@@ -1123,25 +1202,51 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     )
     .all(threadId);
 
-  const turnRows = db
+  const rawTurnRows = db
     .prepare(
-      "SELECT ordinal, status, started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY ordinal ASC"
+      "SELECT rowid AS row_order, ordinal, status, started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC"
     )
     .all(threadId);
+  // Provider ordinals reset across resumed sessions. Use event time, with the
+  // stable insertion order for ties and for a newly inserted undated turn.
+  const turnEvidence = rawTurnRows.map((row, index) => {
+    const payload = safeJsonParse(row.payload_json);
+    const stamp = Date.parse(row.started_at || payload?.startedAt || row.completed_at || payload?.completedAt || "");
+    return { row, payload, stamp, order: Number.isFinite(row.row_order) ? row.row_order : index };
+  });
+  const dated = turnEvidence.filter((entry) => Number.isFinite(entry.stamp)).sort((a, b) => a.stamp - b.stamp || a.order - b.order);
+  let latestTurn = dated[dated.length - 1] || null;
+  for (const entry of turnEvidence) {
+    if (!Number.isFinite(entry.stamp) && (!latestTurn || entry.order > latestTurn.order)) latestTurn = entry;
+  }
+  const turnRows = [...turnEvidence.filter((entry) => !Number.isFinite(entry.stamp)), ...dated]
+    .filter((entry) => entry !== latestTurn).map((entry) => entry.row);
+  if (latestTurn) turnRows.push(latestTurn.row);
+  const latestTurnDriver = latestTurn?.payload?.nativeTurnRef?.driver || latestTurn?.payload?.driver || null;
 
   let isRunning = false;
   let contextUsed = null;
   let contextMax = null;
+  let contextMaxSource = null;
   let latestDriver = fallbackProvider || null;
   let latestModel = fallbackModel || null;
+  const contextsByDriver = new Map();
 
   for (const pt of pThreadRows) {
     const p = safeJsonParse(pt.payload_json);
     if (pt.driver) latestDriver = pt.driver;
-    if (p?.contextUsage?.usedTokens != null) {
-      contextUsed = p.contextUsage.usedTokens;
-      contextMax = p.contextUsage.maxTokens || contextMax;
-    }
+    const current = { used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null, max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null, updatedMs: Date.parse(pt.updated_at || "") };
+    contextsByDriver.set(pt.driver, current);
+    contextUsed = current.used;
+    contextMax = current.max;
+    contextMaxSource = current.max != null ? "reported" : null;
+  }
+  if (latestTurnDriver) {
+    latestDriver = latestTurnDriver;
+    const current = contextsByDriver.get(latestTurnDriver);
+    contextUsed = current?.used ?? null;
+    contextMax = current?.max ?? null;
+    contextMaxSource = contextMax != null ? "reported" : null;
   }
 
   const agyConvIds = new Set();
@@ -1211,6 +1316,10 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     }
   }
 
+  // statev2 provider turns are the only reliable source for cache across all
+  // model calls in one user turn. Native logs remain per-call/session sources.
+  const turnCacheRate = latestProviderTurnCacheRate(turnRows, latestDriver);
+
   if (nativeParts.length > 0) {
     nativeParts.sort((a, b) => a.mtimeMs - b.mtimeMs);
     const coveredDrivers = new Set(nativeParts.map((p) => p.driver));
@@ -1232,6 +1341,9 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     let latestUncoveredTurnMs = 0;
     let latestUncoveredDriver = null;
     let latestUncoveredModel = null;
+    let latestUncoveredOutput = 0;
+    let latestUncoveredStartMs = null;
+    let latestUncoveredEndMs = null;
 
     for (const part of nativeParts) {
       uncached += part.uncached;
@@ -1262,6 +1374,23 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       const d = p?.nativeTurnRef?.driver;
       if (!d || coveredDrivers.has(d)) continue;
       const u = p?.turnTokenUsage;
+      const completed = tr.status === "completed" || Boolean(tr.completed_at || p?.completedAt);
+      const uS = Date.parse(tr.started_at || p?.startedAt || "");
+      const uE = Date.parse(tr.completed_at || p?.completedAt || "");
+      if (completed) stepCount++;
+      const turnMs = Number.isFinite(uE) ? uE : Number.isFinite(uS) ? uS : NaN;
+      // Each uncovered provider row supersedes the prior candidate, including
+      // a completed turn whose usage payload is missing. Such a turn is a
+      // known no-sample result and must clear the old rate.
+      latestUncoveredDriver = d;
+      latestUncoveredTurnMs = Number.isFinite(turnMs) ? turnMs : 0;
+      latestUncoveredOutput = completed && typeof u?.outputTokens === "number" ? Math.max(0, u.outputTokens) : 0;
+      latestUncoveredStartMs = completed && Number.isFinite(uS) ? uS : null;
+      latestUncoveredEndMs = completed && Number.isFinite(uE) ? uE : null;
+      latestUncoveredModel =
+        (Array.isArray(u?.models) && typeof u.models[0] === "string" && u.models[0]) ||
+        (typeof p?.model === "string" && p.model) ||
+        null;
       if (!u || typeof u.inputTokens !== "number") continue;
       let inp = Math.max(0, u.inputTokens || 0);
       const cr = Math.max(0, u.cachedInputTokens || 0);
@@ -1278,22 +1407,9 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, latestModel, d);
       usd += priced.usd;
       savedUsd += priced.savedUsd;
-      const uS = Date.parse(tr.started_at || p?.startedAt || "");
-      const uE = Date.parse(tr.completed_at || p?.completedAt || "");
       if (Number.isFinite(uE) && Number.isFinite(uS) && uE > uS + 50 && out > 0) {
         uncoveredOut += out;
         uncoveredNetSec += (uE - uS) / 1000;
-      }
-      const turnMs = Number.isFinite(uE) ? uE : Number.isFinite(uS) ? uS : NaN;
-      if (Number.isFinite(turnMs) && turnMs >= latestUncoveredTurnMs) {
-        latestUncoveredTurnMs = turnMs;
-        latestUncoveredDriver = d;
-        latestUncoveredModel =
-          Array.isArray(u.models) && typeof u.models[0] === "string" && u.models[0]
-            ? u.models[0]
-            : typeof p?.model === "string" && p.model
-              ? p.model
-              : null;
       }
     }
 
@@ -1305,7 +1421,8 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
           ? uncoveredOut / uncoveredNetSec
           : null;
 
-    const lastPart = nativeParts[nativeParts.length - 1];
+    const matchingParts = latestTurnDriver ? nativeParts.filter((part) => part.driver === latestTurnDriver) : nativeParts;
+    const lastPart = matchingParts[matchingParts.length - 1] || nativeParts[nativeParts.length - 1];
 
     // Mixed-provider freshness: if an uncovered provider ran after the newest
     // native part, its statev2 metadata wins over stale native metadata.
@@ -1332,27 +1449,93 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       }
       overrideMs = lastPThreadMs;
     }
-    const useOverride = Boolean(overrideDriver) && overrideMs > (lastPart.mtimeMs || 0);
+    if (latestTurnDriver && !coveredDrivers.has(latestTurnDriver)) {
+      overrideDriver = latestTurnDriver;
+      overrideModel = latestTurn?.payload?.turnTokenUsage?.models?.[0] || latestTurn?.payload?.model || statev2Model;
+    }
+    const useOverride = Boolean(overrideDriver) && ((overrideDriver === latestTurnDriver && !Number.isFinite(latestTurn?.stamp)) || overrideMs > (lastPart.mtimeMs || 0));
     const effDriver = useOverride ? overrideDriver : lastPart.driver || latestDriver;
     const effModel = useOverride ? overrideModel || statev2Model : lastPart.model || latestModel;
+    const latestCallCacheRate = useOverride
+      ? null
+      : lastPart.lastStepCacheRate ?? null;
+    let latestUncoveredTps = null;
+    let latestUncoveredDurationSec = null;
+    if (
+      useOverride &&
+      !coveredDrivers.has(overrideDriver) &&
+      latestUncoveredDriver === overrideDriver &&
+      latestUncoveredOutput >= 15 &&
+      Number.isFinite(latestUncoveredStartMs) &&
+      Number.isFinite(latestUncoveredEndMs) &&
+      latestUncoveredEndMs > latestUncoveredStartMs
+    ) {
+      let toolIntervals = [];
+      try {
+        toolIntervals = db
+          .prepare("SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE thread_id = ?")
+          .all(threadId)
+          .map((row) => safeJsonParse(row.payload_json))
+          .filter((item) => item && item.startedAt && item.completedAt && item.type !== "assistant_message" && item.type !== "reasoning")
+          .map((item) => [Date.parse(item.startedAt), Date.parse(item.completedAt)])
+          .filter(([startMs, endMs]) => Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs && endMs - startMs < 600000);
+      } catch {}
+      const netSec = subtractToolWait(latestUncoveredStartMs, latestUncoveredEndMs, toolIntervals);
+      const tps = latestUncoveredOutput / netSec;
+      if (netSec > 0.05 && Number.isFinite(tps) && tps <= 1500) {
+        latestUncoveredTps = tps;
+        latestUncoveredDurationSec = netSec;
+      }
+    }
     const promptTotal = uncached + cached + cacheWrite;
     const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
+    const latestTurnCompleted = latestTurn && (String(latestTurn.row.status || latestTurn.payload?.status) === "completed" || Boolean(latestTurn.row.completed_at || latestTurn.payload?.completedAt));
+    const latestTurnHasOutput = Number.isFinite(latestTurn?.payload?.turnTokenUsage?.outputTokens) && latestTurn.payload.turnTokenUsage.outputTokens > 0;
+    const currentTurnSpeedKnown = !latestTurn || (latestTurnCompleted && latestTurnHasOutput && (!latestTurnDriver || latestTurnDriver === effDriver));
 
-    // True contextMax: prefer native part max, then statev2 maxTokens,
-    // then Antigravity fallback (Gemini 1048576 / Claude 1000000), then catalog, then null.
-    let resolvedContextMax = useOverride ? contextMax ?? null : lastPart.contextMax ?? contextMax ?? null;
+    // Prefer host/T3 reported values, then the local model catalog, then an
+    // explicit model-family estimate. The HUD does not infer product compaction.
+    let resolvedContextMax = null;
+    let resolvedContextMaxSource = null;
+    const currentContext = contextsByDriver.get(effDriver);
+    contextUsed = currentContext?.used ?? null;
+    contextMax = currentContext?.max ?? null;
+    contextMaxSource = contextMax != null ? "reported" : null;
+    const preferCurrentReport = contextMax != null && (useOverride || lastPart.contextMax == null || (Number.isFinite(currentContext?.updatedMs) && currentContext.updatedMs >= (lastPart.mtimeMs || 0)));
+    if (preferCurrentReport) {
+      if (contextMax != null) {
+        resolvedContextMax = contextMax;
+        resolvedContextMaxSource = contextMaxSource || "reported";
+      }
+    } else if (!useOverride && lastPart.driver === effDriver && lastPart.contextMax != null) {
+      resolvedContextMax = lastPart.contextMax;
+      resolvedContextMaxSource = lastPart.contextMaxSource || "reported";
+    } else if (contextMax != null) {
+      resolvedContextMax = contextMax;
+      resolvedContextMaxSource = contextMaxSource || "reported";
+    }
     if (resolvedContextMax == null) {
       const drv = effDriver || latestDriver;
       const mdl = effModel || latestModel;
+      const catalogMax = lookupCatalogContextMax(mdl, drv);
+      if (catalogMax != null) {
+        resolvedContextMax = catalogMax;
+        resolvedContextMaxSource = "local-catalog";
+      }
       if (drv === "antigravity") {
         const model = (mdl || "").toLowerCase();
         const isClaude = /opus|sonnet|haiku|claude/.test(model);
-        const catalog = lookupCatalogContextMax(mdl, drv);
-        resolvedContextMax = catalog ?? (isClaude ? 1000000 : 1048576);
+        if (resolvedContextMax == null) {
+          resolvedContextMax = isClaude ? 1000000 : 1048576;
+          resolvedContextMaxSource = "estimated";
+        }
       } else if (drv === "muse") {
-        resolvedContextMax = lookupCatalogContextMax(mdl, drv) ?? 1007997;
+        if (resolvedContextMax == null) {
+          resolvedContextMax = 1007997;
+          resolvedContextMaxSource = "estimated";
+        }
       } else if (drv === "codex") {
-        resolvedContextMax = lookupCatalogContextMax(mdl, drv) ?? contextMax ?? null;
+        // Unknown if neither the host nor the local model catalog has a value.
       }
     }
 
@@ -1372,14 +1555,20 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       usd,
       savedUsd,
       sessionCacheRate,
-      lastTurnCacheRate: lastPart.lastStepCacheRate ?? sessionCacheRate,
+      turnCacheRate: latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
+      lastTurnCacheRate: latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
+      lastCallCacheRate: latestCallCacheRate,
+      contextCacheRate: turnCacheRate ?? latestCallCacheRate ?? sessionCacheRate,
       tokPerSec: sessionAvgTps ?? lastPart.tokPerSec,
       byModelSpeed: Object.fromEntries(Object.entries(mergedByModel).filter(([, v]) => v.sec > 0.1).map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])),
-      lastDecodeTps: lastPart.lastDecodeTps,
+      // Use the latest uncovered turn's own effective duration when it wins the
+      // mixed-provider freshness check; never reuse the previous provider's rate.
+      lastDecodeTps: !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredTps : lastPart.lastDecodeTps,
       e2eTokPerSec: lastPart.e2eTokPerSec,
-      durationSec: lastPart.durationSec,
-      contextUsed: useOverride ? contextUsed : lastPart.lastContextPrompt ?? contextUsed,
+      durationSec: !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredDurationSec : lastPart.durationSec,
+      contextUsed: useOverride ? contextUsed : preferCurrentReport ? contextUsed ?? lastPart.lastContextPrompt : lastPart.lastContextPrompt ?? contextUsed,
       contextMax: resolvedContextMax,
+      contextMaxSource: resolvedContextMaxSource,
     };
   }
 
@@ -1390,11 +1579,17 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     )
     .all(threadId);
   let totalToolWaitSec = 0;
+  const toolIntervals = [];
   for (const it of toolRows) {
     const p = safeJsonParse(it.payload_json);
     if (p && p.startedAt && p.completedAt && p.type !== "assistant_message" && p.type !== "reasoning") {
-      const dt = (Date.parse(p.completedAt) - Date.parse(p.startedAt)) / 1000;
-      if (dt > 0 && dt < 600) totalToolWaitSec += dt;
+      const startMs = Date.parse(p.startedAt);
+      const endMs = Date.parse(p.completedAt);
+      const dt = (endMs - startMs) / 1000;
+      if (dt > 0 && dt < 600) {
+        totalToolWaitSec += dt;
+        toolIntervals.push([startMs, endMs]);
+      }
     }
   }
 
@@ -1406,10 +1601,21 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   let usd = 0;
   let savedUsd = 0;
   let turnDurSum = 0;
+  let lastTurnTps = null;
+  let lastTurnNetSec = null;
   let lastTurnCacheRate = null;
 
   for (const tr of turnRows) {
     const p = safeJsonParse(tr.payload_json);
+    const sMs = Date.parse(tr.started_at || p?.startedAt || "");
+    const eMs = Date.parse(tr.completed_at || p?.completedAt || "");
+    const completed = tr.status === "completed" || (Number.isFinite(eMs) && (!Number.isFinite(sMs) || eMs >= sMs));
+    if (completed) {
+      // Every completed turn replaces the prior turn sample, even when this
+      // one has no usage or a zero-duration/zero-token result.
+      lastTurnTps = null;
+      lastTurnNetSec = null;
+    }
     const u = p?.turnTokenUsage;
     if (!u || typeof u.inputTokens !== "number") continue;
 
@@ -1435,24 +1641,34 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     savedUsd += priced.savedUsd;
     if (inp > 0) lastTurnCacheRate = cr / inp;
 
-    const sMs = Date.parse(tr.started_at || p?.startedAt || "");
-    const eMs = Date.parse(tr.completed_at || p?.completedAt || "");
     if (Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs) {
       turnDurSum += (eMs - sMs) / 1000;
+      const netSec = subtractToolWait(sMs, eMs, toolIntervals);
+      if (completed && out >= 15 && netSec > 0.05 && out / netSec <= 1500) {
+        lastTurnTps = out / netSec;
+        lastTurnNetSec = netSec;
+      }
     }
   }
 
   const netGenSec = Math.max(0.2, turnDurSum - totalToolWaitSec);
   const promptTotal = uncached + cached + cacheWrite;
   const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
-  let effectiveMax = contextMax ?? lookupCatalogContextMax(latestModel, latestDriver) ?? null;
+  let effectiveMax = contextMax ?? null;
+  let effectiveMaxSource = effectiveMax != null ? contextMaxSource || "reported" : null;
+  if (effectiveMax == null) {
+    effectiveMax = lookupCatalogContextMax(latestModel, latestDriver) ?? null;
+    if (effectiveMax != null) effectiveMaxSource = "local-catalog";
+  }
   if (effectiveMax == null && latestDriver === "antigravity") {
     const model = (latestModel || "").toLowerCase();
     const isClaude = /opus|sonnet|haiku|claude/.test(model);
     effectiveMax = isClaude ? 1000000 : 1048576;
+    effectiveMaxSource = "estimated";
   }
   if (effectiveMax == null && latestDriver === "muse") {
     effectiveMax = 1007997;
+    effectiveMaxSource = "estimated";
   }
 
   return {
@@ -1461,7 +1677,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     model: latestModel,
     isRunning,
     turnCount: turnRows.length,
-    stepCount: turnRows.length,
+    stepCount: turnRows.filter((tr) => tr.status === "completed" || tr.completed_at).length,
     uncached,
     cached,
     cacheWrite,
@@ -1471,13 +1687,17 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     usd,
     savedUsd,
     sessionCacheRate,
-    lastTurnCacheRate: lastTurnCacheRate ?? sessionCacheRate,
+    turnCacheRate,
+    lastTurnCacheRate: turnCacheRate,
+    lastCallCacheRate: null,
+    contextCacheRate: turnCacheRate ?? lastTurnCacheRate ?? sessionCacheRate,
     tokPerSec: turnDurSum > 0.2 && output > 0 ? output / netGenSec : null,
-    lastDecodeTps: null,
+    lastDecodeTps: lastTurnTps,
     e2eTokPerSec: turnDurSum > 0.2 && output > 0 ? output / netGenSec : null,
-    durationSec: turnDurSum > 0 ? netGenSec : null,
+    durationSec: lastTurnNetSec,
     contextUsed,
     contextMax: effectiveMax,
+    contextMaxSource: effectiveMaxSource,
   };
 }
 
@@ -1655,15 +1875,19 @@ function getThreadStats(threadHint) {
     const resolvedProvider = mainTel.provider || baseProvider;
     const resolvedModel = mainTel.model || baseModel;
     let resolvedContextMax = mainTel.contextMax ?? null;
+    let resolvedContextMaxSource = mainTel.contextMaxSource ?? null;
     if (resolvedContextMax == null) {
       resolvedContextMax =
         lookupCatalogContextMax(resolvedModel, resolvedProvider) ?? null;
+      if (resolvedContextMax != null) resolvedContextMaxSource = "local-catalog";
       if (resolvedContextMax == null && resolvedProvider === "antigravity") {
         const m = (resolvedModel || "").toLowerCase();
         resolvedContextMax = /opus|sonnet|haiku|claude/.test(m) ? 1000000 : 1048576;
+        resolvedContextMaxSource = "estimated";
       }
       if (resolvedContextMax == null && resolvedProvider === "muse") {
         resolvedContextMax = 1007997;
+        resolvedContextMaxSource = "estimated";
       }
     }
 
@@ -1690,13 +1914,22 @@ function getThreadStats(threadHint) {
         total: mainTotal + subagentTokens,
         contextUsed: mainTel.contextUsed,
         contextMax: resolvedContextMax,
+        contextMaxSource: resolvedContextMaxSource,
       },
       cache: {
         cachedTokens: combinedCached,
+        mainCachedTokens: mainTel.cached,
+        withSubagentsCachedTokens: combinedCached,
         cacheWriteTokens: mainTel.cacheWrite,
-        displayRate: mainTel.lastTurnCacheRate ?? combinedSessionCacheRate,
+        // displayRate is retained for Antigravity context dedupe only; the HUD
+        // cache metric uses turnRate and never falls back to a cumulative rate.
+        displayRate: mainTel.contextCacheRate ?? mainTel.sessionCacheRate,
+        turnRate: mainTel.turnCacheRate ?? null,
         sessionRate: combinedSessionCacheRate,
-        lastTurnRate: mainTel.lastTurnCacheRate,
+        mainSessionRate: mainTel.sessionCacheRate,
+        withSubagentsSessionRate: combinedSessionCacheRate,
+        lastTurnRate: mainTel.turnCacheRate ?? null,
+        lastCallRate: mainTel.lastCallCacheRate ?? null,
         savedUsd: mainTel.savedUsd + subagentSavedUsd,
       },
       speed: {
@@ -1757,18 +1990,36 @@ function priceRemoteProjection(payload) {
   let lastStreamSec = null;
   const decodeByModel = {};
   let lastPromptTotal = null;
-  let lastTurnCacheRate = null;
+  let turnCacheRate = null;
   let lastTurnDriver = null;
   let lastTurnModel = null;
   const byModel = {};
   for (const t of turns) {
     const u = t?.usage;
-    if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") continue;
+    turnCacheRate = null;
+    lastTurnTps = null;
+    lastTurnNetSec = null;
+    lastTurnDecodeTps = null;
+    lastStreamSec = null;
+    lastTurnDriver = t?.driver || payload.provider || "unknown";
+    lastTurnModel = u?.models?.[0] || t?.model || payload.model || null;
+    if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") {
+      continue;
+    }
+    // This row is the newest candidate turn. Clear the prior sample first so
+    // an empty or invalid latest turn never inherits an older turn's speed.
+    lastTurnTps = null;
+    lastTurnNetSec = null;
+    lastTurnDecodeTps = null;
+    lastStreamSec = null;
     const driver = t.driver || payload.provider || "unknown";
     let inp = Math.max(0, u.inputTokens || 0);
     const cr = Math.max(0, u.cachedInputTokens || 0);
     const cw = Math.max(0, u.cacheCreationTokens || 0);
     if (driver === "antigravity" && inp >= cr * 2) inp = inp - cr;
+    // Each projection turn carries its own aggregate usage. An empty/latest
+    // turn stays unknown; do not substitute an older turn or session average.
+    if (inp > 0 && Number.isFinite(u.cachedInputTokens)) turnCacheRate = Math.min(inp, cr) / inp;
     const unc = Math.max(0, inp - cr - cw);
     const out = Math.max(0, u.outputTokens || 0);
     const reas = Math.min(out, Math.max(0, u.reasoningTokens || 0));
@@ -1783,7 +2034,6 @@ function priceRemoteProjection(payload) {
     sumSavedUsd += priced.savedUsd;
     pricedTurns++;
     lastPromptTotal = inp + out;
-    lastTurnCacheRate = inp > 0 ? cr / inp : null;
     lastTurnDriver = driver;
     lastTurnModel = turnModel;
     if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs && out > 0) {
@@ -1836,7 +2086,7 @@ function priceRemoteProjection(payload) {
   if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
     // T3's acpPerTurnPromptUsage counts promptTokenCount + cachedContentTokenCount,
     // but Gemini's promptTokenCount already includes cachedContentTokenCount.
-    const agyCacheRatio = lastTurnCacheRate ?? sessionCacheRate ?? 0;
+    const agyCacheRatio = turnCacheRate ?? sessionCacheRate ?? 0;
     const deduped =
       agyCacheRatio > 0.01
         ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
@@ -1846,13 +2096,22 @@ function priceRemoteProjection(payload) {
       contextUsed = lastPromptTotal;
     }
   }
-  let contextMax = payload.contextUsage?.maxTokens || lookupCatalogContextMax(effModel, effDriver) || null;
+  let contextMax = Number.isFinite(payload.contextUsage?.maxTokens) && payload.contextUsage.maxTokens > 0
+    ? payload.contextUsage.maxTokens
+    : null;
+  let contextMaxSource = contextMax != null ? "reported" : null;
+  if (contextMax == null) {
+    contextMax = lookupCatalogContextMax(effModel, effDriver) || null;
+    if (contextMax != null) contextMaxSource = "local-catalog";
+  }
   if (contextMax == null && effDriver === "antigravity") {
     const model = (effModel || "").toLowerCase();
     contextMax = /opus|sonnet|haiku|claude/.test(model) ? 1000000 : 1048576;
+    contextMaxSource = "estimated";
   }
   if (contextMax == null && effDriver === "muse") {
     contextMax = 1007997;
+    contextMaxSource = "estimated";
   }
   // Live in-progress Turn 1: contextUsage.usedTokens is already live before the
   // first turnTokenUsage lands, so surface it as current consumption + est. cost.
@@ -1873,8 +2132,8 @@ function priceRemoteProjection(payload) {
       .filter(([, v]) => v.sec > 0.1)
       .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
   );
-  const lastDecodeTps = hasDecode ? lastTurnDecodeTps : lastTurnTps;
-  const lastDurationSec = hasDecode ? lastStreamSec : lastTurnNetSec;
+  const lastDecodeTps = lastTurnDecodeTps ?? lastTurnTps;
+  const lastDurationSec = lastStreamSec ?? lastTurnNetSec;
   const subagentCount = Math.max(0, Number(payload.subagentCount) || 0);
   return {
     ok: true,
@@ -1912,13 +2171,20 @@ function priceRemoteProjection(payload) {
       total: promptTotal + outputOut,
       contextUsed: contextUsed ?? null,
       contextMax: contextMax ?? null,
+        contextMaxSource,
     },
     cache: {
       cachedTokens: sumCached,
+        mainCachedTokens: sumCached,
+        withSubagentsCachedTokens: sumCached,
       cacheWriteTokens: sumCacheWrite,
       sessionRate: sessionCacheRate,
-      lastTurnRate: lastTurnCacheRate ?? sessionCacheRate,
-      displayRate: lastTurnCacheRate ?? sessionCacheRate,
+        mainSessionRate: sessionCacheRate,
+        withSubagentsSessionRate: sessionCacheRate,
+        turnRate: turnCacheRate,
+        lastTurnRate: turnCacheRate,
+        lastCallRate: null,
+        displayRate: turnCacheRate ?? sessionCacheRate,
       savedUsd: totalSavedUsd,
     },
     cost: {
@@ -2058,6 +2324,20 @@ function discoverAntigravityRulesPaths(extra = []) {
   return [...out];
 }
 
+function parseDraftProjectRoute(hint) {
+  const route = normalizeT3RouteHint(hint);
+  const parts = route.split(/[?#]/, 1)[0].split("/").filter(Boolean);
+  const lower = parts.map((part) => part.toLowerCase());
+  const isDraft = lower.includes("draft") || lower.includes("new");
+  const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value || "");
+  // T3's actual route is /$environmentId/$threadId, not /project/thread.
+  if (!isDraft) return { isDraft: false, projectId: null, environmentId: parts[1] && !["threads", "_chat"].includes(lower[0]) ? parts[0] : null };
+  let projectId = null;
+  // /draft/$draftId is client-local draft identity and proves no project.
+  if (/^(projects?|workspaces?)$/.test(lower[0] || "") && isUuid(parts[1]) && ["new", "draft"].includes(lower[2])) projectId = parts[1];
+  return { isDraft: true, projectId };
+}
+
 function resolveHubContext(args = {}) {
   if (!didAutoSyncHosts) {
     didAutoSyncHosts = true;
@@ -2066,10 +2346,16 @@ function resolveHubContext(args = {}) {
   const threadHint = args.threadHint || args.threadId || "";
   const routeHint = args.routeHint || args.threadHint || args.threadId || "";
   const hint = routeHint || threadHint;
+  const draft = parseDraftProjectRoute(hint);
   let parsed = extractThreadId(hint);
   if (parsed && parsed.startsWith("__ROUTE_")) parsed = null;
   if (parsed === "__NEW__") parsed = null;
   try {
+    let environmentId = null;
+    if (draft.environmentId) {
+      try { environmentId = fs.readFileSync(path.join(path.dirname(DB_PATH), "environment-id"), "utf8").trim(); } catch {}
+      if (!environmentId || environmentId.toLowerCase() !== draft.environmentId.toLowerCase()) return { ok: false, error: "无法确认当前运行环境，请切回本机工作区" };
+    }
     if (!fs.existsSync(DB_PATH)) {
       return { ok: false, error: "statev2.sqlite not found" };
     }
@@ -2077,8 +2363,16 @@ function resolveHubContext(args = {}) {
     try {
       db = new DatabaseSync(DB_PATH, { open: true, readOnly: true });
       let threadRow = null;
-      if (parsed) {
+      let draftProject = null;
+      if (draft.isDraft) {
+        if (draft.projectId) {
+          try { draftProject = db.prepare("SELECT * FROM projection_projects WHERE project_id = ? COLLATE NOCASE").get(draft.projectId); } catch {}
+        }
+        if (!draftProject?.project_id || draftProject.deleted_at || !String(draftProject.workspace_root || "").trim()) return { ok: false, error: "无法确认新会话所属项目，请先选择项目" };
+        threadRow = { thread_id: "__NEW__", project_id: draftProject.project_id, title: "", default_provider: null, payload_json: "{}" };
+      } else if (parsed) {
         threadRow = db.prepare("SELECT thread_id, project_id, title, default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?").get(parsed);
+        if (!threadRow) return { ok: false, error: "无法确认会话所属项目，请检查连接" };
       }
       if (!threadRow) {
         // Fall back to most recently updated non-delegated thread.
@@ -2089,14 +2383,12 @@ function resolveHubContext(args = {}) {
       const threadId = threadRow.thread_id;
       const projectId = threadRow.project_id;
       const payload = (() => { try { return JSON.parse(threadRow.payload_json || "{}"); } catch { return {}; } })();
-      let projectRow = null;
-      if (projectId) {
-        try { projectRow = db.prepare("SELECT title, workspace_root FROM projection_projects WHERE project_id = ?").get(projectId); } catch {}
+      let projectRow = draftProject;
+      if (!projectRow && projectId) {
+        try { projectRow = db.prepare("SELECT * FROM projection_projects WHERE project_id = ?").get(projectId); } catch {}
       }
-      if (!projectRow) {
-        try { projectRow = db.prepare("SELECT title, workspace_root FROM projection_projects ORDER BY updated_at DESC LIMIT 1").get(); } catch {}
-      }
-      const projectRoot = projectRow?.workspace_root || payload.worktreePath || null;
+      if (!projectRow || projectRow.deleted_at || !String(projectRow.workspace_root || "").trim()) return { ok: false, error: "无法确认会话所属项目，请检查连接" };
+      const projectRoot = projectRow.workspace_root;
       const projectTitle = projectRow?.title || path.basename(projectRoot || "") || threadRow.title || "";
       const projectSlug = (() => {
         if (projectRoot) {
@@ -2156,7 +2448,7 @@ function resolveHubContext(args = {}) {
         const s = hubSubagents.listSubagents({ projectRoot });
         subagents = (s.effectiveItems || []).length;
       } catch {}
-      return { ok: true, threadId, projectId, projectRoot, projectSlug, projectTitle, activeProvider, activeModel, counts: { activePlugins, activeSkills, activeMcps, activeHooks, projectMemories, subagents } };
+      return { ok: true, threadId, environmentId, projectId, projectRoot, projectSlug, projectTitle, activeProvider, activeModel, ...(draft.isDraft ? { draftProjectVerified: true } : {}), counts: { activePlugins, activeSkills, activeMcps, activeHooks, projectMemories, subagents } };
     } finally {
       try { db?.close(); } catch {}
     }
@@ -2306,6 +2598,7 @@ async function hubCall(action, payload = {}) {
       case "agentsMd:get": return hubSkills.getAgentsMd(payload);
       case "agentsMd:save": return hubSkills.saveAgentsMd(payload);
       case "agentsMd:injectSoftRoute": return hubSkills.injectSoftRoute(payload);
+      case "agentsMd:syncProjectReference": return hubSkills.syncProjectRuleReference(payload);
       case "mcp:list": return mcpRouter.listMcpServers(payload);
       case "mcp:setMode": return mcpRouter.setMcpMode(payload);
       case "mcp:upsert": return mcpRouter.upsertMcpServer(payload);
@@ -2392,8 +2685,9 @@ async function hubCall(action, payload = {}) {
         const status = await embedManager.getStatus();
         try {
           const stats = memoryVault.getStats({});
-          if (stats && stats.vectorStats) status.vectorStats = stats.vectorStats;
-        } catch {}
+          if (stats?.ok === false) { delete status.vectorStats; status.vectorStatsError = stats.error || "记忆库统计不可用"; }
+          else if (stats?.vectorStats) { status.vectorStats = stats.vectorStats; delete status.vectorStatsError; }
+        } catch { delete status.vectorStats; status.vectorStatsError = "记忆库统计不可用"; }
         try { await enrichWithEmbedMetrics(status); if (status.vectorStats) await enrichWithEmbedMetrics(status.vectorStats); } catch {}
         return status;
       }
@@ -2481,7 +2775,7 @@ async function hubCall(action, payload = {}) {
         return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
       }
       case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
-      case "subagents:orchestration:get": return hubSubagents.getOrchestrationConfig();
+      case "subagents:orchestration:get": return { ...hubSubagents.getOrchestrationConfig(), legacyStatus: hubSubagents.inspectOrchestrationTargets({ additionalHosts: discoverAntigravityRulesPaths() }) };
       case "subagents:orchestration:update": {
         const p = payload || {};
         const patch = p.config || p.patch || p;
@@ -2491,12 +2785,7 @@ async function hubCall(action, payload = {}) {
         // Prefer updateOrchestrationConfig which already syncs, passing host hints via opts
         try {
           if (typeof hubSubagents.updateOrchestrationConfig === "function") {
-            res = hubSubagents.updateOrchestrationConfig(patch, hostHints ? { hostRulePaths: hostHints, hosts: hostHints } : {});
-            // If update succeeded and additional sync needed, also call explicit sync (idempotent)
-            if (res && res.ok !== false && res.config && typeof hubSubagents.syncOrchestrationDirectiveToHosts === "function") {
-              // Sync already done inside update; calling again is safe
-              try { hubSubagents.syncOrchestrationDirectiveToHosts(hostHints ? { hosts: hostHints } : {}); } catch {}
-            }
+            res = hubSubagents.updateOrchestrationConfig(patch, hostHints ? { hostRulePaths: hostHints, hosts: hostHints } : { additionalHosts: discoverAntigravityRulesPaths() });
           } else {
             throw new Error("updateOrchestrationConfig unavailable");
           }
@@ -2511,32 +2800,22 @@ async function hubCall(action, payload = {}) {
       case "board:get": return getTaskBoard().getBoardSnapshot(payload || {});
       case "board:update": return getTaskBoard().updatePlan(payload || {});
       case "board:clear": return getTaskBoard().clearPlan(payload || {});
+      case "board:openArtifact": return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })(payload || {});
       case "board:readArtifact": {
         const rawPath = payload?.path || payload?.file || payload?.artifactPath || payload?.filePath || "";
-        if (typeof rawPath !== "string" || !rawPath.trim()) return { ok: false, error: "path required" };
-        const abs = path.resolve(String(rawPath).trim());
-        const home = process.env.HOME || os.homedir();
-        const t3Root = path.resolve(path.join(home, ".t3"));
-        const brainRoot = path.resolve(path.join(home, ".gemini", "antigravity", "brain"));
-        const inT3 = abs === t3Root || abs.startsWith(t3Root + path.sep);
-        const inBrain = abs === brainRoot || abs.startsWith(brainRoot + path.sep);
-        if (!inT3 && !inBrain) return { ok: false, error: "path outside allowed roots" };
-        if (!abs.endsWith(".md")) return { ok: false, error: "only .md artifacts allowed" };
-        try {
-          const st = fs.statSync(abs);
-          if (!st.isFile()) return { ok: false, error: "not a file" };
-          if (st.size > 256 * 1024) return { ok: false, error: "artifact too large" };
-          const content = fs.readFileSync(abs, "utf8");
-          if (content.length > 256 * 1024) return { ok: false, error: "artifact too large" };
-          return { ok: true, path: abs, content };
-        } catch (e) {
-          return { ok: false, error: e?.message || String(e) };
-        }
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...payload, path: rawPath, operation: "preview" });
       }
-      case "settings:get": return getHostSettingsManager().getSettingsSnapshot();
+      case "settings:get": {
+        let t3EnvironmentId = null;
+        try {
+          const id = fs.readFileSync(path.join(T3_USERDATA, "environment-id"), "utf8").trim();
+          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) t3EnvironmentId = id;
+        } catch {}
+        return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId };
+      }
       case "settings:update": return getHostSettingsManager().updateHostSetting(payload);
       case "settings:getRule": return getHostSettingsManager().getRuleContent(payload?.host);
-      case "settings:saveRule": return getHostSettingsManager().saveRuleContent(payload?.host, payload?.content);
+      case "settings:saveRule": return getHostSettingsManager().saveRuleContent(payload?.host, payload?.content, payload?.expectedContent, payload?.expectedTarget);
       default: return { ok: false, error: "unknown action: " + action };
     }
   } catch (err) {

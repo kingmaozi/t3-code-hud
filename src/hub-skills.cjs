@@ -1254,37 +1254,65 @@ function createSkillsManager(opts = {}) {
   }
 
   function estimateTokens(text) { return Math.ceil(Buffer.byteLength(text || "", "utf8") / 3.5); }
-  function getAgentsMd(args = {}) {
-    const projectRoot = args.projectRoot || null;
-    let globalContent = "";
-    if (!fileExists(hubGlobalAgentsPath)) {
-      const seed = path.join(codexDir, "AGENTS.md");
-      if (fileExists(seed)) {
-        safeMkdir(hubDir);
-        try { globalContent = fs.readFileSync(seed, "utf8"); fs.writeFileSync(hubGlobalAgentsPath, globalContent, "utf8"); } catch {}
-      }
-    } else { try { globalContent = fs.readFileSync(hubGlobalAgentsPath, "utf8"); } catch {} }
-    const targets = [];
-    const cands = [
+  function sharedRulesOnly(content) {
+    let out = content;
+    for (const [start, end] of [["<!-- t3-hub-subagents:start -->", "<!-- t3-hub-subagents:end -->"], ["<!-- T3_HUB_ORCHESTRATOR_START -->", "<!-- T3_HUB_ORCHESTRATOR_END -->"]]) {
+      const s = out.indexOf(start), e = out.indexOf(end);
+      if ((s < 0) !== (e < 0) || (s >= 0 && (e < s || out.indexOf(start, s + start.length) >= 0 || out.indexOf(end, e + end.length) >= 0))) throw new Error("共享规则包含不完整或重复的托管区块，请先修复");
+      if (s >= 0) { let after = out.slice(e + end.length); if (after.startsWith("\r\n")) after = after.slice(2); else if (after.startsWith("\n")) after = after.slice(1); out = out.slice(0, s) + after; }
+    }
+    return out;
+  }
+  function managedSectionsUnchanged(before, after) {
+    for (const [start, end] of [["<!-- t3-hub-subagents:start -->", "<!-- t3-hub-subagents:end -->"], ["<!-- t3-hub-project-subagents:start -->", "<!-- t3-hub-project-subagents:end -->"], ["<!-- T3_HUB_ORCHESTRATOR_START -->", "<!-- T3_HUB_ORCHESTRATOR_END -->"]]) {
+      const section = (text) => {
+        const s = text.indexOf(start), e = text.indexOf(end);
+        if ((s < 0) !== (e < 0) || (s >= 0 && (e < s || text.indexOf(start, s + start.length) >= 0 || text.indexOf(end, e + end.length) >= 0))) throw new Error("托管区块不完整或重复，请先修复");
+        return s < 0 ? "" : text.slice(s, e + end.length);
+      };
+      if (section(before) !== section(after)) throw new Error("子代理或编排托管区块请在对应页面修改");
+    }
+  }
+  function globalRulesTargets() {
+    const candidates = [
       path.join(codexDir, "AGENTS.md"),
       path.join(homeDir, ".pi", "agent", "AGENTS.md"),
       path.join(homeDir, ".config", "muse", "AGENTS.md"),
       path.join(homeDir, ".claude", "CLAUDE.md"),
+      ...listDirs(agyRoot).map((instance) => path.join(instance, "config", "rules", "AGENTS.md")),
     ];
-    for (const c of cands) {
-      if (c === cands[0] || dirExists(path.dirname(c))) {
-        try { if (fs.readFileSync(c, "utf8") === globalContent && globalContent) targets.push(c); } catch {}
-      }
+    return candidates.filter((p, i) => i === 0 || dirExists(path.dirname(p)));
+  }
+  function readRuleDocument(file) {
+    let st;
+    try { st = fs.lstatSync(file); }
+    catch (e) { if (e.code === "ENOENT") return { exists: false, content: "" }; throw new Error("规则文件不可读取，请检查权限"); }
+    if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o444) === 0) throw new Error("规则文件不可安全读取，请检查文件类型和权限");
+    try { return { exists: true, content: fs.readFileSync(file, "utf8") }; }
+    catch { throw new Error("规则文件不可读取，请检查权限"); }
+  }
+  function getAgentsMd(args = {}) {
+    const projectRoot = args.projectRoot || null;
+    const globalContent = readRuleDocument(hubGlobalAgentsPath).content;
+    const targets = [];
+    let block = null;
+    try { block = "<!-- t3-hub-global-rules:start -->\n" + sharedRulesOnly(globalContent).replace(/\n?$/, "\n") + "<!-- t3-hub-global-rules:end -->"; } catch {}
+    for (const c of globalRulesTargets()) {
+      try { const text = fs.readFileSync(c, "utf8"); if (globalContent && (text === globalContent || block && text.includes(block))) targets.push(c); } catch {}
     }
-    let projectContent = "", projectPath = null, projectExists = false;
+    let projectContent = "", projectPath = null, projectExists = false, projectClaudeReference = false;
     if (projectRoot) {
+      if (!path.isAbsolute(projectRoot)) throw new Error("projectRoot required");
       projectPath = path.join(projectRoot, "AGENTS.md");
-      if (fileExists(projectPath)) { projectExists = true; try { projectContent = fs.readFileSync(projectPath, "utf8"); } catch {} }
+      const project = readRuleDocument(projectPath);
+      projectExists = project.exists; projectContent = project.content;
+      const claudePath = path.join(projectRoot, "CLAUDE.md");
+      try { const st = fs.statSync(claudePath); if (st.isFile() && st.size <= 1024 * 1024) projectClaudeReference = /^\s*@AGENTS\.md\s*$/m.test(fs.readFileSync(claudePath, "utf8")); } catch {}
     }
     return {
       ok: true, globalContent, globalTokens: estimateTokens(globalContent), globalSyncedTargets: targets,
-      projectContent, projectExists, projectTokens: estimateTokens(projectContent), projectPath,
-      agyTargetHint: path.join(agyRoot, "<instance>", "config", "AGENTS.md"),
+      projectContent, projectExists, projectTokens: estimateTokens(projectContent), projectPath, projectClaudeReference,
+      agyTargetHint: path.join(agyRoot, "<instance>", "config", "rules", "AGENTS.md"),
     };
   }
   function atomicWrite(file, content) {
@@ -1301,32 +1329,30 @@ function createSkillsManager(opts = {}) {
     if (!fileExists(bak)) { try { fs.copyFileSync(p, bak); } catch {} }
     try { ensureExclude(projectRoot, ["AGENTS.md.bak-t3hub"]); } catch {}
   }
-  function syncOne(target, content) {
-    const bak = target + ".bak-t3hub";
-    if (fileExists(target) && !fileExists(bak)) { try { fs.copyFileSync(target, bak); } catch {} }
-    atomicWrite(target, content);
-    return target;
-  }
   function saveAgentsMd(args = {}) {
-    const { target, content } = args;
+    const { target, content, expectedContent } = args;
     const projectRoot = args.projectRoot || null;
     if (typeof content !== "string") throw new Error("content must be string");
+    if (typeof expectedContent !== "string") throw new Error("请先重新读取规则，再保存修改");
+    managedSectionsUnchanged(expectedContent, content);
     if (target === "global") {
-      atomicWrite(hubGlobalAgentsPath, content);
-      const synced = [syncOne(path.join(codexDir, "AGENTS.md"), content)];
-      const pi = path.join(homeDir, ".pi", "agent", "AGENTS.md");
-      if (dirExists(path.dirname(pi))) synced.push(syncOne(pi, content));
-      const mu = path.join(homeDir, ".config", "muse", "AGENTS.md");
-      if (dirExists(path.dirname(mu))) synced.push(syncOne(mu, content));
-      const cl = path.join(homeDir, ".claude", "CLAUDE.md");
-      if (dirExists(path.dirname(cl))) synced.push(syncOne(cl, content));
-      return { ok: true, tokens: estimateTokens(content), syncedTargets: synced, agyTargetHint: path.join(agyRoot, "<instance>", "config", "AGENTS.md") };
+      if (content.includes("<!-- t3-hub-global-rules:start -->") || content.includes("<!-- t3-hub-global-rules:end -->")) throw new Error("shared rules contain reserved markers");
+      const sharedContent = sharedRulesOnly(content);
+      const ruleWriter = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir });
+      ruleWriter.replaceRuleDocument(hubGlobalAgentsPath, content, expectedContent);
+      const synced = [], failed = [];
+      for (const file of globalRulesTargets()) {
+        try { ruleWriter.syncManagedRuleBlock(file, sharedContent); synced.push(file); }
+        catch (e) { failed.push({ path: file, error: String(e?.message || e) }); }
+      }
+      return { ok: failed.length === 0, sourceSaved: true, ...(failed.length ? { error: `全局规则已保存，但 ${failed.length} 个宿主规则文件同步失败：${failed.map(x => x.path).join("、")}` } : {}), tokens: estimateTokens(content), syncedTargets: synced, failedTargets: failed, agyTargetHint: path.join(agyRoot, "<instance>", "config", "rules", "AGENTS.md") };
     } else if (target === "project") {
       if (!projectRoot || !path.isAbsolute(projectRoot)) throw new Error("projectRoot required");
       const p = path.join(projectRoot, "AGENTS.md");
       backupProjectAgentsMd(projectRoot);
-      atomicWrite(p, content);
-      return { ok: true, tokens: estimateTokens(content), syncedTargets: [p] };
+      const ruleWriter = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir });
+      ruleWriter.replaceRuleDocument(p, content, expectedContent);
+      return { ok: true, sourceSaved: true, tokens: estimateTokens(content), syncedTargets: [p] };
     }
     throw new Error("invalid target");
   }
@@ -1334,33 +1360,44 @@ function createSkillsManager(opts = {}) {
     const { projectRoot } = args;
     if (!projectRoot || !dirExists(projectRoot)) throw new Error("projectRoot required");
     const p = path.join(projectRoot, "AGENTS.md");
-    let content = "";
-    if (fileExists(p)) { try { content = fs.readFileSync(p, "utf8"); } catch {} }
     const section = [
       "<!-- t3-hub-memory-route -->",
       "## Shared memory (T3 Hub)",
       "1. Before debugging or architectural edits, call `memory_search` (or `node ~/.t3/hub/bin/pc-lite.mjs recall --query \"...\"`) to read shared project rules & pitfalls.",
-      "2. On the FINAL turn after verifying a non-obvious pitfall or new durable constraint, piggyback on the warm cache by calling `memory_write` in the same turn (0 extra input tokens; never store unverified chatter or secrets).",
+      "2. Record verified non-obvious pitfalls or durable constraints with `memory_write`; never store unverified chatter or secrets.",
     ].join("\n");
     const marker = "<!-- t3-hub-memory-route -->";
-    if (content.includes(marker)) {
-      const re = /<!-- t3-hub-memory-route -->[\s\S]*?(?=\n<!-- |\n## |\n# |$)/;
-      content = content.replace(re, section);
-    } else {
-      content = (content.trim() ? content.replace(/\s+$/, "") + "\n\n" : "") + section + "\n";
-    }
     backupProjectAgentsMd(projectRoot);
-    atomicWrite(p, content);
-    const claudeMd = path.join(projectRoot, "CLAUDE.md");
-    if (fileExists(claudeMd)) {
-      let c = "";
-      try { c = fs.readFileSync(claudeMd, "utf8"); } catch {}
-      if (!c.includes("@AGENTS.md")) atomicWrite(claudeMd, "@AGENTS.md\n" + c);
-    }
+    const writer = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir });
+    writer.transformRuleDocument(p, (current) => {
+      if (current.indexOf(marker) !== current.lastIndexOf(marker)) throw new Error("记忆软路由标记重复，请先修复");
+      if (current.includes(marker)) return current.replace(/<!-- t3-hub-memory-route -->[\s\S]*?(?=\n<!-- |\n## |\n# |$)/, section);
+      return current + (current && !current.endsWith("\n") ? "\n" : "") + (current ? "\n" : "") + section + "\n";
+    });
+    const content = fs.readFileSync(p, "utf8");
     return { ok: true, content, tokens: estimateTokens(content) };
   }
 
-  return { homeDir, hubDir, listAssets, listSkills, toggleSkillForAgent, setSkillScope, importFromGitHub, updatePackage, removePackage, getAgentsMd, saveAgentsMd, injectSoftRoute };
+  function syncProjectRuleReference(args = {}) {
+    const root = args.projectRoot;
+    if (typeof root !== "string" || !path.isAbsolute(root)) throw new Error("projectRoot required");
+    const canonicalRoot = fs.realpathSync(root);
+    if (!fs.statSync(canonicalRoot).isDirectory()) throw new Error("projectRoot must be a directory");
+    const agents = path.join(canonicalRoot, "AGENTS.md"), st = fs.lstatSync(agents);
+    if (!st.isFile() || st.isSymbolicLink()) throw new Error("项目 AGENTS.md 不存在或不可安全读取");
+    const target = path.join(canonicalRoot, "CLAUDE.md");
+    try {
+      const current = fs.lstatSync(target);
+      if (current.isFile() && !current.isSymbolicLink() && current.size <= 1024 * 1024 && /^\s*@AGENTS\.md\s*$/m.test(fs.readFileSync(target, "utf8"))) return { ok: true, path: target, reference: "@AGENTS.md", alreadyPresent: true };
+    } catch (e) { if (e.code !== "ENOENT") throw e; }
+    const writer = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir });
+    writer.syncManagedRuleBlock(target, "@AGENTS.md\n", "project");
+    const text = fs.readFileSync(target, "utf8");
+    if (!/^\s*@AGENTS\.md\s*$/m.test(text)) throw new Error("Claude 项目规则引用写入后未能确认");
+    return { ok: true, path: target, reference: "@AGENTS.md" };
+  }
+
+  return { homeDir, hubDir, listAssets, listSkills, toggleSkillForAgent, setSkillScope, importFromGitHub, updatePackage, removePackage, getAgentsMd, saveAgentsMd, injectSoftRoute, syncProjectRuleReference };
 }
 
 let _singleton = null;
@@ -1376,6 +1413,7 @@ async function removePackage(args) { return getDefaultSkillsManager().removePack
 function getAgentsMd(args) { return getDefaultSkillsManager().getAgentsMd(args || {}); }
 function saveAgentsMd(args) { return getDefaultSkillsManager().saveAgentsMd(args || {}); }
 function injectSoftRoute(args) { return getDefaultSkillsManager().injectSoftRoute(args || {}); }
+function syncProjectRuleReference(args) { return getDefaultSkillsManager().syncProjectRuleReference(args || {}); }
 function listSkills(args) { return getDefaultSkillsManager().listSkills(args || {}); }
 function toggleSkillForAgent(args) { return getDefaultSkillsManager().toggleSkillForAgent(args || {}); }
 
@@ -1384,7 +1422,7 @@ module.exports = {
   createSkillsManager,
   parseGitHubInput,
   listAssets, listSkills, toggleSkillForAgent, setSkillScope, importFromGitHub, updatePackage, removePackage,
-  getAgentsMd, saveAgentsMd, injectSoftRoute,
+  getAgentsMd, saveAgentsMd, injectSoftRoute, syncProjectRuleReference,
   getDefaultSkillsManager,
   default: getDefaultSkillsManager(),
 };

@@ -27,10 +27,11 @@
     let toastTimer = null;
     let observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, style, palette, liveBoard;
+    let root, drawer, content, handle, planHandle, style, palette, liveBoard;
     let boardTimer = null;
     let boardLoading = false;
     let boardVersion = 0;
+    let artifactVersion = 0;
     let resizeDrag = null;
     let lastComposer = null;
     let boardSignature = "";
@@ -54,7 +55,7 @@
     let slashSession = null;
     const slashCache = new Map();
     const subagentSaves = new Map();
-    const tabKeys = ["memory", "skills", "subagents", "settings", "board"];
+    const tabKeys = ["memory", "skills", "subagents", "settings", "board", "agents"];
     const cache = { hooks: null, skills: null, subagents: null, orchestration: null, mcp: null, overview: null, memory: null, worktree: null, dream: null, health: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
     const errors = {};
     const drafts = initial?.drafts || {};
@@ -74,7 +75,7 @@
       clearedHostFields: new Set(Array.isArray(initial?.clearedHostFields) ? initial.clearedHostFields : []),
       scope: initial?.scope || storageGet("t3-hub-scope") || "global",
       libraryView: "skills", hooksOpen: false, dreamOpen: false,
-      mcpQuery: "", hookDraft: null, historyExpanded: initial?.historyExpanded || {},
+      mcpQuery: "", mcpFilter: initial?.mcpFilter || "all", hookDraft: null, historyExpanded: initial?.historyExpanded || {},
       supersedeItems: [], supersedeLoading: false,
       lang: "zh", theme: storageGet("t3-hub-theme") || "white", dark: false, context: null, connected: false, threadId: null,
       contextError: "", projectRoot: null, refreshing: false,
@@ -244,6 +245,7 @@
         #t3-sidecar-hub-root{--hub-bg:#fff;--hub-bg-subtle:#f7f7f8;--hub-border:#ececec;--hub-ink:#0d0d0d;--hub-secondary:#5d5d5d;--hub-muted:#8e8e93;--hub-active:#0d0d0d;--hub-on-active:#fff;--hud-bg:var(--hub-bg);--hud-bg-solid:var(--hub-bg);--hud-fg:var(--hub-ink);--hud-muted:var(--hub-secondary);--hud-surface:var(--hub-bg-subtle);--hud-border:var(--hub-border);--hud-hover:rgba(0,0,0,.045);--hud-shadow:0 16px 64px #00000014,0 2px 8px #00000008;--hud-emerald:var(--hub-ink);--hud-blue:var(--hub-ink);--hud-violet:var(--hub-ink);--hud-amber:var(--hub-secondary);--hud-red:var(--hub-ink);--hub-accent-bg:var(--hub-bg-subtle);position:fixed;inset:0;z-index:9993;pointer-events:none;color:var(--hub-ink);font:12px/1.6 -apple-system,BlinkMacSystemFont,"Inter Variable","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;color-scheme:light}
         #t3-sidecar-hub-root,#t3-sidecar-hub-root *{box-sizing:border-box}#t3-sidecar-hub-root :is(button,input,select,textarea){font:inherit;letter-spacing:inherit;color:inherit}#t3-sidecar-hub-root button{cursor:pointer;-webkit-app-region:no-drag}#t3-sidecar-hub-root button:disabled{opacity:.38;cursor:not-allowed}#t3-sidecar-hub-root :is(button,input,select,textarea):focus-visible{outline:2px solid var(--hub-ink);outline-offset:3px}#t3-sidecar-hub-root svg{flex:none;vertical-align:middle}#t3-sidecar-hub-root [hidden]{display:none!important}
         #t3-hub-handle{position:fixed;right:0;top:42%;transform:translateY(-50%);width:28px;min-height:92px;padding:10px 4px;display:flex;flex-direction:column;align-items:center;gap:8px;justify-content:center;border:1px solid var(--hub-border);border-right:0;border-radius:10px 0 0 10px;background:var(--hub-bg);color:var(--hub-secondary);pointer-events:auto;touch-action:none;user-select:none;box-shadow:-2px 3px 16px #00000008}.hub-handle-label{writing-mode:vertical-rl;font-size:9px;letter-spacing:2px}.hub-handle-count{font-size:9px}.is-open #t3-hub-handle{opacity:0;pointer-events:none}
+        #t3-hub-plan-handle{position:fixed;right:0;padding:6px 8px;border:1px solid var(--hub-border);border-right:0;border-radius:8px 0 0 8px;background:var(--hub-bg);color:var(--hub-ink);font-size:10px;pointer-events:auto}.is-open #t3-hub-plan-handle{display:none}
         #t3-sidecar-hub-root #t3-hub-drawer{position:fixed;right:12px;top:12px;bottom:12px;width:min(var(--hub-width,880px),94vw);max-height:calc(100dvh - 24px);display:grid;grid-template-columns:196px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:none;visibility:hidden;opacity:0;transform:translateX(calc(100% + 28px));transition:transform .24s ease,opacity .2s,visibility .24s;-webkit-app-region:no-drag}#t3-sidecar-hub-root.is-open #t3-hub-drawer{pointer-events:auto;visibility:visible;opacity:1;transform:none}#t3-sidecar-hub-root.is-occluded{visibility:hidden!important}#t3-sidecar-hub-root.is-occluded :is(#t3-hub-drawer,#t3-hub-handle,#t3-hub-live-board){visibility:hidden!important;pointer-events:none!important}
         #t3-hub-drawer.is-compact{grid-template-columns:156px minmax(0,1fr)}.hub-header{grid-column:1/-1;padding:20px 24px 16px;border-bottom:1px solid var(--hub-border)}.hub-title-row,.hub-row{display:flex;align-items:center;gap:9px;min-width:0}.hub-title-row{gap:11px}.hub-brand{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-grow{min-width:0;flex:1}.hub-title{font-size:17px;font-weight:650;letter-spacing:-.5px;line-height:1.4}.hub-version{font-size:10px;color:var(--hub-muted);font-weight:450;margin-left:5px}.hub-kicker{color:var(--hub-secondary);font-size:11px;margin-top:2px}.hub-icon-btn{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--hub-secondary)!important}.hub-icon-btn:hover{background:var(--hud-hover);color:var(--hub-ink)!important}.hub-scope-bar{display:flex;gap:8px;align-items:center;margin-top:15px}.hub-scope-select{max-width:280px}.hub-shortcut{font-size:10px;color:var(--hub-muted);margin-left:auto}.hub-context{display:flex;align-items:center;min-width:0;margin-top:10px;font-size:10px;color:var(--hub-secondary)}.hub-context-status{display:flex;gap:6px;align-items:center;overflow:hidden}.hub-context-status>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.hub-widths{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px}.hub-widths button{font-size:10px!important;padding:4px 8px;border:0;border-radius:5px;background:transparent;color:var(--hub-secondary)}.hub-widths button.is-active{background:var(--hub-active);color:var(--hub-on-active)}
         .hub-tabs{grid-column:1;grid-row:2;display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:18px 11px;overflow:auto;background:var(--hub-bg-subtle);border-right:1px solid var(--hub-border)}.hub-tab{display:flex;gap:10px;align-items:center;text-align:left;padding:10px 11px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--hub-secondary)!important;font-size:11px!important;line-height:1.5;white-space:nowrap}.hub-tab:hover{background:var(--hud-hover)}.hub-tab[aria-selected=true]{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-tab-count{margin-left:auto;font-size:9px;opacity:.65;font-variant-numeric:tabular-nums}.hub-content{grid-column:2;grid-row:2;min-width:0;min-height:0;padding:26px 28px 32px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--hub-border) transparent}.hub-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 8px;font-size:15px;font-weight:620;letter-spacing:-.2px}.hub-count{font-size:10px;font-weight:450;color:var(--hub-secondary);font-variant-numeric:tabular-nums}.hub-description{font-size:11px;line-height:1.8;color:var(--hub-secondary);margin:0 0 20px}.hub-card{padding:16px;border:1px solid var(--hub-border);border-radius:12px;background:var(--hub-bg);margin-bottom:12px;min-width:0}.hub-card-top{display:flex;gap:11px;align-items:flex-start;min-width:0}.hub-card-name{font-size:12px;font-weight:600;line-height:1.65;overflow-wrap:anywhere}.hub-card-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:4px}.hub-card-description{color:var(--hub-secondary);font-size:11px;line-height:1.75;margin:8px 0 12px;overflow-wrap:anywhere}.hub-badge,.hub-capability{display:inline-flex;gap:4px;align-items:center;border:1px solid var(--hub-border);border-radius:5px;padding:1px 6px;color:var(--hub-secondary);font-size:9px;line-height:1.7;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-capabilities{display:flex;gap:5px;flex-wrap:wrap;margin:8px 0}.hub-badge>span{overflow:hidden;text-overflow:ellipsis}.hub-asset-icon,.hub-brand-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;position:relative;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);color:var(--hub-ink);overflow:hidden}.hub-brand-icon>img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;filter:none!important}.hub-brand-icon.has-image>svg{opacity:0}.hub-brand-icon.is-small{width:24px;height:24px;border-radius:6px}.hub-brand-icon.is-small>img{inset:2px;width:calc(100% - 4px);height:calc(100% - 4px)}.hub-connection-dot{position:absolute;right:2px;bottom:2px;width:5px;height:5px;border-radius:50%;background:var(--hub-muted);box-shadow:0 0 0 2px var(--hub-bg)}.hub-connection-dot.is-connected{background:var(--hub-ink)}
@@ -287,14 +289,18 @@
         #t3-hub-live-board .hub-board-add .hub-btn{padding:4px 7px;min-height:28px}
         .hub-memory-date{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-detail-meta{flex-wrap:wrap}.hub-dream-times{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:10px;color:var(--hub-secondary);margin-top:10px}
         @media(max-width:639px){.hub-title-row{flex-wrap:wrap}.hub-title-row .hub-grow{flex-basis:calc(100% - 48px)}.hub-header{padding:14px 16px}.hub-header .hub-theme-switcher{margin-right:auto}}
+        .hub-mcp-mode-controls{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end;margin-top:9px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-mcp-mode-controls label{min-width:0;font-size:9px;color:var(--hub-secondary)}.hub-mcp-mode-controls label small{display:block;margin-bottom:4px}.hub-mcp-mode-controls .hub-select{font-size:10px!important;padding:6px 22px 6px 8px}.hub-mcp-mode-hint{grid-column:1/-1;margin:0;font-size:9px;line-height:1.65;color:var(--hub-secondary)}
+        .hub-resource-grid{align-items:stretch;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.hub-resource-card{display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:14px;margin:0;min-width:0}.hub-resource-card .hub-card-top{align-items:flex-start;min-width:0}.hub-resource-card .hub-grow{min-width:0}.hub-resource-card .hub-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:6px;min-width:0}.hub-resource-card .hub-card-description{margin:0;min-height:42px}.hub-resource-card .hub-resource-toggle{width:100%;max-width:none;align-items:flex-start;margin-top:auto;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-resource-card .hub-agent-toggle{width:100%;justify-content:flex-start}.hub-resource-controls-label{font-size:9px;color:var(--hub-secondary);margin-top:2px}.hub-resource-card .hub-mcp-mode-controls{grid-column:auto;width:100%;grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:0;padding:9px}.hub-resource-card .hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}.hub-unavailable-hint{color:var(--hub-secondary);font-size:9px}.hub-unavailable{border-color:color-mix(in srgb,var(--hud-amber) 45%,var(--hub-border));color:var(--hub-secondary)}.hub-route-status{white-space:normal;text-overflow:clip}
+        @media(max-width:639px){.hub-mcp-mode-controls{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}}
       `;
       document.head.appendChild(style);
       root = document.createElement("div");
       root.id = "t3-sidecar-hub-root";
-      root.innerHTML = `<button type="button" id="t3-hub-handle" aria-controls="t3-hub-drawer" aria-expanded="false">${icon("hub", 15)}<span class="hub-handle-label">HUB</span><span class="hub-handle-count" hidden></span></button><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="实时任务进度" hidden></section>`;
+      root.innerHTML = `<button type="button" id="t3-hub-handle" aria-controls="t3-hub-drawer" aria-expanded="false">${icon("hub", 15)}<span class="hub-handle-label">HUB</span><span class="hub-handle-count" hidden></span></button><button type="button" id="t3-hub-plan-handle" data-action="open-board-studio" aria-controls="t3-hub-drawer" hidden></button><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="实时任务进度" hidden></section>`;
       document.body.appendChild(root);
       drawer = root.querySelector("#t3-hub-drawer");
       handle = root.querySelector("#t3-hub-handle");
+      planHandle = root.querySelector("#t3-hub-plan-handle");
       content = root.querySelector(".hub-content");
       liveBoard = root.querySelector("#t3-hub-live-board");
       palette = document.createElement("section");
@@ -407,7 +413,7 @@
         const count = tabCount(key);
         return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === state.tab}" tabindex="${key === state.tab ? 0 : -1}">${icon(glyph, 14)}<span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
       }).join("");
-      content.setAttribute("aria-labelledby", `t3-hub-tab-${state.tab}`);
+      content.setAttribute("aria-labelledby", `t3-hub-tab-${state.tab === "agents" ? "settings" : state.tab}`);
       root.querySelector(".hub-footer").innerHTML = `<span class="hub-footer-status"><i class="hub-dot"></i>${esc(state.connected ? tr("已连接 · 所有更改保存在本机", "Connected · Changes stay local") : tr("等待 Hub 连接", "Waiting for Hub"))}</span><span class="hub-footer-key">Esc ${esc(tr("收起", "Close"))}</span>`;
     }
     function tabCount(key) {
@@ -519,8 +525,16 @@
       const attrs = `data-domain="${domain}" data-id="${esc(id)}" data-name="${esc(item.name || id)}"`;
       const isMcp = domain === "mcp";
       const label = isMcp ? tr("启用到 Agent（该 Agent 的各项目共用）", "Enable for agents (shared across their projects)") : tr("启用到 Agent", "Enable for agents");
-      const allAction = all ? tr("从全部 Agent 配置移除", "Remove from all agent configs") : tr("写入全部 Agent 配置", "Add to all agent configs");
-      return `<div class="hub-resource-toggle" role="group" aria-label="${esc(item.displayName || item.name || id)} · ${esc(label)}"><span class="hub-hint hub-resource-toggle-label">${esc(label)}</span><button type="button" class="hub-btn hub-small" data-action="resource-toggle-all" ${attrs} data-enabled="${!all}" aria-label="${esc(allAction)}" title="${esc(allAction)}" aria-pressed="${all}" ${item.unavailable ? "disabled" : ""}>${esc(tr("全部 Agent", "All agents"))}</button><div class="hub-agent-toggle">${agentHosts.map((host) => { const activation = agentActivationState(item, host), enabled = activation === true, unknown = activation === null; const action = unknown ? tr(`${host.label} 状态未知；点击可写入配置`, `${host.label} status unknown; click to add it to config`) : enabled ? tr(`从 ${host.label} 配置移除`, `Remove from ${host.label}`) : tr(`启用到 ${host.label}`, `Enable for ${host.label}`); const pressed = unknown ? "mixed" : String(enabled); return `<button type="button" data-action="resource-toggle" ${attrs} data-agent="${host.id}" data-enabled="${!enabled}" aria-label="${esc(action)}" aria-pressed="${pressed}" title="${esc(action)}" ${item.unavailable ? "disabled" : ""}>${agentMark(host.id)}<span>${host.label}</span>${unknown ? `<span class="hub-agent-unknown">${esc(tr("未知", "Unknown"))}</span>` : ""}</button>`; }).join("")}</div></div>`;
+      const launchBlocked = isMcp && item.launchable === false;
+      const conflict = isMcp && item.modeConflict === true;
+      const reason = conflict
+        ? tr("名称冲突已暂停；可移除单个原生配置或关闭 Hub，启用需先解决冲突。", "Name conflict paused; you can remove an exact native entry or turn Hub off. Resolve the conflict before enabling.")
+        : launchBlocked ? tr("服务缺少可运行入口；可关闭已有配置或 Hub 方式。", "No runnable endpoint; existing config and Hub routes can still be turned off.") : item.unavailable ? tr("当前来源不支持启用", "This source cannot be enabled") : "";
+      const blockEnable = conflict || launchBlocked;
+      const allTargetEnabled = conflict ? false : !all;
+      const allAction = conflict ? tr("从全部 Agent 配置移除此确切名称", "Remove this exact name from all agent configs") : all ? tr("从全部 Agent 配置移除", "Remove from all agent configs") : tr("写入全部 Agent 配置", "Add to all agent configs");
+      const allBlocked = !!item.unavailable || (blockEnable && allTargetEnabled);
+      return `<div class="hub-resource-toggle" role="group" aria-label="${esc(item.displayName || item.name || id)} · ${esc(label)}"><span class="hub-hint hub-resource-toggle-label">${esc(label)}${reason ? ` · ${esc(reason)}` : ""}</span><button type="button" class="hub-btn hub-small" data-action="resource-toggle-all" ${attrs} data-enabled="${allTargetEnabled}" aria-label="${esc(allAction)}" title="${esc(reason || allAction)}" aria-pressed="${all ? "true" : "mixed"}" ${allBlocked ? "disabled" : ""}>${esc(conflict ? tr("全部 Agent：移除", "Remove from all") : tr("全部 Agent", "All agents"))}</button><div class="hub-agent-toggle">${agentHosts.map((host) => { const activation = agentActivationState(item, host), enabled = activation === true, unknown = activation === null; const targetEnabled = conflict ? false : !enabled; const action = conflict ? tr(`从 ${host.label} 配置中移除此确切名称`, `Remove this exact name from ${host.label} config`) : launchBlocked && targetEnabled ? tr(`${host.label} 尚不能启用；可关闭已存在项`, `${host.label} cannot enable this endpoint; an existing entry can be removed`) : item.unavailable ? tr(`${host.label} 当前不可用`, `${host.label} is unavailable`) : unknown ? tr(`${host.label} 状态未知；点击可写入配置`, `${host.label} status unknown; click to add it to config`) : enabled ? tr(`从 ${host.label} 配置移除`, `Remove from ${host.label}`) : tr(`启用到 ${host.label}`, `Enable for ${host.label}`); const pressed = unknown ? "mixed" : String(enabled); const disabled = !!item.unavailable || (blockEnable && targetEnabled); return `<button type="button" data-action="resource-toggle" ${attrs} data-agent="${host.id}" data-enabled="${targetEnabled}" aria-label="${esc(action)}" aria-pressed="${pressed}" title="${esc(action)}" ${disabled ? "disabled" : ""}>${agentMark(host.id)}<span>${host.label}</span>${unknown ? `<span class="hub-agent-unknown">${esc(tr("未知", "Unknown"))}</span>` : ""}</button>`; }).join("")}</div></div>`;
     }
     async function toggleResource(element, all = false) {
       const { domain, id, name, agent } = element.dataset;
@@ -548,6 +562,13 @@
         const confirmedItem = domain === "mcp"
           ? mcpServers().find((item) => item.name === name || item.name === id)
           : items(cache[domain], ["items", "skills"]).find((item) => String(item.id || item.name) === String(id || name));
+        if (domain === "mcp" && enabled === false && confirmedItem?.modeConflict) {
+          const failed = results.filter((result) => result.status === "rejected");
+          const labels = targets.map((host) => agentHosts.find((entry) => entry.id === host)?.label || host).join("、");
+          if (!failed.length) toast(tr(`已从 ${labels} 配置移除选中的确切名称；冲突仍存在，汇总状态暂时未知。`, `Removed the selected exact name from ${labels} config. The conflict remains, so aggregate status is still unknown.`));
+          else toast(tr(`已提交精确移除 ${results.length - failed.length}/${targets.length} 个 Agent 配置；其余失败：${errorText(failed[0].reason)}`, `Exact-name removal submitted for ${results.length - failed.length}/${targets.length} agents; remaining failure: ${errorText(failed[0].reason)}`), true);
+          return;
+        }
         const confirmed = targets.filter((host) => !!confirmedItem && agentActivationState(confirmedItem, agentHosts.find((entry) => entry.id === host) || agentHosts[0]) === enabled);
         if (failed.length || confirmed.length !== targets.length) {
           const detail = failed[0]?.reason ? ` · ${errorText(failed[0].reason)}` : "";
@@ -585,7 +606,49 @@
 
     function sourceLabel(source, fallback) {
       const key = String(source || "").toLowerCase();
-      return ({ "codex-market": tr("Codex 市场", "Codex market"), marketplace: tr("Codex 市场", "Codex market"), github: "GitHub", zcode: "ZCode", claude: "Claude", global: tr("全局", "Global"), archive: tr("归档", "Archived"), archived: tr("归档", "Archived"), magpie: "Magpie", custom: tr("自定义", "Custom"), hub: tr("自定义", "Custom"), cli: "CLI" })[key] || fallback || source || tr("本地", "Local");
+      return ({ "codex-market": tr("Codex 市场", "Codex market"), marketplace: tr("Codex 市场", "Codex market"), github: "GitHub", zcode: "ZCode", claude: "Claude", muse: "Muse", codex: "Codex", pi: "Pi", agy: "AGY", antigravity: "AGY", project: tr("当前项目", "This project"), global: tr("全局", "Global"), archive: tr("归档", "Archived"), archived: tr("归档", "Archived"), magpie: "Magpie", builtin: tr("内置", "Built in"), native: tr("本机 Agent", "Local agent"), both: tr("本机 + Hub", "Local + Hub"), custom: tr("自定义", "Custom"), hub: tr("自定义", "Custom"), cli: "CLI" })[key] || fallback || source || tr("本地", "Local");
+    }
+    function mcpSourceLabels(server) {
+      const sources = new Set(Array.isArray(server.sources) ? server.sources.map((source) => String(source).toLowerCase()) : []);
+      const primary = String(server.source || "").toLowerCase();
+      if (primary) sources.add(primary);
+      const labels = [mcpSourceLabel(server)];
+      if (sources.has("magpie") && !labels.includes("Magpie")) labels.push("Magpie");
+      const combined = labels.includes(tr("本机 + Hub", "Local + Hub"));
+      const localSources = ["agy", "muse", "codex", "pi", "claude", "zcode", "native", "both"];
+      if (!combined && localSources.some((source) => sources.has(source)) && !labels.includes(tr("本机 Agent", "Local agent"))) labels.push(tr("本机 Agent", "Local agent"));
+      const hubSources = ["hub", "plugin", "both"];
+      if (!combined && hubSources.some((source) => sources.has(source)) && !labels.includes("Hub")) labels.push("Hub");
+      if ((server.builtin || sources.has("builtin")) && !labels.includes(tr("内置", "Built in"))) labels.push(tr("内置", "Built in"));
+      return [...new Set(labels.filter(Boolean))];
+    }
+    function mcpSourceMatchesFilter(server, filter) {
+      if (filter === "all") return true;
+      const primary = String(server.source || "").toLowerCase();
+      const sources = new Set(Array.isArray(server.sources) ? server.sources.map((source) => String(source).toLowerCase()) : []);
+      if (server.builtin) sources.add("builtin");
+      if (primary) sources.add(primary);
+      if (filter === "magpie") return sources.has("magpie");
+      if (filter === "builtin") return sources.has("builtin");
+      const localSources = ["plugin", "pi", "muse", "claude", "zcode", "codex", "agy", "hub", "native", "both"];
+      return localSources.some((source) => sources.has(source)) || (!sources.has("magpie") && !sources.has("builtin"));
+    }
+    function mcpSourceLabel(server) { return sourceLabel(server.source, server.sourceLabel); }
+    function agentStatusLabel(item, domain = "mcp") {
+      const states = agentHosts.map(host => agentActivationState(item, host));
+      const prefix = domain === "skills" ? tr("技能", "Skill") : tr("Agent 原生", "Agent config");
+      if (states.every(value => value === false)) return `${prefix}: ${tr("未启用", "off")}`;
+      if (states.every(value => value === true)) return `${prefix}: ${tr("全部启用", "enabled in all agents")}`;
+      if (states.some(value => value === true)) return `${prefix}: ${tr("部分启用", "enabled in some agents")}`;
+      return `${prefix}: ${tr("状态未知", "status unknown")}`;
+    }
+    function hubModeLabel(server) {
+      if (server.modeConflict) return tr("Hub 自动路由：冲突暂停", "Hub route: paused by conflict");
+      const mode = server.mode === "project-lazy" || server.mode === "global-lazy" ? tr("用到时连接", "Connect on demand") : server.mode === "project-direct" || server.mode === "global-direct" ? tr("列出全部工具", "List all tools") : tr("不经 Hub", "Bypass Hub");
+      return `${tr("Hub", "Hub")}: ${mode} · ${server.modeScope === "project" ? tr("项目覆盖", "Project override") : tr("全局默认", "Global default")}`;
+    }
+    function launchReasonLabel(reason) {
+      return ({ "missing-endpoint": tr("没有命令或 URL", "No command or URL"), "invalid-url": tr("URL 无效", "Invalid URL"), "invalid-cwd": tr("工作目录不存在或不是文件夹", "Working directory is missing or not a folder"), "command-unavailable": tr("找不到可执行命令", "Executable command not found") })[reason] || tr("启动入口不可用", "Launch entry unavailable");
     }
     function renderTab() {
       if (!content || disposed) return;
@@ -594,24 +657,31 @@
       if (state.tab === "memory") renderMemory();
       if (state.tab === "board") renderBoardTab();
       if (state.tab === "settings") renderSettings();
+      if (state.tab === "agents") renderAgents();
     }
     function librarySegments() { return `<div class="hub-segments">${[["skills", "Skills 技能"], ["mcp", "MCP 服务"]].map(([key, label]) => `<button type="button" class="hub-pill ${state.libraryView === key ? "is-active" : ""}" data-action="library-view" data-view="${key}" aria-pressed="${state.libraryView === key}">${esc(label)}</button>`).join("")}</div>`; }
     function renderSkills() {
-      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("Skills 技能", "Skills"))}</span><span class="hub-count" id="t3-hub-skills-count"></span></div><p class="hub-description">${esc(tr("为五位 AI 搭档按需启用技能，读取各宿主的真实状态。", "Choose skills for each agent using live host configuration."))}</p>${resourceFilters("skills", "skillQuery", state.skillQuery)}<details class="hub-import"><summary class="hub-import-title">${icon("github", 14)}${esc(tr("从 GitHub 导入技能", "Import skills from GitHub"))}</summary><form data-form="import"><div class="hub-import-grid"><input class="hub-input" name="repoInput" aria-label="GitHub repository" placeholder="owner/repo" value="${esc(state.importRepo)}" autocomplete="off" spellcheck="false"><select class="hub-select" name="importScope" aria-label="${esc(tr("导入范围", "Import scope"))}"><option value="project" ${state.importScope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("仅本项目", "Project"))}</option><option value="global" ${state.importScope === "global" ? "selected" : ""}>${esc(tr("全局", "Global"))}</option></select>${button("import-skill", tr("导入", "Import"), { icon: "plus", primary: true })}</div></form></details><div class="hub-filters" id="t3-hub-skill-filters"></div><div id="t3-hub-skill-list"></div>`;
+      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("Skills 技能", "Skills"))}</span><span class="hub-count" id="t3-hub-skills-count"></span></div><p class="hub-description">${esc(tr("用卡片查看来源，并在卡片底部把技能写入对应 Agent 的配置。当前会话何时刷新由 Agent 决定。", "Review each skill's source, then use the card footer to add it to an agent's config. The agent decides when an active session refreshes."))}</p>${resourceFilters("skills", "skillQuery", state.skillQuery)}<details class="hub-import"><summary class="hub-import-title">${icon("github", 14)}${esc(tr("从 GitHub 导入技能", "Import skills from GitHub"))}</summary><form data-form="import"><div class="hub-import-grid"><input class="hub-input" name="repoInput" aria-label="GitHub repository" placeholder="owner/repo" value="${esc(state.importRepo)}" autocomplete="off" spellcheck="false"><select class="hub-select" name="importScope" aria-label="${esc(tr("导入范围", "Import scope"))}"><option value="project" ${state.importScope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("仅本项目", "Project"))}</option><option value="global" ${state.importScope === "global" ? "selected" : ""}>${esc(tr("全局", "Global"))}</option></select>${button("import-skill", tr("导入", "Import"), { icon: "plus", primary: true })}</div></form></details><div class="hub-filters" id="t3-hub-skill-filters"></div><div id="t3-hub-skill-list"></div>`;
       renderSkillList();
+    }
+    function skillSourceFilterKey(item) {
+      if (item.scope === "project" || item.source === "project") return "project";
+      if (item.source === "codex-market") return "codex-market";
+      if (item.source === "github") return "github";
+      return "local";
     }
     function renderSkillList() {
       if (state.tab !== "skills" || disposed) return;
-      const filters = [["all", tr("全部来源", "All sources")], ["project", tr("当前项目", "Project")], ["codex-market", tr("插件技能", "Plugin skills")], ["github", "GitHub"]];
+      const filters = [["all", tr("全部来源", "All sources")], ["project", tr("当前项目", "Project")], ["local", tr("本机 Agent", "Local agents")], ["codex-market", tr("插件技能", "Plugin skills")], ["github", "GitHub"]];
       root.querySelector("#t3-hub-skill-filters").innerHTML = filters.map(([key, label]) => `<button type="button" class="hub-pill ${state.skillFilter === key ? "is-active" : ""}" data-action="skill-filter" data-filter="${key}" aria-pressed="${state.skillFilter === key}">${esc(label)}</button>`).join("");
       const all = items(cache.skills, ["items", "skills", "plugins"]), query = state.skillQuery.trim().toLowerCase();
       const filtered = all.filter((item) => {
         const filter = state.skillFilter;
-        const matches = filter === "all" || filter === "enabled" && agentHosts.some((host) => agentEnabled(item, host)) || filter === "project" && item.scope === "project" || filter === "codex-market" && /codex|market|plugin/.test(item.source || "") || filter === "github" && item.source === "github";
+        const matches = filter === "all" || filter === "enabled" && agentHosts.some((host) => agentEnabled(item, host)) || filter === skillSourceFilterKey(item);
         return matches && resourceMatches(item, "skills") && (!query || `${item.name} ${item.displayName} ${item.description} ${item.id}`.toLowerCase().includes(query));
       });
       root.querySelector("#t3-hub-skills-count").textContent = `${all.length} ${tr("项", "skills")}`;
-      root.querySelector("#t3-hub-skill-list").innerHTML = errors.skills ? inlineError(errors.skills) : !cache.skills ? loading() : !filtered.length ? empty(tr("没有匹配的技能", "No matching skills"), tr("更换筛选条件，或导入一个技能。", "Change filters or import a skill."), "skill") : filtered.map((item) => `<article class="hub-resource-row">${brandIcon(item)}<div class="hub-grow"><div class="hub-card-name">${esc(item.displayName || item.name || item.id)}</div><div class="hub-hint">${esc(sourceLabel(item.source, item.sourceLabel))}</div><p class="hub-card-description">${esc(item.shortDescription || item.description || tr("暂无描述", "No description available"))}</p>${item.updatable ? `<div class="hub-editor-actions">${button("update-skill", tr("更新", "Update"), { small: true, icon: "refresh", attrs: `data-id="${esc(item.id)}"` })}${button("remove-skill", tr("移除技能包", "Remove package"), { small: true, attrs: `data-id="${esc(item.id)}"` })}</div><div data-skill-confirm class="hub-confirm-delete" hidden>${esc(tr("移除整个来源技能包及其启用链接？", "Remove this package and its activation links?"))}<div class="hub-row">${button("confirm-remove-skill", tr("确认移除", "Remove"), { small: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-remove-skill", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}</div>${agentToggleRow(item, "skills")}</article>`).join("");
+      root.querySelector("#t3-hub-skill-list").innerHTML = errors.skills ? inlineError(errors.skills) : !cache.skills ? loading() : !filtered.length ? empty(tr("没有匹配的技能", "No matching skills"), tr("更换筛选条件，或导入一个技能。", "Change filters or import a skill."), "skill") : `<div class="hub-market-grid hub-resource-grid">${filtered.map((item) => `<article class="hub-card hub-market-card hub-resource-card" data-skill-id="${esc(item.id)}"><div class="hub-card-top">${brandIcon(item)}<div class="hub-grow"><div class="hub-card-name">${esc(item.displayName || item.name || item.id)}</div><div class="hub-card-meta"><span class="hub-badge">${esc(sourceLabel(item.source, item.sourceLabel))}</span><span class="hub-badge">${esc(agentStatusLabel(item, "skills"))}</span></div></div></div><p class="hub-card-description">${esc(item.shortDescription || item.description || tr("暂无描述", "No description available"))}</p>${item.updatable ? `<div class="hub-editor-actions">${button("update-skill", tr("更新", "Update"), { small: true, icon: "refresh", attrs: `data-id="${esc(item.id)}"` })}${button("remove-skill", tr("移除技能包", "Remove package"), { small: true, attrs: `data-id="${esc(item.id)}"` })}</div><div data-skill-confirm class="hub-confirm-delete" hidden>${esc(tr("移除整个来源技能包及其启用链接？", "Remove this package and its activation links?"))}<div class="hub-row">${button("confirm-remove-skill", tr("确认移除", "Remove"), { small: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-remove-skill", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}${agentToggleRow(item, "skills")}</article>`).join("")}</div>`;
     }
 
     const providerDefaults = [
@@ -690,6 +760,10 @@
     }
     function renderSubagents() {
       const scope = state.subagentScope;
+      if (scope === "project" && !projectContextReady()) {
+        content.innerHTML = `${renderCommander()}<p class="hub-hint">${esc(tr("正在确认当前项目，项目路由暂不可编辑。", "Confirming the current project; project routes cannot be edited yet."))}</p>${button("subagent-scope", tr("查看全局角色", "View global roles"), { attrs: 'data-scope="global"' })}`;
+        return;
+      }
       const list = subagentItems();
       const newDraft = state.subagentDrafts[subagentKey("__new__")];
       const label = scope === "global" ? tr("内置子智能体", "Built-in sub-agents") : tr("本项目专属子智能体", "Project agents");
@@ -704,7 +778,7 @@
         const draft = expanded ? subagentDraft(id) : null;
         return `<article class="hub-subagent-card" data-subagent-card="${esc(id)}"><div class="hub-subagent-main">${renderBotAvatar(item)}<button type="button" class="hub-subagent-summary" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="t3-subagent-editor-${esc(id)}"><span class="hub-subagent-name">${esc(item.name || id)}<span class="hub-tool-badge">${esc(item.toolBadge || role[2])}</span></span><span class="hub-subagent-desc">${esc(item.description || tr("为这位子智能体添加职责与交付说明。", "Add responsibilities and delivery guidelines."))}</span></button>${subagentControls(item, id, busy)}</div><div class="hub-subagent-meta"><span class="hub-badge ${scope === "project" ? "hub-cyan" : saved ? "hub-green" : ""}">${busy ? spinner() : icon(saved ? "check" : scope === "project" ? "folder" : "globe", 10)}${esc(busy ? tr("保存并注入中…", "Saving & injecting…") : status)}${item.enabled === false ? ` · ${esc(tr("已停用", "Disabled"))}` : ""}</span>${memoryPolicyControl(item, id, busy)}<button type="button" class="hub-subagent-edit" data-action="expand-subagent" data-id="${esc(id)}" aria-expanded="${expanded}">${icon("edit", 11)}${esc(expanded ? tr("收起设置", "Close settings") : tr("编辑提示词 / 设置", "Prompt / settings"))}</button></div>${custom ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="${esc(id)}" value="${esc(custom.value || "")}" placeholder="group/1m-auto" autocomplete="off" spellcheck="false">${button("save-subagent-model", tr("保存", "Save"), { small: true, primary: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: `data-id="${esc(id)}"` })}</div></label></div>` : ""}<div id="t3-subagent-editor-${esc(id)}" class="hub-subagent-expand ${expanded ? "is-expanded" : ""}" ${expanded ? "" : "inert"}><div>${draft ? renderSubagentEditor(draft, id) : ""}</div></div></article>`;
       }).join("");
-      content.innerHTML = `${renderCommander()}<div class="hub-subagent-scopes" aria-label="${esc(tr("子智能体作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}"> ${esc(tr("全局子智能体", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}"> ${esc(tr("项目子智能体", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子智能体", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子智能体", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子智能体。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子智能体，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子智能体。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后自动注入全局 AGENTS.md，并同步 5 个 CLI。", "Saving injects global AGENTS.md and synchronizes five CLIs.") : tr("保存后自动写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
+      content.innerHTML = `${renderCommander()}${cache.subagents?.legacyProjectConfig ? `<p class="hub-error" role="alert">${esc(tr("发现旧项目路由，无法确认归属，暂未应用；请核对后重新配置。", "An older project route has unknown ownership and was not applied."))}</p>` : ""}<div class="hub-subagent-scopes" aria-label="${esc(tr("子智能体作用域", "Agent scope"))}"><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="global" aria-pressed="${scope === "global"}"> ${esc(tr("全局子智能体", "Global agents"))}<small>${esc(tr("全项目通用", "Across all projects"))}</small></button><button type="button" class="hub-subagent-scope" data-action="subagent-scope" data-scope="project" aria-pressed="${scope === "project"}" ${projectDisabled() ? "disabled" : ""} title="${esc(projectTitle())}"> ${esc(tr("项目子智能体", "Project agents"))}<small>${esc(tr("仅当前项目", "This project only"))}</small></button></div><div class="hub-subagent-heading"><h3>${esc(label)}<span>${esc(count)}</span></h3>${button("new-subagent", tr("新建子智能体", "New agent"), { small: true, primary: true, icon: "plus", disabled: scope === "project" && projectDisabled() })}</div><p class="hub-description">${esc(scope === "global" ? tr("为常用任务配好搭档。切换 Agent、模型或思考程度，即时保存。", "Choose your team. Agent, model, and effort changes save instantly.") : tr("为当前项目定制模型与提示词，同名配置优先于全局模板。", "Customize models and prompts here. Matching IDs override global templates."))}</p>${newDraft ? `<article class="hub-card">${subagentControls(newDraft, "__new__")}${state.subagentCustom[subagentKey("__new__")] ? `<div class="hub-subagent-custom"><label class="hub-field"><span>${esc(tr("自定义模型 ID", "Custom model ID"))}</span><div class="hub-row"><input class="hub-input" name="subagent-customModel" data-subagent-id="__new__" value="${esc(state.subagentCustom[subagentKey("__new__")].value || "")}" placeholder="group/1m-auto" spellcheck="false">${button("save-subagent-model", tr("使用模型", "Use model"), { small: true, primary: true, attrs: 'data-id="__new__"' })}${button("cancel-subagent-model", tr("取消", "Cancel"), { small: true, attrs: 'data-id="__new__"' })}</div></label></div>` : ""}${renderSubagentEditor(newDraft, "__new__", true)}</article>` : ""}${errors.subagents ? inlineError(errors.subagents) : !cache.subagents ? loading() : scope === "project" && projectDisabled() ? empty(tr("请先打开一个项目", "Open a project first"), "", "folder") : cards ? `<div class="hub-subagent-list">${cards}</div>` : `${empty(scope === "project" ? tr("这个项目，还没有专属搭档", "No project agents yet") : tr("还没有全局子智能体", "No global agents yet"), scope === "project" ? tr("当前仍使用全局子智能体。克隆一个模板，即可单独定制。", "Global agents remain available. Clone a template to customize it here.") : tr("新建子智能体，为常用任务配置专属助手。", "Create an agent for your recurring tasks."), "hub")}${scope === "project" ? `<div class="hub-subagent-clones"><strong>${esc(tr("从全局模板克隆定制…", "Customize a global template…"))}</strong><div class="hub-row">${subagentItems("global").filter((item) => ["worker", "explorer", "frontend"].includes(subagentId(item))).map((item) => button("clone-subagent", item.name || subagentId(item), { small: true, icon: "plus", attrs: `data-id="${esc(subagentId(item))}"` })).join("") || `<span class="hub-description">${esc(tr("先创建一个全局模板，或直接新建项目子智能体。", "Create a global template or a new project agent."))}</span>`}</div></div>` : ""}` }<div class="hub-subagent-note">${icon("check", 13)}<span>${esc(scope === "global" ? tr("保存后自动注入全局 AGENTS.md，并同步 5 个 CLI。", "Saving injects global AGENTS.md and synchronizes five CLIs.") : tr("保存后自动写入本项目 AGENTS.md，其他项目保持各自配置。", "Saving injects this project's AGENTS.md. Other projects keep their own settings."))}</span></div>`;
       content.innerHTML += `<details class="hub-import" ${state.hooksOpen ? "open" : ""}><summary data-action="hooks-fold">${esc(tr("高级生命周期 Hooks", "Advanced lifecycle hooks"))}</summary><div id="t3-hub-hooks-section"></div></details>`;
       const hooksSection = root.querySelector("#t3-hub-hooks-section"); if (hooksSection) renderHooks(hooksSection);
       greetBots();
@@ -718,8 +792,8 @@
       content.querySelector('[name="subagent-id"]')?.focus();
     }
     async function persistSubagent(id, patch = null) {
-      const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id);
-      if (scope === "project" && !projectRoot) return;
+      const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id), version = contextVersion;
+      if (scope === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
       if (subagentSaves.has(key)) return;
       const original = subagentItems().find((item) => subagentId(item) === id);
       const item = { ...(patch ? original || state.subagentDrafts[key] : state.subagentDrafts[key] || original), ...(patch || {}) };
@@ -735,8 +809,9 @@
       subagentSaves.set(key, true);
       renderSubagents();
       try {
+        if (scope === "project" && (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot)) return;
         const result = await request("subagents:update", { scope, projectRoot, item });
-        if (disposed) return;
+        if (disposed || (scope === "project" && (version !== contextVersion || !projectContextReady() || projectRoot !== state.projectRoot))) return;
         cache.agents = null;
         const saved = { ...item, ...(result.item || {}), injected: true };
         // A late save must never replace another project's list or a newly typed prompt.
@@ -755,18 +830,20 @@
         }
         toast(tr(`已保存并自动注入${scope === "global" ? "全局" : "项目"} AGENTS.md`, `Saved and injected into ${scope} AGENTS.md`));
       } catch (error) { if (!disposed) toast(errorText(error), true); }
-      finally { subagentSaves.delete(key); if (!disposed && state.tab === "subagents" && projectRoot === state.projectRoot && scope === state.subagentScope) { renderSubagents(); renderChrome(); } }
+      finally { subagentSaves.delete(key); if (!disposed && state.tab === "subagents" && (scope !== "project" || version === contextVersion) && projectRoot === state.projectRoot && scope === state.subagentScope) { renderSubagents(); renderChrome(); } }
     }
     async function cloneSubagent(id, element) {
       const item = subagentItems("global").find((entry) => subagentId(entry) === id);
-      const projectRoot = state.projectRoot;
-      if (!item || !projectRoot) return;
+      const projectRoot = state.projectRoot, version = contextVersion;
+      if (!item) return;
+      if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
       const existing = subagentItems("project").find((entry) => subagentId(entry) === id);
       if (existing) { state.subagentScope = "project"; state.subagentExpanded[subagentKey(id)] = true; renderSubagents(); renderChrome(); toast(tr("已打开现有项目配置", "Opened the existing project override")); return; }
       await busy(`clone:${projectRoot}:${id}`, element, async () => {
+        if (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
         const result = await request("subagents:update", { scope: "project", projectRoot, item: { ...item, memoryPolicy: memoryPolicy(item), id, scope: "project", projectRoot, builtin: false, builtIn: false, isBuiltin: false, overridesGlobal: true } });
+        if (disposed || version !== contextVersion || !projectContextReady() || projectRoot !== state.projectRoot) return;
         cache.agents = null;
-        if (disposed || projectRoot !== state.projectRoot) return;
         if (cache.subagents) cache.subagents.projectItems = [...subagentItems("project"), { ...item, ...(result.item || {}), id, scope: "project", projectRoot, builtin: false, overridesGlobal: true, injected: true }];
         state.subagentScope = "project";
         state.subagentExpanded[subagentKey(id)] = true;
@@ -775,13 +852,15 @@
       });
     }
     async function deleteSubagent(id, element) {
-      const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id);
+      const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id), version = contextVersion;
+      if (scope === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
       const item = subagentItems().find((entry) => subagentId(entry) === id);
       if (!item || !canDeleteSubagent(item) || subagentSaves.has(key)) return;
       await busy(`delete-subagent:${key}`, element, async () => {
+        if (scope === "project" && (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot)) return;
         await request("subagents:delete", { scope, projectRoot, id });
+        if (disposed || (scope === "project" && (version !== contextVersion || !projectContextReady())) || projectRoot !== state.projectRoot) return;
         cache.agents = null;
-        if (disposed || projectRoot !== state.projectRoot) return;
         if (cache.subagents) cache.subagents[scope === "global" ? "globalItems" : "projectItems"] = subagentItems(scope).filter((entry) => subagentId(entry) !== id);
         delete state.subagentDrafts[key]; delete state.subagentExpanded[key]; delete state.subagentCustom[key];
         if (state.tab === "subagents") { renderSubagents(); renderChrome(); }
@@ -802,8 +881,14 @@
       for (const key of ["upstream", "upstreamCatalog", "catalog", "groups"]) items(data, [key]).forEach((entry) => add(entry));
       return [...byName.values()];
     }
+    function renderMcpSourceFilters() {
+      const filters = [["all", tr("全部来源", "All sources")], ["magpie", "Magpie"], ["local", tr("本机 Agent", "Local agents")], ["builtin", tr("内置", "Built in")]];
+      const node = root.querySelector("#t3-hub-mcp-source-filters");
+      if (node) node.innerHTML = `<div class="hub-hint">${esc(tr("目录来源：Magpie 本机服务、本机 Agent 配置和 Hub 内置项。", "Catalog sources: local Magpie services, native agent configs, and built-ins."))}</div><div class="hub-filters">${filters.map(([key, label]) => `<button type="button" class="hub-pill ${state.mcpFilter === key ? "is-active" : ""}" data-action="mcp-filter" data-filter="${key}" aria-pressed="${state.mcpFilter === key}">${esc(label)}</button>`).join("")}</div>`;
+    }
     function renderMcp() {
-      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务", "MCP servers"))}</span>${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}</div><p class="hub-description">${esc(tr("选择要启用这个 MCP 的 Agent，Hub 会写入它的 MCP 配置。配置对该 Agent 的各个项目共用；新会话通常会读取，当前会话是否立即更新取决于 Agent。", "Choose which agents to enable this MCP for. Hub writes to each agent's MCP config, shared across that agent's projects. New sessions usually read it; current-session refresh depends on the agent."))}</p>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}${button("sync-mcp", tr("同步五宿主", "Sync agents"), { small: true })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
+      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务目录", "MCP service catalog"))}</span><div class="hub-row">${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}${button("sync-mcp", tr("同步 Hub 入口", "Sync Hub entry"), { small: true })}</div></div><p class="hub-description">${esc(tr("“启用到 Agent”会把上游服务写进该 Agent 的原生配置；“通过 Hub 使用”单独控制Hub路由。首次使用Hub路由时，先同步Hub入口。新会话通常读取配置，当前会话是否刷新由Agent决定。", "“Enable for Agent” writes the upstream service to that agent's native config. “Use through Hub” controls Hub routing separately. Sync the Hub entry before first use. New sessions usually read saved config; active-session refresh depends on the agent."))}</p><div id="t3-hub-mcp-source-filters"></div>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
+      renderMcpSourceFilters();
       renderMcpForm(); renderMcpList();
     }
     function renderMcpForm() {
@@ -813,18 +898,89 @@
       node.hidden = !state.mcpAddOpen;
       node.innerHTML = `<div class="hub-segments" role="group" aria-label="${esc(tr("新增方式", "Configuration method"))}">${[["form", tr("命令 / URL", "Command / URL")], ["json", tr("粘贴 JSON", "Paste JSON")]].map(([kind, label]) => `<button type="button" data-action="mcp-form-kind" data-kind="${kind}" class="${form.kind === kind ? "is-active" : ""}" aria-pressed="${form.kind === kind}">${esc(label)}</button>`).join("")}</div>${form.kind === "json" ? `<label class="hub-field">mcpServers JSON<textarea class="hub-editor" name="mcp-json" spellcheck="false" placeholder='{"mcpServers":{"my-server":{"command":"npx","args":["-y","package"]}}}'>${esc(form.json)}</textarea></label>` : `<div class="hub-form-grid"><label class="hub-field">${esc(tr("服务名称", "Server name"))}<input class="hub-input" name="mcp-name" value="${esc(form.name)}" placeholder="my-server" autocomplete="off"></label><label class="hub-field">${esc(tr("传输", "Transport"))}<select class="hub-select" name="mcp-transport"><option value="stdio" ${form.transport === "stdio" ? "selected" : ""}>stdio</option><option value="http" ${form.transport === "http" ? "selected" : ""}>http</option></select></label></div>${form.transport === "http" ? `<label class="hub-field">URL<input class="hub-input" name="mcp-url" value="${esc(form.url)}" placeholder="https://example.com/mcp" spellcheck="false"></label>` : `<label class="hub-field">${esc(tr("启动命令", "Command"))}<input class="hub-input" name="mcp-command" value="${esc(form.command)}" placeholder="npx" spellcheck="false"></label><label class="hub-field">${esc(tr("参数（JSON 数组或每行一个）", "Arguments (JSON array or one per line)"))}<textarea class="hub-input" name="mcp-args" rows="2" placeholder='["-y", "@example/mcp"]' spellcheck="false">${esc(form.args)}</textarea></label>`}`}${button("save-mcp", tr("添加服务", "Add server"), { primary: true, icon: "plus" })}`;
     }
+    function mcpModeChoice(server, scope) {
+      if (server.modeConflict) return "off";
+      const stored = scope === "project" ? server.modeProject : server.modeGlobal;
+      if (scope === "project" && stored == null) return "inherit";
+      if (stored === `${scope}-lazy`) return "lazy";
+      if (stored === `${scope}-direct`) return "direct";
+      return "off";
+    }
+    function mcpModeText(mode) {
+      return mode === "global-lazy" || mode === "project-lazy" ? tr("用到时再连接", "Connect on demand")
+        : mode === "global-direct" || mode === "project-direct" ? tr("列出全部工具", "List all tools") : tr("不经 Hub", "Bypass Hub");
+    }
+    function mcpModeScopeHint(server, scope, reason = "") {
+      const hasProjectOverride = typeof server.modeProject === "string";
+      const scopeHint = scope === "project"
+        ? hasProjectOverride
+          ? tr("项目单独设置优先于全局默认。当前项目已单独设置；选择“跟随全局”可清除本项目设置。", "Project settings override the global default. This project has an override; choose “Follow global” to clear it.")
+          : tr(`项目单独设置优先于全局默认。当前项目未单独设置，正跟随全局默认“${mcpModeText(server.modeGlobal || "off")}”。`, `Project settings override the global default. This project has no override and follows “${mcpModeText(server.modeGlobal || "off") }”.`)
+        : hasProjectOverride
+          ? tr("正在编辑全局默认；项目单独设置优先于全局默认，当前项目的单独设置仍优先。", "Editing the global default; project overrides take precedence, including this project's setting.")
+          : tr("正在编辑所有项目默认；项目单独设置优先于全局默认。", "Editing the default for all projects; individual project overrides take precedence.");
+      return [reason, tr("这只控制 Hub 转发；不经 Hub 不会关闭 Agent 原生配置。", "This controls Hub forwarding only; bypassing Hub does not disable native agent config."), scopeHint, tr("当前 Agent 工具列表是否刷新由 Agent 决定。", "Whether the current agent refreshes its tool list depends on that agent.")].filter(Boolean).join(" ");
+    }
+    function renderMcpModeControls(server) {
+      const scope = server.modeScope === "project" ? "project" : "global";
+      const mode = mcpModeChoice(server, scope);
+      const cannotEnable = server.modeConflict === true || server.launchable === false;
+      const cannotInherit = server.modeConflict === true || (server.launchable === false && ["global-lazy", "global-direct"].includes(server.modeGlobal));
+      const reason = server.modeConflict
+        ? tr("名称冲突已暂停；可保存“不经 Hub”。启用前请先解决冲突。", "Name conflict paused; you can save “Bypass Hub”. Resolve the conflict before enabling.")
+        : server.launchable === false ? tr("服务缺少可运行入口；可保存“不经 Hub”关闭转发。", "No runnable endpoint; save “Bypass Hub” to turn forwarding off.") : "";
+      return `<div class="hub-mcp-mode-controls"><label>${esc(tr("范围", "Scope"))}<select class="hub-select" name="mcp-mode-scope" aria-label="${esc(tr("Hub 调用方式范围", "Hub usage scope"))}" data-name="${esc(server.name)}"><option value="project" ${scope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("当前项目", "This project"))}</option><option value="global" ${scope === "global" ? "selected" : ""}>${esc(tr("所有项目默认", "All projects default"))}</option></select></label><label>${esc(tr("通过 Hub 使用", "Use through Hub"))}<select class="hub-select" name="mcp-mode" aria-label="${esc(tr("Hub 调用方式", "Hub usage mode"))}" data-name="${esc(server.name)}"><option value="off" ${mode === "off" ? "selected" : ""}>${esc(tr("不经 Hub", "Bypass Hub"))}</option><option value="inherit" ${mode === "inherit" ? "selected" : ""} ${scope === "global" ? "hidden" : ""} ${cannotInherit ? "disabled" : ""}>${esc(tr("跟随全局", "Follow global"))}</option><option value="lazy" ${mode === "lazy" ? "selected" : ""} ${cannotEnable ? "disabled" : ""}>${esc(tr("用到时再连接", "Connect on demand"))}</option><option value="direct" ${mode === "direct" ? "selected" : ""} ${cannotEnable ? "disabled" : ""}>${esc(tr("列出全部工具", "List all tools"))}</option></select></label>${button("save-mcp-mode", tr("保存 Hub 方式", "Save Hub mode"), { small: true, attrs: `data-name="${esc(server.name)}"` })}<p class="hub-mcp-mode-hint">${esc(mcpModeScopeHint(server, scope, reason))}</p></div>`;
+    }
+    async function saveMcpMode(element) {
+      const name = element.dataset.name, controls = element.closest(".hub-mcp-mode-controls");
+      const scope = controls?.querySelector('[name="mcp-mode-scope"]')?.value;
+      const choice = controls?.querySelector('[name="mcp-mode"]')?.value;
+      const projectRoot = state.projectRoot, version = contextVersion;
+      if (!name || !["project", "global"].includes(scope) || !["off", "inherit", "lazy", "direct"].includes(choice)) return;
+      if (choice === "inherit" && scope !== "project") return;
+      if (scope === "project" && !projectRoot) { toast(tr("请先打开一个项目", "Open a project first"), true); return; }
+      const mode = choice === "inherit" ? "inherit" : choice === "off" ? "off" : `${scope}-${choice}`;
+      const payload = { name, mode, ...(scope === "project" ? { projectRoot } : {}) };
+      await busy(`mcp-mode:${name}`, element, async () => {
+        await request("mcp:setMode", payload);
+        if (disposed || version !== contextVersion) return;
+        const verification = await request("mcp:list", scope === "global" ? {} : { projectRoot });
+        const saved = items(verification, ["items", "servers"]).find((item) => item.name === name);
+        const readbackMatches = choice === "inherit"
+          ? saved?.modeProject == null && saved?.modeScope === "global" && saved?.mode === (saved.modeGlobal || "off")
+          : saved?.mode === mode && saved?.modeScope === scope;
+        if (!saved || !readbackMatches) throw new Error(tr("设置已提交，但回读结果不一致，请刷新后检查", "The mode was submitted, but readback did not match. Refresh and check it."));
+        const current = scope === "global" && projectRoot ? await request("mcp:list", { projectRoot }) : verification;
+        if (disposed || version !== contextVersion) return;
+        cache.mcp = current;
+        delete errors.mcp;
+        renderMcpList();
+        const effective = items(current, ["items", "servers"]).find((item) => item.name === name);
+        const message = choice === "inherit"
+          ? tr("已清除当前项目的单独设置，现跟随全局默认。", "This project's override was cleared; it now follows the global default.")
+          : scope === "global" && effective?.modeScope === "project"
+          ? tr("已保存全局 Hub 调用方式；当前项目的单独设置仍优先生效。", "Global Hub mode saved; this project's setting still takes precedence.")
+          : tr("已保存 Hub 调用方式；当前 Agent 工具列表刷新取决于 Agent。", "Hub usage mode saved; the agent controls when its tool list refreshes.");
+        toast(message);
+      });
+    }
     function renderMcpList() {
       const node = root.querySelector("#t3-hub-mcp-list");
       if ((state.tab !== "skills" || state.libraryView !== "mcp") || disposed || !node) return;
       if (errors.mcp || !cache.mcp) { node.innerHTML = errors.mcp ? inlineError(errors.mcp) : loading(); return; }
       const query = state.mcpQuery.trim().toLowerCase();
-      const servers = mcpServers().filter((server) => resourceMatches(server, "mcp") && (!query || `${server.name} ${server.displayName} ${server.groupTitle} ${server.description || ""}`.toLowerCase().includes(query)));
-      node.innerHTML = servers.map((server) => {
+      const servers = mcpServers().filter((server) => mcpSourceMatchesFilter(server, state.mcpFilter) && resourceMatches(server, "mcp") && (!query || `${server.name} ${server.displayName} ${server.groupTitle} ${server.description || ""}`.toLowerCase().includes(query)));
+      renderMcpSourceFilters();
+      node.innerHTML = servers.length ? `<div class="hub-market-grid hub-resource-grid">${servers.map((server) => {
         const summary = redact(server.summary || server.url || [server.command, ...items(server, ["args"])].filter(Boolean).join(" "));
         const removable = server.removable === true || !server.builtin && !server.readonly && ["custom", "hub"].includes(server.source);
-        const connectionLabel = server.connected === true ? tr("已连接", "Connected") : server.connected === false ? tr("未连接", "Disconnected") : tr("尚未检测", "Not checked");
-        return `<article class="hub-resource-row hub-mcp-row" data-mcp-name="${esc(server.name)}">${brandIcon(server, "mcp")}<div class="hub-grow"><div class="hub-resource-title"><span class="hub-mcp-name">${esc(server.displayName || server.title || server.name)}</span><span class="hub-badge">${esc(connectionLabel)}</span></div><p class="hub-card-description">${esc(server.shortDescription || server.description || summary || tr("工具服务", "Tool server"))}</p><div class="hub-mcp-row-options">${removable ? `<button type="button" class="hub-icon-btn" data-action="remove-mcp" data-name="${esc(server.name)}" aria-label="${esc(tr("移除", "Remove"))} ${esc(server.name)}">${icon("trash", 12)}</button>` : ""}</div><div class="hub-confirm-delete" data-mcp-confirm hidden>${esc(tr("移除此自定义 MCP？", "Remove this custom MCP?"))}<div class="hub-row">${button("confirm-remove-mcp", tr("移除", "Remove"), { small: true, attrs: `data-name="${esc(server.name)}"` })}${button("cancel-remove-mcp", tr("取消", "Cancel"), { small: true })}</div></div></div>${agentToggleRow(server, "mcp")}</article>`;
-      }).join("") || empty(tr("没有匹配的 MCP", "No matching MCP servers"));
+        const connectionLabel = !server.probed ? tr("连通性未检测", "Connection not checked") : server.connected === true ? tr("探测成功", "Probe succeeded") : tr("探测未通", "Probe failed");
+        const availabilityBadge = server.launchable === false ? `<span class="hub-badge hub-unavailable" title="${esc(launchReasonLabel(server.launchReason))}">${esc(tr("入口不可用", "Entry unavailable"))}</span>` : `<span class="hub-badge">${esc(tr("入口已配置", "Entry configured"))}</span>`;
+        const hubModeBadge = `<span class="hub-badge hub-route-status">${esc(hubModeLabel(server))}</span>`;
+        const nativeBadge = `<span class="hub-badge">${esc(agentStatusLabel(server, "mcp"))}</span>`;
+        const conflictBadge = server.modeConflict ? `<span class="hub-badge" title="${esc(tr("同名归一键对应多个定义，自动启用已暂停", "Multiple definitions share a normalized name; automatic activation is paused"))}">${esc(tr("名称冲突已暂停", "Name conflict · paused"))}</span>` : "";
+        return `<article class="hub-card hub-market-card hub-resource-card hub-mcp-row" data-mcp-name="${esc(server.name)}"><div class="hub-card-top">${brandIcon(server, "mcp")}<div class="hub-grow"><div class="hub-card-name">${esc(server.displayName || server.title || server.name)}</div><div class="hub-card-meta">${mcpSourceLabels(server).map((label) => `<span class="hub-badge">${esc(label)}</span>`).join("")}${availabilityBadge}<span class="hub-badge" title="${esc(server.statusText || connectionLabel)}">${esc(connectionLabel)}</span>${nativeBadge}${hubModeBadge}${conflictBadge}</div></div></div><p class="hub-card-description">${esc(server.shortDescription || server.description || summary || tr("工具服务", "Tool server"))}</p>${!server.launchable && server.launchReason ? `<p class="hub-hint hub-unavailable-hint">${esc(launchReasonLabel(server.launchReason))}</p>` : ""}<div class="hub-mcp-row-options">${removable ? `<button type="button" class="hub-icon-btn" data-action="remove-mcp" data-name="${esc(server.name)}" aria-label="${esc(tr("移除", "Remove"))} ${esc(server.name)}">${icon("trash", 12)} ${esc(tr("移除", "Remove"))}</button>` : ""}</div><div class="hub-confirm-delete" data-mcp-confirm hidden>${esc(tr("移除此 MCP 配置？", "Remove this MCP definition?"))}<div class="hub-row">${button("confirm-remove-mcp", tr("确认移除", "Remove"), { small: true, attrs: `data-name="${esc(server.name)}"` })}${button("cancel-remove-mcp", tr("取消", "Cancel"), { small: true })}</div></div><div class="hub-resource-controls-label">${esc(tr("Agent 原生配置（与 Hub 路由分开）", "Native agent config (separate from Hub routing)"))}</div>${agentToggleRow(server, "mcp")}${renderMcpModeControls(server)}</article>`;
+      }).join("")}</div>` : empty(tr("没有匹配的 MCP", "No matching MCP servers"), tr("换个来源筛选条件，或添加一个已核验配置的本机服务。", "Try another source filter or add a locally configured service."));
     }
     function mcpGroupTitle(name) {
       const names = [[/chrome/i, "Chrome Devtools MCP"], [/codegraph/i, "Codegraph"], [/context7/i, "Context7 Docs"], [/playwright/i, "Playwright MCP"], [/lcu|computer.use/i, "LCU Computer Use"], [/reach/i, "Briking Agent Reach"], [/product|library/i, tr("产品库查询", "Product Library")], [/github/i, "GitHub"], [/cloudflare/i, "Cloudflare"]];
@@ -894,7 +1050,9 @@
       const agent = report?.agentUsed;
       const consumption = report ? [agent === false || report.dreamMode === "local" ? tr("本地整理", "Local processing") : typeof agent === "string" ? agent : agent && typeof agent === "object" ? [agent.providerInstanceId || agent.provider, agent.model].filter(Boolean).join(" · ") : agent === true ? tr("后台 Agent", "Background agent") : "", report.estimatedInputTokens != null ? `${metric(report.estimatedInputTokens)} input tok` : "", report.estimatedCostUsd != null ? tr(`预估 ${cost(report.estimatedCostUsd)}`, `Estimated ${cost(report.estimatedCostUsd)}`) : ""].filter(Boolean).join(" · ") : "";
       const status = state.dreamRunning ? tr("正在整理…", "Dreaming…") : state.dreamSaving ? tr("保存中…", "Saving…") : !loaded ? tr("正在读取", "Loading") : data.enabled ? tr(`已开启 · 每日 ${data.dreamTime}`, `Enabled · Daily ${data.dreamTime}`) : tr("未开启", "Disabled");
-      node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold">AutoDream · ${esc(status)} · ${esc(metric(cache.embed?.vectorStats?.syncedVectors))}/${esc(metric(cache.embed?.vectorStats?.totalMemories))} ${esc(tr("向量同步", "vectors synced"))} · ${esc(tr("配置 / 立即整理", "Configure / Dream now"))}</summary><section aria-label="${esc(tr("梦境整理 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境整理", "Memory Dream"))} · AutoDream</span><span class="hub-badge">${esc(status)}</span><span class="hub-dream-size">${esc(tr(`索引体积 ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`, `Index size ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`))}</span></div><p class="hub-dream-description">${esc(tr("T3 开着，就会在设定时间整理记忆。", "Keep T3 open to organize memory at the chosen time."))}</p><div class="hub-dream-engine-row"><label class="hub-field hub-dream-engine">${esc(tr("执行引擎 · 后台 Agent / 模型", "Execution engine · Background agent / model"))}<select class="hub-select" name="dream-engine" aria-label="${esc(tr("AutoDream 执行引擎", "AutoDream execution engine"))}" ${busy || !loaded ? "disabled" : ""}>${!current ? `<option value="__current__" selected>${esc(`${data.providerInstanceId} · ${data.model}`)}</option>` : ""}${presets.map((preset) => `<option value="${esc(preset.id)}" ${current?.id === preset.id ? "selected" : ""}>${esc(preset.label || `${preset.providerInstanceId} · ${preset.model}`)}</option>`).join("")}</select></label><span class="hub-dream-budget" aria-label="${esc(tr("省流闸门", "Token budget"))}">${icon("bolt", 11)}${esc(budget)}</span></div><div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日做梦时间", "Daily dream time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补梦", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Dreaming…") : tr("立即做梦", "Dream now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded })}</div><div class="hub-dream-report">${state.dreamRunning ? `${spinner()} ` : ""}${esc(summary)}${consumption ? `<div class="hub-dream-consumption">${esc(consumption)}</div>` : ""}${overview.archivedCount != null || overview.staleVectorCount != null ? `<div class="hub-hint">${esc(tr(`已归档 ${metric(overview.archivedCount)} 条 · 待同步向量 ${metric(overview.staleVectorCount)} 条`, `${metric(overview.archivedCount)} archived · ${metric(overview.staleVectorCount)} stale vectors`))}</div>` : ""}</div><div class="hub-dream-times"><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span></div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
+      const vectors = cache.embed?.vectorStats;
+      const syncSummary = cache.embed?.vectorStatsError ? tr("记忆统计不可用", "Memory statistics unavailable") : vectors?.syncedVectors != null && vectors?.totalMemories != null ? `${metric(vectors.syncedVectors)}/${metric(vectors.totalMemories)} ${tr("向量同步", "vectors synced")}` : tr("统计读取中", "Loading statistics");
+      node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold">AutoDream · ${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Dream now"))}</summary><section aria-label="${esc(tr("梦境整理 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境整理", "Memory Dream"))} · AutoDream</span><span class="hub-badge">${esc(status)}</span><span class="hub-dream-size">${esc(tr(`索引体积 ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`, `Index size ${metric(overview.dbSizeMb ?? report?.dbSizeMb)} MB`))}</span></div><p class="hub-dream-description">${esc(tr("T3 开着，就会在设定时间整理记忆。", "Keep T3 open to organize memory at the chosen time."))}</p><div class="hub-dream-engine-row"><label class="hub-field hub-dream-engine">${esc(tr("执行引擎 · 后台 Agent / 模型", "Execution engine · Background agent / model"))}<select class="hub-select" name="dream-engine" aria-label="${esc(tr("AutoDream 执行引擎", "AutoDream execution engine"))}" ${busy || !loaded ? "disabled" : ""}>${!current ? `<option value="__current__" selected>${esc(`${data.providerInstanceId} · ${data.model}`)}</option>` : ""}${presets.map((preset) => `<option value="${esc(preset.id)}" ${current?.id === preset.id ? "selected" : ""}>${esc(preset.label || `${preset.providerInstanceId} · ${preset.model}`)}</option>`).join("")}</select></label><span class="hub-dream-budget" aria-label="${esc(tr("省流闸门", "Token budget"))}">${icon("bolt", 11)}${esc(budget)}</span></div><div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日做梦时间", "Daily dream time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补梦", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Dreaming…") : tr("立即做梦", "Dream now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded })}</div><div class="hub-dream-report">${state.dreamRunning ? `${spinner()} ` : ""}${esc(summary)}${consumption ? `<div class="hub-dream-consumption">${esc(consumption)}</div>` : ""}${overview.archivedCount != null || overview.staleVectorCount != null ? `<div class="hub-hint">${esc(tr(`已归档 ${metric(overview.archivedCount)} 条 · 待同步向量 ${metric(overview.staleVectorCount)} 条`, `${metric(overview.archivedCount)} archived · ${metric(overview.staleVectorCount)} stale vectors`))}</div>` : ""}</div><div class="hub-dream-times"><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span></div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
     }
     async function saveDream(patch) {
       if (disposed || state.dreamSaving || state.dreamRunning) return;
@@ -1174,8 +1332,8 @@
     }
     function renderAgents() {
       const draft = agentDraft();
-      const blocked = state.agentsTarget === "project" && projectDisabled();
-      content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("把协作方式写下来", "Make your preferences explicit"))}</span></div><p class="hub-description">${esc(tr("规则轻一点，记忆深一点。让每个助手都懂你的习惯。", "Keep rules lean and memory deep. Help every assistant work your way."))}</p><div class="hub-agents-targets">${[["global", "globe", tr("全局 AGENTS.md", "Global AGENTS.md"), tr("一处编辑 · 5 端同步", "Edit once · Sync across 5 CLIs")], ["project", "folder", tr("当前项目 AGENTS.md", "Project AGENTS.md"), state.projectRoot ? tr("仅应用于当前项目", "Applies to the current project") : projectTitle()]].map(([target, name, label, hint]) => `<button type="button" class="hub-agents-target ${state.agentsTarget === target ? "is-active" : ""}" data-action="agents-target" data-target="${target}" aria-pressed="${state.agentsTarget === target}" ${target === "project" && projectDisabled() ? `disabled title="${esc(projectTitle())}"` : ""}>${icon(name, 16)}<span><strong>${esc(label)}</strong><small>${esc(hint)}</small></span><span class="hub-radio"></span></button>`).join("")}</div>${blocked ? empty(projectTitle(), "", "folder") : errors.agents ? inlineError(errors.agents) : !draft ? loading() : `${state.agentsTarget === "project" ? button("inject-soft-route", tr("注入记忆库软路由模板", "Insert memory routing template"), { icon: "spark", attrs: 'title="AGENTS.md"' }) : ""}<div class="hub-token-bar"><strong>AGENTS.md</strong><span id="t3-hub-token-count" class="hub-token"></span></div><p id="t3-hub-token-warning" class="hub-token-warning" hidden>${esc(tr("建议把详细知识放进记忆库，AGENTS.md 保留简洁入口。", "Move detailed knowledge into memory; keep AGENTS.md a lean entry point."))}</p><textarea class="hub-editor hub-agents-editor" name="agents-content" spellcheck="false" aria-label="AGENTS.md Markdown" placeholder="${esc(tr("写下你希望所有助手遵守的协作规则…", "How would you like your assistants to work?"))}">${esc(draft.content)}</textarea><div class="hub-agents-save"><span id="t3-hub-agents-dirty" class="hub-saved-hint"></span>${button("save-agents", tr("保存并同步", "Save & sync"), { primary: true, icon: "save" })}</div><div id="t3-hub-sync-badges" class="hub-sync-badges"></div><div class="hub-hint" style="margin-top:11px">${icon("info", 12)}${esc(tr("Tab 缩进 · ⌘S / Ctrl+S 保存", "Tab to indent · ⌘S / Ctrl+S to save"))}</div>`}`;
+      const blocked = state.agentsTarget === "project" && !projectContextReady();
+      content.innerHTML = `${button("back-to-settings", tr("返回宿主设置", "Back to settings"), { small: true })}<div class="hub-section-heading"><span>${esc(tr("把协作方式写下来", "Make your preferences explicit"))}</span></div><p class="hub-description">${esc(tr("规则轻一点，记忆深一点。让每个助手都懂你的习惯。", "Keep rules lean and memory deep. Help every assistant work your way."))}</p><div class="hub-agents-targets">${[["global", "globe", tr("全局 AGENTS.md", "Global AGENTS.md"), tr("写入已发现宿主的托管区块", "Sync managed blocks to discovered hosts")], ["project", "folder", tr("当前项目 AGENTS.md", "Project AGENTS.md"), state.projectRoot ? tr("仅应用于当前项目", "Applies to the current project") : projectTitle()]].map(([target, name, label, hint]) => `<button type="button" class="hub-agents-target ${state.agentsTarget === target ? "is-active" : ""}" data-action="agents-target" data-target="${target}" aria-pressed="${state.agentsTarget === target}" ${target === "project" && projectDisabled() ? `disabled title="${esc(projectTitle())}"` : ""}>${icon(name, 16)}<span><strong>${esc(label)}</strong><small>${esc(hint)}</small></span><span class="hub-radio"></span></button>`).join("")}</div>${state.agentsTarget === "project" && !blocked && cache.agents ? `<p class="hub-hint">${esc(cache.agents.projectExists ? tr("项目 AGENTS.md 已存在；Codex / Pi 按各自规则发现文件，AGY / Muse 当前会话加载状态未知。", "Project AGENTS.md exists; loading depends on each host.") : tr("项目尚无 AGENTS.md，编辑后保存即可创建。", "No project AGENTS.md; save to create it."))} ${esc(cache.agents.projectClaudeReference ? tr("Claude 规则含引用，当前会话是否加载未知。", "Claude rules contain a reference; session loading is unknown.") : tr("Claude 尚未发现引用。", "No Claude reference found."))}</p>${!cache.agents.projectClaudeReference ? button("sync-project-rule-reference", tr("为 Claude 添加项目规则引用", "Add Claude project rule reference"), { small: true, disabled: !cache.agents.projectExists }) : ""}` : ""}${blocked ? empty(projectTitle(), "", "folder") : errors.agents ? inlineError(errors.agents) : !draft ? loading() : `${state.agentsTarget === "project" ? button("inject-soft-route", tr("注入记忆库软路由模板", "Insert memory routing template"), { icon: "spark", attrs: 'title="AGENTS.md"' }) : ""}<div class="hub-token-bar"><strong>AGENTS.md</strong><span id="t3-hub-token-count" class="hub-token"></span></div><p id="t3-hub-token-warning" class="hub-token-warning" hidden>${esc(tr("建议把详细知识放进记忆库，AGENTS.md 保留简洁入口。", "Move detailed knowledge into memory; keep AGENTS.md a lean entry point."))}</p><textarea class="hub-editor hub-agents-editor" name="agents-content" spellcheck="false" aria-label="AGENTS.md Markdown" placeholder="${esc(tr("写下你希望所有助手遵守的协作规则…", "How would you like your assistants to work?"))}">${esc(draft.content)}</textarea><div class="hub-agents-save"><span id="t3-hub-agents-dirty" class="hub-saved-hint"></span>${button("save-agents", tr("保存并同步", "Save & sync"), { primary: true, icon: "save" })}</div><div id="t3-hub-sync-badges" class="hub-sync-badges"></div><div class="hub-hint" style="margin-top:11px">${icon("info", 12)}${esc(tr("Tab 缩进 · ⌘S / Ctrl+S 保存", "Tab to indent · ⌘S / Ctrl+S to save"))}</div>`}`;
       content.querySelector('[data-action="inject-soft-route"]')?.classList.add("hub-soft-route");
       updateAgentCounter();
       renderSyncBadges();
@@ -1303,7 +1461,10 @@
         }
       }
       const anchor = anchorCache;
-      let hidden = !anchor || state.open || root.classList.contains("is-occluded") || /^\/(settings|usage|pair)(\/|$)/.test(routeHint());
+      const routeHintValue = routeHint();
+      const blocked = state.open || root.classList.contains("is-occluded") || /^\/(settings|usage|pair)(\/|$)/.test(routeHintValue) || routeHintValue === "/" ||
+        (state.threadId === "__NEW__" && !/(?:^|\/)(?:new|draft)(?:\/|[?#]|$)/i.test(routeHintValue));
+      let hidden = !anchor || blocked, reason = tr("会话详情侧栏未显示或布局不同", "Session details are not visible");
       if (!hidden) {
         const rect = anchor.card.getBoundingClientRect();
         const clip = anchor.viewport?.getBoundingClientRect();
@@ -1323,11 +1484,52 @@
           liveBoard.classList.toggle("is-space-limited", limited);
           liveBoard.querySelector(".hub-board-toggle")?.setAttribute("aria-expanded", String(state.boardExpanded && !limited));
           hidden = maxHeight < 48;
+          if (hidden) reason = tr("空间不足", "Not enough space");
           if (!hidden) Object.assign(liveBoard.style, { left: `${left}px`, width: `${right - left}px`, top: `${top}px`, maxHeight: `${maxHeight}px` });
         }
       }
       liveBoard.hidden = !!hidden;
+      if (planHandle) {
+        planHandle.hidden = !hidden || blocked;
+        const status = boardStatus();
+        planHandle.textContent = status === tr("暂无计划", "No plan") ? status : `${tr("计划", "Plan")} · ${status}`;
+        planHandle.title = `${reason} · ${status} · ${tr("点击查看计划", "Open plan")}`;
+        planHandle.setAttribute("aria-label", planHandle.title);
+      }
       if (slashSession) positionSlash();
+    }
+    function boardMismatch() {
+      const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+      if (state.threadId === "__NEW__") {
+        const match = routeHint().match(new RegExp(`^/?(?:projects?|workspaces?)/(${uuid})/(?:new|draft)(?:[/?#]|$)`, "i"));
+        const projectId = match?.[1];
+        return !projectId || state.context?.draftProjectVerified !== true || state.context?.threadId !== "__NEW__" ||
+          String(state.context?.projectId || "").toLowerCase() !== projectId.toLowerCase() || !state.projectRoot || state.context?.projectRoot !== state.projectRoot;
+      }
+      const nativePair = routeHint().match(/^\/?([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/);
+      const pair = nativePair && !["threads", "_chat"].includes(nativePair[1].toLowerCase()) ? nativePair : null;
+      let routeThreadId = pair?.[2];
+      try { if (routeThreadId) routeThreadId = decodeURIComponent(routeThreadId); } catch { return true; }
+      if (pair && (String(state.context?.environmentId || "").toLowerCase() !== pair[1].toLowerCase() || String(state.threadId || "") !== routeThreadId || !state.projectRoot || state.context?.projectRoot !== state.projectRoot)) return true;
+      const contextId = state.context?.threadId || state.context?.thread?.id;
+      return !!(contextId && state.threadId && String(contextId) !== String(state.threadId));
+    }
+    function projectContextReady() {
+      return Boolean(state.connected && !contextLoading && state.projectRoot && state.context?.threadId && state.context?.projectRoot === state.projectRoot && routeKey() === lastRoute && !boardMismatch());
+    }
+    function boardProblem() {
+      if (contextLoading) return tr("读取中", "Loading");
+      if (!state.connected) return /无法确认(?:新)?会话所属项目/.test(state.contextError) ? tr("未确认所属项目", "Project not identified") : state.contextError ? tr("连接失败", "Connection failed") : tr("读取中", "Loading");
+      if (boardMismatch()) return tr("会话未匹配", "Session mismatch");
+      if (errors.board?.code === "board_thread_mismatch") return tr("会话未匹配", "Session mismatch");
+      if (errors.board) return tr("读取失败，请刷新", "Read failed; refresh");
+      return cache.board ? "" : tr("读取中", "Loading");
+    }
+    function boardStatus() {
+      const problem = boardProblem();
+      if (problem) return problem;
+      const progress = boardData().progress;
+      return progress.total ? `${progress.completed}/${progress.total}` : tr("暂无计划", "No plan");
     }
     function boardData() {
       const raw = cache.board?.board || cache.board || {};
@@ -1357,18 +1559,18 @@
         const file = typeof artifact === "string" ? artifact : artifact.name || artifact.title || artifact.path || artifact.id;
         return `<button type="button" class="hub-artifact-chip" data-action="read-artifact" data-index="${index}" title="${esc(file)}">${icon("edit", 11)} ${esc(String(file || "document.md").split(/[\\/]/).pop())}</button>`;
       }).join("");
-      return `${compact ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact ? "" : `<div class="hub-board-section"><span>${esc(tr("进程", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("") || `<li class="hub-hint">${esc(tr("当前没有计划步骤", "No plan steps yet"))}</li>`}</ol>${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}`;
+      return `${compact ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact ? "" : `<div class="hub-board-section"><span>${esc(tr("进程", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "◉" : "○"}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("") || `<li class="hub-hint">${esc(tr("当前没有计划步骤", "No plan steps yet"))}</li>`}</ol>${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
     function renderLiveBoard() {
       if (!liveBoard) return;
-      const board = boardData();
+      const problem = boardProblem(), status = boardStatus();
       const threadId = state.threadId || "";
       const scrollTop = liveBoard.dataset.threadId === threadId ? liveBoard.querySelector(".hub-board-content")?.scrollTop ?? 0 : 0;
       // A poll must not replace an input (or a checkbox) under the user's hands.
       if (document.activeElement?.matches('input[name="board-step-draft"]') && liveBoard.contains(document.activeElement) && liveBoard.dataset.threadId === (state.threadId || "")) { positionConversationTools(); return; }
       liveBoard.dataset.threadId = threadId;
       liveBoard.classList.toggle("is-collapsed", !state.boardExpanded);
-      liveBoard.innerHTML = `<div class="hub-board-toolbar"><button type="button" class="hub-board-toggle" data-action="toggle-board" aria-expanded="${state.boardExpanded}"><span>${icon("check", 12)} ${esc(tr("计划进度", "Plan progress"))} ${board.progress.completed}/${board.progress.total}</span><span aria-hidden="true">${state.boardExpanded ? "−" : "+"}</span></button>${themeSwitcher()}<button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 13)}<span class="hub-board-open-label">${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}</span></button></div>${state.boardExpanded ? `<div class="hub-board-content">${boardMarkup(true, true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("+ 添加本会话步骤", "+ Add a step to this thread"))}" aria-label="${esc(tr("添加本会话步骤", "Add a thread step"))}">${button("board-add", tr("添加", "Add"), { small: true, icon: "plus" })}</div></div>` : ""}`;
+      liveBoard.innerHTML = `<div class="hub-board-toolbar"><button type="button" class="hub-board-toggle" data-action="toggle-board" aria-expanded="${state.boardExpanded}"><span>${icon("check", 12)} ${esc(tr("计划进度", "Plan progress"))} ${esc(status)}</span><span aria-hidden="true">${state.boardExpanded ? "−" : "+"}</span></button>${themeSwitcher()}<button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 13)}<span class="hub-board-open-label">${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}</span></button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${boardMarkup(true, true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("+ 添加本会话步骤", "+ Add a step to this thread"))}" aria-label="${esc(tr("添加本会话步骤", "Add a thread step"))}">${button("board-add", tr("添加", "Add"), { small: true, icon: "plus" })}</div>`}</div>` : ""}`;
       applyTheme();
       positionConversationTools();
       const scroller = liveBoard.querySelector(".hub-board-content");
@@ -1376,28 +1578,34 @@
     }
     function artifactMarkup() {
       if (!state.artifact) return "";
-      return `<section class="hub-artifact-preview"><div class="hub-row"><strong class="hub-grow">${esc(state.artifact.name)}</strong>${button("close-artifact", tr("收起", "Close"), { small: true })}</div><pre>${esc(state.artifact.content)}</pre></section>`;
+      return `<section class="hub-artifact-preview"><div class="hub-row" style="flex-wrap:wrap"><strong class="hub-grow" style="overflow-wrap:anywhere">${esc(state.artifact.name)}</strong>${button("artifact-folder", tr("打开所在文件夹", "Open containing folder"), { small: true })}${button("reveal-artifact", tr("在 Finder 中显示", "Show in Finder"), { small: true })}${button("close-artifact", tr("关闭", "Close"), { small: true })}</div><pre>${esc(state.artifact.content)}</pre></section>`;
     }
     function renderBoardTab() {
-      if (!cache.board && errors.board) { content.innerHTML = inlineError(errors.board); return; }
+      const problem = boardProblem();
+      if (problem) { content.innerHTML = `<p class="hub-hint">${esc(problem)} · ${esc(tr("可点右上角刷新连接", "Use refresh to reconnect"))}</p>`; return; }
       content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务进度", "Task progress"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划步骤与产物文档，随会话实时同步。", "Plan steps and artifacts, synced to this thread."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio">${boardMarkup(true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("添加一个步骤…", "Add a step…"))}" aria-label="${esc(tr("新计划步骤", "New plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus" })}</div><div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}<span class="hub-hint">${esc(tr("约每 3.5 秒同步 · 五宿主通用", "Synced every 3.5s · All agents"))}</span></div></section>`}${artifactMarkup()}`;
     }
     async function pollBoard() {
       if (disposed || document.hidden || !state.connected || boardLoading) return;
+      if (boardMismatch()) { renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab(); return; }
       boardLoading = true;
       const version = ++boardVersion, projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", context = contextVersion;
       try {
         const data = await request("board:get", { projectRoot, threadId: threadId || undefined, strictThreadMatch: true, excludeSubagentInference: true });
         if (disposed || version !== boardVersion || context !== contextVersion || projectRoot !== state.projectRoot || threadId !== state.threadId) return;
+        if (Object.hasOwn(data, "threadId") && String(data.threadId || "") !== threadId) {
+          const error = new Error("board session mismatch"); error.code = "board_thread_mismatch"; throw error;
+        }
+        const recovered = !!errors.board;
         cache.board = data; delete errors.board;
         const signature = JSON.stringify(data);
         renderLiveBoard();
-        if (signature !== boardSignature) {
+        if (recovered || signature !== boardSignature) {
           boardSignature = signature; renderChrome();
           if (state.open && state.tab === "board" && !content.contains(document.activeElement)) renderBoardTab();
         }
       } catch (error) {
-        if (!disposed && version === boardVersion && context === contextVersion) { errors.board = error; if (!cache.board && state.open && state.tab === "board") renderBoardTab(); }
+        if (!disposed && version === boardVersion && context === contextVersion) { errors.board = error; renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab(); }
       } finally { if (version === boardVersion) boardLoading = false; }
     }
     function scheduleBoardPoll() {
@@ -1405,6 +1613,7 @@
       boardTimer = later(async () => { await pollBoard(); if (!disposed) scheduleBoardPoll(); }, 3500);
     }
     async function updateBoard(element, action, index) {
+      if (boardMismatch() || errors.board?.code === "board_thread_mismatch") { toast(tr("会话未匹配，请刷新连接", "Session mismatch; refresh the connection"), true); return; }
       const projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", version = contextVersion;
       await busy(`board-update:${threadId || "project"}`, element, async () => {
         if (action === "clear") await request("board:clear", { projectRoot, threadId: threadId || undefined, strictThreadMatch: true });
@@ -1429,14 +1638,28 @@
       const artifact = boardData().artifacts[index];
       if (!artifact) return;
       const path = typeof artifact === "string" ? artifact : artifact.path || artifact.id || artifact.name;
-      const projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", version = contextVersion;
-      await busy(`artifact:${path}`, element, async () => {
-        const data = await request("board:readArtifact", { projectRoot, threadId: threadId || undefined, strictThreadMatch: true, path, id: artifact.id });
-        if (disposed || version !== contextVersion || threadId !== state.threadId) return;
-        state.artifact = { name: data.name || String(path).split(/[\\/]/).pop(), content: data.content || data.markdown || data.text || "" };
+      const projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", version = contextVersion, selection = ++artifactVersion;
+      await busy(`artifact:${selection}`, element, async () => {
+        let data;
+        try { data = await request("board:openArtifact", { projectRoot, threadId, path }); }
+        catch (error) {
+          if (!disposed && version === contextVersion && threadId === state.threadId && selection === artifactVersion) throw error;
+          return;
+        }
+        if (disposed || version !== contextVersion || threadId !== state.threadId || selection !== artifactVersion) return;
+        if (data.kind !== "markdown") { toast(tr("已在 Finder 中显示", "Shown in Finder")); return; }
+        state.artifact = { path, name: data.name || String(path).split(/[\\/]/).pop(), content: data.content || "" };
         if (state.tab !== "board") switchTab("board");
         setOpen(true, false); renderBoardTab();
         content.querySelector(".hub-artifact-preview")?.scrollIntoView({ block: "nearest" });
+      });
+    }
+    async function revealArtifact(element, operation = "reveal") {
+      const path = state.artifact?.path;
+      if (!path) return;
+      await busy(`artifact:${path}`, element, async () => {
+        await request("board:openArtifact", { projectRoot: state.projectRoot, threadId: state.threadId, path, operation });
+        toast(tr("已在 Finder 中显示", "Shown in Finder"));
       });
     }
 
@@ -1445,28 +1668,30 @@
       const orchestrator = data.orchestratorMode || data.orchestrator?.mode || (typeof data.orchestrator === "string" ? data.orchestrator : "") || data.mode || "off";
       return {
         orchestratorMode: /argon/i.test(orchestrator) ? "argon" : /carbon/i.test(orchestrator) ? "carbon" : "off",
-        swarmEnabled: (data.swarmEnabled ?? data.swarm?.enabled ?? (typeof data.swarm === "boolean" ? data.swarm : false)) === true,
-        maxConcurrency: Math.max(1, Math.min(20, Number(data.maxConcurrency ?? data.swarm?.maxConcurrency ?? data.maxParallel ?? 5) || 5)),
+        swarmMode: ["auto", "on", "off"].includes(data.swarmMode) ? data.swarmMode : data.swarmEnabled === true ? "on" : "auto",
+        maxParallelAgents: Math.max(1, Math.min(20, Number(data.maxParallelAgents ?? data.maxConcurrency ?? 6) || 6)),
+        strictCommanderOnly: typeof data.strictCommanderOnly === "boolean" ? data.strictCommanderOnly : /carbon|argon/i.test(orchestrator) || data.swarmMode === "on",
         autoWorktreeIsolation: (data.autoWorktreeIsolation ?? data.worktreeIsolation ?? data.swarm?.worktreeIsolation ?? true) !== false,
       };
     }
     function renderCommander() {
       if (!cache.orchestration) return errors.orchestration ? inlineError(errors.orchestration) : loading();
-      const data = orchestrationValues();
-      const description = data.orchestratorMode === "carbon" ? tr("极速敏锐总控主帅。主会话负责排版、决策、派单与验收，执行交给子代理；全体无法解决时由主帅兜底。", "A fast commander for decisions, delegation, and acceptance. Agents execute; the commander handles the final fallback.") : data.orchestratorMode === "argon" ? tr("深谋推演总控主帅。面向复杂跨模块架构，持续核对依赖、不变量与需求覆盖。", "A deliberate commander for complex architecture, dependencies, invariants, and requirement coverage.") : tr("按当前宿主的常规协作方式工作。", "Use the current agent's regular collaboration mode.");
-      return `<section class="hub-card hub-commander"><div class="hub-commander-title">${esc(tr("主帅总控模式", "Master commander"))}</div><p class="hub-description">Orchestrator · ${esc(tr("决策、派单与验收", "Decide, delegate, verify"))}</p><label class="hub-field">Orchestrator<select class="hub-select" name="orchestration-mode">${[["off", tr("关闭（常规模式）", "Off · Regular mode")], ["carbon", "Orchestrator (Carbon) [New]"], ["argon", "Orchestrator (Argon) [New]"]].map(([value, label]) => `<option value="${value}" ${data.orchestratorMode === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><div class="hub-commander-note">${esc(description)}</div><div class="hub-control-row"><div class="hub-grow"><strong>/swarm ${esc(tr("蜂群并发模式", "Swarm mode"))}</strong><small>${esc(data.swarmEnabled ? tr("全火力蜂群开启", "Full swarm enabled") : tr("按需并发", "Parallelize as needed"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-swarm" aria-label="/swarm 蜂群并发模式" aria-checked="${data.swarmEnabled}"><span></span></button></div><div class="hub-control-row"><div class="hub-grow"><strong>${esc(tr("最大并发路数", "Maximum concurrency"))}</strong><small>${esc(tr("1–20 路，按任务负载调整", "1–20 concurrent agents"))}</small></div><div class="hub-range"><input type="range" min="1" max="20" name="orchestration-concurrency-range" value="${data.maxConcurrency}" aria-label="${esc(tr("最大并发路数", "Maximum concurrency"))}"><input class="hub-input" type="number" min="1" max="20" name="orchestration-concurrency" value="${data.maxConcurrency}" aria-label="${esc(tr("并发数量", "Concurrency"))}"></div></div><div class="hub-control-row"><div class="hub-grow"><strong>${esc(tr("工作树自动隔离", "Automatic worktree isolation"))}</strong><small>${esc(tr("让并行任务拥有各自的工作副本", "Give parallel tasks their own working copy"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-worktree-isolation" aria-label="${esc(tr("工作树自动隔离", "Automatic worktree isolation"))}" aria-checked="${data.autoWorktreeIsolation}"><span></span></button></div><div class="hub-editor-actions">${button("save-orchestration", tr("保存设置", "Save settings"), { primary: true, small: true })}${button("sync-orchestration", tr("同步军规到五宿主", "Sync rules to all agents"), { small: true, icon: "refresh" })}</div></section>`;
+      const legacy = orchestrationValues();
+      const legacyState = cache.orchestration?.legacyStatus?.state || "unknown";
+      const active = legacy.orchestratorMode !== "off" || legacy.swarmMode === "on" || legacyState !== "clear";
+      return `<section class="hub-card hub-commander"><div class="hub-commander-title">${esc(tr("协作策略", "Collaboration policy"))}</div><p class="hub-description">${esc(tr("统一使用下方角色路由：按任务分配，独立工作可并行；极小修改可由主会话处理，子代理连续两次未解决时由主会话接管。", "Use the role routes below; parallelize independent work. The main agent may make tiny changes or take over after two unsuccessful attempts."))}</p><p class="hub-hint">${esc(tr("全局角色是默认值，项目可单独覆盖；实际采用情况取决于宿主加载的规则。角色卡片可修改模型和思考强度。", "Global role routes are defaults; projects may override them. The host decides which rules it loads."))}</p>${active ? `<p class="hub-error" role="alert">${esc(legacyState === "unknown" ? tr("无法确认旧编排提示是否残留；可检查并清理托管区块。", "Legacy guidance status is unknown; check managed blocks.") : tr(`检测到旧总控/蜂群提示（${legacy.orchestratorMode} / ${legacy.swarmMode}），可能与现有协作规则重复或冲突。`, `Legacy commander/swarm guidance (${legacy.orchestratorMode} / ${legacy.swarmMode}) may conflict with your current policy.`))}</p>${button("disable-legacy-orchestration", tr("关闭旧编排提示", "Disable legacy guidance"), { small: true })}` : `<p class="hub-hint">${esc(tr("未发现旧 Carbon / Argon 或蜂群托管提示；不需要再开一套。", "Legacy Carbon, Argon and swarm guidance are off."))}</p>`}</section>`;
     }
-    async function saveOrchestration(element, sync = false) {
-      const version = contextVersion, projectRoot = state.projectRoot, patch = orchestrationValues();
+    async function disableLegacyOrchestration(element) {
+      const version = contextVersion, projectRoot = state.projectRoot;
       await busy("orchestration-save", element, async () => {
-        await request("subagents:orchestration:update", { ...patch, projectRoot, syncToHosts: sync, sync });
+        const result = await hubRpc("subagents:orchestration:update", { orchestratorMode: "off", swarmMode: "off", strictCommanderOnly: false, projectRoot });
         if (disposed || version !== contextVersion) return;
         cache.orchestration = await request("subagents:orchestration:get", { projectRoot });
         if (disposed || version !== contextVersion) return;
-        state.orchestrationDraft = null;
-        if (state.tab === "subagents") renderSubagents();
-        invalidateSlashCache();
-        toast(sync ? tr("总控军规已同步到五宿主", "Commander rules synchronized") : tr("总控设置已保存", "Commander settings saved"));
+        renderSubagents();
+        const failed = (result?.hostResults || []).filter(item => !item.ok);
+        if (result?.ok === false || failed.length) throw new Error(tr(`已关闭旧配置，${failed.length || "部分"} 个规则文件清理失败。`, `Legacy setting disabled, but ${failed.length || "some"} rule files could not be cleaned.`));
+        toast(tr("已关闭旧编排提示；角色路由保持不变。", "Legacy guidance disabled; role routes unchanged."));
       });
     }
     // These keys mirror hub-host-settings.cjs; metadata and raw files are never written.
@@ -1529,7 +1754,47 @@
       const allowed = Object.prototype.hasOwnProperty.call(nativeSettingKeys, state.settingsHost) ? nativeSettingKeys[state.settingsHost] : [];
       return Array.isArray(entry.editableKeys) ? allowed.filter((key) => entry.editableKeys.includes(key)) : allowed;
     }
+    let t3SettingsView = { loading: false, value: null, error: "", environmentId: null };
+    async function loadT3Settings() {
+      const generation = ++settingsVersion, version = contextVersion;
+      const current = () => !disposed && state.settingsHost === "t3" && version === contextVersion && generation === settingsVersion;
+      t3SettingsView = { loading: true, value: null, error: "", environmentId: null };
+      if (state.open && state.tab === "settings") renderSettings();
+      try {
+        const env = (await request("settings:get"))?.t3EnvironmentId;
+        if (!current()) return;
+        if (!env || typeof window.__t3HudRemoteRpc !== "function") throw new Error(tr("无法确认本机 T3 环境连接", "Local T3 environment connection unavailable"));
+        const response = await window.__t3HudRemoteRpc(env, "server.getConfig", {});
+        if (!current()) return;
+        const value = response?.value?.settings?.promptSuggestionsEnabled;
+        if (!response?.ok || typeof value !== "boolean") throw new Error(tr("未连接或当前版本不支持此设置", "Disconnected or setting unsupported"));
+        t3SettingsView = { loading: false, value, error: "", environmentId: env };
+      } catch (e) { if (current()) t3SettingsView = { loading: false, value: null, error: errorText(e), environmentId: null }; }
+      if (current() && state.open && state.tab === "settings") renderSettings();
+    }
+    async function toggleT3PromptSuggestions(element) {
+      const previous = t3SettingsView.value, env = t3SettingsView.environmentId, version = contextVersion;
+      if (typeof previous !== "boolean" || !env || typeof window.__t3HudRemoteRpc !== "function") return;
+      await busy("t3-prompt-suggestions", element, async () => {
+        const response = await window.__t3HudRemoteRpc(env, "server.updateSettings", { patch: { promptSuggestionsEnabled: !previous } });
+        if (disposed || state.settingsHost !== "t3" || version !== contextVersion) return;
+        if (!response?.ok) throw new Error(tr("T3 设置未能保存", "T3 setting could not be saved"));
+        const readback = await window.__t3HudRemoteRpc(env, "server.getConfig", {});
+        if (disposed || state.settingsHost !== "t3" || version !== contextVersion) return;
+        const actual = readback?.value?.settings?.promptSuggestionsEnabled;
+        if (!readback?.ok || actual !== !previous) { t3SettingsView = { loading: false, value: null, environmentId: null, error: tr("保存后无法确认，请重新读取。", "Could not confirm after saving; reload.") }; renderSettings(); throw new Error(t3SettingsView.error); }
+        t3SettingsView = { loading: false, value: actual, error: "", environmentId: env };
+        renderSettings();
+        toast(tr("T3 设置已保存并读回确认", "T3 setting saved and verified"));
+      });
+    }
     function renderSettings() {
+      if (state.settingsHost === "t3") {
+        const tabs = [...agentHosts, { id: "t3", label: "T3" }].map(host => `<button type="button" class="hub-pill ${host.id === "t3" ? "is-active" : ""}" role="tab" data-action="settings-host" data-agent="${esc(host.id)}" aria-selected="${host.id === "t3"}">${esc(host.label)}</button>`).join("");
+        const body = t3SettingsView.loading ? loading() : t3SettingsView.error ? `<p class="hub-error" role="alert">${esc(t3SettingsView.error)}</p>` : `<div class="hub-control-row"><div class="hub-grow"><strong>${esc(tr("下一条提示建议", "Next prompt suggestions"))}</strong><small>${esc(tr("显示后续提问建议；已打开的 Claude 会话可能需要新会话。", "Show follow-up suggestions; open Claude sessions may need a new session."))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-t3-prompt-suggestions" aria-label="${esc(tr("下一条提示建议", "Next prompt suggestions"))}" aria-checked="${t3SettingsView.value === true}" ${typeof t3SettingsView.value !== "boolean" ? "disabled" : ""}><span></span></button></div>`;
+        content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("本机 T3 设置", "Local T3 settings"))}</span></div><p class="hub-description">${esc(tr("通过当前已连接的 T3 修改，并在保存后重新读取确认。", "Updated through the connected T3 and verified by reading it back."))}</p><div class="hub-agent-filters hub-native-hosts" role="tablist">${tabs}</div>${button("open-project-agents", tr("项目 / 全局 AGENTS 规则", "Project / global AGENTS rules"), { small: true })}<section class="hub-native-settings">${body}<div class="hub-editor-actions">${button("reload-native-settings", tr("重新读取", "Reload"), { small: true, icon: "refresh" })}</div></section>`;
+        return;
+      }
       const entry = settingsValues(), keys = editableSettingKeys(entry);
       const host = agentHosts.find((host) => host.id === state.settingsHost);
       const labels = { model: tr("模型", "Model"), defaultModel: tr("默认模型", "Default model"), defaultProvider: tr("默认提供商", "Default provider"), model_reasoning_effort: tr("思考强度", "Reasoning effort"), approval_policy: tr("审批策略", "Approval policy"), sandbox_mode: tr("沙箱模式", "Sandbox mode"), permissionMode: tr("权限模式", "Permission mode"), reasoningEffort: tr("思考强度", "Reasoning effort"), effort: tr("思考强度", "Effort"), defaultEffort: tr("默认思考强度", "Default effort"), thinkingLevel: tr("思考档位", "Thinking level") };
@@ -1543,12 +1808,13 @@
         // that LF ourselves so even values beginning with a newline survive.
         return `<div class="hub-field hub-native-field"><div class="hub-native-field-heading"><label for="${esc(id)}">${esc(labels[key] || key)}</label><button type="button" class="hub-native-clear" data-action="clear-native-setting" data-host-field-clear="${esc(key)}" aria-label="${esc(tr(`清空${labels[key] || key}并恢复默认`, `Clear ${labels[key] || key} and use the default`))}" ${saved == null && !settingText(value) ? "hidden" : ""} ${cleared ? "disabled" : ""}>${esc(tr("清空 / 恢复默认", "Clear / default"))}</button></div><code class="hub-native-key" id="${esc(id)}-key">${esc(key)}</code><textarea class="hub-input" id="${esc(id)}" name="native-setting" data-settings-key="${esc(key)}" rows="${nativeSettingRows(value)}" aria-describedby="${esc(id)}-key ${saved === "" && !cleared ? `${esc(id)}-empty ` : ""}${esc(id)}-hint" placeholder="${esc(nativeSettingPlaceholder(key, saved))}" spellcheck="false" autocomplete="off">\n${esc(settingInputText(value))}</textarea><span class="hub-native-empty" id="${esc(id)}-empty" ${saved !== "" || cleared ? "hidden" : ""}>${esc(tr('当前显式为空 ""', 'Explicitly set to ""'))}</span><small class="hub-hint" id="${esc(id)}-hint" aria-live="polite">${esc(nativeSettingHint(key, saved))}</small></div>`;
       }).join("");
-      const native = !cache.settings ? loading() : `<section class="hub-native-settings"><div class="hub-row"><strong>${esc(host?.label || state.settingsHost)}</strong><span class="hub-badge">${esc(warning ? tr("只读 · 配置异常", "Read-only · configuration error") : !keys.length ? tr("未托管配置", "No managed configuration") : entry.exists === false ? tr("文件不存在 · 保存时创建", "Missing file · created on save") : tr("已读取", "Loaded"))}</span></div>${path ? `<div class="hub-settings-host-description" title="${esc(path)}">${esc(path)}</div>` : ""}${warning ? `<div class="hub-error" role="alert"><div><strong>${esc(tr("只读保护：配置暂不可写", "Read-only: configuration cannot be edited"))}</strong><span>${esc(warning)}</span></div></div>` : keys.length ? `<div class="hub-native-fields">${fields}</div>` : empty(tr("此宿主暂无可托管的原生配置", "No managed native configuration for this agent"), tr("当前接口不支持写入此宿主的原生设置。可用规则文件单独显示在下方。", "The current service cannot write this agent's settings. Available rules are shown separately below."), "info")}<div class="hub-editor-actions">${keys.length ? button("save-native-settings", tr("保存配置", "Save configuration"), { primary: true, small: true, icon: "save", disabled: pending.has("native-settings") }) : ""}${button("reload-native-settings", tr("重新读取", "Reload"), { small: true, icon: "refresh" })}</div></section>`;
+      const native = !cache.settings ? loading() : `<section class="hub-native-settings"><div class="hub-row"><strong>${esc(host?.label || state.settingsHost)}</strong><span class="hub-badge">${esc(warning ? tr("只读 · 配置异常", "Read-only · configuration error") : !keys.length ? tr("原生设置未接入", "Native settings unavailable") : entry.exists === false ? tr("文件不存在 · 保存时创建", "Missing file · created on save") : tr("已读取", "Loaded"))}</span></div>${path ? `<div class="hub-settings-host-description" title="${esc(path)}">${esc(path)}</div>` : ""}${warning ? `<div class="hub-error" role="alert"><div><strong>${esc(tr("只读保护：配置暂不可写", "Read-only: configuration cannot be edited"))}</strong><span>${esc(warning)}</span></div></div>` : keys.length ? `<div class="hub-native-fields">${fields}</div>` : empty(tr("原生设置暂不可编辑", "Native settings unavailable"), tr(state.settingsHost === "antigravity" ? "T3 可以启动 AGY ACP；其原生设置来源和当前会话加载状态尚未验证。下方规则文件存在不代表已加载。" : "当前接口不支持写入此宿主的原生设置。", "T3 can start AGY ACP; the native settings source and active rules are not verified."), "info")}${state.settingsHost === "antigravity" ? (entry?.ruleCandidates || []).map(item => `<p class="hub-hint">${esc(item.path)} · ${esc(item.exists ? tr("文件存在 · 是否加载未知", "File exists · loading unknown") : tr("不存在", "Missing"))}</p>`).join("") : ""}<div class="hub-editor-actions">${keys.length ? button("save-native-settings", tr("保存配置", "Save configuration"), { primary: true, small: true, icon: "save", disabled: pending.has("native-settings") }) : ""}${button("reload-native-settings", tr("重新读取", "Reload"), { small: true, icon: "refresh" })}</div></section>`;
       const ruleInfo = cache.settingsRule;
-      content.innerHTML = `<div class="hub-agent-filters" aria-label="宿主状态">${agentHosts.map((h) => `<span class="hub-badge">${esc(h.label)} · ${esc(state.context?.activeProvider === h.id || state.context?.activeCli === h.id ? tr("当前", "Active") : tr("状态未知", "Unknown"))}</span>`).join("")}</div><div class="hub-section-heading"><span>${esc(tr("原生设置", "Native settings"))}</span></div><p class="hub-description">${esc(tr("分别管理每位搭档的原生配置，只保存你修改的字段。", "Manage each agent's native settings and save only the fields you change."))}</p><div class="hub-agent-filters hub-native-hosts" role="tablist" aria-label="${esc(tr("选择宿主", "Choose agent"))}">${agentHosts.map((host) => `<button type="button" class="hub-pill ${state.settingsHost === host.id ? "is-active" : ""}" role="tab" data-action="settings-host" data-agent="${esc(host.id)}" aria-selected="${state.settingsHost === host.id}">${agentMark(host.id)}${esc(host.label)}</button>`).join("")}</div>${errors.settings ? inlineError(errors.settings, "reload-native-settings") : native}<div class="hub-section-heading" style="margin-top:28px"><span>${esc(tr("宿主规则 · 全局", "Agent rules · Global"))}</span></div>${ruleInfo?.path ? `<p class="hub-hint">${esc(ruleInfo.path)}</p>` : ""}${errors.settingsRule ? inlineError(errors.settingsRule, "reload-native-settings") : !ruleInfo ? `<p class="hub-hint">${esc(tr("当前宿主暂无可用的托管规则文件。", "No managed rules file is available for this agent."))}</p>` : `<label class="hub-field">${esc(tr("对话与协作指令", "Conversation and collaboration instructions"))}<textarea class="hub-editor" name="native-rule" spellcheck="false" aria-label="${esc(tr("宿主规则", "Agent rules"))}">${esc(state.settingsRule)}</textarea></label>${button("save-native-rule", tr("保存规则", "Save rules"), { primary: true, small: true, icon: "save", disabled: pending.has("native-rule") })}`}`;
+      content.innerHTML = `<div class="hub-agent-filters" aria-label="宿主状态">${agentHosts.map((h) => `<span class="hub-badge">${esc(h.label)} · ${esc(state.context?.activeProvider === h.id || state.context?.activeCli === h.id ? tr("当前", "Active") : tr("状态未知", "Unknown"))}</span>`).join("")}</div><div class="hub-section-heading"><span>${esc(tr("原生设置", "Native settings"))}</span></div><p class="hub-description">${esc(tr("分别管理每位搭档的原生配置，只保存你修改的字段。", "Manage each agent's native settings and save only the fields you change."))}</p><div class="hub-agent-filters hub-native-hosts" role="tablist" aria-label="${esc(tr("选择宿主", "Choose agent"))}">${[...agentHosts, { id: "t3", label: "T3" }].map((host) => `<button type="button" class="hub-pill ${state.settingsHost === host.id ? "is-active" : ""}" role="tab" data-action="settings-host" data-agent="${esc(host.id)}" aria-selected="${state.settingsHost === host.id}">${agentMark(host.id)}${esc(host.label)}</button>`).join("")}</div>${button("open-project-agents", tr("项目 / 全局 AGENTS 规则", "Project / global AGENTS rules"), { small: true })}${errors.settings ? inlineError(errors.settings, "reload-native-settings") : native}<div class="hub-section-heading" style="margin-top:28px"><span>${esc(tr("宿主规则 · 全局", "Agent rules · Global"))}</span></div>${ruleInfo?.path ? `<p class="hub-hint">${esc(ruleInfo.path)}</p>` : ""}${errors.settingsRule ? inlineError(errors.settingsRule, "reload-native-settings") : !ruleInfo ? `<p class="hub-hint">${esc(tr("当前宿主暂无可用的托管规则文件。", "No managed rules file is available for this agent."))}</p>` : `<label class="hub-field">${esc(tr("对话与协作指令", "Conversation and collaboration instructions"))}<textarea class="hub-editor" name="native-rule" spellcheck="false" aria-label="${esc(tr("宿主规则", "Agent rules"))}">${esc(state.settingsRule)}</textarea></label>${button("save-native-rule", tr("保存规则", "Save rules"), { primary: true, small: true, icon: "save", disabled: pending.has("native-rule") })}`}`;
     }
     async function loadSettings(force = false, resetDrafts = force) {
       const host = state.settingsHost, version = contextVersion;
+      if (host === "t3") return loadT3Settings();
       if (cache.settings && !force) return;
       const generation = ++settingsVersion;
       const ruleSupported = ["codex", "antigravity", "muse", "pi"].includes(host);
@@ -1575,7 +1841,7 @@
           if (rule) {
             if (!cache.settingsRule || errors.settingsRule) throw new Error(tr("当前宿主规则不可写，请重新读取。", "Reload an available rules file before saving."));
             const saved = state.settingsRule;
-            await request("settings:saveRule", { host, content: saved });
+            await request("settings:saveRule", { host, content: saved, expectedContent: cache.settingsRule.content, expectedTarget: cache.settingsRule.targetPath });
             if (!isCurrent()) return;
             state.settingsRuleDirty = state.settingsRule !== saved;
           } else {
@@ -1724,9 +1990,7 @@
     function scopedSlashItems(data, projectRoot) {
       if (data.projectRoot != null && data.projectRoot !== projectRoot) return [];
       const rows = [...items(data, ["skills"]).map((item) => ({ ...item, type: "skill" })), ...items(data, ["subagents"]).map((item) => ({ ...item, type: "subagent" })),
-        { id: "swarm", name: "/swarm 蜂群并发", description: "按任务拆分并发执行，汇总结果与验证证据。", type: "mode", trigger: "/swarm " },
-        { id: "orchestrator-carbon", name: "Orchestrator (Carbon)", description: "极速敏锐总控主帅 · 决策、派单与验收", type: "mode", trigger: "使用 Orchestrator (Carbon) 总控模式：" },
-        { id: "orchestrator-argon", name: "Orchestrator (Argon)", description: "深谋推演总控主帅 · 复杂架构与需求防漏", type: "mode", trigger: "使用 Orchestrator (Argon) 总控模式：" },
+        { id: "collaboration", name: "协作策略", description: "按当前角色路由分工，独立任务按需并行。", type: "mode", trigger: "按当前角色路由分工；独立任务按需并行。" },
         { id: "plan", name: "/plan 规划模式", description: "先厘清目标、依赖与验收标准，再开始执行。", type: "mode", trigger: "/plan " }];
       const seen = new Set();
       return rows.filter((item) => {
@@ -1978,7 +2242,7 @@
       const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
       for (const path of paths) {
         // Draft and project-only routes must not inherit another thread.
-        if (/(?:^|\/)(?:draft)(?:\/|[?#]|$)/i.test(path) || /(?:^|\/)new\/?(?:[?#]|$)/i.test(path) ||
+        if (/(?:^|\/)(?:draft|new)(?:\/|[?#]|$)/i.test(path) ||
             new RegExp(`^\\/?(?:projects?|workspaces?)\\/${uuid}\\/?(?:[?#]|$)`, "i").test(path) ||
             new RegExp(`^\\/?${uuid}\\/?(?:[?#]|$)`, "i").test(path)) return "__NEW__";
         const match = path.match(/(?:^|\/)(?:threads|_chat)\/([^/?#]+)/i);
@@ -1992,9 +2256,9 @@
             return match[1];
           }
         }
-        // Native routes use /<project UUID>/<thread UUID>.
-        const native = path.match(new RegExp(`^\\/?${uuid}\\/(${uuid})(?:[/?#]|$)`, "i"));
-        if (native) return native[1];
+        // Native routes use /<environment UUID>/<thread UUID>.
+        const native = path.match(new RegExp(`^\\/?${uuid}\\/([^/?#]+)(?:[/?#]|$)`, "i"));
+        if (native) { try { return decodeURIComponent(native[1]); } catch { return "__NEW__"; } }
       }
       for (const path of paths) {
         const match = path.match(/(?:^|\/)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i);
@@ -2006,6 +2270,7 @@
       const threadId = currentThreadId();
       if (!force && threadId === state.threadId) return false;
       state.threadId = threadId;
+      artifactVersion++;
       cache.board = null; state.artifact = null; state.boardDraft = "";
       delete errors.board;
       boardVersion++; boardLoading = false; boardSignature = "";
@@ -2017,6 +2282,7 @@
       const route = routeKey(), changed = route !== lastRoute;
       if (changed) { lastRoute = route; state.context = null; }
       const threadChanged = syncThread(changed);
+      if (changed && state.open && ["agents", "subagents"].includes(state.tab)) renderTab();
       if (changed) refreshContext();
       if (threadChanged) pollBoard();
     }
@@ -2116,7 +2382,7 @@
       if (tab === "skills") await Promise.all([load("skills", "skills:list", { projectRoot }), load("mcp", "mcp:list", { projectRoot })]);
       if (tab === "subagents") await Promise.all([load("subagents", "subagents:list", { projectRoot }), load("orchestration", "subagents:orchestration:get", { projectRoot }), load("hooks", "hooks:list", { projectRoot })]);
       if (tab === "mcp") await load("mcp", "mcp:list", { projectRoot });
-      if (tab === "agents") await primeCatalogs();
+      if (tab === "agents") await load("agents", "agentsMd:get", { projectRoot });
       if (tab === "settings") await loadSettings(force);
       if (tab === "memory") {
         await Promise.all([load("overview", "memory:overview", { projectRoot }), load("worktree", "memory:worktreeInfo", { projectRoot }), load("dream", "memory:dream:get", {}), load("health", "memory:health", { projectRoot }), refreshEmbed(false, force)]);
@@ -2158,8 +2424,8 @@
         const prevVs = cache.embed?.vectorStats;
         const prevMemory = [cache.embed?.activeMb, cache.embed?.ceilingMb, cache.embed?.cacheMb, cache.embed?.rssMb, prevVs?.activeMb, prevVs?.ceilingMb, prevVs?.cacheMb].join("/");
         const nextMemory = [data.activeMb, data.ceilingMb, data.cacheMb, data.rssMb, data.vectorStats?.activeMb, data.vectorStats?.ceilingMb, data.vectorStats?.cacheMb].join("/");
-        const prevSig = prevVs ? `${prevVs.syncedVectors}/${prevVs.totalMemories}:${prevVs.reindexing}` : "";
-        const nextSig = data.vectorStats ? `${data.vectorStats.syncedVectors}/${data.vectorStats.totalMemories}:${data.vectorStats.reindexing}` : "";
+        const prevSig = prevVs ? `${prevVs.syncedVectors}/${prevVs.totalMemories}:${prevVs.reindexing}` : cache.embed?.vectorStatsError || "";
+        const nextSig = data.vectorStats ? `${data.vectorStats.syncedVectors}/${data.vectorStats.totalMemories}:${data.vectorStats.reindexing}` : data.vectorStatsError || "";
         const wasWaiting = state.embedReadyDeadline > 0;
         cache.embed = data;
         if (!state.embedInitialized) { state.useMirror = !!data.useMirror; state.embedInitialized = true; }
@@ -2170,6 +2436,7 @@
         if ((ready === true || keyword) && !data.vectorStats?.reindexing) state.embedReadyDeadline = 0;
         delete errors.embed;
         if (render && state.tab === "memory") {
+          if (prevSig !== nextSig && !root.querySelector("#t3-hub-dream")?.contains(document.activeElement)) renderDream();
           if (!!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
           else renderDownloadProgress();
         }
@@ -2217,7 +2484,7 @@
         renderTab();
         if (state.context) { loadTab(); primeCatalogs(); }
         else if (state.contextError) content.innerHTML = inlineError(state.contextError);
-        if (focus) later(() => root.querySelector(`[data-tab="${state.tab}"]`)?.focus({ preventScroll: true }), 50);
+        if (focus) later(() => (root.querySelector(`[data-tab="${state.tab}"]`) || content)?.focus({ preventScroll: true }), 50);
       } else {
         cancelTimer(embedTimer);
         if (focus && focusReturn?.isConnected) focusReturn.focus({ preventScroll: true });
@@ -2256,7 +2523,12 @@
       if (!handle) return;
       const saved = Number(storageGet("t3-hub-handle-y"));
       const y = saved > 0 ? saved * innerHeight : innerHeight * .42;
-      handle.style.top = `${Math.max(70, Math.min(innerHeight - 70, y))}px`;
+      const top = Math.max(70, Math.min(innerHeight - 70, y));
+      handle.style.top = `${top}px`;
+      placePlanHandle(top);
+    }
+    function placePlanHandle(top) {
+      if (planHandle) planHandle.style.top = `${top + 54 <= innerHeight - 36 ? top + 54 : Math.max(8, top - 82)}px`;
     }
     function onDragStart(event) {
       if (event.button !== 0) return;
@@ -2267,7 +2539,7 @@
       if (!drag || drag.pointerId !== event.pointerId) return;
       const delta = event.clientY - drag.startY;
       if (Math.abs(delta) > 4) drag.moved = true;
-      if (drag.moved) { event.preventDefault(); handle.style.top = `${Math.max(70, Math.min(innerHeight - 70, drag.top + delta))}px`; }
+      if (drag.moved) { event.preventDefault(); const top = Math.max(70, Math.min(innerHeight - 70, drag.top + delta)); handle.style.top = `${top}px`; placePlanHandle(top); }
     }
     function onDragEnd(event) {
       if (!drag || drag.pointerId !== event.pointerId) return;
@@ -2291,10 +2563,12 @@
       else if (action === "open-picker") { if (slashSession) closeSlash(); else openPicker(); }
       else if (action === "slash-tab") { if (slashSession) { slashSession.tab = target.dataset.tab; slashSession.active = 0; filterSlashRows(); renderSlash(); } }
       else if (action === "library-view") { state.libraryView = target.dataset.view; renderTab(); loadTab(); }
+      else if (action === "mcp-filter") { state.mcpFilter = target.dataset.filter; renderMcpList(); }
       else if (action === "hooks-fold") { state.hooksOpen = !state.hooksOpen; }
       else if (action === "resource-filter") { resourceFilter(target.dataset.domain).agent = target.dataset.agent; renderTab(); }
       else if (action === "resource-toggle") toggleResource(target);
       else if (action === "resource-toggle-all") toggleResource(target, true);
+      else if (action === "save-mcp-mode") saveMcpMode(target);
       else if (action === "toggle-board") {
         if (liveBoard.classList.contains("is-space-limited")) { switchTab("board"); setOpen(true); }
         else { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-board-expanded-v2", state.boardExpanded); renderLiveBoard(); }
@@ -2304,7 +2578,9 @@
       else if (action === "board-step") updateBoard(target, "toggle", Number(target.dataset.index));
       else if (action === "board-clear") updateBoard(target, "clear");
       else if (action === "read-artifact") readArtifact(Number(target.dataset.index), target);
-      else if (action === "close-artifact") { state.artifact = null; renderBoardTab(); }
+      else if (action === "reveal-artifact") revealArtifact(target);
+      else if (action === "artifact-folder") revealArtifact(target, "folder");
+      else if (action === "close-artifact") { artifactVersion++; state.artifact = null; renderBoardTab(); }
       else if (action === "memory-scope-filter") setMemoryScope(target.dataset.scope);
       else if (action === "open-memory-folder") busy("memory-folder", target, () => request("memory:openFolder", memoryPayload()));
       else if (action === "promote-memory") promoteMemory(id, target);
@@ -2313,9 +2589,8 @@
       else if (action === "run-dream") runDream();
       else if (action === "import-host-memories") importHostMemories(target);
       else if (action === "trim-embed") trimEmbedCache(target);
-      else if (action === "toggle-swarm") { const values = orchestrationValues(); state.orchestrationDraft = { ...values, swarmEnabled: !values.swarmEnabled }; renderSubagents(); }
-      else if (action === "toggle-worktree-isolation") { const values = orchestrationValues(); state.orchestrationDraft = { ...values, autoWorktreeIsolation: !values.autoWorktreeIsolation }; renderSubagents(); }
-      else if (action === "save-orchestration" || action === "sync-orchestration") saveOrchestration(target, action === "sync-orchestration");
+      else if (action === "disable-legacy-orchestration") disableLegacyOrchestration(target);
+      else if (action === "toggle-t3-prompt-suggestions") toggleT3PromptSuggestions(target);
       else if (action === "settings-host" || action === "matrix-settings") {
         if (state.settingsHost !== target.dataset.agent) {
           state.settingsHost = target.dataset.agent; cache.settings = null; cache.settingsRule = null; settingsVersion++; settingsSelectionVersion++;
@@ -2405,8 +2680,11 @@
       else if (action === "cancel-delete-memory") target.closest("[data-delete-confirm]").hidden = true;
       else if (action === "confirm-delete-memory") deleteMemory(id, target);
       else if (action === "agents-target") { state.agentsTarget = target.dataset.target; renderAgents(); }
+      else if (action === "open-project-agents") { state.agentsTarget = projectDisabled() ? "global" : "project"; switchTab("agents"); }
+      else if (action === "back-to-settings") switchTab("settings");
       else if (action === "save-agents") saveAgents(target);
       else if (action === "inject-soft-route") injectSoftRoute(target);
+      else if (action === "sync-project-rule-reference") syncProjectRuleReference(target);
     }
     function onInput(event) {
       const input = event.target;
@@ -2421,12 +2699,6 @@
         return;
       }
       if (name === "native-rule") { state.settingsRule = input.value; state.settingsRuleDirty = true; return; }
-      if (name === "orchestration-concurrency" || name === "orchestration-concurrency-range") {
-        const maxConcurrency = Math.max(1, Math.min(20, Number(input.value) || 1));
-        state.orchestrationDraft = { ...orchestrationValues(), maxConcurrency };
-        content.querySelectorAll('[name="orchestration-concurrency"],[name="orchestration-concurrency-range"]').forEach((node) => { if (node !== input) node.value = String(maxConcurrency); });
-        return;
-      }
       if (name?.startsWith("subagent-")) {
         const id = input.dataset.subagentId, key = subagentKey(id), field = name.slice(9);
         if (field === "customModel") { if (state.subagentCustom[key]) state.subagentCustom[key].value = input.value; }
@@ -2465,7 +2737,22 @@
       if (name === "dream-time") { saveDream({ dreamTime: input.value }); return; }
       if (name === "dream-catch-up") { saveDream({ catchUpOnWake: input.checked }); return; }
       if (name === "resource-status") { resourceFilter(input.dataset.domain).status = input.value; renderTab(); return; }
-      if (name === "orchestration-mode") { state.orchestrationDraft = { ...orchestrationValues(), orchestratorMode: input.value }; renderSubagents(); return; }
+      if (name === "mcp-mode-scope") {
+        if (!["project", "global"].includes(input.value)) return;
+        const controls = input.closest(".hub-mcp-mode-controls");
+        const modeSelect = controls?.querySelector('[name="mcp-mode"]');
+        const server = mcpServers().find((item) => item.name === input.dataset.name);
+        if (!server || !modeSelect) return;
+        modeSelect.value = mcpModeChoice(server, input.value);
+        const inheritOption = modeSelect.querySelector?.('option[value="inherit"]');
+        if (inheritOption) inheritOption.hidden = input.value !== "project";
+        const hint = controls.querySelector(".hub-mcp-mode-hint");
+        const reason = server.modeConflict
+          ? tr("名称冲突已暂停；可保存“不经 Hub”。启用前请先解决冲突。", "Name conflict paused; you can save “Bypass Hub”. Resolve the conflict before enabling.")
+          : server.launchable === false ? tr("服务缺少可运行入口；可保存“不经 Hub”关闭转发。", "No runnable endpoint; save “Bypass Hub” to turn forwarding off.") : "";
+        if (hint) hint.textContent = mcpModeScopeHint(server, input.value, reason);
+        return;
+      }
       if (name?.startsWith("subagent-")) {
         const id = input.dataset.subagentId, key = subagentKey(id), draft = subagentDraft(id), field = name.slice(9);
         if (!draft || subagentSaves.has(key)) return;
@@ -2526,7 +2813,7 @@
       if (input.name === "board-step-draft" && event.key === "Enter" && !event.isComposing) { event.preventDefault(); updateBoard(input, "add"); return; }
       if (input.getAttribute("role") === "tab" && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        const tabs = tabKeys;
+        const tabs = ["memory", "skills", "subagents", "settings"];
         const index = tabs.indexOf(state.tab);
         const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
         switchTab(tabs[next], true);
@@ -2775,28 +3062,38 @@
     }
     async function saveAgents(element) {
       const draft = agentDraft();
-      if (!draft || (state.agentsTarget === "project" && !state.projectRoot)) return;
+      if (!draft) return;
+      if (state.agentsTarget === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
       const key = agentKey();
       const target = state.agentsTarget;
-      const projectRoot = state.projectRoot;
+      const projectRoot = state.projectRoot, version = contextVersion;
       const value = draft.content;
       await busy(`agents-save:${key}`, element, async () => {
-        const result = await request("agentsMd:save", { target, content: value, projectRoot });
-        if (disposed) return;
+        if (target === "project" && (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot)) return;
+        const result = await hubRpc("agentsMd:save", { target, content: value, expectedContent: draft.saved, projectRoot });
+        if (disposed || (target === "project" && (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot))) return;
+        if (result?.ok === false && !result?.sourceSaved) throw new Error(result.error || tr("规则保存失败", "Could not save rules"));
+        const readback = await request("agentsMd:get", { projectRoot });
+        if (disposed || (target === "project" && (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot))) return;
+        const confirmed = target === "project" ? readback.projectContent : readback.globalContent;
+        if (confirmed !== value) throw new Error(tr("保存后规则已变化，请重新读取并合并修改", "Rules changed after saving; reload and merge your edits"));
         draft.saved = value;
+        if (version === contextVersion && projectRoot === state.projectRoot) cache.agents = readback;
         draft.syncedTargets = result.syncedTargets || result.syncedClis || [];
-        if (key === agentKey() && state.tab === "agents") { updateAgentCounter(); renderSyncBadges(); }
+        if (key === agentKey() && state.tab === "agents") renderAgents();
+        if (result?.ok === false) throw new Error(result.error || tr("规则已保存，但部分宿主同步失败", "Rules saved but some hosts could not be synced"));
         toast(tr("已保存并同步", "Saved and synchronized"));
       });
     }
     async function injectSoftRoute(element) {
-      const projectRoot = state.projectRoot;
-      if (!projectRoot) return;
+      const projectRoot = state.projectRoot, version = contextVersion;
+      if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
       const draft = agentDraft();
       if (draft && draft.content !== draft.saved) { toast(tr("请先保存当前修改，再注入模板", "Save your edits before inserting the template"), true); return; }
       await busy("inject-route", element, async () => {
+        if (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
         const result = await request("agentsMd:injectSoftRoute", { projectRoot });
-        if (disposed) return;
+        if (disposed || !projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
         const key = `project:${projectRoot}`;
         if (typeof result.content === "string") {
           const latest = state.agentDrafts[key];
@@ -2807,6 +3104,18 @@
         toast(tr("记忆库软路由已写入", "Memory routing template inserted"));
       });
     }
+    async function syncProjectRuleReference(element) {
+      const projectRoot = state.projectRoot, version = contextVersion;
+      if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+      await busy("project-rule-reference", element, async () => {
+        if (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
+        await request("agentsMd:syncProjectReference", { projectRoot });
+        if (disposed || !projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
+        if (cache.agents) cache.agents.projectClaudeReference = true;
+        if (state.tab === "agents") renderAgents();
+        toast(tr("已写入 Claude 项目规则引用；当前会话是否加载取决于宿主。", "Claude project reference saved; session loading depends on the host."));
+      });
+    }
 
     const api = {
       options: opts,
@@ -2815,7 +3124,7 @@
       toggle: () => setOpen(!state.open),
       refresh,
       selectTab: (tab) => switchTab(tab),
-      snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
+      snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
       destroy: () => {
         if (disposed) return;
         closeSlash();

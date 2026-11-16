@@ -6,6 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
+const crypto = require("node:crypto");
 
 const HOME_DIR = process.env.HOME || os.homedir();
 const HUB_DIR = process.env.T3_HUB_DIR || path.join(HOME_DIR, ".t3", "hub");
@@ -41,6 +42,42 @@ function listDirsBin(dir) {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => path.join(dir, e.name)); } catch { return []; }
 }
 function skillFileExists(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
+function canonicalProjectRoot(root) {
+  if (typeof root !== "string" || !root || !path.isAbsolute(root)) return null;
+  const absolute = path.resolve(root);
+  try { return fs.realpathSync(absolute); } catch { return absolute; }
+}
+function hasSymlinkComponent(root) {
+  if (typeof root !== "string" || !path.isAbsolute(root)) return true;
+  const absolute = path.resolve(root), parsed = path.parse(absolute);
+  let current = parsed.root;
+  for (const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try { if (fs.lstatSync(current).isSymbolicLink()) return true; }
+    catch (error) { if (error?.code !== "ENOENT") return true; break; }
+  }
+  return false;
+}
+function projectModeKeys(projects, root) {
+  const canonical = canonicalProjectRoot(root);
+  if (!canonical) return [];
+  const aliases = Object.keys(projects || {}).filter((key) => !hasSymlinkComponent(key) && canonicalProjectRoot(key) === canonical).sort();
+  return [...new Set([canonical, ...aliases])];
+}
+function modeFor(modes, name) {
+  if (!modes || typeof modes !== "object") return undefined;
+  if (Object.prototype.hasOwnProperty.call(modes, name)) return modes[name];
+  const matches = Object.keys(modes).filter((key) => normModeKey(key) === normModeKey(name));
+  return matches.length === 1 ? modes[matches[0]] : undefined;
+}
+function normModeKey(name) { return String(name).toLowerCase().replace(/_/g, "-"); }
+function projectModeFor(projects, root, name) {
+  for (const key of projectModeKeys(projects, root)) {
+    const mode = modeFor(projects?.[key], name);
+    if (mode !== undefined) return mode;
+  }
+  return undefined;
+}
 function parseSkillMeta(skillFile) {
   let raw = "";
   try { raw = fs.readFileSync(skillFile, "utf8"); } catch { return { name: "", description: "" }; }
@@ -214,37 +251,47 @@ function discoveredDefs() {
   return byName;
 }
 function resolveProjectRoot() {
-  let cur = path.resolve(process.cwd());
+  let cur = canonicalProjectRoot(process.cwd()) || path.resolve(process.cwd());
   const state = readState();
-  const registered = new Set(Object.keys(state.mcpModes?.projects || {}));
+  const registered = new Set(Object.keys(state.mcpModes?.projects || {}).filter((key) => !hasSymlinkComponent(key)).map(canonicalProjectRoot).filter(Boolean));
   let fallback = cur;
   while (true) {
     try {
       const st = fs.statSync(path.join(cur, ".git"));
-      if (st.isDirectory() || st.isFile()) return cur;
+      if (st.isDirectory() || st.isFile()) return canonicalProjectRoot(cur) || cur;
     } catch {}
-    if (registered.has(cur)) return cur;
+    if (registered.has(canonicalProjectRoot(cur))) return canonicalProjectRoot(cur) || cur;
     const parent = path.dirname(cur);
-    if (parent === cur) return fallback;
+    if (parent === cur) return canonicalProjectRoot(fallback) || fallback;
     cur = parent;
     if (cur === path.parse(cur).root) break;
   }
-  return fallback;
+  return canonicalProjectRoot(fallback) || fallback;
 }
 function enabledServers() {
   const registry = readRegistry();
   const state = readState();
   const projectRoot = resolveProjectRoot();
   const globalModes = state.mcpModes?.global || {};
-  const projModes = state.mcpModes?.projects?.[projectRoot] || {};
+  const projectModes = state.mcpModes?.projects || {};
   const discovered = discoveredDefs();
   const merged = new Map();
   for (const [k, v] of discovered) merged.set(k, v);
   for (const s of registry) { if (s && s.name) merged.set(s.name, s); }
+  const namesByModeKey = new Map();
+  for (const s of merged.values()) {
+    if (!s || !s.name) continue;
+    const key = normModeKey(s.name);
+    if (!namesByModeKey.has(key)) namesByModeKey.set(key, new Set());
+    namesByModeKey.get(key).add(s.name);
+  }
   const out = [];
   for (const s of merged.values()) {
     if (!s || !s.name) continue;
-    const mode = projModes[s.name] || globalModes[s.name] || "off";
+    if (s.modeConflict || (namesByModeKey.get(normModeKey(s.name))?.size || 0) > 1) continue;
+    const projectMode = projectModeFor(projectModes, projectRoot, s.name);
+    const globalMode = modeFor(globalModes, s.name);
+    const mode = projectMode !== undefined ? projectMode : globalMode !== undefined ? globalMode : "off";
     if (mode === "off") continue;
     out.push({ def: s, mode });
   }
@@ -338,8 +385,50 @@ const HUB_LIST_DEF = { name: "hub_list_mcp_tools", description: "List tools from
 const HUB_CALL_DEF = { name: "hub_call_mcp_tool", description: "Invoke a tool on an upstream MCP server.", inputSchema: { type: "object", properties: { server: { type: "string" }, tool: { type: "string" }, arguments: { type: "object" } }, required: ["server", "tool"] } };
 
 const stdioPool = new Map();
-function childKey(def) {
-  return def.name + "|" + (def.command || "") + "|" + JSON.stringify(def.args || []) + "|" + (def.url || "");
+function stableJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(stableJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + stableJson(value[key])).join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+function stdioDefinition(def, projectRoot = resolveProjectRoot(), validate = true) {
+  const root = path.resolve(projectRoot || process.cwd());
+  let cwd = root;
+  if (def.cwd !== undefined && def.cwd !== null && def.cwd !== "") {
+    if (typeof def.cwd !== "string") {
+      if (validate) throw new Error("invalid cwd for " + def.name);
+      cwd = def.cwd;
+    } else {
+      const configured = def.cwd.replace(/^~(?=\/)/, HOME_DIR);
+      cwd = path.resolve(root, configured);
+    }
+  }
+  if (validate) {
+    if (typeof cwd !== "string") throw new Error("invalid cwd for " + def.name);
+    let stat;
+    try { stat = fs.statSync(cwd); } catch { throw new Error("cwd directory does not exist for " + def.name); }
+    if (!stat.isDirectory()) throw new Error("cwd is not a directory for " + def.name);
+    try { cwd = fs.realpathSync(cwd); } catch { throw new Error("cwd directory is unavailable for " + def.name); }
+  } else if (typeof cwd === "string") {
+    try { cwd = fs.realpathSync(cwd); } catch {}
+  }
+  return { ...def, cwd, args: Array.isArray(def.args) ? def.args : [] };
+}
+function definitionFingerprint(def, projectRoot = resolveProjectRoot()) {
+  const effective = def.url ? { ...def } : stdioDefinition(def, projectRoot, false);
+  const payload = {
+    name: effective.name,
+    transport: effective.transport || (effective.url ? "http" : "stdio"),
+    command: effective.command || null,
+    args: Array.isArray(effective.args) ? effective.args : [],
+    url: effective.url || null,
+    env: effective.env && typeof effective.env === "object" ? effective.env : {},
+    headers: effective.headers && typeof effective.headers === "object" ? effective.headers : {},
+    cwd: effective.url ? (effective.cwd || null) : effective.cwd,
+  };
+  const hash = crypto.createHash("sha256").update(stableJson(payload)).digest("hex");
+  return { effective, hash };
 }
 function isWritableUpstream(entry) {
   const proc = entry.proc;
@@ -369,6 +458,26 @@ function killPoolEntry(key, expectedEntry) {
     } catch {}
   }, 100);
   if (killer.unref) killer.unref();
+}
+function retireStdioEntries(name, exceptKey) {
+  for (const [key, entry] of stdioPool) {
+    if (entry.name === name && key !== exceptKey) killPoolEntry(key, entry);
+  }
+}
+function prepareStdioDefinition(def, projectRoot, fingerprint) {
+  try { return { effective: stdioDefinition(fingerprint.effective, projectRoot, true), hash: fingerprint.hash }; }
+  catch (error) {
+    retireStdioEntries(def.name);
+    throw error;
+  }
+}
+function prepareUpstreamDefinition(def, projectRoot) {
+  const fingerprint = definitionFingerprint(def, projectRoot);
+  const key = def.url ? undefined : def.name + "|" + fingerprint.hash;
+  // Apply the current definition before transport selection or a schema-cache
+  // hit. Both can bypass spawnStdioUpstream, but must retire the old process.
+  retireStdioEntries(def.name, key);
+  return def.url ? fingerprint : prepareStdioDefinition(def, projectRoot, fingerprint);
 }
 function scheduleIdle(entry) {
   if (stdioPool.get(entry.key) !== entry || entry.closed) return;
@@ -415,8 +524,11 @@ function withTimeout(p, ms, label, entry, id) {
   });
   return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
-function spawnStdioUpstream(def) {
-  const key = childKey(def);
+function spawnStdioUpstream(def, projectRoot = resolveProjectRoot()) {
+  const { effective, hash } = prepareUpstreamDefinition(def, projectRoot);
+  def = effective;
+  const key = def.name + "|" + hash;
+  retireStdioEntries(def.name, key);
   let entry = stdioPool.get(key);
   if (entry && isWritableUpstream(entry)) return entry;
   if (entry) closePoolEntry(entry, new Error("upstream unavailable"));
@@ -424,12 +536,12 @@ function spawnStdioUpstream(def) {
   if (!cmd) throw new Error("missing command for " + def.name);
   const args = Array.isArray(def.args) ? def.args : [];
   const env = { ...process.env, ...(def.env && typeof def.env === "object" ? def.env : {}) };
-  const proc = spawn(cmd, args, { env, stdio: ["pipe", "pipe", "pipe"] });
+  const proc = spawn(cmd, args, { cwd: def.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
   let buffer = "";
   let bufferOverflow = false;
   const waiters = new Map(); // id -> {resolve, reject}
   let nextId = 1;
-  entry = { key, proc, waiters, writes: new Set(), nextId: () => nextId++, initialized: false, initPromise: null, closed: false, idleTimer: null, def };
+  entry = { key, name: def.name, fingerprint: hash, proc, waiters, writes: new Set(), nextId: () => nextId++, initialized: false, initPromise: null, closed: false, idleTimer: null, def };
   // Install this immediately: ChildProcess's error handler does not handle
   // errors emitted by its stdin Writable (notably EPIPE).
   proc.stdin.on("error", (error) => {
@@ -505,15 +617,15 @@ async function ensureInitialized(entry) {
   }
   await entry.initPromise;
 }
-async function stdioToolsList(def) {
-  const entry = spawnStdioUpstream(def);
+async function stdioToolsList(def, projectRoot = resolveProjectRoot()) {
+  const entry = spawnStdioUpstream(def, projectRoot);
   await ensureInitialized(entry);
   const res = await withTimeout(sendToStdio(entry, "tools/list", {}), 10000, "tools/list " + def.name);
   if (!res || !Array.isArray(res.tools)) throw new Error("invalid tools/list from " + def.name);
   return res.tools;
 }
-async function stdioToolsCall(def, tool, args) {
-  const entry = spawnStdioUpstream(def);
+async function stdioToolsCall(def, tool, args, projectRoot = resolveProjectRoot()) {
+  const entry = spawnStdioUpstream(def, projectRoot);
   await ensureInitialized(entry);
   const res = await withTimeout(sendToStdio(entry, "tools/call", { name: tool, arguments: args || {} }), 15000, "tools/call " + def.name + "/" + tool);
   if (!res || !Array.isArray(res.content)) return { content: [{ type: "text", text: JSON.stringify(res) }] };
@@ -570,29 +682,33 @@ function httpPostJson(urlStr, payload, env) {
     req.end();
   });
 }
-async function upstreamToolsList(def) {
+async function upstreamToolsList(def, projectRoot = resolveProjectRoot()) {
+  def = prepareUpstreamDefinition(def, projectRoot).effective;
   if (def.url) {
     const res = await withTimeout(httpPostJson(def.url, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, def.env), 10000, "http tools/list " + def.name);
     if (!res || !Array.isArray(res.tools)) throw new Error("invalid tools/list from " + def.name);
     return res.tools;
   }
-  return stdioToolsList(def);
+  return stdioToolsList(def, projectRoot);
 }
-async function upstreamToolsCall(def, tool, args) {
+async function upstreamToolsCall(def, tool, args, projectRoot = resolveProjectRoot()) {
+  def = prepareUpstreamDefinition(def, projectRoot).effective;
   if (def.url) {
     const res = await withTimeout(httpPostJson(def.url, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args || {} } }, def.env), 15000, "http tools/call " + def.name + "/" + tool);
     if (!res || !Array.isArray(res.content)) return { content: [{ type: "text", text: JSON.stringify(res) }] };
     return res;
   }
-  return stdioToolsCall(def, tool, args);
+  return stdioToolsCall(def, tool, args, projectRoot);
 }
 function readSchemaCache() { const c = readJson(SCHEMA_CACHE_PATH, {}); return c && typeof c === "object" ? c : {}; }
 function writeSchemaCache(c) { try { fs.mkdirSync(HUB_DIR, { recursive: true }); const tmp = SCHEMA_CACHE_PATH + ".tmp-" + process.pid; fs.writeFileSync(tmp, JSON.stringify(c, null, 2), "utf8"); fs.renameSync(tmp, SCHEMA_CACHE_PATH); } catch {} }
-async function getToolsCachedLive(def, forceLive = false) {
+async function getToolsCachedLive(def, forceLive = false, projectRoot = resolveProjectRoot()) {
+  const { effective, hash: fingerprint } = prepareUpstreamDefinition(def, projectRoot);
+  def = effective;
   const cache = readSchemaCache();
-  if (!forceLive && cache[def.name] && Array.isArray(cache[def.name].tools)) return cache[def.name].tools;
-  const tools = await upstreamToolsList(def);
-  cache[def.name] = { tools, fetchedAt: new Date().toISOString() };
+  if (!forceLive && cache[def.name] && cache[def.name].definitionFingerprint === fingerprint && Array.isArray(cache[def.name].tools)) return cache[def.name].tools;
+  const tools = await upstreamToolsList(def, projectRoot);
+  cache[def.name] = { definitionFingerprint: fingerprint, tools, fetchedAt: new Date().toISOString() };
   writeSchemaCache(cache);
   return tools;
 }
@@ -606,7 +722,7 @@ function writeResponse(res, framed) {
   }
 }
 async function handleToolsList() {
-  const { servers } = enabledServers();
+  const { servers, projectRoot } = enabledServers();
   const tools = [];
   for (const t of memoryTools()) tools.push(t);
   const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
@@ -614,7 +730,7 @@ async function handleToolsList() {
   if (lazy.length) { tools.push(HUB_LIST_DEF, HUB_CALL_DEF); }
   for (const { def } of direct) {
     try {
-      const upstream = await getToolsCachedLive(def, false);
+      const upstream = await getToolsCachedLive(def, false, projectRoot);
       for (const t of upstream) tools.push({ name: `${def.name}__${t.name}`, description: t.description || `${def.name} ${t.name}`, inputSchema: t.inputSchema || { type: "object", properties: {} } });
     } catch {}
   }
@@ -750,7 +866,7 @@ async function handleToolsCall(params) {
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "hub_list_mcp_tools") {
-    const { servers } = enabledServers();
+    const { servers, projectRoot } = enabledServers();
     const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
     const target = args.server ? lazy.find((s) => s.def.name === args.server) : null;
     if (args.server && !target) throw new Error("server not enabled as lazy: " + args.server);
@@ -758,29 +874,30 @@ async function handleToolsCall(params) {
     const serversObj = {};
     for (const { def } of list) {
       try {
-        const tools = await getToolsCachedLive(def, true);
+        const tools = await getToolsCachedLive(def, true, projectRoot);
         serversObj[def.name] = { tools: tools.map((t) => ({ name: t.name, description: t.description || "", inputSchema: t.inputSchema || { type: "object", properties: {} } })) };
       } catch (e) { serversObj[def.name] = { tools: [], error: String(e && e.message || e) }; }
     }
-    const payload = target ? { server: target.def.name, tools: serversObj[target.def.name]?.tools || [] } : { servers: serversObj };
+    const detail = target ? serversObj[target.def.name] : null;
+    const payload = target ? { server: target.def.name, tools: detail?.tools || [], ...(detail?.error ? { error: detail.error } : {}) } : { servers: serversObj };
     return { content: [{ type: "text", text: JSON.stringify(payload) }] };
   }
   if (name === "hub_call_mcp_tool") {
-    const { servers } = enabledServers();
+    const { servers, projectRoot } = enabledServers();
     const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
     const entry = lazy.find((s) => s.def.name === args.server);
     if (!entry) throw new Error("server not enabled as lazy: " + (args.server || ""));
     if (!args.tool) throw new Error("tool required");
-    return upstreamToolsCall(entry.def, args.tool, args.arguments || {});
+    return upstreamToolsCall(entry.def, args.tool, args.arguments || {}, projectRoot);
   }
   if (name && name.includes("__")) {
     const idx = name.indexOf("__");
     const srv = name.slice(0, idx), tool = name.slice(idx + 2);
-    const { servers } = enabledServers();
+    const { servers, projectRoot } = enabledServers();
     const direct = servers.filter((s) => s.mode === "project-direct" || s.mode === "global-direct");
     const entry = direct.find((s) => s.def.name === srv);
     if (!entry) throw new Error("server not enabled as direct: " + srv);
-    return upstreamToolsCall(entry.def, tool, args);
+    return upstreamToolsCall(entry.def, tool, args, projectRoot);
   }
   throw new Error("unknown tool: " + name);
 }

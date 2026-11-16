@@ -253,15 +253,14 @@ describe("backend hubCall v3 integration", () => {
 
   it("subagents:orchestration update and get", async () => {
     const upd = await backend.hubCall("subagents:orchestration:update", { orchestratorMode: "carbon", swarmMode: "on", maxParallelAgents: 7 });
-    assert.equal(upd.ok, true, JSON.stringify(upd));
-    const cfg = upd.config || upd;
-    assert.ok(cfg && cfg.orchestratorMode === "carbon");
+    assert.equal(upd.ok, false, JSON.stringify(upd));
+    assert.match(upd.error, /旧|legacy/i);
     const got = await backend.hubCall("subagents:orchestration:get", {});
     const gotCfg = got.config || got;
-    assert.equal(gotCfg.orchestratorMode, "carbon");
-    assert.equal(gotCfg.swarmMode, "on");
+    assert.equal(gotCfg.orchestratorMode, "off");
+    assert.equal(gotCfg.swarmMode, "auto");
     const slash = await backend.hubCall("subagents:slashPrompt", { mode: "swarm" });
-    assert.ok(slash.prompt && slash.prompt.includes("/swarm"));
+    assert.ok(slash.prompt && slash.prompt.includes("角色"));
   });
 
   it("board:get and board:update", async () => {
@@ -276,12 +275,12 @@ describe("backend hubCall v3 integration", () => {
     assert.equal(snap.steps.length, 2);
     assert.equal(snap.steps[0].text, "step one");
     assert.equal(snap.progress.label, "1/2");
-    // readArtifact test: create a markdown artifact under ~/.t3
+    // The legacy read action must no longer allow unscoped access merely
+    // because a Markdown file resides under ~/.t3.
     const artifactPath = path.join(tmpHome, ".t3", "hub", "artifact-test.md");
     writeFile(artifactPath, "# artifact content\n");
     const art = await backend.hubCall("board:readArtifact", { path: artifactPath });
-    assert.equal(art.ok, true, JSON.stringify(art));
-    assert.equal(art.content, "# artifact content\n");
+    assert.equal(art.ok, false, JSON.stringify(art));
     // traversal should fail
     const bad = await backend.hubCall("board:readArtifact", { path: "/etc/passwd" });
     assert.equal(bad.ok, false);
@@ -342,7 +341,7 @@ describe("backend hubCall v3 integration", () => {
     assert.ok(snap2.codex);
     const ruleGet = await backend.hubCall("settings:getRule", { host: "codex" });
     assert.ok(ruleGet && typeof ruleGet.path === "string");
-    const ruleSave = await backend.hubCall("settings:saveRule", { host: "codex", content: "# test rule\n" });
+    const ruleSave = await backend.hubCall("settings:saveRule", { host: "codex", content: "# test rule\n", expectedContent: ruleGet.content, expectedTarget: ruleGet.targetPath });
     assert.ok(ruleSave && ruleSave.path);
   });
 });

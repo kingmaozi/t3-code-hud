@@ -181,7 +181,7 @@ describe("hub-skills importFromGitHub", () => {
 });
 
 describe("hub-skills AGENTS.md", () => {
-  it("seeds, saves and syncs global AGENTS.md to all CLIs with backup", () => {
+  it("saves and syncs only shared global rules to CLIs with backup", () => {
     const home = makeTmp("home");
     const hub = path.join(home, ".t3", "hub");
     const mgr = createSkillsManager({ homeDir: home, hubDir: hub });
@@ -191,19 +191,21 @@ describe("hub-skills AGENTS.md", () => {
     fs.mkdirSync(path.join(home, ".config", "muse"), { recursive: true });
     fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
     const seeded = mgr.getAgentsMd({});
-    assert.equal(seeded.globalContent, "ORIGINAL-CODE\n");
-    assert.ok(seeded.globalTokens > 0);
-    const saved = mgr.saveAgentsMd({ target: "global", content: "# New global\n" });
+    assert.equal(seeded.globalContent, "");
+    assert.equal(seeded.globalTokens, 0);
+    const saved = mgr.saveAgentsMd({ target: "global", content: "# New global\n", expectedContent: "" });
     assert.equal(saved.ok, true);
     assert.ok(saved.syncedTargets.length >= 4);
     assert.ok(saved.agyTargetHint.includes("antigravity"));
     for (const p of [path.join(home, ".codex", "AGENTS.md"), path.join(home, ".pi", "agent", "AGENTS.md"), path.join(home, ".config", "muse", "AGENTS.md"), path.join(home, ".claude", "CLAUDE.md")]) {
-      assert.equal(fs.readFileSync(p, "utf8"), "# New global\n");
+      const content = fs.readFileSync(p, "utf8");
+      assert.match(content, /<!-- t3-hub-global-rules:start -->\n# New global\n<!-- t3-hub-global-rules:end -->/);
+      if (p.includes(".codex")) assert.match(content, /^ORIGINAL-CODE\n/);
     }
     assert.equal(fs.readFileSync(path.join(home, ".codex", "AGENTS.md.bak-t3hub"), "utf8"), "ORIGINAL-CODE\n");
-    mgr.saveAgentsMd({ target: "global", content: "# New global v2\n" });
+    mgr.saveAgentsMd({ target: "global", content: "# New global v2\n", expectedContent: "# New global\n" });
     assert.equal(fs.readFileSync(path.join(home, ".codex", "AGENTS.md.bak-t3hub"), "utf8"), "ORIGINAL-CODE\n");
-    assert.equal(fs.readFileSync(path.join(home, ".codex", "AGENTS.md"), "utf8"), "# New global v2\n");
+    assert.match(fs.readFileSync(path.join(home, ".codex", "AGENTS.md"), "utf8"), /^ORIGINAL-CODE\n[\s\S]*# New global v2\n/);
   });
 
   it("writes project AGENTS.md and injects soft route idempotently", () => {
@@ -212,7 +214,7 @@ describe("hub-skills AGENTS.md", () => {
     const mgr = createSkillsManager({ homeDir: home, hubDir: hub });
     const proj = makeTmp("proj");
     fs.writeFileSync(path.join(proj, "CLAUDE.md"), "# Claude\n", "utf8");
-    mgr.saveAgentsMd({ target: "project", content: "# Proj\n", projectRoot: proj });
+    mgr.saveAgentsMd({ target: "project", content: "# Proj\n", expectedContent: "", projectRoot: proj });
     assert.equal(fs.readFileSync(path.join(proj, "AGENTS.md"), "utf8"), "# Proj\n");
     mgr.injectSoftRoute({ projectRoot: proj });
     mgr.injectSoftRoute({ projectRoot: proj });
@@ -221,6 +223,7 @@ describe("hub-skills AGENTS.md", () => {
     assert.ok(content.includes("memory_search") && content.includes("memory_write"));
     const lines = content.split("\n").filter((l) => l.trim());
     assert.ok(lines.length <= 12);
+    mgr.syncProjectRuleReference({ projectRoot: proj });
     const claude = fs.readFileSync(path.join(proj, "CLAUDE.md"), "utf8");
     assert.equal((claude.match(/@AGENTS\.md/g) || []).length, 1);
     const got = mgr.getAgentsMd({ projectRoot: proj });
@@ -296,6 +299,25 @@ function spawnRouter({ cwd, hubDir }) {
 function spawnRouterCont(cwd, hubDir) { return spawnRouter({ cwd, hubDir }); }
 
 describe("mcp-router.cjs", () => {
+  it("reports launch configuration separately from probe connectivity", () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub");
+    fs.mkdirSync(path.join(home, ".config", "magpie"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".config", "magpie", "library.json"), JSON.stringify({ mcp: [
+      { name: "missing-entry" },
+      { name: "bad-cwd", command: process.execPath, cwd: "missing-directory" },
+      { name: "http-configured", url: "https://example.invalid/mcp", transport: "http" },
+    ] }), "utf8");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    const byName = Object.fromEntries(r.listMcpServers({ projectRoot: home }).items.map(item => [item.name, item]));
+    assert.equal(byName["missing-entry"].launchable, false);
+    assert.equal(byName["missing-entry"].launchReason, "missing-endpoint");
+    assert.equal(byName["bad-cwd"].launchable, false);
+    assert.equal(byName["bad-cwd"].launchReason, "invalid-cwd");
+    assert.equal(byName["http-configured"].launchable, true, "a configured endpoint is distinct from a successful network probe");
+    assert.equal(byName["http-configured"].probed, false);
+    assert.equal(byName["http-configured"].connected, null);
+  });
+
   it("imports magpie library.json and redacts secrets", () => {
     const home = makeTmp("home");
     const hub = path.join(home, ".t3", "hub");
@@ -356,18 +378,258 @@ describe("mcp-router.cjs", () => {
     assert.ok(listed.items.find((i) => i.name === "other"));
   });
 
+  it("keeps project mode ownership stable when a historical symlink key is retargeted", () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub");
+    const projA = makeTmp("proj-a"), projB = makeTmp("proj-b"), alias = projA + "-alias", other = makeTmp("other");
+    for (const proj of [projA, projB, other]) fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    fs.symlinkSync(projA, alias, "dir");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "canonical", command: process.execPath, args: ["/tmp/mock.cjs"] });
+    r.upsertMcpServer({ name: "legacy", command: process.execPath, args: ["/tmp/mock.cjs"] });
+    r.setMcpMode({ name: "canonical", mode: "project-lazy", projectRoot: alias });
+    const statePath = path.join(hub, "state.json");
+    let state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const realA = fs.realpathSync(projA), realB = fs.realpathSync(projB);
+    assert.equal(state.mcpModes.projects[realA].canonical, "project-lazy");
+    assert.equal(Object.hasOwn(state.mcpModes.projects, alias), false, "new writes use the canonical key");
+
+    state.mcpModes.projects[alias] = { legacy: "project-direct", unknown: "keep-me" };
+    fs.writeFileSync(statePath, JSON.stringify(state), "utf8");
+    const list = (projectRoot) => r.listMcpServers({ projectRoot }).items;
+    assert.equal(list(projA).find((item) => item.name === "canonical").mode, "project-lazy");
+    assert.equal(list(projA).find((item) => item.name === "legacy").mode, "off", "unbound legacy symlink records are kept but do not auto-activate");
+    assert.equal(list(projB).find((item) => item.name === "canonical").mode, "off");
+    assert.equal(list(projB).find((item) => item.name === "legacy").mode, "off");
+
+    fs.unlinkSync(alias);
+    fs.symlinkSync(projB, alias, "dir");
+    assert.equal(list(projA).find((item) => item.name === "canonical").mode, "project-lazy", "new canonical record stays bound to A");
+    assert.equal(list(projB).find((item) => item.name === "canonical").mode, "off", "retargeting alias A→B cannot redirect A's mode");
+    assert.equal(list(projB).find((item) => item.name === "legacy").mode, "off", "the old symlink key cannot grant A's mode to B");
+
+    r.setMcpMode({ name: "legacy", mode: "project-lazy", projectRoot: projB });
+    state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(state.mcpModes.projects[alias].unknown, "keep-me", "legacy and unknown records are not deleted");
+    assert.equal(state.mcpModes.projects[realB].legacy, "project-lazy", "explicit action creates a canonical binding for B");
+    assert.equal(list(projA).find((item) => item.name === "legacy").mode, "off");
+    assert.equal(list(other).find((item) => item.name === "legacy").mode, "off", "project modes do not leak to other roots");
+  });
+
+  it("router ignores a retargeted legacy symlink mode until the project is explicitly bound", async () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub");
+    fs.mkdirSync(hub, { recursive: true });
+    const projA = makeTmp("proj-a"), projB = makeTmp("proj-b"), alias = projA + "-alias";
+    for (const proj of [projA, projB]) fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    fs.symlinkSync(projA, alias, "dir");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "probe", command: process.execPath, args: ["/tmp/mock.cjs"] });
+    const statePath = path.join(hub, "state.json");
+    fs.writeFileSync(statePath, JSON.stringify({ mcpModes: { global: {}, projects: { [alias]: { probe: "project-lazy" } } } }), "utf8");
+    fs.unlinkSync(alias);
+    fs.symlinkSync(projB, alias, "dir");
+
+    const rt = await spawnRouter({ cwd: projB, hubDir: hub });
+    try {
+      await rt.request("initialize", { protocolVersion: "2024-11-05" });
+      let names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(!names.includes("hub_list_mcp_tools") && !names.includes("hub_call_mcp_tool"));
+      assert.ok(!names.some((name) => name.startsWith("probe__")));
+      r.setMcpMode({ name: "probe", mode: "project-lazy", projectRoot: projB });
+      names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(names.includes("hub_list_mcp_tools") && names.includes("hub_call_mcp_tool"), "explicit canonical binding enables B");
+    } finally { rt.kill(); }
+  });
+
+  it("does not let an unbound symlink project key truncate nested project-root discovery", async () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub"), project = makeTmp("nested-project");
+    const nested = path.join(project, "nested"), work = path.join(nested, "work"), alias = project + "-legacy-link";
+    fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+    fs.mkdirSync(work, { recursive: true });
+    fs.symlinkSync(nested, alias, "dir");
+    const mockFile = path.join(home, "nested-root-upstream.cjs");
+    fs.writeFileSync(mockFile, MOCK_UPSTREAM, "utf8");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "probe", command: process.execPath, args: [mockFile] });
+    r.setMcpMode({ name: "probe", mode: "project-lazy", projectRoot: project });
+    const statePath = path.join(hub, "state.json"), state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    state.mcpModes.projects[alias] = { unrelated: "project-direct" };
+    fs.writeFileSync(statePath, JSON.stringify(state), "utf8");
+
+    const rt = await spawnRouter({ cwd: work, hubDir: hub });
+    try {
+      await rt.request("initialize", { protocolVersion: "2024-11-05" });
+      const names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(names.includes("hub_list_mcp_tools") && names.includes("hub_call_mcp_tool"), JSON.stringify(names));
+    } finally { rt.kill(); }
+  });
+
+  it("reads a unique legacy normalized MCP mode key consistently in manager and runtime", async () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub"), proj = makeTmp("legacy-mode-project");
+    fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    const mockFile = path.join(home, "legacy-mode-upstream.cjs");
+    fs.writeFileSync(mockFile, MOCK_UPSTREAM, "utf8");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "legacy-name", command: process.execPath, args: [mockFile] });
+    const statePath = path.join(hub, "state.json");
+    fs.writeFileSync(statePath, JSON.stringify({ mcpModes: { global: { legacy_name: "global-direct" }, projects: {} } }), "utf8");
+    assert.equal(r.listMcpServers({ projectRoot: proj }).items.find((item) => item.name === "legacy-name").mode, "global-direct");
+    const rt = await spawnRouter({ cwd: proj, hubDir: hub });
+    try {
+      await rt.request("initialize", { protocolVersion: "2024-11-05" });
+      const names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(names.includes("legacy-name__mock_echo"), JSON.stringify(names));
+    } finally { rt.kill(); }
+  });
+
+  it("pauses every definition in a normalized-name collision in manager and runtime", async () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub"), proj = makeTmp("collision-project");
+    fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    const codexPath = path.join(home, ".codex", "config.toml");
+    fs.mkdirSync(path.dirname(codexPath), { recursive: true });
+    fs.writeFileSync(codexPath, '[mcp_servers.echo_server]\ncommand = "node"\nargs = ["/tmp/one.cjs"]\n\n[mcp_servers.echo-server]\ncommand = "node"\nargs = ["/tmp/two.cjs"]\n', "utf8");
+    const mockFile = path.join(home, "collision-upstream.cjs");
+    fs.writeFileSync(mockFile, MOCK_UPSTREAM, "utf8");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "echo_server", command: process.execPath, args: [mockFile] });
+    r.setMcpMode({ name: "echo_server", mode: "global-direct" });
+    r.upsertMcpServer({ name: "echo-server", command: process.execPath, args: [mockFile] });
+
+    const items = r.listMcpServers({ projectRoot: proj }).items.filter((item) => ["echo_server", "echo-server"].includes(item.name));
+    assert.equal(items.length, 2, "both original definitions stay visible");
+    assert.ok(items.every((item) => item.modeConflict && item.mode === "off" && !item.enabled));
+    assert.throws(() => r.setMcpMode({ name: "echo_server", mode: "global-direct" }), /normalized MCP name conflict/);
+    assert.throws(() => r.toggleServerForAgent({ name: "echo_server", agent: "codex", enabled: true }), /normalized MCP name conflict/);
+    assert.doesNotThrow(() => r.setMcpMode({ name: "echo_server", mode: "off" }), "an exact conflict row can save Hub off");
+    let state = JSON.parse(fs.readFileSync(path.join(hub, "state.json"), "utf8"));
+    assert.equal(state.mcpModes.global.echo_server, "off");
+    r.toggleServerForAgent({ name: "echo_server", agent: "codex", enabled: false });
+    let codex = fs.readFileSync(codexPath, "utf8");
+    assert.doesNotMatch(codex, /mcp_servers\.echo_server\]/, "conflict disable removes only the exact selected entry");
+    assert.match(codex, /mcp_servers\.echo-server\]/, "the other colliding native config stays untouched");
+
+    const rt = await spawnRouter({ cwd: proj, hubDir: hub });
+    try {
+      await rt.request("initialize", { protocolVersion: "2024-11-05" });
+      const names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(!names.some((name) => name.startsWith("echo_server__") || name.startsWith("echo-server__")), JSON.stringify(names));
+      assert.ok(!names.includes("hub_list_mcp_tools") && !names.includes("hub_call_mcp_tool"));
+    } finally { rt.kill(); }
+    r.removeMcpServer({ name: "echo_server" });
+    const remaining = r.listMcpServers({ projectRoot: proj }).items.filter((item) => ["echo_server", "echo-server"].includes(item.name));
+    assert.deepEqual(remaining.map((item) => item.name), ["echo-server"], "explicit removal deletes only the selected registry definition");
+  });
+
+  it("refreshes schema and stdio child when env and cwd change without exposing env in cache", async () => {
+    const home = makeTmp("home"), hub = path.join(home, ".t3", "hub"), proj = makeTmp("exec-project");
+    fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    const cwdB = path.join(proj, "server-b");
+    fs.mkdirSync(cwdB);
+    const pidFile = path.join(home, "upstream-pid.txt"), mockFile = path.join(home, "dynamic-upstream.cjs");
+    fs.writeFileSync(mockFile, `
+      const fs = require("node:fs");
+      fs.writeFileSync(process.env.QA_PID_FILE, String(process.pid));
+      let buf = "";
+      process.stdin.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        let index;
+        while ((index = buf.indexOf("\\n")) >= 0) {
+          const line = buf.slice(0, index).trim(); buf = buf.slice(index + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          let result;
+          if (msg.method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "dynamic", version: "1" } };
+          else if (msg.method === "tools/list") result = { tools: [{ name: process.env.QA_TOOL_NAME, inputSchema: { type: "object", properties: {} } }] };
+          else if (msg.method === "tools/call") result = { content: [{ type: "text", text: JSON.stringify({ value: process.env.QA_VALUE, cwd: process.cwd() }) }] };
+          else continue;
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");
+        }
+      });
+    `, "utf8");
+    const r = createMcpRouter({ homeDir: home, hubDir: hub });
+    r.upsertMcpServer({ name: "mutable", command: process.execPath, args: [mockFile], env: { QA_PID_FILE: pidFile, QA_VALUE: "SECRET_VALUE_A", QA_TOOL_NAME: "alpha" } });
+    r.setMcpMode({ name: "mutable", mode: "global-direct" });
+    const rt = await spawnRouter({ cwd: proj, hubDir: hub });
+    try {
+      await rt.request("initialize", { protocolVersion: "2024-11-05" });
+      let names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(names.includes("mutable__alpha"), JSON.stringify(names));
+      const defaultCwdCall = await rt.request("tools/call", { name: "mutable__alpha", arguments: {} });
+      assert.equal(JSON.parse(defaultCwdCall.content[0].text).cwd, fs.realpathSync(proj), "missing cwd defaults to the active project root");
+      const oldPid = Number(fs.readFileSync(pidFile, "utf8"));
+
+      r.upsertMcpServer({ name: "mutable", command: process.execPath, args: [mockFile], cwd: path.relative(proj, cwdB), env: { QA_PID_FILE: pidFile, QA_VALUE: "SECRET_VALUE_B", QA_TOOL_NAME: "beta" } });
+      names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+      assert.ok(names.includes("mutable__beta"), JSON.stringify(names));
+      assert.ok(!names.includes("mutable__alpha"), JSON.stringify(names));
+      const currentPid = Number(fs.readFileSync(pidFile, "utf8"));
+      assert.notEqual(currentPid, oldPid, "the changed execution definition starts a fresh child");
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.throws(() => process.kill(oldPid, 0), { code: "ESRCH" }, "the previous child is closed after definition change");
+
+      const called = await rt.request("tools/call", { name: "mutable__beta", arguments: {} });
+      const observed = JSON.parse(called.content[0].text);
+      assert.equal(observed.value, "SECRET_VALUE_B");
+      assert.equal(observed.cwd, fs.realpathSync(cwdB), "configured relative cwd resolves against the project root");
+      const cache = fs.readFileSync(path.join(hub, "mcp-schema-cache.json"), "utf8");
+      assert.ok(!cache.includes("SECRET_VALUE_A") && !cache.includes("SECRET_VALUE_B"), "schema cache stores only a definition hash, never env values");
+
+      const invalidCwd = path.join(proj, "not-a-directory.txt");
+      fs.writeFileSync(invalidCwd, "fixture");
+      const pidBeforeInvalid = Number(fs.readFileSync(pidFile, "utf8"));
+      r.upsertMcpServer({ name: "mutable", command: process.execPath, args: [mockFile], cwd: path.basename(invalidCwd), env: { QA_PID_FILE: pidFile, QA_VALUE: "SECRET_VALUE_C", QA_TOOL_NAME: "gamma" } });
+      r.setMcpMode({ name: "mutable", mode: "global-lazy" });
+      const badCwdList = await rt.request("tools/call", { name: "hub_list_mcp_tools", arguments: { server: "mutable" } });
+      const badCwdPayload = JSON.parse(badCwdList.content[0].text);
+      assert.match(badCwdPayload.error, /cwd is not a directory/);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.throws(() => process.kill(pidBeforeInvalid, 0), { code: "ESRCH" }, "invalid replacement config closes the previous same-name child");
+
+      r.upsertMcpServer({ name: "mutable", command: process.execPath, args: [mockFile], cwd: proj, env: { QA_PID_FILE: pidFile, QA_TOOL_NAME: "delta" } });
+      r.setMcpMode({ name: "mutable", mode: "global-direct" });
+      await rt.request("tools/list", {});
+      const pidBeforeCacheHit = Number(fs.readFileSync(pidFile, "utf8"));
+      r.upsertMcpServer({ name: "mutable", command: process.execPath, args: [mockFile], cwd: proj, env: { QA_PID_FILE: pidFile, QA_TOOL_NAME: "epsilon" } });
+      const peer = await spawnRouter({ cwd: proj, hubDir: hub });
+      try {
+        await peer.request("initialize", { protocolVersion: "2024-11-05" });
+        await peer.request("tools/list", {}); // Another router fills the shared new-definition cache.
+        names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+        assert.ok(names.includes("mutable__epsilon"));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.throws(() => process.kill(pidBeforeCacheHit, 0), { code: "ESRCH" }, "a schema cache hit must still retire this router's old child");
+      } finally { peer.kill(); }
+
+      await rt.request("tools/call", { name: "mutable__epsilon", arguments: {} });
+      const pidBeforeHttp = Number(fs.readFileSync(pidFile, "utf8"));
+      const httpServer = require("node:http").createServer((req, res) => {
+        req.resume();
+        req.on("end", () => { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "http_tool", inputSchema: { type: "object" } }] } })); });
+      });
+      await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+      try {
+        r.upsertMcpServer({ name: "mutable", transport: "http", url: "http://127.0.0.1:" + httpServer.address().port });
+        names = (await rt.request("tools/list", {})).tools.map((tool) => tool.name);
+        assert.ok(names.includes("mutable__http_tool"));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.throws(() => process.kill(pidBeforeHttp, 0), { code: "ESRCH" }, "switching to HTTP must retire the previous stdio child");
+      } finally { await new Promise((resolve) => httpServer.close(resolve)); }
+    } finally { rt.kill(); }
+  }, { timeout: 60000 });
+
   it("routes lazy then direct modes live without restart", async () => {
     const home = makeTmp("home");
     const hub = path.join(home, ".t3", "hub");
     fs.mkdirSync(hub, { recursive: true });
     const proj = makeTmp("proj");
+    const projAlias = proj + "-alias";
     fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    fs.symlinkSync(proj, projAlias, "dir");
     const mockFile = path.join(home, "mock-upstream.cjs");
     fs.writeFileSync(mockFile, MOCK_UPSTREAM, "utf8");
     const r = createMcpRouter({ homeDir: home, hubDir: hub });
     r.upsertMcpServer({ name: "mock", command: process.execPath, args: [mockFile] });
-    r.setMcpMode({ name: "mock", mode: "project-lazy", projectRoot: proj });
-    const rt = await spawnRouter({ cwd: proj, hubDir: hub });
+    r.setMcpMode({ name: "mock", mode: "project-lazy", projectRoot: projAlias });
+    const rt = await spawnRouter({ cwd: projAlias, hubDir: hub });
     try {
       await rt.request("initialize", { protocolVersion: "2024-11-05" });
       rt.notify("notifications/initialized");
@@ -381,9 +643,7 @@ describe("mcp-router.cjs", () => {
       const called = await rt.request("tools/call", { name: "hub_call_mcp_tool", arguments: { server: "mock", tool: "mock_echo", arguments: { text: "hi" } } });
       assert.ok(String(called.content[0].text).includes("echo:hi"));
       assert.ok(fs.existsSync(path.join(hub, "mcp-schema-cache.json")));
-      const state = JSON.parse(fs.readFileSync(path.join(hub, "state.json"), "utf8"));
-      state.mcpModes.projects[proj].mock = "project-direct";
-      fs.writeFileSync(path.join(hub, "state.json"), JSON.stringify(state), "utf8");
+      r.setMcpMode({ name: "mock", mode: "project-direct", projectRoot: projAlias });
       const list2 = await rt.request("tools/list", {});
       const names2 = (list2.tools || []).map((t) => t.name);
       assert.ok(names2.includes("mock__mock_echo"), JSON.stringify(names2));
