@@ -6,6 +6,8 @@
 
 日常操作见 [Hub 使用指南](HUB-GUIDE.zh-CN.md)：任务进度、产物、技能/MCP 卡片、项目与全局开关、编排和宿主设置。
 
+工程接手请先看 [AGENTS.md](../AGENTS.md) 与 [工程交接](HANDOFF.md)；开发环境、需求/试探台账、可直接交给 T3 的接手修复提示词和开关自测提示词见 [开发说明](DEVELOPMENT.zh-CN.md)、[需求台账](REQUIREMENTS-AND-EXPERIMENTS.zh-CN.md)、[接手修复提示词](T3-HUB-TAKEOVER-PROMPT.zh-CN.md)、[自测提示词](T3-HUB-SELFTEST-PROMPT.zh-CN.md)。
+
 为 **T3 Code / T3 Code (Beta)** 打造的**零侵入式**实时遥测悬浮胶囊、十亿级子代理与费用追踪器、真实上下文圆环、额度监控器和可交互 Git 图谱悬浮窗。
 
 > **不修改 `app.asar`、不破坏签名、跟随官方自动更新不失效。** 精准修复原版 T3 在 **Antigravity / Muse / Codex / Claude** 多引擎下的遥测误报：速度虚标、缓存重复计数、上下文容量虚高及子代理 Token 漏算。

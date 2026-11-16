@@ -1,3 +1,6 @@
 
 __pycache__/
 *.pyc
+
+# Local handoff evidence may contain private project data. Never publish.
+.handoff-local/
