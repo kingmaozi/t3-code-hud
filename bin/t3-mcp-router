@@ -13,6 +13,8 @@ const STATE_PATH = path.join(HUB_DIR, "state.json");
 const REGISTRY_PATH = path.join(HUB_DIR, "mcp-registry.json");
 const SCHEMA_CACHE_PATH = path.join(HUB_DIR, "mcp-schema-cache.json");
 const IDLE_MS = 3 * 60 * 1000;
+const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+const SKILL_READ_MAX_BYTES = 64 * 1024;
 
 let memoryVault = null;
 for (const cand of [
@@ -37,6 +39,121 @@ function readRegistry() {
 function dirExistsBin(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
 function listDirsBin(dir) {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => path.join(dir, e.name)); } catch { return []; }
+}
+function skillFileExists(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
+function parseSkillMeta(skillFile) {
+  let raw = "";
+  try { raw = fs.readFileSync(skillFile, "utf8"); } catch { return { name: "", description: "" }; }
+  let name = "", description = "";
+  const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (fm) {
+    const block = fm[1];
+    const nd = block.match(/^name:\s*(.+)$/m);
+    const dd = block.match(/^description:\s*(.+)$/m);
+    if (nd) name = nd[1].trim().replace(/^["']|["']$/g, "");
+    if (dd) description = dd[1].trim().replace(/^["']|["']$/g, "");
+  }
+  if (!description) {
+    const body = fm ? raw.slice(fm[0].length) : raw;
+    for (const line of body.split("\n")) {
+      const t = line.trim();
+      if (t && !t.startsWith("#")) { description = t.slice(0, 200); break; }
+    }
+  }
+  if (!name) {
+    const h = raw.match(/^#\s*(.+)$/m);
+    if (h) name = h[1].trim().slice(0, 80);
+  }
+  return { name, description };
+}
+function findSkillDirsRecursive(root, maxDepth = 4) {
+  const out = [];
+  if (!dirExistsBin(root)) return out;
+  const stack = [{ dir: root, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      if (!ent.isDirectory() && !ent.isSymbolicLink()) continue;
+      const full = path.join(dir, ent.name);
+      if (skillFileExists(path.join(full, "SKILL.md"))) out.push(full);
+      if (depth < maxDepth) stack.push({ dir: full, depth: depth + 1 });
+    }
+  }
+  return out;
+}
+function discoverSkills(projectRoot) {
+  const roots = [
+    path.join(HUB_DIR, "skills"),
+    path.join(HUB_DIR, "packages"),
+    path.join(HOME_DIR, ".agents", "skills"),
+    path.join(HOME_DIR, ".zcode", "skills"),
+    path.join(HOME_DIR, ".claude", "skills"),
+    path.join(HOME_DIR, ".config", "muse", "skills"),
+    path.join(HOME_DIR, ".pi", "agent", "skills"),
+    path.join(HOME_DIR, ".codex", "skills"),
+  ];
+  try {
+    const agyRoot = path.join(HOME_DIR, ".t3", "userdata", "providers", "antigravity");
+    for (const inst of listDirsBin(agyRoot)) roots.push(path.join(inst, "config", "skills"));
+  } catch {}
+  if (projectRoot) {
+    roots.push(path.join(projectRoot, ".agents", "skills"));
+    roots.push(path.join(projectRoot, ".claude", "skills"));
+    roots.push(path.join(projectRoot, ".codex", "skills"));
+  }
+  const byId = new Map();
+  function addDir(dir) {
+    try {
+      if (!skillFileExists(path.join(dir, "SKILL.md"))) return;
+      const id = path.basename(dir);
+      if (!id || id.startsWith(".")) return;
+      const meta = parseSkillMeta(path.join(dir, "SKILL.md"));
+      byId.set(id, { id, name: meta.name || id, description: meta.description || "", dir, path: path.join(dir, "SKILL.md") });
+    } catch {}
+  }
+  for (const root of roots) {
+    if (!dirExistsBin(root)) continue;
+    const isPackages = root.endsWith("packages");
+    if (isPackages) {
+      for (const d of listDirsBin(root)) addDir(d);
+      for (const d of findSkillDirsRecursive(root, 4)) addDir(d);
+    } else {
+      for (const d of listDirsBin(root)) addDir(d);
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+function findSkill(slug, projectRoot) {
+  if (typeof slug !== "string" || !slug.trim()) throw new Error("skill slug required");
+  const s = slug.trim();
+  if (s.includes("/") || s.includes("\\") || s.includes("..") || path.isAbsolute(s)) throw new Error("invalid skill slug: " + slug);
+  const skills = discoverSkills(projectRoot);
+  let found = skills.find((x) => x.id === s);
+  if (found) return found;
+  found = skills.find((x) => x.id.toLowerCase() === s.toLowerCase());
+  if (found) return found;
+  found = skills.find((x) => x.name === s);
+  if (found) return found;
+  throw new Error("skill not found: " + slug);
+}
+function readSkillFileLimited(dir, filePath, maxBytes) {
+  const st = fs.statSync(filePath);
+  if (!st.isFile()) throw new Error("not a file: " + filePath);
+  const truncated = st.size > maxBytes;
+  let buf;
+  if (truncated) {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      buf = Buffer.alloc(maxBytes);
+      const n = fs.readSync(fd, buf, 0, maxBytes, 0);
+      buf = buf.subarray(0, n);
+    } finally { fs.closeSync(fd); }
+  } else {
+    buf = fs.readFileSync(filePath);
+  }
+  return { content: buf.toString("utf8"), truncated, size: st.size };
 }
 function discoveredDefs() {
   try {
@@ -164,6 +281,25 @@ for (const cand of [
 ]) {
   try { hubSubagentsMod = require(cand); if (hubSubagentsMod) break; } catch {}
 }
+let hubTaskBoardMod = null;
+for (const cand of [
+  process.env.T3_HUB_TASK_BOARD ? path.resolve(process.env.T3_HUB_TASK_BOARD) : null,
+  path.join(__dirname, "..", "src", "hub-task-board.cjs"),
+  path.join(__dirname, "..", "hud-plugin", "hub-task-board.cjs"),
+  path.join(HOME_DIR, ".t3", "hud-plugin", "hub-task-board.cjs"),
+].filter(Boolean)) {
+  try { hubTaskBoardMod = require(cand); if (hubTaskBoardMod) break; } catch {}
+}
+function getTaskBoard() {
+  if (!hubTaskBoardMod) return null;
+  if (typeof hubTaskBoardMod.createTaskBoard === "function") {
+    // Respect HUB_DIR / HOME isolation for tests
+    const hubPlansDir = path.join(HUB_DIR, "task-plans");
+    const t3DbPath = path.join(HOME_DIR, ".t3", "userdata", "statev2.sqlite");
+    try { return hubTaskBoardMod.createTaskBoard({ hubPlansDir, t3DbPath }); } catch { return hubTaskBoardMod.createTaskBoard({}); }
+  }
+  return hubTaskBoardMod;
+}
 function memoizeVault(names) {
   let cached;
   let tried = false;
@@ -174,15 +310,29 @@ function memoizeVault(names) {
   };
 }
 function memoryTools() {
-  if (!memoryVault) return [];
-  return [
-    { name: "memory_search", description: "Search shared project memory (rules, pitfalls, decisions).", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, includeGlobal: { type: "boolean" }, limit: { type: "number" } }, required: ["query"] } },
-    { name: "memory_read", description: "Read a memory module entry.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" } } } },
-    { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" } }, required: ["module", "title", "content"] } },
-    { name: "memory_consolidate", description: "Consolidate overlapping project memories, or preview candidate pairs with dryRun.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string" }, dryRun: { type: "boolean" } } } },
-    { name: "memory_rollback", description: "Roll back an evolved memory item to a previous version from its history.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string" } }, required: ["id"] } },
-    ...(hubSubagentsMod && typeof hubSubagentsMod.resolveSubagentRoute === "function" ? [{ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } }] : []),
-  ];
+  const tools = [];
+  if (memoryVault) {
+    tools.push(
+      { name: "memory_search", description: "Search shared project memory (rules, pitfalls, decisions).", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, includeGlobal: { type: "boolean" }, limit: { type: "number" }, scope: { type: "string", enum: ["shared", "worktree", "global"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "global", "all"] }, projectRoot: { type: "string" } }, required: ["query"] } },
+      { name: "memory_read", description: "Read a memory module entry.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" }, projectRoot: { type: "string" } } } },
+      { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint. Pinned is human-only: agent-supplied pinned is always stripped to false.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" }, pinned: { type: "boolean" }, scope: { type: "string", enum: ["shared", "worktree", "global"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "global", "all"] }, projectRoot: { type: "string" } }, required: ["module", "title", "content"] } },
+      { name: "memory_consolidate", description: "Consolidate overlapping project memories, or preview candidate pairs with dryRun.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string" }, dryRun: { type: "boolean" } } } },
+      { name: "memory_rollback", description: "Roll back an evolved memory item to a previous version from its history.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string" } }, required: ["id"] } },
+    );
+  }
+  if (hubSubagentsMod && typeof hubSubagentsMod.resolveSubagentRoute === "function") {
+    tools.push({ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } });
+  }
+  // plan_update is available even without memoryVault for Pi/general hosts
+  if (hubTaskBoardMod) {
+    tools.push({ name: "plan_update", description: "Update or clear the live T3 Hub task progress checklist (计划/进程 N/M) so the user sees real-time step completion across AGY, Pi, Muse, Codex, and Claude", inputSchema: { type: "object", properties: { title: { type: "string" }, background: { type: "string" }, steps: { type: "array", items: { type: "object", properties: { id: { type: "string" }, text: { type: "string" }, status: { type: "string" } }, required: ["text", "status"] } }, clear: { type: "boolean" }, projectRoot: { type: "string" }, threadId: { type: "string" } } } });
+  }
+  tools.push(
+    { name: "context_search", description: "Search shared memory + local skills in one call (Runelay search_context).", inputSchema: { type: "object", properties: { query: { type: "string" }, projectRoot: { type: "string" }, limit: { type: "number" } }, required: ["query"] } },
+    { name: "skill_read", description: "Read a skill SKILL.md on demand (Runelay read_skill).", inputSchema: { type: "object", properties: { slug: { type: "string" }, projectRoot: { type: "string" } }, required: ["slug"] } },
+    { name: "skill_read_file", description: "Read a file inside a skill dir (Runelay read_skill_file).", inputSchema: { type: "object", properties: { slug: { type: "string" }, relativePath: { type: "string" }, projectRoot: { type: "string" } }, required: ["slug", "relativePath"] } },
+  );
+  return tools;
 }
 const HUB_LIST_DEF = { name: "hub_list_mcp_tools", description: "List tools from lazy upstream MCP servers (connects on demand).", inputSchema: { type: "object", properties: { server: { type: "string" } } } };
 const HUB_CALL_DEF = { name: "hub_call_mcp_tool", description: "Invoke a tool on an upstream MCP server.", inputSchema: { type: "object", properties: { server: { type: "string" }, tool: { type: "string" }, arguments: { type: "object" } }, required: ["server", "tool"] } };
@@ -191,40 +341,117 @@ const stdioPool = new Map();
 function childKey(def) {
   return def.name + "|" + (def.command || "") + "|" + JSON.stringify(def.args || []) + "|" + (def.url || "");
 }
-function killPoolEntry(key) {
+function isWritableUpstream(entry) {
+  const proc = entry.proc;
+  return !entry.closed && !proc.killed && proc.exitCode === null &&
+    proc.stdin && !proc.stdin.destroyed && proc.stdin.writable;
+}
+function closePoolEntry(entry, error) {
+  entry.closed = true;
+  entry.initialized = false;
+  entry.initPromise = null;
+  clearTimeout(entry.idleTimer);
+  if (stdioPool.get(entry.key) === entry) stdioPool.delete(entry.key);
+  for (const reject of [...entry.writes]) reject(error);
+  for (const [id, waiter] of entry.waiters) {
+    entry.waiters.delete(id);
+    waiter.reject(error);
+  }
+}
+function killPoolEntry(key, expectedEntry) {
   const e = stdioPool.get(key);
-  if (!e) return;
-  clearTimeout(e.idleTimer);
+  if (!e || (expectedEntry && e !== expectedEntry)) return;
+  closePoolEntry(e, new Error("upstream killed"));
   try { e.proc.kill("SIGTERM"); } catch {}
-  stdioPool.delete(key);
+  const killer = setTimeout(() => {
+    try {
+      if (e.proc.exitCode === null && e.proc.signalCode == null) e.proc.kill("SIGKILL");
+    } catch {}
+  }, 100);
+  if (killer.unref) killer.unref();
 }
-function scheduleIdle(key) {
-  const e = stdioPool.get(key);
-  if (!e) return;
-  clearTimeout(e.idleTimer);
-  e.idleTimer = setTimeout(() => killPoolEntry(key), IDLE_MS);
-  if (e.idleTimer.unref) e.idleTimer.unref();
+function scheduleIdle(entry) {
+  if (stdioPool.get(entry.key) !== entry || entry.closed) return;
+  clearTimeout(entry.idleTimer);
+  entry.idleTimer = setTimeout(() => killPoolEntry(entry.key, entry), IDLE_MS);
+  if (entry.idleTimer.unref) entry.idleTimer.unref();
 }
-function withTimeout(p, ms, label) {
+// A write is complete only after its callback succeeds while the same upstream
+// is still alive. Lifecycle errors also reject writes whose callbacks never run.
+function writeJsonRpc(entry, msg) {
+  return new Promise((resolve, reject) => {
+    if (!isWritableUpstream(entry)) { reject(new Error("upstream stdin is not writable")); return; }
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      entry.writes.delete(fail);
+      reject(error);
+    };
+    entry.writes.add(fail);
+    try {
+      entry.proc.stdin.write(JSON.stringify(msg) + "\n", (error) => {
+        if (error) { closePoolEntry(entry, error); return; }
+        if (settled) return;
+        if (!isWritableUpstream(entry)) { fail(new Error("upstream closed during write")); return; }
+        settled = true;
+        entry.writes.delete(fail);
+        resolve();
+      });
+    } catch (error) { closePoolEntry(entry, error); }
+  });
+}
+function withTimeout(p, ms, label, entry, id) {
   let t;
-  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error("timeout: " + label)), ms); });
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => {
+      const e = entry || (p && p._waiterEntry) || null;
+      const wid = id != null ? id : (p && p._waiterId != null ? p._waiterId : null);
+      if (e && wid != null) {
+        try { e.waiters.delete(wid); } catch {}
+      }
+      rej(new Error("timeout: " + label));
+    }, ms);
+  });
   return Promise.race([p, timeout]).finally(() => clearTimeout(t));
 }
 function spawnStdioUpstream(def) {
   const key = childKey(def);
   let entry = stdioPool.get(key);
-  if (entry && !entry.proc.killed) return entry;
+  if (entry && isWritableUpstream(entry)) return entry;
+  if (entry) closePoolEntry(entry, new Error("upstream unavailable"));
   const cmd = def.command;
   if (!cmd) throw new Error("missing command for " + def.name);
   const args = Array.isArray(def.args) ? def.args : [];
   const env = { ...process.env, ...(def.env && typeof def.env === "object" ? def.env : {}) };
   const proc = spawn(cmd, args, { env, stdio: ["pipe", "pipe", "pipe"] });
   let buffer = "";
+  let bufferOverflow = false;
   const waiters = new Map(); // id -> {resolve, reject}
   let nextId = 1;
-  let initialized = false;
+  entry = { key, proc, waiters, writes: new Set(), nextId: () => nextId++, initialized: false, initPromise: null, closed: false, idleTimer: null, def };
+  // Install this immediately: ChildProcess's error handler does not handle
+  // errors emitted by its stdin Writable (notably EPIPE).
+  proc.stdin.on("error", (error) => {
+    closePoolEntry(entry, error);
+    try { proc.kill("SIGTERM"); } catch {}
+  });
+  proc.stdin.on("close", () => closePoolEntry(entry, new Error("upstream stdin closed")));
+  proc.on("error", (error) => closePoolEntry(entry, error));
+  proc.on("exit", () => closePoolEntry(entry, new Error("upstream exited")));
+  proc.on("close", () => closePoolEntry(entry, new Error("upstream closed")));
   proc.stdout.on("data", (chunk) => {
+    if (bufferOverflow || entry.closed) return;
     buffer += chunk.toString("utf8");
+    if (Buffer.byteLength(buffer, "utf8") > MAX_BUFFER_BYTES || buffer.length > MAX_BUFFER_BYTES) {
+      bufferOverflow = true;
+      buffer = "";
+      closePoolEntry(entry, new Error("upstream output exceeds 2MB limit"));
+      try { proc.kill("SIGTERM"); } catch {}
+      const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 100);
+      if (killer.unref) killer.unref();
+      return;
+    }
     let idx;
     while ((idx = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, idx).trim();
@@ -240,28 +467,43 @@ function spawnStdioUpstream(def) {
       }
     }
   });
-  proc.on("error", () => {});
-  proc.on("exit", () => { for (const k of [...waiters.keys()]) { const w = waiters.get(k); waiters.delete(k); w.reject(new Error("upstream exited")); } stdioPool.delete(key); });
-  entry = { key, proc, waiters, nextId: () => nextId++, initialized: false, idleTimer: null, def };
   stdioPool.set(key, entry);
   return entry;
 }
 function sendToStdio(entry, method, params) {
-  return new Promise((resolve, reject) => {
-    const id = entry.nextId();
-    entry.waiters.set(id, { resolve, reject });
-    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} });
-    entry.proc.stdin.write(msg + "\n");
-    scheduleIdle(entry.key);
+  const id = entry.nextId();
+  let resolveFn;
+  let rejectFn;
+  const prom = new Promise((resolve, reject) => { resolveFn = resolve; rejectFn = reject; });
+  entry.waiters.set(id, { resolve: resolveFn, reject: rejectFn });
+  prom._waiterId = id;
+  prom._waiterEntry = entry;
+  writeJsonRpc(entry, { jsonrpc: "2.0", id, method, params: params || {} }).then(() => {
+    scheduleIdle(entry);
+  }, (error) => {
+    const waiter = entry.waiters.get(id);
+    if (waiter) { entry.waiters.delete(id); waiter.reject(error); }
   });
+  return prom;
 }
 async function ensureInitialized(entry) {
+  if (!isWritableUpstream(entry)) throw new Error("upstream unavailable");
   if (entry.initialized) return;
-  entry.initialized = true;
-  try {
-    await withTimeout(sendToStdio(entry, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t3-mcp-router", version: "1.0.0" } }), 8000, "initialize " + entry.def.name);
-    entry.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-  } catch (e) { entry.initialized = false; throw e; }
+  if (!entry.initPromise) {
+    entry.initPromise = (async () => {
+      try {
+        await withTimeout(sendToStdio(entry, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t3-mcp-router", version: "1.0.0" } }), 8000, "initialize " + entry.def.name);
+        await writeJsonRpc(entry, { jsonrpc: "2.0", method: "notifications/initialized" });
+        if (entry.proc.exitCode !== null || entry.closed || !isWritableUpstream(entry)) throw new Error("upstream closed during initialization");
+        entry.initialized = true;
+      } catch (e) {
+        entry.initialized = false;
+        entry.initPromise = null;
+        throw e;
+      }
+    })();
+  }
+  await entry.initPromise;
 }
 async function stdioToolsList(def) {
   const entry = spawnStdioUpstream(def);
@@ -287,8 +529,22 @@ function httpPostJson(urlStr, payload, env) {
     const lib = u.protocol === "https:" ? https : http;
     const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: "POST", headers }, (res) => {
       const chunks = [];
-      res.on("data", (c) => chunks.push(c));
+      let totalBytes = 0;
+      let overflowed = false;
+      res.on("data", (c) => {
+        if (overflowed) return;
+        totalBytes += c.length;
+        if (totalBytes > MAX_BUFFER_BYTES) {
+          overflowed = true;
+          try { res.destroy(); } catch {}
+          try { req.destroy(); } catch {}
+          reject(new Error("HTTP response exceeds 2MB limit"));
+          return;
+        }
+        chunks.push(c);
+      });
       res.on("end", () => {
+        if (overflowed) return;
         const text = Buffer.concat(chunks).toString("utf8");
         const ct = String(res.headers["content-type"] || "");
         if (ct.includes("text/event-stream")) {
@@ -370,7 +626,7 @@ async function handleToolsCall(params) {
   if (name === "memory_search") {
     if (!memoryVault) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultSearch({ projectRoot, query: args.query, module: args.module, includeGlobal: args.includeGlobal !== false, limit: args.limit });
+    const res = await vaultSearch({ projectRoot, query: args.query, module: args.module, includeGlobal: args.includeGlobal !== false, limit: args.limit, scope: args.scope, scopeFilter: args.scopeFilter });
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
@@ -384,9 +640,74 @@ async function handleToolsCall(params) {
   if (name === "memory_write") {
     if (!memoryVault) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent, supersedesId: args.supersedesId, autoEvolve: args.autoEvolve });
+    // Pin Shield (Runelay security model): pinned memories get permanent
+    // high-priority injection into every agent. Only a human in the Hub UI
+    // may set them. Agent-supplied pinned:true from web/issue injection is
+    // always stripped to false so an attacker cannot plant an immortal memory.
+    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent, supersedesId: args.supersedesId, autoEvolve: args.autoEvolve, pinned: false, scope: args.scope, scopeFilter: args.scopeFilter });
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? true) }] };
+  }
+  if (name === "context_search") {
+    if (typeof args.query !== "string" || !args.query.trim()) throw new Error("query required");
+    const query = args.query.trim();
+    const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const startedAt = Date.now();
+    let memories = [];
+    if (memoryVault) {
+      try {
+        const res = await vaultSearch({ projectRoot, query, module: args.module, includeGlobal: true, limit, scope: args.scope, scopeFilter: args.scopeFilter });
+        if (res && Array.isArray(res.items)) memories = res.items;
+        else if (res && Array.isArray(res.content)) {
+          try {
+            const first = res.content.find((c) => c && typeof c.text === "string");
+            const parsed = first ? JSON.parse(first.text) : null;
+            if (parsed && Array.isArray(parsed.items)) memories = parsed.items;
+          } catch {}
+        } else if (Array.isArray(res)) memories = res;
+      } catch { memories = []; }
+    }
+    const memoriesOut = memories.slice(0, limit).map((m) => ({
+      id: m && (m.id || m.memoryId) ? String(m.id || m.memoryId) : "",
+      title: String((m && (m.title || m.heading)) || ""),
+      module: String((m && m.module) || ""),
+      snippet: String((m && (m.content || m.snippet || m.text)) || "").slice(0, 240),
+      score: typeof (m && m.score) === "number" ? m.score : undefined,
+    }));
+    const ql = query.toLowerCase();
+    const skills = discoverSkills(projectRoot).filter((s) => {
+      const hay = (s.id + " " + s.name + " " + s.description + " " + s.dir + " " + s.path).toLowerCase();
+      return hay.includes(ql);
+    }).slice(0, limit).map((s) => ({ slug: s.id, id: s.id, name: s.name, description: s.description, path: s.path }));
+    const payload = { query, memories: memoriesOut, skills, tookMs: Date.now() - startedAt };
+    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+  }
+  if (name === "skill_read") {
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const skill = findSkill(args.slug, projectRoot);
+    const { content, truncated, size } = readSkillFileLimited(skill.dir, skill.path, SKILL_READ_MAX_BYTES);
+    return { content: [{ type: "text", text: JSON.stringify({ slug: skill.id, name: skill.name, description: skill.description, path: skill.path, content, truncated, size }) }] };
+  }
+  if (name === "skill_read_file") {
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const skill = findSkill(args.slug, projectRoot);
+    const relativePath = args.relativePath;
+    if (typeof relativePath !== "string" || !relativePath) throw new Error("relativePath required");
+    if (path.isAbsolute(relativePath)) throw new Error("invalid relativePath (must be relative): " + relativePath);
+    const target = path.resolve(skill.dir, relativePath);
+    const rel = path.relative(skill.dir, target);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) throw new Error("path traversal blocked: " + relativePath);
+    try {
+      const realTarget = fs.realpathSync(target);
+      const realSkill = fs.realpathSync(skill.dir);
+      const realRel = path.relative(realSkill, realTarget);
+      if (realRel.startsWith("..") || path.isAbsolute(realRel)) throw new Error("path traversal blocked: " + relativePath);
+    } catch (e) {
+      if (e && String(e.message).includes("traversal")) throw e;
+    }
+    const { content, truncated, size } = readSkillFileLimited(skill.dir, target, SKILL_READ_MAX_BYTES);
+    return { content: [{ type: "text", text: JSON.stringify({ slug: skill.id, relativePath, path: target, content, truncated, size }) }] };
   }
   if (name === "memory_consolidate") {
     if (!memoryVault) throw new Error("memory-vault not available");
@@ -398,6 +719,28 @@ async function handleToolsCall(params) {
     if (!memoryVault) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
     const res = await vaultRollback({ projectRoot, projectSlug: args.projectSlug, id: args.id, targetVersion: args.targetVersion, revisionId: args.revisionId });
+    return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
+  }
+  if (name === "plan_update") {
+    const board = getTaskBoard();
+    if (!board) throw new Error("hub-task-board not available");
+    const projectRoot = args.projectRoot || resolveProjectRoot();
+    const threadId = args.threadId || "";
+    if (args.clear === true) {
+      const res = board.clearPlan({ threadId: threadId || undefined, projectRoot });
+      // Also support clearPlan with projectRoot only fallback
+      const final = res && res.deleted !== undefined ? res : board.clearPlan({ projectRoot });
+      return { content: [{ type: "text", text: JSON.stringify(final ?? true) }] };
+    }
+    // Require steps array for update
+    if (!Array.isArray(args.steps)) throw new Error("steps array required");
+    const res = board.updatePlan({
+      title: args.title || "",
+      background: args.background || "",
+      steps: args.steps,
+      projectRoot,
+      threadId: threadId || undefined,
+    });
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "subagent_resolve") {
@@ -458,8 +801,12 @@ async function handleMessage(msg, framed) {
   } catch (e) { fail(-32603, String((e && e.message) || e)); }
 }
 let inBuffer = "";
-process.stdin.on("data", (chunk) => {
+function onStdinData(chunk) {
   inBuffer += chunk.toString("utf8");
+  if (inBuffer.length > MAX_BUFFER_BYTES || Buffer.byteLength(inBuffer, "utf8") > MAX_BUFFER_BYTES) {
+    inBuffer = "";
+    return;
+  }
   while (true) {
     const trimmedStart = inBuffer.replace(/^\s+/, "");
     const isFramed = /^content-length:/i.test(trimmedStart);
@@ -488,7 +835,13 @@ process.stdin.on("data", (chunk) => {
       handleMessage(msg, false).catch(() => {});
     }
   }
-});
-process.stdin.on("end", () => { for (const k of [...stdioPool.keys()]) killPoolEntry(k); });
+}
+if (require.main === module) {
+  process.stdin.on("data", onStdinData);
+  process.stdin.on("end", () => { for (const k of [...stdioPool.keys()]) killPoolEntry(k); });
+}
+if (require.main !== module) {
+  module.exports = { handleToolsCall, handleToolsList, handleMessage, memoryTools, withTimeout, spawnStdioUpstream, killPoolEntry, sendToStdio, stdioPool, discoverSkills, findSkill, MAX_BUFFER_BYTES, SKILL_READ_MAX_BYTES };
+}
 
 

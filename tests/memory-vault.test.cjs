@@ -419,14 +419,27 @@ describe("embed-manager", () => {
     const mgrHome = path.join(tmpRoot, "emb-home");
     const hub = path.join(mgrHome, ".t3", "hub");
     const cache = path.join(mgrHome, ".cache", "huggingface", "hub");
-    fs.mkdirSync(path.join(cache, "models--mlx-community--embeddinggemma-2-8bit", "blobs"), { recursive: true });
-    fs.writeFileSync(path.join(cache, "models--mlx-community--embeddinggemma-2-8bit", "blobs", "x"), "1234");
+    const safe = "models--mlx-community--embeddinggemma-2-8bit";
+    // 仅 blobs/ 视为下载未完成，不能误报已缓存（embed-manager 安全契约）。
+    fs.mkdirSync(path.join(cache, safe, "blobs"), { recursive: true });
+    fs.writeFileSync(path.join(cache, safe, "blobs", "x"), "1234");
     fs.mkdirSync(mgrHome, { recursive: true });
     const mgr = createEmbedManager({ homeDir: mgrHome, hubDir: hub, cacheDir: cache, port: 18099, launchAgentPlistPath: null });
+    assert.equal(mgr._isModelCached("mlx-community/embeddinggemma-2-8bit"), false, "blobs-only cache must be incomplete");
+    // 完整 HF snapshot：snapshots/<rev>/config.json（非空）+ model.safetensors（非空）+ refs/main。
+    const rev = "rev1";
+    const snap = path.join(cache, safe, "snapshots", rev);
+    fs.mkdirSync(snap, { recursive: true });
+    fs.writeFileSync(path.join(snap, "config.json"), JSON.stringify({ model_type: "embedding_gemma2" }), "utf8");
+    fs.writeFileSync(path.join(snap, "model.safetensors"), "1234");
+    fs.mkdirSync(path.join(cache, safe, "refs"), { recursive: true });
+    fs.writeFileSync(path.join(cache, safe, "refs", "main"), rev);
+    assert.equal(mgr._isModelCached("mlx-community/embeddinggemma-2-8bit"), true, "complete snapshots layout must be cached");
     const st = mgr.getStatus();
     assert.equal(st.ok, true);
     assert.equal(st.port, 18099);
-    assert.equal(st.presets.length, 11);
+    assert.equal(st.presets.length, 17);
+    assert.ok(st.presets.find((x) => x.id === "mlx-community/Octen-Embedding-4B-MLX-4bit"), "should include Octen-Embedding-4B-MLX-4bit");
     const eg = st.presets.find((x) => x.id === "mlx-community/embeddinggemma-2-8bit");
     const qwen = st.presets.find((x) => x.id === "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ");
     assert.equal(eg.downloaded, true);
@@ -449,5 +462,434 @@ describe("embed-manager", () => {
     assert.equal(embedMgrMod.validateModelId(goodLocal, mgrHome).ok, true);
     assert.equal(embedMgrMod.validateModelId("mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ", mgrHome).ok, true);
     assert.equal(embedMgrMod.validateModelId("", mgrHome).ok, false);
+  });
+});
+
+describe("runHygiene 四重治理", () => {
+  function hygieneVault(extra = {}) {
+    return createMemoryVault({ vaultDir, homeDir: homeTmp, embeddingUrl: "http://127.0.0.1:59999/v1/embeddings", _embedFn: () => null, _healthFn: () => ({ modelId: null, dim: null }), ...extra });
+  }
+  function setUpdatedAt(vaultDirPath, id, iso) {
+    const db = new DatabaseSync(path.join(vaultDirPath, "index.sqlite"));
+    try {
+      db.prepare("UPDATE memories SET updated_at = ? WHERE id = ?").run(iso, id);
+    } finally { db.close(); }
+  }
+  it("免死金牌（constraints/architecture/hit_count/pinned/core）绝不归档", () => {
+    const v = hygieneVault();
+    const proj = path.join(tmpRoot, "hygiene-immortal-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6));
+    fs.mkdirSync(proj, { recursive: true });
+    const old = new Date(Date.now() - 100 * 86400000).toISOString();
+    // 冷数据候选：pitfalls/topics + hit_count=0 + 无 pinned/core + 超 60 天
+    const immortalIds = [];
+    const i1 = v.saveMemory({ projectRoot: proj, module: "constraints", kind: "constraint", title: "imm-constraint", content: "imm constraint " + Date.now() + "-" + Math.random(), autoEvolve: false });
+    const i2 = v.saveMemory({ projectRoot: proj, module: "architecture", kind: "decision", title: "imm-arch", content: "imm arch " + Date.now() + "-" + Math.random(), autoEvolve: false });
+    const i3 = v.saveMemory({ projectRoot: proj, module: "pitfalls", kind: "pitfall", title: "imm-hit", content: "imm hit " + Date.now() + "-" + Math.random(), autoEvolve: false });
+    const i4 = v.saveMemory({ projectRoot: proj, module: "pitfalls", kind: "pitfall", title: "imm-pinned", content: "imm pinned " + Date.now() + "-" + Math.random(), tags: ["pinned"], autoEvolve: false });
+    const i5 = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "imm-core", content: "imm core " + Date.now() + "-" + Math.random(), tags: ["core"], autoEvolve: false });
+    for (const r of [i1, i2, i3, i4, i5]) { assert.equal(r.ok, true, JSON.stringify(r)); immortalIds.push(r.item.id); setUpdatedAt(vaultDir, r.item.id, old); }
+    // hit_count>=1 免死：直接置 hit_count=1
+    {
+      const db = new DatabaseSync(path.join(vaultDir, "index.sqlite"));
+      try { db.prepare("UPDATE memories SET hit_count = 1 WHERE id = ?").run(i3.item.id); } finally { db.close(); }
+    }
+    // 再加几条冷数据 + 新鲜冷数据，逼超水位但只有旧冷数据可归档
+    const coldIds = [];
+    for (let k = 0; k < 4; k++) {
+      const c = v.saveMemory({ projectRoot: proj, module: "pitfalls", kind: "pitfall", title: "cold-" + k + "-" + Math.random(), content: "cold流水账 " + k + " " + Date.now() + " " + Math.random(), autoEvolve: false });
+      assert.equal(c.ok, true);
+      setUpdatedAt(vaultDir, c.item.id, old);
+      coldIds.push(c.item.id);
+    }
+    const fresh = v.saveMemory({ projectRoot: proj, module: "pitfalls", kind: "pitfall", title: "fresh-" + Math.random(), content: "fresh " + Date.now() + " " + Math.random(), autoEvolve: false });
+    assert.equal(fresh.ok, true);
+    const res = v.runHygiene({ maxActivePerProject: 3, staleDays: 60 });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const db = new DatabaseSync(path.join(vaultDir, "index.sqlite"));
+    let rows;
+    try { rows = db.prepare("SELECT id FROM memories").all(); } finally { db.close(); }
+    const active = new Set(rows.map((r) => String(r.id)));
+    // 免死金牌仍在
+    for (const id of immortalIds) assert.ok(active.has(id), "immortal must remain: " + id);
+    assert.ok(active.has(fresh.item.id), "fresh must remain");
+    // 冷数据已归档移出
+    for (const id of coldIds) assert.ok(!active.has(id), "cold must be archived: " + id);
+    const slug = v.resolveProjectSlug(proj);
+    const coldFile = path.join(vaultDir, "projects", slug, "_archive", "cold.md");
+    assert.ok(fs.existsSync(coldFile), "cold.md should exist");
+    const coldText = fs.readFileSync(coldFile, "utf8");
+    assert.ok(coldText.includes("cold流水账"), "cold content preserved");
+  });
+  it("孤儿 worktree 归档到 _archive/worktrees.md 并清理空目录", () => {
+    const v = hygieneVault();
+    const proj = path.join(tmpRoot, "hygiene-wt-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6));
+    fs.mkdirSync(proj, { recursive: true });
+    const w = v.saveMemory({ projectRoot: proj, scope: "worktree", worktreeId: "wt-orphan-1", module: "topics", kind: "wip", title: "wt-orphan", content: "wt orphan content " + Math.random(), autoEvolve: false });
+    const w2 = v.saveMemory({ projectRoot: proj, scope: "worktree", worktreeId: "wt-orphan-1", module: "pitfalls", kind: "wip", title: "wt-orphan-2", content: "wt orphan content2 " + Math.random(), autoEvolve: false });
+    assert.equal(w.ok, true, JSON.stringify(w));
+    assert.equal(w2.ok, true, JSON.stringify(w2));
+    // 让 updated_at 超 orphanWorktreeDays（默认 7 天）
+    const old = new Date(Date.now() - 20 * 86400000).toISOString();
+    setUpdatedAt(vaultDir, w.item.id, old);
+    setUpdatedAt(vaultDir, w2.item.id, old);
+    // activeWorktreeIds 不包含该 worktree => 孤儿
+    const res = v.runHygiene({ activeWorktreeIds: [] });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const slug = v.resolveProjectSlug(proj);
+    const arc = path.join(vaultDir, "projects", slug, "_archive", "worktrees.md");
+    assert.ok(fs.existsSync(arc), "worktrees.md should exist");
+    const text = fs.readFileSync(arc, "utf8");
+    assert.ok(text.includes("wt-orphan"), "archived text preserved");
+    assert.ok(text.includes("wt orphan content"), "archived content preserved");
+    const l = v.listMemories({ projectSlug: slug, scopeFilter: "all" });
+    assert.ok(!l.items.some((i) => i.id === w.item.id || i.id === w2.item.id), "orphan worktree removed from active");
+  });
+  it("孤儿/旧模型向量清理 + getOverview 体积字段", () => {
+    const isoVault = fs.mkdtempSync(path.join(os.tmpdir(), "hygiene-vec-vault-"));
+    const v = hygieneVault({ vaultDir: isoVault, _healthFn: () => ({ modelId: "model-new", dim: 16 }) });
+    const proj = path.join(tmpRoot, "hygiene-vec-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6));
+    fs.mkdirSync(proj, { recursive: true });
+    const a = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "vec-a-" + Math.random(), content: "vec content a " + Math.random(), autoEvolve: false });
+    const b = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "vec-b-" + Math.random(), content: "vec content b " + Math.random(), autoEvolve: false });
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    const dbPath = path.join(isoVault, "index.sqlite");
+    const db = new DatabaseSync(dbPath);
+    let orphanDeleted = 0;
+    try {
+      // 新模型全量覆盖
+      const vec = Buffer.from(new Float32Array(16).fill(0.1).buffer);
+      db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)").run(a.item.id, "model-new", 16, vec, new Date().toISOString());
+      db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)").run(b.item.id, "model-new", 16, vec, new Date().toISOString());
+      // 旧模型遗留（id 存在但模型旧）
+      db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)").run("mem_legacy_1", "model-old", 16, vec, new Date().toISOString());
+      db.prepare("INSERT OR REPLACE INTO memory_vectors(id, model_id, dim, vec_f32, updated_at) VALUES (?,?,?,?,?)").run("mem_ghost", "model-old", 16, vec, new Date().toISOString());
+      orphanDeleted = 2;
+    } finally { db.close(); }
+    const res = v.runHygiene({ vacuum: true });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.ok((res.orphanVectorsDeleted || 0) >= orphanDeleted, "orphan deleted");
+    let after;
+    {
+      const db2 = new DatabaseSync(dbPath);
+      try {
+        after = db2.prepare("SELECT id, model_id FROM memory_vectors").all();
+        const orphanStill = db2.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)").get();
+        assert.equal(Number(orphanStill.c), 0, "no orphan vectors remain");
+      } finally { db2.close(); }
+    }
+    // 新模型向量保留
+    assert.ok(after.some((r) => String(r.id) === a.item.id && r.model_id === "model-new"), "new vector kept");
+    const o = v.getOverview({ projectRoot: proj });
+    assert.equal(o.ok, true);
+    assert.equal(typeof o.dbSizeBytes, "number");
+    assert.equal(typeof o.dbSizeMb, "number");
+    assert.ok(o.dbSizeBytes > 0);
+    assert.ok(o.dbSizeMb > 0);
+    assert.equal(typeof o.vectorCount, "number");
+    assert.equal(typeof o.staleVectorCount, "number");
+    assert.equal(typeof o.worktreeMemoryCount, "number");
+    assert.equal(typeof o.archivedCount, "number");
+  });
+});
+
+describe("Dream System (AutoDream)", () => {
+  function makeDreamVault(extra = {}) {
+    const isoBase = fs.mkdtempSync(path.join(os.tmpdir(), "dream-test-"));
+    const isoVault = path.join(isoBase, "memory");
+    const isoHub = isoBase;
+    const isoHome = path.join(isoBase, "home");
+    fs.mkdirSync(isoVault, { recursive: true });
+    fs.mkdirSync(isoHome, { recursive: true });
+    const v = createMemoryVault({
+      vaultDir: isoVault,
+      hubDir: isoHub,
+      homeDir: isoHome,
+      embeddingUrl: "http://127.0.0.1:59999/v1/embeddings",
+      _embedFn: () => null,
+      _healthFn: () => ({ modelId: null, dim: null }),
+      ...extra,
+    });
+    return { v, isoBase, isoVault, isoHub };
+  }
+  function setHitCount(vaultDirPath, id, n) {
+    const db = new DatabaseSync(path.join(vaultDirPath, "index.sqlite"));
+    try {
+      db.prepare("UPDATE memories SET hit_count = ? WHERE id = ?").run(Number(n), id);
+    } finally { db.close(); }
+  }
+  function setUpdatedAtDream(vaultDirPath, id, iso) {
+    const db = new DatabaseSync(path.join(vaultDirPath, "index.sqlite"));
+    try {
+      db.prepare("UPDATE memories SET updated_at = ? WHERE id = ?").run(iso, id);
+    } finally { db.close(); }
+  }
+
+  it("updateDreamConfig 校验合法/非法 HH:MM 与开关持久化", () => {
+    const { v, isoHub } = makeDreamVault();
+    const state0 = v.getDreamState();
+    assert.equal(state0.ok, true);
+    assert.equal(state0.config.enabled, true);
+    assert.equal(state0.config.dreamTime, "03:00");
+    assert.equal(state0.config.catchUpOnWake, true);
+    assert.equal(state0.config.lastDreamAt, null);
+    assert.equal(state0.config.lastDreamDate, null);
+    assert.equal(state0.config.dreamCount, 0);
+    assert.equal(state0.config.lastReport, null);
+    assert.ok(Array.isArray(state0.journal));
+    // 合法更新
+    const ok = v.updateDreamConfig({ dreamTime: "04:30", enabled: false, catchUpOnWake: false });
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(ok.config.dreamTime, "04:30");
+    assert.equal(ok.config.enabled, false);
+    assert.equal(ok.config.catchUpOnWake, false);
+    const state1 = v.getDreamState();
+    assert.equal(state1.config.dreamTime, "04:30");
+    assert.equal(state1.config.enabled, false);
+    assert.equal(state1.config.catchUpOnWake, false);
+    const persisted = JSON.parse(fs.readFileSync(path.join(isoHub, "dream-config.json"), "utf8"));
+    assert.equal(persisted.dreamTime, "04:30");
+    assert.equal(persisted.enabled, false);
+    // 非法 HH:MM
+    for (const bad of ["25:00", "3:00", "03-00", "ab:cd", "24:00", "03:60", "", "0300"]) {
+      const badRes = v.updateDreamConfig({ dreamTime: bad });
+      assert.equal(badRes.ok, false, JSON.stringify({ bad, badRes }));
+      assert.equal(badRes.error, "invalid dreamTime (expected HH:MM)");
+    }
+    // 非法不应覆盖已存值
+    assert.equal(v.getDreamState().config.dreamTime, "04:30");
+    // 合法边界值
+    const b1 = v.updateDreamConfig({ dreamTime: "00:00" });
+    assert.equal(b1.ok, true);
+    const b2 = v.updateDreamConfig({ dreamTime: "23:59" });
+    assert.equal(b2.ok, true);
+    assert.equal(v.getDreamState().config.dreamTime, "23:59");
+    // 开关持久化回读
+    const b3 = v.updateDreamConfig({ enabled: true, catchUpOnWake: true });
+    assert.equal(b3.ok, true);
+    assert.equal(v.getDreamState().config.enabled, true);
+    assert.equal(v.getDreamState().config.catchUpOnWake, true);
+  });
+
+  it("runDreamCycle 四阶段联动：合并/晋升/归档/日志与 overview", async () => {
+    const { v, isoVault, isoHub } = makeDreamVault();
+    const proj = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dream-proj-")), "proj");
+    fs.mkdirSync(proj, { recursive: true });
+    // Phase1 合并：两条同义记忆（autoEvolve 关闭保证双行）
+    const a = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-cache-ttl-rule", content: "cache ttl must be 60 seconds for api responses to reduce load", autoEvolve: false });
+    const b = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-cache-ttl-rule", content: "cache ttl must be 60 seconds for api responses to reduce load retries", autoEvolve: false });
+    assert.equal(a.ok, true, JSON.stringify(a));
+    assert.equal(b.ok, true, JSON.stringify(b));
+    assert.notEqual(a.item.id, b.item.id);
+    // Phase2 晋升：hit_count>=2 的 worktree
+    const w = v.saveMemory({ projectRoot: proj, scope: "worktree", worktreeId: "dream-wt-promote", module: "topics", kind: "wip", title: "dream-wt-promote", content: "dream wt promote content " + Date.now(), autoEvolve: false });
+    assert.equal(w.ok, true, JSON.stringify(w));
+    setHitCount(isoVault, w.item.id, 2);
+    // Phase3 归档目标：过期孤儿 worktree 碎片（hit 0、无免死标签）
+    const orphan = v.saveMemory({ projectRoot: proj, scope: "worktree", worktreeId: "dream-wt-orphan", module: "topics", kind: "wip", title: "dream-wt-orphan", content: "dream wt orphan fragment " + Date.now(), autoEvolve: false });
+    assert.equal(orphan.ok, true, JSON.stringify(orphan));
+    const old = new Date(Date.now() - 20 * 86400000).toISOString();
+    setUpdatedAtDream(isoVault, orphan.item.id, old);
+    // 免死金牌：旧 constraints 绝不归档
+    const immortal = v.saveMemory({ projectRoot: proj, module: "constraints", kind: "constraint", title: "dream-immortal", content: "dream immortal constraint " + Date.now(), autoEvolve: false });
+    assert.equal(immortal.ok, true, JSON.stringify(immortal));
+    setUpdatedAtDream(isoVault, immortal.item.id, old);
+    const res = await v.runDreamCycle({ reason: "manual" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.ok(res.report.mergedCount >= 1, "mergedCount " + res.report.mergedCount);
+    assert.ok(res.report.promotedCount >= 1, "promotedCount " + res.report.promotedCount);
+    assert.ok(res.report.archivedCount >= 1, "archivedCount " + res.report.archivedCount);
+    assert.equal(typeof res.report.scannedProjects, "number");
+    assert.ok(res.report.scannedProjects >= 1);
+    assert.equal(res.report.reason, "manual");
+    // 晋升验证：worktree 已变 shared
+    const promotedList = v.listMemories({ projectRoot: proj, scopeFilter: "all", limit: 50 });
+    const promotedItem = promotedList.items.find((i) => i.id === w.item.id);
+    assert.ok(promotedItem, "promoted item still present");
+    assert.equal(promotedItem.scope === "shared" || promotedItem.memory_scope === "shared" ? "shared" : String(promotedItem.scope || promotedItem.memory_scope), "shared");
+    // 孤儿已归档移出活跃
+    assert.ok(!promotedList.items.some((i) => i.id === orphan.item.id), "orphan archived");
+    // 免死金牌仍在
+    assert.ok(promotedList.items.some((i) => i.id === immortal.item.id), "immortal preserved");
+    // dream-journal.json 写入且 getOverview().dream.lastReport 可读
+    const journalFile = path.join(isoHub, "dream-journal.json");
+    assert.ok(fs.existsSync(journalFile), "dream-journal.json should exist");
+    const journalRaw = JSON.parse(fs.readFileSync(journalFile, "utf8"));
+    const entries = Array.isArray(journalRaw) ? journalRaw : journalRaw.entries;
+    assert.ok(Array.isArray(entries));
+    assert.ok(entries.length >= 1);
+    assert.equal(entries[entries.length - 1].at, res.report.at);
+    const ov = v.getOverview({ projectRoot: proj });
+    assert.equal(ov.ok, true);
+    assert.ok(ov.dream, "overview.dream should exist");
+    assert.ok(ov.dream.lastReport, "overview.dream.lastReport");
+    assert.equal(ov.dream.lastReport.at, res.report.at);
+    assert.equal(res.config.dreamCount, 1);
+    assert.equal(res.config.lastDreamAt, res.report.at);
+    assert.equal(res.config.lastDreamDate, res.report.date);
+    const st = v.getDreamState();
+    assert.equal(st.config.dreamCount, 1);
+    assert.ok(st.journal.length >= 1);
+  });
+
+  it("checkAndRunDueDream 未到点/精准触发/同日不重复/唤醒补梦", async () => {
+    // 未到点不触发
+    {
+      const { v, isoBase } = makeDreamVault();
+      const proj = path.join(isoBase, "proj-notdue");
+      fs.mkdirSync(proj, { recursive: true });
+      const s = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-notdue", content: "dream notdue content " + Date.now(), autoEvolve: false });
+      assert.equal(s.ok, true);
+      v.updateDreamConfig({ dreamTime: "03:00", enabled: true, catchUpOnWake: true });
+      const now = new Date(2026, 10, 15, 2, 0, 0);
+      const r = await v.checkAndRunDueDream({ now });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.equal(r.triggered, false, JSON.stringify(r));
+    }
+    // 03:00 精准触发 + 同一天不重复
+    {
+      const { v, isoBase } = makeDreamVault();
+      const proj = path.join(isoBase, "proj-sched");
+      fs.mkdirSync(proj, { recursive: true });
+      const s = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-sched", content: "dream sched content " + Date.now(), autoEvolve: false });
+      assert.equal(s.ok, true);
+      v.updateDreamConfig({ dreamTime: "03:00", enabled: true, catchUpOnWake: true });
+      const now = new Date(2026, 10, 15, 3, 0, 0);
+      const r = await v.checkAndRunDueDream({ now });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.equal(r.triggered, true, JSON.stringify(r));
+      assert.equal(r.report.reason, "scheduled");
+      assert.equal(r.config.lastDreamDate, "2026-11-15");
+      const now2 = new Date(2026, 10, 15, 3, 2, 0);
+      const r2 = await v.checkAndRunDueDream({ now: now2 });
+      assert.equal(r2.ok, true, JSON.stringify(r2));
+      assert.equal(r2.triggered, false, JSON.stringify(r2));
+      assert.equal(r2.reason, "already-dreamed-today");
+    }
+    // 合盖睡过 03:00 在 09:00 唤醒触发 catchup
+    {
+      const { v, isoBase } = makeDreamVault();
+      const proj = path.join(isoBase, "proj-catchup");
+      fs.mkdirSync(proj, { recursive: true });
+      const s = v.saveMemory({ projectRoot: proj, module: "topics", kind: "topic", title: "dream-catchup", content: "dream catchup content " + Date.now(), autoEvolve: false });
+      assert.equal(s.ok, true);
+      v.updateDreamConfig({ dreamTime: "03:00", enabled: true, catchUpOnWake: true });
+      const now = new Date(2026, 10, 15, 9, 0, 0);
+      const r = await v.checkAndRunDueDream({ now });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.equal(r.triggered, true, JSON.stringify(r));
+      assert.equal(r.report.reason, "catchup");
+    }
+  });
+});
+
+describe("memory-vault: slow 1100ms batch reindex does not truncate, sync keeps 800ms", () => {
+  let slowChild = null;
+  let slowUrl = "";
+  let slowVaultDir = "";
+  let slowVaultRoot = "";
+  let slowHomeDir = "";
+  let slowProj = "";
+
+  function startSlowMockServer() {
+    return new Promise((resolve, reject) => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "slow-mock-"));
+      const file = path.join(base, "slow.cjs");
+      const code = [
+        "const http = require('node:http');",
+        "const crypto = require('node:crypto');",
+        "const DIM = 16;",
+        "function tokVec(t){const v=new Array(DIM).fill(0);for(const tok of t){const h=crypto.createHash('sha256').update(String(tok)).digest('hex');const idx=parseInt(h.slice(0,2),16)%DIM;v[idx]+=1;}const n=Math.sqrt(v.reduce((s,x)=>s+x*x,0))||1;return v.map(x=>x/n);}",
+        "function tokenize(s){return (String(s).toLowerCase().match(/[\\p{L}\\p{N}_]+/gu)||[]).filter(x=>x.length>0);}",
+        "const srv=http.createServer((req,res)=>{",
+        " if(req.method==='GET'&&req.url==='/health'){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:true,modelId:'mock-slow',dim:DIM}));return;}",
+        " if(req.method==='POST'&&req.url==='/v1/embeddings'){let b='';req.on('data',c=>b+=c);req.on('end',()=>{setTimeout(()=>{let texts=[];try{const j=JSON.parse(b);texts=Array.isArray(j.input)?j.input:[j.input];}catch{texts=[b];}const data=texts.map((t,i)=>({object:'embedding',index:i,embedding:tokVec(tokenize(t))}));res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({object:'list',data,model:'mock-slow'}));},1100);});return;}",
+        " res.writeHead(404);res.end('nf');});",
+        "srv.listen(0,'127.0.0.1',()=>{console.log('SLOW_PORT='+srv.address().port);});",
+      ].join("\n");
+      fs.writeFileSync(file, code);
+      const child = spawn("node", [file], { stdio: ["ignore", "pipe", "pipe"] });
+      let buf = "";
+      child.stdout.on("data", (c) => {
+        buf += String(c);
+        const m = buf.match(/SLOW_PORT=(\d+)/);
+        if (m) {
+          slowUrl = "http://127.0.0.1:" + Number(m[1]) + "/v1/embeddings";
+          resolve(child);
+        }
+      });
+      child.on("error", reject);
+      child.stderr.on("data", (d) => console.error("[slow-mock]", String(d).trim()));
+      setTimeout(() => reject(new Error("slow start timeout: " + buf)), 8000);
+    });
+  }
+
+  before(async () => {
+    slowChild = await startSlowMockServer();
+    slowVaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), "slow-vault-"));
+    slowVaultDir = path.join(slowVaultRoot, "memory");
+    slowHomeDir = path.join(slowVaultRoot, "home");
+    slowProj = path.join(slowVaultRoot, "proj-slow");
+    fs.mkdirSync(slowVaultDir, { recursive: true });
+    fs.mkdirSync(slowHomeDir, { recursive: true });
+    fs.mkdirSync(slowProj, { recursive: true });
+  });
+
+  after(() => {
+    try { if (slowChild) slowChild.kill(); } catch {}
+    try { if (slowVaultRoot) fs.rmSync(slowVaultRoot, { recursive: true, force: true }); } catch {}
+  });
+
+  it("reindexVectors 1100ms 批量完整写入，同步查询 800ms 快速降级 FTS5", async () => {
+    // 未显式传 embeddingTimeoutMs，走批量 30000
+    const v = createMemoryVault({ vaultDir: slowVaultDir, homeDir: slowHomeDir, embeddingUrl: slowUrl });
+    v.invalidateEmbedHealthCache();
+    const stamp = Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+    const r1 = v.saveMemory({ projectRoot: slowProj, module: "topics", kind: "topic", title: "slow-a-" + stamp, content: "slow batch content alpha " + stamp, autoEvolve: false });
+    const r2 = v.saveMemory({ projectRoot: slowProj, module: "topics", kind: "topic", title: "slow-b-" + stamp, content: "slow batch content beta " + stamp, autoEvolve: false });
+    const r3 = v.saveMemory({ projectRoot: slowProj, module: "topics", kind: "topic", title: "slow-c-" + stamp, content: "slow batch content gamma " + stamp, autoEvolve: false });
+    assert.equal(r1.ok, true, JSON.stringify(r1));
+    assert.equal(r2.ok, true);
+    assert.equal(r3.ok, true);
+
+    // 清掉后台异步可能已写的少量向量，强制走 reindex 批量
+    {
+      const db = new DatabaseSync(path.join(slowVaultDir, "index.sqlite"));
+      try { db.prepare("DELETE FROM memory_vectors WHERE id IN (?,?,?)").run(r1.item.id, r2.item.id, r3.item.id); } finally { db.close(); }
+    }
+    const re = v.reindexVectors({});
+    assert.equal(re.ok, true);
+    assert.ok(re.promise);
+    await re.promise;
+    const ok = await waitForVectors(slowVaultDir, 3, 8000);
+    assert.equal(ok, true, "reindex should write all vectors despite 1100ms");
+    {
+      const db = new DatabaseSync(path.join(slowVaultDir, "index.sqlite"));
+      try {
+        const row = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE id IN (?,?,?)").get(r1.item.id, r2.item.id, r3.item.id);
+        assert.equal(Number(row.c), 3);
+      } finally { db.close(); }
+    }
+    // 同步路径仍 800ms：删向量后查询应快速降级 lexical 仍命中
+    {
+      const db = new DatabaseSync(path.join(slowVaultDir, "index.sqlite"));
+      try { db.prepare("DELETE FROM memory_vectors WHERE id IN (?,?,?)").run(r1.item.id, r2.item.id, r3.item.id); } finally { db.close(); }
+    }
+    v.invalidateEmbedHealthCache();
+    const t0 = Date.now();
+    const r = v.listMemories({ projectRoot: slowProj, query: "slow batch" });
+    const dt = Date.now() - t0;
+    assert.equal(r.ok, true);
+    assert.ok(r.items.some((i) => i.id === r1.item.id), "lexical fallback hit after sync timeout");
+    // 同步 800ms 超时 + FTS 降级，绝不应等到批量 30000 或 1100 成功才返回慢查询太长；允许 < 2500ms
+    assert.ok(dt < 2500, "sync degrade should be fast, got " + dt + "ms");
+    // 显式传 embeddingTimeoutMs 时同步异步均尊重该值（此处显式 500ms 仍应快速失败但不抛）
+    const vExplicit = createMemoryVault({ vaultDir: slowVaultDir, homeDir: slowHomeDir, embeddingUrl: slowUrl, embeddingTimeoutMs: 500 });
+    vExplicit.invalidateEmbedHealthCache();
+    const t1 = Date.now();
+    const r2q = vExplicit.listMemories({ projectRoot: slowProj, query: "slow batch" });
+    const dt2 = Date.now() - t1;
+    assert.equal(r2q.ok, true);
+    assert.ok(dt2 < 2000, "explicit timeout respected sync fast " + dt2);
   });
 });

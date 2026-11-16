@@ -854,7 +854,8 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   // ============================================================================
@@ -1103,7 +1104,7 @@
   styleEl.id = "t3-hud-styles";
   styleEl.textContent = `
     .t3-hud-composer-spaced {
-      padding-top: 32px !important;
+      padding-top: var(--t3-hud-composer-space, 29px) !important;
     }
 
     /* Hide T3's redundant right-sidebar quota & context sections while keeping React Fiber live */
@@ -1878,9 +1879,7 @@
     }
     /* OpenAI monochrome chrome. Quota is the sole semantic-color exception. */
     #t3-hud-root{--hud-bg:#fff;--hud-bg-solid:#fff;--hud-fg:#0d0d0d;--hud-muted:#5d5d5d;--hud-surface:#f7f7f8;--hud-border:#ececec;--hud-hover:rgba(0,0,0,.04);--hud-emerald:var(--hud-fg);--hud-blue:var(--hud-fg);--hud-cyan:var(--hud-fg);--hud-amber:var(--hud-muted);--hud-orange:var(--hud-fg);--hud-red:var(--hud-fg);--hud-violet:var(--hud-fg);--hud-emerald-fill:var(--hud-fg);--hud-blue-fill:var(--hud-fg);--hud-amber-fill:var(--hud-fg);--hud-orange-fill:var(--hud-fg);--hud-red-fill:var(--hud-fg)}
-    :is(.dark,[data-theme="dark"]) #t3-hud-root,#t3-hud-root.is-dark{--hud-bg:#171717;--hud-bg-solid:#171717;--hud-fg:#ececec;--hud-muted:#a3a3a3;--hud-surface:#212121;--hud-border:rgba(255,255,255,.12);--hud-hover:rgba(255,255,255,.06);color-scheme:dark}
-    @media(prefers-color-scheme:dark){html:not(.light):not([data-theme="light"]) #t3-hud-root{--hud-bg:#171717;--hud-bg-solid:#171717;--hud-fg:#ececec;--hud-muted:#a3a3a3;--hud-surface:#212121;--hud-border:rgba(255,255,255,.12);--hud-hover:rgba(255,255,255,.06);color-scheme:dark}}
-    .t3-hud-composer-spaced{padding-top:40px!important}
+    .t3-hud-composer-spaced{padding-top:var(--t3-hud-composer-space,29px)!important}
     #t3-hud-topbar{height:27px;padding:0 7px;border-radius:8px;background:var(--hud-bg-solid);backdrop-filter:none;-webkit-backdrop-filter:none;box-shadow:0 1px 3px #00000005;font-size:10px}
     #t3-hud-git-btn{font-size:10px}.t3-hud-sub-badge{background:var(--hud-surface);color:var(--hud-muted)}#t3-hud-git-btn.active{background:var(--hud-fg);color:var(--hud-bg-solid)}#t3-hud-git-btn.active .t3-git-symbol{color:inherit}
     #t3-hud-root .t3-quota-fill,#t3-hud-root #t3-hud-quota-bar{background:#10a37f}#t3-hud-root .t3-quota-val,#t3-hud-root #t3-hud-quota{color:#10a37f}
@@ -1977,6 +1976,29 @@
     </aside>
   `;
   document.body.appendChild(root);
+
+  const hudThemes = {
+    white: ["#ffffff", "#f8fafc", "#e2e8f0", "#0f172a", "#475569", "#2563eb"],
+    dark: ["#14161a", "#1e2128", "#2e333d", "#f8fafc", "#94a3b8", "#60a5fa"],
+    sky: ["#f4f9ff", "#eaf3ff", "#bfdbfe", "#0c4a6e", "#0369a1", "#0284c7"],
+    emerald: ["#f2fdf7", "#e6faef", "#a7f3d0", "#064e3b", "#047857", "#059669"],
+    violet: ["#faf7ff", "#f3e8ff", "#ddd6fe", "#3b0764", "#6d28d9", "#7c3aed"],
+  };
+  function syncHudTheme(event) {
+    let theme = event?.detail?.theme;
+    if (!theme) { try { theme = localStorage.getItem("t3-hub-theme"); } catch {} }
+    if (!Object.hasOwn(hudThemes, theme)) theme = "white";
+    const [bg, surface, border, ink, muted, accent] = hudThemes[theme];
+    const variables = { "hud-bg": bg, "hud-bg-solid": bg, "hud-surface": surface, "hud-border": border, "hud-fg": ink, "hud-muted": muted, "hud-accent": accent,
+      "hud-hover": theme === "dark" ? "#ffffff0f" : "#0f172a08", "hud-shadow": theme === "dark" ? "0 14px 40px #00000066" : "0 8px 30px #0f172a14,0 1px 3px #0f172a08" };
+    for (const [key, value] of Object.entries(variables)) root.style.setProperty(`--${key}`, value);
+    for (const color of ["emerald", "blue", "cyan", "violet"]) root.style.setProperty(`--hud-${color}`, accent);
+    root.dataset.theme = theme;
+    root.style.colorScheme = theme === "dark" ? "dark" : "light";
+  }
+  syncHudTheme();
+  window.addEventListener("t3-hub-theme-change", syncHudTheme);
+  window.addEventListener("storage", syncHudTheme);
   document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());
 
   const topbar = document.getElementById("t3-hud-topbar");
@@ -2051,12 +2073,29 @@
   function setComposerTopSpacing(stackEl) {
     if (spacedComposerStack && spacedComposerStack !== stackEl) {
       spacedComposerStack.classList.remove("t3-hud-composer-spaced");
+      spacedComposerStack.style.removeProperty("--t3-hud-composer-space");
       spacedComposerStack = null;
     }
     if (stackEl && !stackEl.classList.contains("t3-hud-composer-spaced")) {
       stackEl.classList.add("t3-hud-composer-spaced");
     }
+    if (stackEl) {
+      const spacing = `${(topbar.offsetHeight || 26) + 2}px`;
+      if (stackEl.style.getPropertyValue("--t3-hud-composer-space") !== spacing) stackEl.style.setProperty("--t3-hud-composer-space", spacing);
+    }
     spacedComposerStack = stackEl || null;
+  }
+
+  function findComposerSurface(shell) {
+    const editor = shell.querySelector('textarea,[contenteditable="true"],[contenteditable="plaintext-only"]');
+    for (let node = editor?.parentElement; node && shell.contains(node); node = node.parentElement) {
+      const css = getComputedStyle(node), rect = node.getBoundingClientRect();
+      const background = css.backgroundColor && !/^(transparent|rgba\(0,\s*0,\s*0,\s*0\))$/.test(css.backgroundColor);
+      const border = parseFloat(css.borderTopWidth) > 0 && css.borderTopStyle !== "none";
+      if (parseFloat(css.borderRadius || css.borderTopLeftRadius) >= 6 && (background || border) && rect.width >= 180 && rect.height >= 28) return node;
+      if (node === shell) break;
+    }
+    return shell;
   }
 
   // Audit: NEVER cover Settings, Non-Chat Routes, or Modals/Dialogs
@@ -2082,12 +2121,7 @@
     // 3) Composer check
     const shell = document.querySelector('[data-slot="composer-shell"]');
     if (!shell) return null;
-    let surface = null;
-    try {
-      surface = shell.querySelector("textarea")?.closest("div") || shell.children[0] || shell;
-    } catch {
-      surface = shell;
-    }
+    const surface = findComposerSurface(shell);
     let sRect = null;
     try {
       sRect = surface.getBoundingClientRect();
@@ -2175,25 +2209,24 @@
       lastLayoutState.hidden = false;
     }
 
-    const shellRect = composer?.getBoundingClientRect();
-    const narrow = (cRect?.width || innerWidth) < 640;
-    const available = Math.max(170, (shellRect?.right || cRect?.right || innerWidth) - Math.max(12, (cRect?.left || 0) + 12) - 153);
+    const surface = composer ? findComposerSurface(composer) : null;
+    const sRect = surface?.getBoundingClientRect();
+    const available = Math.max(200, Math.min((sRect?.width || cRect?.width || innerWidth) - 16, innerWidth - 24));
     topbar.classList.toggle("is-tight", available < 610);
-    topbar.classList.toggle("is-mini", narrow || available < 420);
-    topbar.style.maxWidth = `${narrow ? Math.min(306, (cRect?.width || innerWidth) - 112) : available}px`;
+    topbar.classList.toggle("is-mini", available < 420);
+    topbar.style.maxWidth = `${available}px`;
     const tbWidth = topbar.offsetWidth || 220;
     let nextTop = "";
     let nextLeft = "";
     let nextRight = "auto";
-    if (composer && shellRect?.width > 120) {
+    if (composer && sRect?.width > 120) {
       const stackEl = composer.closest('[class*="group/composer-stack"]');
       setComposerTopSpacing(stackEl);
-      const minLeft = cRect ? cRect.left + 12 : 12;
-      const right = Math.min(innerWidth - 12, shellRect.right);
-      // The left launcher owns the left gutter. On narrow chats the HUD joins
-      // the header, so neither surface can cover the composer's input text.
-      nextTop = narrow && hRect ? `${Math.round(hRect.top + (hRect.height - 27) / 2)}px` : `${Math.max(46, Math.round(shellRect.top - 34))}px`;
-      nextLeft = `${Math.round(Math.max(minLeft, right - tbWidth))}px`;
+      const minLeft = Math.max(12, sRect.left + 8);
+      const idealLeft = sRect.left + (sRect.width - tbWidth) / 2;
+      nextLeft = `${Math.round(Math.max(minLeft, Math.min(innerWidth - 12 - tbWidth, idealLeft)))}px`;
+      const tbHeight = topbar.offsetHeight || 26;
+      nextTop = `${Math.max(42, Math.round(sRect.top - tbHeight - 2))}px`;
     }
 
     if (!nextTop && hRect) {
@@ -2625,14 +2658,14 @@
         : "";
     const subTokLine =
       s.cost.subagentCount > 0 && s.tokens.subagentTokens > 0
-        ? `<div class="t3-pop-row"><span>${escapeHtml(t("mainSubPrefix"))} (${s.cost.subagentCount})</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
+        ? `<div class="t3-pop-row"><span>${escapeHtml(t("mainSubPrefix"))} (${escapeHtml(s.cost.subagentCount)})</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
         : "";
 
     popover.innerHTML = `
       <div class="t3-pop-title">
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.title || t("untitled"))}</span>
         <span style="display:flex;align-items:center;gap:6px">
-          <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${s.turnCount} ${escapeHtml(t("rounds"))}</span>
+          <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${escapeHtml(s.turnCount)} ${escapeHtml(t("rounds"))}</span>
           <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
         </span>
       </div>
@@ -2653,7 +2686,7 @@
       </div>
       ${
         s.cost.subagentCount > 0
-          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${s.cost.subagentCount})</span><span style="color:var(--hud-violet)">+${formatUsd(s.cost.subagentUsd)}</span></div>
+          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${escapeHtml(s.cost.subagentCount)})</span><span style="color:var(--hud-violet)">+${formatUsd(s.cost.subagentUsd)}</span></div>
              <div class="t3-pop-row"><span>${escapeHtml(t("totalCost"))}</span><span style="font-weight:700">${formatUsd(s.cost.withSubagentsUsd)}</span></div>`
           : ""
       }
@@ -3121,7 +3154,7 @@
     commitMsgEl.textContent = res.message || t("noMessage");
     const countSuffix = res.diffUnavailable ? "" : ` · ${(res.files || []).length} ${t("filesCount")}`;
     const emailPart = res.authorEmail ? ` <${res.authorEmail}>` : "";
-    commitMetaEl.textContent = `${res.authorName || ""}${emailPart} · ${res.hash.slice(0, 10)}${countSuffix}`;
+    commitMetaEl.textContent = `${res.authorName || ""}${emailPart} · ${String(res.hash || "").slice(0, 10)}${countSuffix}`;
 
     const filesHtml = (res.files || [])
       .map(
@@ -3129,8 +3162,8 @@
         <div class="t3-commit-file">
           <span class="t3-commit-file-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
           <span style="flex:none">
-            ${f.added != null ? `<span class="t3-diff-add">+${f.added}</span>` : ""}
-            ${f.deleted != null ? ` <span class="t3-diff-del">-${f.deleted}</span>` : ""}
+            ${f.added != null ? `<span class="t3-diff-add">+${escapeHtml(f.added)}</span>` : ""}
+            ${f.deleted != null ? ` <span class="t3-diff-del">-${escapeHtml(f.deleted)}</span>` : ""}
           </span>
         </div>`
       )
@@ -3479,6 +3512,8 @@
     window.removeEventListener("hashchange", onRouteMaybeChanged);
     window.removeEventListener("popstate", onRouteMaybeChanged);
     window.removeEventListener("resize", scheduleLayoutSync);
+    window.removeEventListener("t3-hub-theme-change", syncHudTheme);
+    window.removeEventListener("storage", syncHudTheme);
     history.pushState = origPushState;
     history.replaceState = origReplaceState;
     document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());

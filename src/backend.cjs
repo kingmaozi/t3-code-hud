@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const { StringDecoder } = require("node:string_decoder");
 const { DatabaseSync } = require("node:sqlite");
 const hubSkills = require("./hub-skills.cjs");
 const mcpRouter = require("./mcp-router.cjs");
@@ -13,8 +14,67 @@ const embedManager = require("./embed-manager.cjs");
 const hubSubagents = require("./hub-subagents.cjs");
 const hubPlugins = require("./hub-plugins.cjs");
 const hubHooks = require("./hub-hooks.cjs");
+const hubTaskBoard = require("./hub-task-board.cjs");
+const hubHostSettings = require("./hub-host-settings.cjs");
 
 const execFileAsync = promisify(execFile);
+
+// Hub v3 engines (lazy singletons respecting process.env.HOME for tests)
+let _taskBoardInstance = null;
+let _taskBoardHome = null;
+let _hostSettingsInstance = null;
+let _hostSettingsHome = null;
+function getTaskBoard() {
+  const curHome = process.env.HOME || os.homedir();
+  if (_taskBoardInstance && _taskBoardHome === curHome) return _taskBoardInstance;
+  _taskBoardInstance = hubTaskBoard.createTaskBoard({});
+  _taskBoardHome = curHome;
+  return _taskBoardInstance;
+}
+function getHostSettingsManager() {
+  const curHome = process.env.HOME || os.homedir();
+  if (_hostSettingsInstance && _hostSettingsHome === curHome) return _hostSettingsInstance;
+  _hostSettingsInstance = hubHostSettings.createHostSettingsManager({});
+  _hostSettingsHome = curHome;
+  return _hostSettingsInstance;
+}
+function isTestEnv() {
+  return !!(process.env.NODE_ENV === "test" || process.env.T3_HUB_TEST || process.env.UNDER_TEST);
+}
+
+function getMemoryVault() {
+  try { ensureDreamScheduler(); } catch {}
+  try {
+    if (memoryVault && typeof memoryVault.getDefaultMemoryVault === "function") return memoryVault.getDefaultMemoryVault();
+  } catch {}
+  return memoryVault;
+}
+
+let _dreamSchedulerStarted = false;
+let _dreamInterval = null;
+let _dreamWakeTimeout = null;
+function ensureDreamScheduler() {
+  if (_dreamSchedulerStarted) return true;
+  if (process.env.NODE_TEST_CONTEXT) return false;
+  if (process.env.T3_DISABLE_DREAM_SCHEDULER === "1") return false;
+  _dreamSchedulerStarted = true;
+  const tick = () => {
+    try {
+      const v = memoryVault && typeof memoryVault.getDefaultMemoryVault === "function" ? memoryVault.getDefaultMemoryVault() : memoryVault;
+      const p = v.checkAndRunDueDream();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } catch {}
+  };
+  try {
+    _dreamInterval = setInterval(tick, 60_000);
+    if (_dreamInterval && typeof _dreamInterval.unref === "function") _dreamInterval.unref();
+  } catch { _dreamInterval = null; }
+  try {
+    _dreamWakeTimeout = setTimeout(tick, 15_000);
+    if (_dreamWakeTimeout && typeof _dreamWakeTimeout.unref === "function") _dreamWakeTimeout.unref();
+  } catch { _dreamWakeTimeout = null; }
+  return true;
+}
 
 const HOME_DIR = os.homedir();
 const T3_USERDATA = process.env.T3CODE_HOME
@@ -201,12 +261,14 @@ function resolveModelRate(model, provider, promptTokens = 0) {
     }
   }
 
+  // Muse Wonder 灯塔最贵费率（kyma/muse-wonder 真实费率 $5.40/$27.00）
+  const MUSE_WONDER_RATE = { input: 5.4 / 1e6, output: 27.0 / 1e6, cacheRead: 0.54 / 1e6, cacheWrite: 5.4 / 1e6 };
   // Safe fallback rates (USD per token) if model is absent from catalog
   if (norm.includes("muse-ember")) {
     return { input: 0.1 / 1e6, output: 0.5 / 1e6, cacheRead: 0.004 / 1e6, cacheWrite: 0.1 / 1e6 };
   }
   if (norm.includes("muse-wonder")) {
-    return { input: 4.0 / 1e6, output: 20.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 4.0 / 1e6 };
+    return { ...MUSE_WONDER_RATE };
   }
   if (norm.includes("opus")) {
     return { input: 5.0 / 1e6, output: 25.0 / 1e6, cacheRead: 0.5 / 1e6, cacheWrite: 6.25 / 1e6 };
@@ -223,9 +285,21 @@ function resolveModelRate(model, provider, promptTokens = 0) {
   if (norm.includes("hydrogen")) {
     return { input: 1.5 / 1e6, output: 7.5 / 1e6, cacheRead: 0.075 / 1e6, cacheWrite: 1.5 / 1e6 };
   }
-  return { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 2.0 / 1e6 };
+  // 未知模型一律按最贵 muse-wonder 计费，替换旧 $2/$10 兜底
+  return { ...MUSE_WONDER_RATE, isWonderFallback: true };
 }
 
+const MUSE_WONDER_RATES_EXPORT = { input: 5.4 / 1e6, output: 27.0 / 1e6, cacheRead: 0.54 / 1e6, cacheWrite: 5.4 / 1e6 };
+function getWonderFallbackRate() {
+  return { ...MUSE_WONDER_RATES_EXPORT, isWonderFallback: true };
+}
+function getMuseWonderRate() {
+  return { ...MUSE_WONDER_RATES_EXPORT };
+}
+// 纯函数：未知模型兜底，供单测直接断言
+function resolveModelRateWithWonderFallback(model, provider, promptTokens = 0) {
+  return resolveModelRate(model, provider, promptTokens);
+}
 function priceStep(totals, model, provider) {
   const prompt = totals.uncached + totals.cached + totals.cacheWrite;
   const r = resolveModelRate(model, provider, prompt);
@@ -272,7 +346,117 @@ function subtractToolWait(startMs, endMs, toolIntervals) {
 // ============================================================================
 // 2. Native Provider Telemetry Readers (Muse, Antigravity, Codex) with Cache
 // ============================================================================
+const CACHE_LIMIT = 500;
 const fileParseCache = new Map(); // key -> { sig, data }
+
+function lruGet(map, key) {
+  if (!map.has(key)) return undefined;
+  const v = map.get(key);
+  map.delete(key);
+  map.set(key, v);
+  return v;
+}
+function lruSet(map, key, value) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > CACHE_LIMIT) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+// Full-session accounting MUST scan every line. Retain only the current record,
+// never the complete file or an array of historical records. The I/O buffer is
+// fixed; oversized/corrupt records are skipped without retaining their contents.
+function forEachJsonlLineSync(filePath, onLine, { chunkBytes = 256 * 1024, maxLineChars = 8 * 1024 * 1024 } = {}) {
+  if (!Number.isInteger(chunkBytes) || chunkBytes < 1 || chunkBytes > 256 * 1024) {
+    throw new RangeError("JSONL chunkBytes must be between 1 and 262144");
+  }
+  if (!Number.isSafeInteger(maxLineChars) || maxLineChars < 1) {
+    throw new RangeError("JSONL maxLineChars must be a positive safe integer");
+  }
+  const stats = { skippedOversizedLines: 0, maxBufferedLineChars: 0 };
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(chunkBytes);
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    let overflowingLine = false;
+    const consume = (text) => {
+      let start = 0;
+      while (start < text.length) {
+        const end = text.indexOf("\n", start);
+        const stop = end === -1 ? text.length : end;
+        if (!overflowingLine) {
+          if (pending.length + stop - start > maxLineChars) {
+            pending = "";
+            overflowingLine = true;
+            stats.skippedOversizedLines++;
+          } else {
+            pending += text.slice(start, stop);
+            stats.maxBufferedLineChars = Math.max(stats.maxBufferedLineChars, pending.length);
+          }
+        }
+        if (end === -1) break;
+        if (!overflowingLine) onLine(pending);
+        pending = "";
+        overflowingLine = false;
+        start = end + 1;
+      }
+    };
+    let bytesRead;
+    while ((bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      consume(decoder.write(buffer.subarray(0, bytesRead)));
+    }
+    consume(decoder.end());
+    if (!overflowingLine && pending) onLine(pending);
+    return stats;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Lossy preview-only helper retained for compatibility. Never use it for
+// cumulative tokens, cost, cache savings, or other full-session accounting.
+const JSONL_LARGE_THRESHOLD = 24 * 1024 * 1024;
+const JSONL_HEAD_BYTES = 2 * 1024 * 1024;
+const JSONL_TAIL_BYTES = 16 * 1024 * 1024;
+function readJsonlLinesSafe(filePath) {
+  let st;
+  try {
+    st = fs.statSync(filePath);
+  } catch {
+    return [];
+  }
+  if (st.size <= JSONL_LARGE_THRESHOLD) {
+    try {
+      const content = fs.readFileSync(filePath, "utf8");
+      return content.split("\n");
+    } catch {
+      return [];
+    }
+  }
+  // Large file: head 2MB (first metadata) + tail 16MB (newest stats), newline-aligned
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const headBuf = Buffer.alloc(JSONL_HEAD_BYTES);
+    const headRead = fs.readSync(fd, headBuf, 0, JSONL_HEAD_BYTES, 0);
+    let headText = headBuf.slice(0, headRead).toString("utf8");
+    const lastNl = headText.lastIndexOf("\n");
+    if (lastNl !== -1) headText = headText.slice(0, lastNl + 1);
+    const tailOffset = st.size - JSONL_TAIL_BYTES;
+    const tailBuf = Buffer.alloc(JSONL_TAIL_BYTES);
+    const tailRead = fs.readSync(fd, tailBuf, 0, JSONL_TAIL_BYTES, tailOffset);
+    let tailText = tailBuf.slice(0, tailRead).toString("utf8");
+    const firstNl = tailText.indexOf("\n");
+    if (firstNl !== -1) tailText = tailText.slice(firstNl + 1);
+    const combined = headText + tailText;
+    return combined.split("\n");
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
 
 function getFileSig(filePath) {
   try {
@@ -338,11 +522,8 @@ function findMuseSessionJsonl(nativeId) {
 function readMuseSessionFile(jsonlPath, fallbackModel) {
   const sig = getFileSig(jsonlPath);
   if (!sig) return null;
-  const cached = fileParseCache.get(jsonlPath);
+  const cached = lruGet(fileParseCache, jsonlPath);
   if (cached && cached.sig === sig) return cached.data;
-
-  const content = fs.readFileSync(jsonlPath, "utf8");
-  const lines = content.split("\n");
 
   let sumUncached = 0;
   let sumCached = 0;
@@ -367,19 +548,18 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
 
   let pendingResponseCreatedUs = null;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  forEachJsonlLineSync(jsonlPath, (line) => {
     if (!line || (!line.includes("model_response_created") && !line.includes("model_completed"))) {
-      continue;
+      return;
     }
     let rec;
     try {
       rec = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
     const evt = rec?.payload?.event;
-    if (!evt) continue;
+    if (!evt) return;
 
     if (evt.kind === "model_response_created") {
       pendingResponseCreatedUs = typeof rec.recorded_at === "number" ? rec.recorded_at : null;
@@ -401,7 +581,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
         (typeof evt.model === "string" ? evt.model : evt.model?.model_id) || latestModel;
       if (model) latestModel = model;
 
-      if (inputTotal + output === 0) continue;
+      if (inputTotal + output === 0) return;
       stepCount++;
 
       sumUncached += uncached;
@@ -436,7 +616,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
       }
       pendingResponseCreatedUs = null;
     }
-  }
+  });
 
   const avgDecodeTps = decodeSecSum > 0.05 ? decodeTokensSum / decodeSecSum : null;
   const avgE2eTps = e2eSecSum > 0.1 ? e2eTokensSum / e2eSecSum : null;
@@ -464,7 +644,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     durationSec: lastDecodeSec ?? (decodeSecSum > 0 ? decodeSecSum : null),
   };
 
-  fileParseCache.set(jsonlPath, { sig, data });
+  lruSet(fileParseCache, jsonlPath, { sig, data });
   return data;
 }
 
@@ -533,16 +713,21 @@ function protoTimestampSec(buf) {
 }
 
 let cachedAgyConvDirs = null;
+let cachedAgyConvDirsAt = 0;
+const CACHED_AGY_TTL_MS = 60 * 1000;
 function findAntigravityConvDb(convId) {
   if (!convId || !fs.existsSync(AGY_PROVIDERS_ROOT)) return null;
-  if (!cachedAgyConvDirs) {
+  const now = Date.now();
+  if (!cachedAgyConvDirs || now - cachedAgyConvDirsAt > CACHED_AGY_TTL_MS) {
     try {
       cachedAgyConvDirs = fs
         .readdirSync(AGY_PROVIDERS_ROOT)
         .map((d) => path.join(AGY_PROVIDERS_ROOT, d, "antigravity-acp", "conversations"))
         .filter((p) => fs.existsSync(p));
+      cachedAgyConvDirsAt = now;
     } catch {
       cachedAgyConvDirs = [];
+      cachedAgyConvDirsAt = now;
     }
   }
   for (const dir of cachedAgyConvDirs) {
@@ -555,7 +740,7 @@ function findAntigravityConvDb(convId) {
 function readAntigravityConvDb(dbFile, fallbackModel) {
   const sig = getFileSig(dbFile);
   if (!sig) return null;
-  const cached = fileParseCache.get(dbFile);
+  const cached = lruGet(fileParseCache, dbFile);
   if (cached && cached.sig === sig) return cached.data;
 
   let adb;
@@ -709,7 +894,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       durationSec: lastStreamSec ?? (e2eSecSum > 0 ? e2eSecSum : null),
     };
 
-    fileParseCache.set(dbFile, { sig, data });
+    lruSet(fileParseCache, dbFile, { sig, data });
     return data;
   } catch {
     return null;
@@ -766,10 +951,9 @@ function findCodexSessionJsonl(nativeId) {
 function readCodexSessionFile(jsonlPath, fallbackModel) {
   const sig = getFileSig(jsonlPath);
   if (!sig) return null;
-  const cached = fileParseCache.get(jsonlPath);
+  const cached = lruGet(fileParseCache, jsonlPath);
   if (cached && cached.sig === sig) return cached.data;
 
-  const lines = fs.readFileSync(jsonlPath, "utf8").split("\n");
   let sumUncached = 0;
   let sumCached = 0;
   let sumCacheWrite = 0;
@@ -793,13 +977,13 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
   let stepInputReadyMs = null;
   let reasoningDoneMs = null;
 
-  for (const line of lines) {
-    if (!line) continue;
+  forEachJsonlLineSync(jsonlPath, (line) => {
+    if (!line) return;
     let rec;
     try {
       rec = JSON.parse(line);
     } catch {
-      continue;
+      return;
     }
     const tsMs = rec.timestamp ? Date.parse(rec.timestamp) : null;
     const p = rec.payload;
@@ -831,7 +1015,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       const out = Math.max(0, Number(u.output_tokens) || 0);
       const reas = Math.min(out, Math.max(0, Number(u.reasoning_output_tokens) || 0));
 
-      if (inp + out === 0) continue;
+      if (inp + out === 0) return;
       stepCount++;
 
       sumUncached += uncached;
@@ -866,7 +1050,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       stepInputReadyMs = tsMs;
       reasoningDoneMs = null;
     }
-  }
+  });
 
   const avgDecodeTps = decodeSecSum > 0.1 ? decodeTokensSum / decodeSecSum : null;
   const avgE2eTps = e2eSecSum > 0.1 ? e2eTokensSum / e2eSecSum : null;
@@ -893,7 +1077,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     durationSec: decodeSecSum > 0 ? decodeSecSum : e2eSecSum > 0 ? e2eSecSum : null,
   };
 
-  fileParseCache.set(jsonlPath, { sig, data });
+  lruSet(fileParseCache, jsonlPath, { sig, data });
   return data;
 }
 
@@ -1298,6 +1482,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 }
 
 // Memoize completed subagent telemetry keyed by childThreadId + updated_at so 400+ subagents run in < 2ms
+// LRU-capped at 500 to avoid long-session monotonic memory growth
 const childSubagentCache = new Map();
 
 function getCachedChildTelemetry(db, childThreadId, fallbackModel, fallbackProvider) {
@@ -1318,7 +1503,7 @@ function getCachedChildTelemetry(db, childThreadId, fallbackModel, fallbackProvi
     turnSig = "";
   }
   const sig = cRow ? `${cRow.updated_at || ""}${turnSig}` : "";
-  const hit = childSubagentCache.get(childThreadId);
+  const hit = lruGet(childSubagentCache, childThreadId);
   if (hit && sig && hit.sig === sig && !hit.data.isRunning) {
     return hit.data;
   }
@@ -1330,7 +1515,7 @@ function getCachedChildTelemetry(db, childThreadId, fallbackModel, fallbackProvi
     cPayload?.modelSelection?.provider || cRow?.default_provider || fallbackProvider
   );
   if (sig && !cTel.isRunning) {
-    childSubagentCache.set(childThreadId, { sig, data: cTel });
+    lruSet(childSubagentCache, childThreadId, { sig, data: cTel });
   }
   return cTel;
 }
@@ -1980,6 +2165,114 @@ function resolveHubContext(args = {}) {
   }
 }
 
+// Bridge helpers for embed health/trim JSON (python service exposes both camelCase and snake_case)
+async function fetchEmbedHealthJson() {
+  const urls = ["http://127.0.0.1:8001/health"];
+  for (const url of urls) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => { try { ctrl.abort(); } catch {} }, 3000);
+      let res;
+      if (typeof fetch === "function") {
+        res = await fetch(url, { signal: ctrl.signal });
+      } else {
+        // fallback via http for older runtimes
+        const http = require("node:http");
+        res = await new Promise((resolve, reject) => {
+          const req = http.get(url, (r) => {
+            const chunks = [];
+            r.on("data", (c) => chunks.push(c));
+            r.on("end", () => resolve({ ok: r.statusCode >= 200 && r.statusCode < 300, json: async () => JSON.parse(Buffer.concat(chunks).toString("utf8")) }));
+          });
+          req.on("error", reject);
+          setTimeout(() => { try { req.destroy(new Error("timeout")); } catch {} }, 3000);
+        });
+      }
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const json = await res.json();
+      if (json && typeof json === "object") return json;
+    } catch {}
+  }
+  // last fallback: curl spawnSync (sync, best-effort)
+  try {
+    const { spawnSync } = require("node:child_process");
+    const r = spawnSync("curl", ["-s", "-m", "3", "--connect-timeout", "2", "http://127.0.0.1:8001/health"], { encoding: "utf8", timeout: 4000 });
+    if (r.status === 0 && r.stdout) return JSON.parse(r.stdout);
+  } catch {}
+  return null;
+}
+function embedMetricsFromHealth(healthJson) {
+  if (!healthJson || typeof healthJson !== "object") return {};
+  const pick = (a, b) => (healthJson[a] != null ? healthJson[a] : healthJson[b]);
+  const num = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v) * 10) / 10 : 0);
+  const int = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const baseActiveMb = num(pick("baseActiveMb", "base_active_mb"));
+  const ceilingMb = num(pick("ceilingMb", "ceiling_mb"));
+  const cacheMb = num(pick("cacheMb", "cache_mb"));
+  const cacheLimitMb = num(pick("cacheLimitMb", "cache_limit_mb"));
+  const autoTrimmedCount = int(pick("autoTrimmedCount", "auto_trimmed_count"));
+  return { baseActiveMb, ceilingMb, cacheMb, cacheLimitMb, autoTrimmedCount,
+    base_active_mb: baseActiveMb, ceiling_mb: ceilingMb, cache_mb: cacheMb, cache_limit_mb: cacheLimitMb, auto_trimmed_count: autoTrimmedCount };
+}
+async function enrichWithEmbedMetrics(target) {
+  try {
+    const h = await fetchEmbedHealthJson();
+    if (!h) return target;
+    const m = embedMetricsFromHealth(h);
+    // ensure passthrough (camelCase primary)
+    for (const k of ["baseActiveMb", "ceilingMb", "cacheMb", "cacheLimitMb", "autoTrimmedCount"]) {
+      if (target[k] == null) target[k] = m[k];
+      else if (Number(target[k]) === 0 && Number(m[k]) !== 0) target[k] = m[k];
+    }
+    // also snake_case for completeness
+    for (const k of ["base_active_mb", "ceiling_mb", "cache_mb", "cache_limit_mb", "auto_trimmed_count"]) {
+      if (target[k] == null) target[k] = m[k];
+    }
+    return target;
+  } catch { return target; }
+}
+async function fetchEmbedTrimJson() {
+  const url = "http://127.0.0.1:8001/trim";
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch {} }, 3000);
+    let res;
+    if (typeof fetch === "function") {
+      res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: ctrl.signal });
+    } else {
+      const http = require("node:http");
+      res = await new Promise((resolve, reject) => {
+        const req = http.request(url, { method: "POST", headers: { "Content-Type": "application/json" } }, (r) => {
+          const chunks = [];
+          r.on("data", (c) => chunks.push(c));
+          r.on("end", () => resolve({ ok: r.statusCode >= 200 && r.statusCode < 300, json: async () => JSON.parse(Buffer.concat(chunks).toString("utf8")) }));
+        });
+        req.on("error", reject);
+        req.end("{}");
+        setTimeout(() => { try { req.destroy(new Error("timeout")); } catch {} }, 3000);
+      });
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+      let msg = "trim failed " + res.status;
+      try { msg += " " + (await res.clone?.().text?.() || ""); } catch {}
+      const txt = await res.text().catch(() => "");
+      if (txt) msg = txt;
+      throw new Error(msg);
+    }
+    return await res.json();
+  } catch (e) {
+    // last fallback via curl
+    try {
+      const { spawnSync } = require("node:child_process");
+      const r = spawnSync("curl", ["-s", "-m", "3", "--connect-timeout", "2", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{}", "http://127.0.0.1:8001/trim"], { encoding: "utf8", timeout: 4000 });
+      if (r.status === 0 && r.stdout) return JSON.parse(r.stdout);
+    } catch {}
+    throw e;
+  }
+}
+
 async function hubCall(action, payload = {}) {
   try {
     switch (action) {
@@ -2018,6 +2311,9 @@ async function hubCall(action, payload = {}) {
       case "mcp:upsert": return mcpRouter.upsertMcpServer(payload);
       case "mcp:remove": return mcpRouter.removeMcpServer(payload);
       case "plugins:list": return hubPlugins.listPlugins(payload);
+      case "plugins:catalog": return hubPlugins.listCatalog(payload);
+      case "plugins:install": return hubPlugins.installFromMarketplace(payload);
+      case "plugins:toggleAgent": return hubPlugins.togglePluginForAgent({ ...(payload || {}), mcpRouter, skillsManager: hubSkills, hooksManager: hubHooks });
       case "plugins:setScope": {
         const res = hubPlugins.setPluginScope(payload);
         if (payload && payload.id === "t3-memory-vault" && payload.scope && payload.scope !== "off") {
@@ -2034,6 +2330,10 @@ async function hubCall(action, payload = {}) {
       case "mcp:probe": return await mcpRouter.probeMcpServers(payload);
       case "mcp:autoSync": return mcpRouter.autoSyncHosts();
       case "mcp:syncClis": return mcpRouter.syncRouterToClis();
+      case "mcp:toggleAgent": return mcpRouter.toggleServerForAgent(payload);
+      case "mcp:setAgents": return mcpRouter.setServerAgents(payload);
+      case "mcp:matrix": return mcpRouter.getAgentMatrix(payload);
+      case "skills:toggleAgent": return hubSkills.toggleSkillForAgent(payload);
       case "hooks:list": return hubHooks.listHooks(payload);
       case "hooks:toggle":
       case "hooks:setScope": return hubHooks.toggleHook(payload);
@@ -2045,20 +2345,86 @@ async function hubCall(action, payload = {}) {
       case "memory:overview": return memoryVault.getOverview(payload);
       case "memory:list":
       case "memory:search": return await memoryVault.listMemories(payload);
+      case "memory:write":
       case "memory:save": return await memoryVault.saveMemory(payload);
+      case "memory:worktreeInfo": return memoryVault.resolveWorktreeContext(payload?.projectRoot || process.cwd());
+      case "memory:promote": return memoryVault.promoteWorktreeMemory(payload);
+      case "memory:ensureLink": return memoryVault.ensureProjectMemoryLink(payload?.projectRoot);
+      case "memory:openFolder": {
+        const linkRes = memoryVault.ensureProjectMemoryLink(payload?.projectRoot);
+        const vaultPath = linkRes?.vaultPath || null;
+        const linkPath = linkRes?.linkPath || null;
+        if (!vaultPath) return { ok: false, error: linkRes?.error || "vaultPath unavailable" };
+        const shouldOpen = payload?.openInFinder !== false && !isTestEnv();
+        if (shouldOpen) {
+          try { execFile("open", [vaultPath], () => {}); } catch {}
+        }
+        return { ok: true, vaultPath, linkPath };
+      }
       case "memory:consolidate": return await memoryVault.consolidateMemories(payload);
       case "memory:rollback": return await memoryVault.rollbackMemory(payload);
       case "memory:delete": return memoryVault.deleteMemory(payload);
       case "memory:pinToAgentsMd": return memoryVault.pinToAgentsMd(payload);
       case "memory:migratePowerContext": return await memoryVault.migrateFromPowerContext(payload);
-      case "memory:stats": return memoryVault.getStats(payload || {});
+      case "memory:importHostMemories": return await memoryVault.importHostMemories(payload || {});
+      case "memory:health": return memoryVault.getMemoryHealth(payload || {});
+      case "memory:stats": {
+        const s = memoryVault.getStats(payload || {});
+        try { await enrichWithEmbedMetrics(s); if (s.vectorStats) await enrichWithEmbedMetrics(s.vectorStats); } catch {}
+        return s;
+      }
+      case "memory:vectorStats": {
+        const vs = memoryVault.getStats(payload || {});
+        try { await enrichWithEmbedMetrics(vs); if (vs.vectorStats) await enrichWithEmbedMetrics(vs.vectorStats); } catch {}
+        return vs;
+      }
+      case "memory:hygiene": return memoryVault.runHygiene(payload || {});
+      case "memory:dream:get": return getMemoryVault().getDreamOverview ? getMemoryVault().getDreamOverview() : getMemoryVault().getDreamState();
+      case "memory:dream:save":
+      case "memory:dream:update": return getMemoryVault().updateDreamConfig(payload || {});
+      case "memory:dream:run": {
+        const r = await getMemoryVault().runDreamCycle({ reason: (payload && payload.reason) || "manual", projectRoot: payload && payload.projectRoot, force: !!(payload && payload.force), agentRunner: payload && typeof payload.agentRunner === "function" ? payload.agentRunner : undefined });
+        let journal = [];
+        try { journal = (getMemoryVault().getDreamState() || {}).journal || []; } catch {}
+        return { ...r, journal };
+      }
       case "embed:status": {
         const status = await embedManager.getStatus();
         try {
           const stats = memoryVault.getStats({});
           if (stats && stats.vectorStats) status.vectorStats = stats.vectorStats;
         } catch {}
+        try { await enrichWithEmbedMetrics(status); if (status.vectorStats) await enrichWithEmbedMetrics(status.vectorStats); } catch {}
         return status;
+      }
+      case "embed:trim": {
+        try {
+          const beforeHealth = await fetchEmbedHealthJson().catch(() => null);
+          const trimRes = await fetchEmbedTrimJson();
+          const afterHealth = await fetchEmbedHealthJson().catch(() => null);
+          const before = (trimRes && trimRes.before) ? trimRes.before : (beforeHealth ? embedMetricsFromHealth(beforeHealth) : {});
+          const after = (trimRes && trimRes.after) ? trimRes.after : (afterHealth ? embedMetricsFromHealth(afterHealth) : {});
+          // compute freed from trim before/after cache/active if present
+          let freedCacheMb = null;
+          let freedActiveMb = null;
+          try {
+            const bCache = before.cache_mb ?? before.cacheMb ?? beforeHealth?.cache_mb ?? beforeHealth?.cacheMb;
+            const aCache = after.cache_mb ?? after.cacheMb ?? afterHealth?.cache_mb ?? afterHealth?.cacheMb;
+            if (Number.isFinite(Number(bCache)) && Number.isFinite(Number(aCache))) freedCacheMb = Number(bCache) - Number(aCache);
+            const bAct = before.active_mb ?? before.activeMb ?? beforeHealth?.active_mb ?? beforeHealth?.activeMb;
+            const aAct = after.active_mb ?? after.activeMb ?? afterHealth?.active_mb ?? afterHealth?.activeMb;
+            if (Number.isFinite(Number(bAct)) && Number.isFinite(Number(aAct))) freedActiveMb = Number(bAct) - Number(aAct);
+          } catch {}
+          const out = { ok: true, before, after, freedCacheMb, freedActiveMb, raw: trimRes };
+          // ensure health metrics passthrough
+          const afterMetrics = afterHealth ? embedMetricsFromHealth(afterHealth) : {};
+          for (const k of ["baseActiveMb", "ceilingMb", "cacheMb", "cacheLimitMb", "autoTrimmedCount"]) {
+            if (out[k] == null && afterMetrics[k] != null) out[k] = afterMetrics[k];
+          }
+          return out;
+        } catch (e) {
+          return { ok: false, error: e?.message || String(e) };
+        }
       }
       case "embed:switch": {
         try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
@@ -2115,6 +2481,62 @@ async function hubCall(action, payload = {}) {
         return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
       }
       case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      case "subagents:orchestration:get": return hubSubagents.getOrchestrationConfig();
+      case "subagents:orchestration:update": {
+        const p = payload || {};
+        const patch = p.config || p.patch || p;
+        // Extract host hints for sync
+        const hostHints = p.hostRulePaths || p.hosts || p.host || p.extraSyncPaths;
+        let res;
+        // Prefer updateOrchestrationConfig which already syncs, passing host hints via opts
+        try {
+          if (typeof hubSubagents.updateOrchestrationConfig === "function") {
+            res = hubSubagents.updateOrchestrationConfig(patch, hostHints ? { hostRulePaths: hostHints, hosts: hostHints } : {});
+            // If update succeeded and additional sync needed, also call explicit sync (idempotent)
+            if (res && res.ok !== false && res.config && typeof hubSubagents.syncOrchestrationDirectiveToHosts === "function") {
+              // Sync already done inside update; calling again is safe
+              try { hubSubagents.syncOrchestrationDirectiveToHosts(hostHints ? { hosts: hostHints } : {}); } catch {}
+            }
+          } else {
+            throw new Error("updateOrchestrationConfig unavailable");
+          }
+        } catch (e) {
+          return { ok: false, error: e?.message || String(e) };
+        }
+        // Return latest config per spec (prefer res.config)
+        const latest = res?.config || hubSubagents.getOrchestrationConfig();
+        return { ok: true, config: latest, ...(res || {}) };
+      }
+      case "subagents:slashPrompt": return { prompt: hubSubagents.buildSlashCommandPrompt(payload?.mode) };
+      case "board:get": return getTaskBoard().getBoardSnapshot(payload || {});
+      case "board:update": return getTaskBoard().updatePlan(payload || {});
+      case "board:clear": return getTaskBoard().clearPlan(payload || {});
+      case "board:readArtifact": {
+        const rawPath = payload?.path || payload?.file || payload?.artifactPath || payload?.filePath || "";
+        if (typeof rawPath !== "string" || !rawPath.trim()) return { ok: false, error: "path required" };
+        const abs = path.resolve(String(rawPath).trim());
+        const home = process.env.HOME || os.homedir();
+        const t3Root = path.resolve(path.join(home, ".t3"));
+        const brainRoot = path.resolve(path.join(home, ".gemini", "antigravity", "brain"));
+        const inT3 = abs === t3Root || abs.startsWith(t3Root + path.sep);
+        const inBrain = abs === brainRoot || abs.startsWith(brainRoot + path.sep);
+        if (!inT3 && !inBrain) return { ok: false, error: "path outside allowed roots" };
+        if (!abs.endsWith(".md")) return { ok: false, error: "only .md artifacts allowed" };
+        try {
+          const st = fs.statSync(abs);
+          if (!st.isFile()) return { ok: false, error: "not a file" };
+          if (st.size > 256 * 1024) return { ok: false, error: "artifact too large" };
+          const content = fs.readFileSync(abs, "utf8");
+          if (content.length > 256 * 1024) return { ok: false, error: "artifact too large" };
+          return { ok: true, path: abs, content };
+        } catch (e) {
+          return { ok: false, error: e?.message || String(e) };
+        }
+      }
+      case "settings:get": return getHostSettingsManager().getSettingsSnapshot();
+      case "settings:update": return getHostSettingsManager().updateHostSetting(payload);
+      case "settings:getRule": return getHostSettingsManager().getRuleContent(payload?.host);
+      case "settings:saveRule": return getHostSettingsManager().saveRuleContent(payload?.host, payload?.content);
       default: return { ok: false, error: "unknown action: " + action };
     }
   } catch (err) {
@@ -2173,6 +2595,7 @@ async function getGitGraph(threadHint, maxCommits = 90, fallbackCwd = null) {
     await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
       cwd: repoPath,
       timeout: 3000,
+      maxBuffer: 2 * 1024 * 1024,
     });
   } catch {
     return { ok: false, repoPath, error: "当前项目目录尚未初始化 Git 仓库" };
@@ -2208,6 +2631,7 @@ async function getGitGraph(threadHint, maxCommits = 90, fallbackCwd = null) {
       execFileAsync("git", ["branch", "--show-current"], {
         cwd: repoPath,
         timeout: 3000,
+        maxBuffer: 2 * 1024 * 1024,
       }).catch(() => ({ stdout: "" })),
     ]);
 
@@ -2291,7 +2715,7 @@ async function getCommitDetail(threadHint, commitHash, fallbackCwd = null) {
       execFileAsync(
         "git",
         ["show", "-s", "--format=%H%x1f%an%x1f%ae%x1f%ai%x1f%B", commitHash],
-        { cwd: graphInfo.repoPath, timeout: 4000 }
+        { cwd: graphInfo.repoPath, timeout: 4000, maxBuffer: 2 * 1024 * 1024 }
       ),
       execFileAsync("git", ["show", "--numstat", "--format=", commitHash], {
         cwd: graphInfo.repoPath,
@@ -2827,6 +3251,25 @@ module.exports = {
   getConfig,
   setConfig,
   lookupCatalogContextMax,
+  resolveModelRate,
+  resolveModelRateWithWonderFallback,
+  getWonderFallbackRate,
+  getMuseWonderRate,
+  MUSE_WONDER_RATES: MUSE_WONDER_RATES_EXPORT,
   resolveHubContext,
   hubCall,
+  ensureDreamScheduler,
+  getMemoryVault,
+  // Test exposure for leak guards (TDD)
+  _fileParseCache: fileParseCache,
+  _childSubagentCache: childSubagentCache,
+  _lruSet: lruSet,
+  _lruGet: lruGet,
+  lruSet,
+  lruGet,
+  readJsonlLines: readJsonlLinesSafe,
+  readJsonlLinesSafe,
+  forEachJsonlLineSync,
+  readMuseSessionFile,
+  readCodexSessionFile,
 };

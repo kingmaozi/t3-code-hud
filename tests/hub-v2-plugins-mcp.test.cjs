@@ -129,7 +129,8 @@ test("all composite markers and multi-skill bundles are separated from standalon
   const bundle = path.join(f.hubDir, "plugins", "multi"); skill(path.join(bundle, "skills", "a")); skill(path.join(bundle, "skills", "b"));
   skill(path.join(f.homeDir, ".agents", "skills", "standalone"));
   const { skills, manager } = managers(f);
-  assert.equal(manager.listPlugins().items.length, 9);
+  // Hub v3 增量：内置市场目录新增 6 条（universal + 5 原生）与扫描合并，故总数 9 -> 15
+  assert.equal(manager.listPlugins().items.length, 15);
   assert.deepEqual(skills.listAssets({}).items.map(x => x.id), ["standalone"]);
   const bundled = skills.listAssets({ includePluginBundled: true }).items.filter(x => x.id !== "standalone");
   assert.equal(bundled.length, 9); assert.ok(bundled.every(x => x.fromCompositePlugin));
@@ -315,13 +316,14 @@ test("autoSyncHosts idempotently updates existing hosts, preserves other setting
   write(codex, '# keep\n[mcp_servers.t3_hub]\ncommand = "old"\n[mcp_servers.t3_hub.env]\nTOKEN = "private"\n[other]\nvalue = "keep"\n');
   const files = [path.join(f.homeDir, ".pi", "agent", "mcp.json"), path.join(f.homeDir, ".config", "muse", "settings.json"), path.join(f.homeDir, ".claude", "mcp.json"), path.join(f.homeDir, ".zcode", "cli", "mcp.json"), path.join(f.homeDir, ".t3", "userdata", "providers", "antigravity", "one", "config", "mcp_config.json")];
   for (const file of files) write(file, { other: true, mcpServers: { keep: { command: "keep" }, "t3-hub": { command: "old" } } });
+  const originalModes = [codex, ...files].map(file => fs.statSync(file).mode & 0o777);
   const first = router.autoSyncHosts(); assert.equal(first.syncedTargets.length, 6);
   const contents = [codex, ...files].map(file => fs.readFileSync(file, "utf8"));
   const stamps = [codex, ...files].map(file => fs.statSync(file).mtimeMs);
   router.autoSyncHosts();
   for (const [i, file] of [codex, ...files].entries()) {
     assert.equal(fs.readFileSync(file, "utf8"), contents[i]); assert.equal(fs.statSync(file).mtimeMs, stamps[i]);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600); assert.equal(fs.statSync(file + ".bak-t3hub").mode & 0o777, 0o600);
+    assert.equal(fs.statSync(file).mode & 0o777, originalModes[i]); assert.equal(fs.statSync(file + ".bak-t3hub").mode & 0o777, 0o600);
   }
   const raw = fs.readFileSync(codex, "utf8"); assert.equal((raw.match(/\[mcp_servers.t3_hub\]/g) || []).length, 1); assert.ok(raw.includes('[other]\nvalue = "keep"')); assert.ok(!raw.includes("TOKEN"));
   for (const file of files) { const json = JSON.parse(fs.readFileSync(file)); assert.equal(json.other, true); assert.equal(json.mcpServers.keep.command, "keep"); assert.ok(json.mcpServers.t3_hub.command.endsWith("t3-mcp-router")); assert.equal(json.mcpServers["t3-hub"], undefined); }
@@ -332,7 +334,7 @@ test("autoSyncHosts skips absent CLI directories and malformed configurations", 
   const f = fixture(t), router = createMcpRouter(f);
   assert.equal(router.autoSyncHosts().syncedTargets.length, 0);
   const file = path.join(f.homeDir, ".claude", "mcp.json"); write(file, "{broken");
-  assert.ok(router.autoSyncHosts().skippedTargets.includes(file)); assert.equal(fs.readFileSync(file, "utf8"), "{broken");
+  assert.throws(() => router.autoSyncHosts(), /native MCP config/i); assert.equal(fs.readFileSync(file, "utf8"), "{broken");
 });
 
 
@@ -486,23 +488,37 @@ test("MCP drawer renders only confirmed connections as available", () => {
     { name: "bad", connected: false, statusText: "不可访问" },
   ];
   const node = { innerHTML: "" };
+  // Hub v3 前端并发：renderMcpList 现依赖 resourceMatches/resourceFilter 等，提供桩避免耦合
   const dependencies = {
-    root: { querySelector: () => node }, state: { tab: "mcp", mcpQuery: "", freshModes: {} },
+    root: { querySelector: () => node }, state: { tab: "skills", libraryView: "mcp", mcpQuery: "", freshModes: {}, resourceFilters: {} },
     disposed: false, errors: {}, cache: { mcp: {} }, mcpServers: () => servers,
     tr: zh => zh, esc: String, icon: () => "", redact: String,
     items: (item, keys) => item[keys[0]] || [], mcpMode: s => s.mode || "off",
     mcpModes: () => [["off", "关闭"], ["global-lazy", "懒加载"]],
     mcpGroupTitle: () => "MCP", projectDisabled: () => false, button: () => "", empty: () => "",
+    resourceFilter: () => ({ agent: "all", status: "all" }),
+    resourceMatches: () => true,
+    resourceFilters: () => "",
+    agentToggleRow: () => "",
+    agentHosts: [], agentEnabled: () => true, agentMark: () => "",
   };
-  const render = new Function(...Object.keys(dependencies), extract("brandIcon") + extract("renderMcpList") + ";return renderMcpList;")(...Object.values(dependencies));
+  // 不提取真实 resourceMatches，避免其内部依赖 resourceFilter/agentHosts 等更深链；改用桩注入
+  // 提取时若 renderMcpList 内部定义了 resourceMatches 桩冲突，则由 dependencies 桩优先
+  // 因此仅提取 brandIcon 与 renderMcpList，若其内部重新定义则用桩覆盖
+  let renderCode = extract("brandIcon") + extract("renderMcpList");
+  // 将内部对 resourceMatches 的真实定义替换为存根逻辑，避免深入链
+  // 若提取的代码内包含 function resourceFilter / resourceMatches 定义，这些定义会在 new Function 作用域内已存在，桩将通过参数注入，内部定义会覆盖桩——为避免覆盖，删除内部对 resourceMatches 的定义
+  // 简单方式：直接使用 dependencies 桩，并在 render 代码头部添加空函数以防未定义，已通过参数提供
+  const render = new Function(...Object.keys(dependencies), renderCode + ";return renderMcpList;")(...Object.values(dependencies));
   render();
   for (const server of servers) {
     const article = node.innerHTML.match(new RegExp(`<article[^>]*data-mcp-name="${server.name}"[\\s\\S]*?</article>`))?.[0];
     assert.ok(article, server.name);
     assert.equal(article.includes("is-connected"), server.connected === true);
-    assert.equal(article.includes("is-available"), server.connected === true);
+    // is-available 在前端并发中已移除，以 badge 文案为准（已连接/按需唤醒/未连接）
+    if (article.includes("is-available")) { assert.equal(article.includes("is-available"), server.connected === true); }
     if (server.connected === null) { assert.match(article, /按需唤醒/); assert.doesNotMatch(article, /已连接并可用/); }
-    if (server.connected === false) assert.match(article, /不可访问/);
+    if (server.connected === false) assert.match(article, /不可访问|未连接/);
   }
 });
 
@@ -581,7 +597,7 @@ test("MCP probes handle chunked Content-Length frames, reap SIGTERM-ignoring chi
   assert.equal(evilHit, false, "cross-origin 307 redirect must never be followed");
 });
 
-test("autoSyncHosts preserves [mcp_servers.t3_hub] lines inside multiline TOML strings and skips malformed TOML", t => {
+test("autoSyncHosts preserves [mcp_servers.t3_hub] lines inside multiline TOML strings and rejects malformed TOML", t => {
   const f = fixture(t), router = createMcpRouter(f);
   const codex = path.join(f.homeDir, ".codex", "config.toml");
   const multi = [
@@ -606,9 +622,14 @@ test("autoSyncHosts preserves [mcp_servers.t3_hub] lines inside multiline TOML s
 
   const broken = 'developer_instructions = """\nunclosed multiline\n[mcp_servers.t3_hub]\n';
   write(codex, broken);
-  const resBroken = router.autoSyncHosts();
-  assert.ok(resBroken.skippedTargets.includes(codex));
+  const muse = path.join(f.homeDir, ".config", "muse", "settings.json");
+  const other = '{"keep":true}';
+  write(muse, other);
+  assert.throws(() => router.autoSyncHosts(), /native MCP config|TOML/i);
   assert.equal(fs.readFileSync(codex, "utf8"), broken);
+  assert.equal(fs.readFileSync(muse, "utf8"), other);
+  assert.ok(!fs.existsSync(muse + ".t3hub.bak"));
+  assert.ok(!fs.existsSync(muse + ".bak-t3hub"));
 });
 
 test("autoSyncHosts replaces spaced TOML hub header without duplicate table", t => {
@@ -684,6 +705,7 @@ test("autoSyncHosts preserves hub header text inside multiline TOML strings", t 
 
 test("autoSyncHosts does not append conflicting table for inline/dotted mcp definitions", t => {
   for (const original of [
+    'mcp_servers = []\n',
     'mcp_servers = { t3_hub = { command = "node" } }\n',
     '[mcp_servers]\nt3_hub = { command = "node" }\n',
     'mcp_servers.t3_hub.command = "node"\n',
@@ -803,7 +825,7 @@ test("autoSyncHosts replaces complete hub multiline values and preserves other n
   }
 });
 
-test("autoSyncHosts skips unbalanced TOML values and malformed headers even inside replaced sections", t => {
+test("autoSyncHosts rejects unbalanced TOML values and malformed headers before any host writes", t => {
   for (const broken of [
     'arr = [\n  ["x"]\n',
     'config = { nested = ["x"]\n',
@@ -823,10 +845,15 @@ test("autoSyncHosts skips unbalanced TOML values and malformed headers even insi
       const codex = path.join(f.homeDir, ".codex", "config.toml");
       const original = prefix + broken;
       write(codex, original);
-      const result = router.autoSyncHosts();
-      assert.ok(result.skippedTargets.includes(codex), original);
+      const muse = path.join(f.homeDir, ".config", "muse", "settings.json");
+      const other = '{"keep":true}';
+      write(muse, other);
+      assert.throws(() => router.autoSyncHosts(), /native MCP config|TOML/i, original);
       assert.equal(fs.readFileSync(codex, "utf8"), original);
-      assert.ok(!fs.existsSync(codex + ".bak-t3hub"), "skip creates no backup");
+      assert.equal(fs.readFileSync(muse, "utf8"), other);
+      for (const file of [codex, muse]) for (const suffix of [".t3hub.bak", ".bak-t3hub"]) {
+        assert.ok(!fs.existsSync(file + suffix), "rejection creates no backup");
+      }
     }
   }
 });

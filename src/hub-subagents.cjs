@@ -3,22 +3,619 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-function safeMkdir(dir) { fs.mkdirSync(dir, { recursive: true }); }
-function dirExists(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
-function fileExists(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
-function lstatSafe(p) { try { return fs.lstatSync(p); } catch { return null; } }
-function readJsonFile(file, fallback) { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } }
-function writeJsonFileAtomic(file, obj) {
-  safeMkdir(path.dirname(file));
-  const tmp = file + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", "utf8");
-  fs.renameSync(tmp, file);
+// Refuse links at both the leaf and any parent before reading, creating,
+// replacing or deleting. The OS temp root itself may be a system alias.
+function assertNoSymlinkPath(file) {
+  let current = path.resolve(file);
+  const tempRoot = path.resolve(os.tmpdir());
+  while (true) {
+    if (current === tempRoot) return;
+    const st = lstatSafe(current);
+    if (st && st.isSymbolicLink()) throw new Error("unsafe symlink path: " + current);
+    const parent = path.dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
 }
-function writeTextAtomic(file, text) {
+function safeMkdir(dir) { assertNoSymlinkPath(dir); fs.mkdirSync(dir, { recursive: true }); }
+function dirExists(p) { assertNoSymlinkPath(p); try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+function fileExists(p) { assertNoSymlinkPath(p); try { return fs.statSync(p).isFile(); } catch { return false; } }
+function lstatSafe(p) { try { return fs.lstatSync(p); } catch { return null; } }
+function readJsonFile(file, fallback) { assertNoSymlinkPath(file); try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } }
+function existingFileMode(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.isFile()) return st.mode & 0o777;
+  } catch {}
+  return null;
+}
+function writeJsonFileAtomic(file, obj) {
+  writeTextAtomic(file, JSON.stringify(obj, null, 2) + "\n", 0o600);
+}
+function writeTextAtomic(file, text, defaultMode) {
+  assertNoSymlinkPath(file);
   safeMkdir(path.dirname(file));
+  const current = lstatSafe(file);
+  if (current && !current.isFile()) throw new Error("unsafe non-regular file: " + file);
+  let mode = existingFileMode(file);
+  if (mode === null) {
+    if (typeof defaultMode === "number") mode = defaultMode;
+    else if (/\.json$/i.test(file)) mode = 0o600;
+    else mode = 0o644;
+  }
   const tmp = file + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-  fs.writeFileSync(tmp, text, "utf8");
-  fs.renameSync(tmp, file);
+  let fd = null;
+  let ownsTmp = false;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600);
+    ownsTmp = true;
+    fs.writeSync(fd, text, 0, "utf8");
+    try { fs.fsyncSync(fd); } catch {}
+    try { fs.fchmodSync(fd, mode); } catch {}
+    fs.closeSync(fd);
+    fd = null;
+    assertNoSymlinkPath(file);
+    fs.renameSync(tmp, file);
+    ownsTmp = false;
+  } catch (e) {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+    try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+    throw e;
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+    try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+  }
+}
+function yamlDoubleQuotedScalar(value) {
+  // Emit single-line YAML 1.2 double-quoted escapes losslessly for every control,
+  // line separator (CR/LF/NEL/LS/PS), format char, and noncharacter code point.
+  let quoted = '"';
+  for (const ch of String(value ?? "")) {
+    const cp = ch.codePointAt(0);
+    if (ch === '"' || ch === "\\") quoted += "\\" + ch;
+    else if (ch === "\n") quoted += "\\n";
+    else if (ch === "\r") quoted += "\\r";
+    else if (ch === "\t") quoted += "\\t";
+    // Lone UTF-16 surrogates are not Unicode scalars (nor valid YAML).
+    else if (cp >= 0xd800 && cp <= 0xdfff) quoted += "\\ufffd";
+    else if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(ch) || (cp >= 0xfdd0 && cp <= 0xfdef) || (cp & 0xffff) >= 0xfffe) {
+      quoted += (cp <= 0xffff ? "\\u" : "\\U") + cp.toString(16).padStart(cp <= 0xffff ? 4 : 8, "0");
+    } else quoted += ch;
+  }
+  return quoted + '"';
+}
+const HUB_LOCK_STALE_MS = 30000;
+const HUB_LOCK_WAIT_MS = 5000;
+function acquireT3HubLock(lockPath) {
+  safeMkdir(path.dirname(lockPath));
+  assertNoSymlinkPath(lockPath);
+  const deadline = Date.now() + HUB_LOCK_WAIT_MS;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      try { fs.writeSync(fd, String(process.pid) + "\n"); } catch {}
+      try { fs.fsyncSync(fd); } catch {}
+      try { fs.closeSync(fd); } catch {}
+      return lockPath;
+    } catch (e) {
+      if (!e || e.code !== "EEXIST") throw e;
+      let st = null;
+      try { st = fs.lstatSync(lockPath); } catch {}
+      if (st && st.isSymbolicLink()) throw new Error("unsafe symlink path: " + lockPath);
+      if (st && Date.now() - st.mtimeMs > HUB_LOCK_STALE_MS) {
+        try { fs.unlinkSync(lockPath); continue; } catch {}
+      } else if (!st) {
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error("timeout acquiring lock: " + lockPath);
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      } catch {
+        const end = Date.now() + 10;
+        while (Date.now() < end) {}
+      }
+    }
+  }
+}
+function releaseT3HubLock(lockPath) {
+  try { fs.unlinkSync(lockPath); } catch {}
+}
+function writeNewFileExclusive(file, text, mode) {
+  assertNoSymlinkPath(file);
+  safeMkdir(path.dirname(file));
+  const current = lstatSafe(file);
+  if (current && !current.isFile()) throw new Error("unsafe non-regular file: " + file);
+  const safeMode = (mode & 0o555) || 0o444;
+  const tmp = file + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  let fd = null;
+  let ownsTmp = false;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600);
+    ownsTmp = true;
+    fs.writeSync(fd, text, 0, "utf8");
+    try { fs.fsyncSync(fd); } catch {}
+    fs.fchmodSync(fd, safeMode);
+    const newStat = fs.fstatSync(fd);
+    if ((newStat.mode & 0o222) !== 0) {
+      throw new Error("failed to strip write bits before publish: " + file);
+    }
+    const publishedIno = newStat.ino;
+    fs.closeSync(fd);
+    fd = null;
+    assertNoSymlinkPath(file);
+    fs.linkSync(tmp, file);
+    try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
+    const post = lstatSafe(file);
+    if (!post || !post.isFile() || post.ino !== publishedIno) {
+      return { replacedConcurrently: true };
+    }
+    return { replacedConcurrently: false };
+  } catch (e) {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+    try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+    throw e;
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+    try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+  }
+}
+// The staged inode is private: never delete it until ownership was checked or
+// an exclusive hard link has secured it elsewhere. A second editor save wins
+// the target name; the captured inode gets its own discoverable preserved name.
+function restoreStagedFile(staged, file) {
+  try {
+    fs.linkSync(staged, file);
+  } catch (e) {
+    if (e && e.code === "EEXIST") {
+      while (true) {
+        const preservedPath = file + ".unmanaged-preserved-" + Date.now() + "-" + process.pid + "-" + Math.random().toString(16).slice(2);
+        try { fs.linkSync(staged, preservedPath); }
+        catch (preserveError) {
+          if (preserveError && preserveError.code === "EEXIST") continue;
+          return { preservedPath: staged };
+        }
+        fs.unlinkSync(staged);
+        return { preservedPath };
+      }
+    }
+    // Unsupported links, permission failures, directories, etc.: retain the
+    // original staged inode rather than falling back to a lossy copy/delete.
+    return { preservedPath: staged };
+  }
+  fs.unlinkSync(staged);
+  return {};
+}
+function readUtf8FromFdAtZero(fd) {
+  const st = fs.fstatSync(fd);
+  if (!st.isFile() || st.nlink !== 1) return { st, text: null, raw: null };
+  if (st.size === 0) return { st, text: "", raw: Buffer.alloc(0) };
+  const chunks = [];
+  let pos = 0;
+  const buf = Buffer.allocUnsafe(Math.min(Math.max(st.size, 4096), 65536));
+  while (true) {
+    const n = fs.readSync(fd, buf, 0, buf.length, pos);
+    if (n <= 0) break;
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+    pos += n;
+  }
+  const raw = Buffer.concat(chunks);
+  return { st: fs.fstatSync(fd), text: raw.toString("utf8"), raw };
+}
+function readRegularSnapshot(file) {
+  const st = lstatSafe(file);
+  if (!st) return { missing: true };
+  if (!st.isFile() || st.nlink !== 1) return { missing: false, unsafe: true, st };
+  let fd = null;
+  try {
+    const nofollow = fs.constants.O_NOFOLLOW || 0;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | nofollow);
+    const snap = readUtf8FromFdAtZero(fd);
+    if (!snap.st.isFile() || snap.st.nlink !== 1 || snap.st.ino !== st.ino || snap.raw === null) {
+      return { missing: false, unsafe: true, st: snap.st };
+    }
+    return { missing: false, unsafe: false, ino: snap.st.ino, text: snap.text, raw: snap.raw };
+  } catch (e) {
+    if (e && e.code === "ENOENT") return { missing: true };
+    return { missing: false, unsafe: true, error: e };
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+  }
+}
+function retireStagedFile(staged, file, retiredDir) {
+  const candidates = [
+    retiredDir,
+    path.join(path.dirname(file), ".t3hub-retired"),
+  ].filter(Boolean);
+  const base = path.basename(file);
+  for (const dir of candidates) {
+    try {
+      assertNoSymlinkPath(dir);
+      safeMkdir(dir);
+      try { fs.chmodSync(dir, 0o700); } catch {}
+      assertNoSymlinkPath(dir);
+    } catch {
+      continue;
+    }
+    let crossDevice = false;
+    for (let i = 0; i < 64; i += 1) {
+      const retiredPath = path.join(dir, `${base}.${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`);
+      try {
+        fs.linkSync(staged, retiredPath);
+      } catch (err) {
+        if (err && err.code === "EEXIST") continue;
+        if (err && err.code === "EXDEV") { crossDevice = true; break; }
+        return { retiredPath: staged };
+      }
+      fs.unlinkSync(staged);
+      return { retiredPath };
+    }
+    if (!crossDevice) break;
+  }
+  return { retiredPath: staged };
+}
+function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
+  assertNoSymlinkPath(file);
+  safeMkdir(path.dirname(file));
+  const updating = text !== undefined;
+  const entrySnap = readRegularSnapshot(file);
+  if (entrySnap.missing) return { changed: false, skippedUnmanaged: updating };
+  if (entrySnap.unsafe || !isHubManagedContent(entrySnap.text)) {
+    return { changed: false, skippedUnmanaged: true };
+  }
+  if (expectedSnap && (expectedSnap.ino !== entrySnap.ino || Buffer.compare(expectedSnap.raw, entrySnap.raw) !== 0)) {
+    return { changed: false, skippedUnmanaged: true };
+  }
+  const baselineIno = entrySnap.ino;
+  const baselineRaw = entrySnap.raw;
+  // mkdtemp reserves a same-filesystem, mode-0700 namespace. rename cannot
+  // overwrite a pre-existing staging name, including a malicious symlink.
+  const stageDir = fs.mkdtempSync(file + ".stage-");
+  const tmp = path.join(stageDir, "new");
+  const staged = path.join(stageDir, "old");
+  let fd = null;
+  let stagedFd = null;
+  let stagedOrigMode = null;
+  let publishedIno = null;
+  let ownsTmp = false;
+  let stageDirCleaned = false;
+  const restoreWithMode = (sourcePath = staged) => {
+    if (stagedFd !== null && stagedOrigMode !== null) {
+      try { fs.fchmodSync(stagedFd, stagedOrigMode); } catch {}
+    }
+    if (stagedFd !== null) {
+      try { fs.closeSync(stagedFd); } catch {}
+      stagedFd = null;
+    }
+    return restoreStagedFile(sourcePath, file);
+  };
+  try {
+    if (updating) {
+      const safeMode = (mode & 0o555) || 0o444;
+      fd = fs.openSync(tmp, "wx", 0o600);
+      ownsTmp = true;
+      fs.writeFileSync(fd, text, "utf8");
+      fs.fsyncSync(fd);
+      fs.fchmodSync(fd, safeMode);
+      const newStat = fs.fstatSync(fd);
+      if ((newStat.mode & 0o222) !== 0) {
+        throw new Error("failed to strip write bits before stage link: " + file);
+      }
+      publishedIno = newStat.ino;
+      fs.closeSync(fd);
+      fd = null;
+    }
+    assertNoSymlinkPath(file);
+    try { fs.renameSync(file, staged); }
+    catch (e) {
+      if (e && e.code === "ENOENT") return { changed: false, skippedUnmanaged: updating };
+      throw e;
+    }
+    let managed = false;
+    let stagedSnapRaw = null;
+    try {
+      const stagedLinkStat = fs.lstatSync(staged);
+      if (stagedLinkStat.isFile() && stagedLinkStat.nlink === 1 && stagedLinkStat.ino === baselineIno) {
+        const lockFlags = process.platform === "darwin" ? (0x20 | fs.constants.O_NONBLOCK) : 0;
+        stagedFd = fs.openSync(staged, fs.constants.O_RDONLY | lockFlags);
+        const openStat = fs.fstatSync(stagedFd);
+        if (openStat.isFile() && openStat.ino === baselineIno && openStat.nlink === 1) {
+          stagedOrigMode = openStat.mode & 0o777;
+          if ((stagedOrigMode & 0o222) !== 0) {
+            try { fs.fchmodSync(stagedFd, (stagedOrigMode & 0o555) || 0o400); } catch {}
+          }
+          const snap = readUtf8FromFdAtZero(stagedFd);
+          if (
+            snap.st.nlink === 1 &&
+            snap.raw !== null &&
+            Buffer.compare(snap.raw, baselineRaw) === 0 &&
+            isHubManagedContent(snap.text)
+          ) {
+            managed = true;
+            stagedSnapRaw = snap.raw;
+          }
+        }
+      }
+    } catch {} // Locked, multi-linked, mutated, or unreadable staged inode is restored intact.
+    if (!managed) return { changed: false, skippedUnmanaged: true, ...restoreWithMode(staged) };
+    // Never rename over `file` (which could clobber a concurrent save), and
+    // never drop the staged inode nlink to 0 (retire it via hard link first,
+    // then re-read stagedFd AFTER stageDir/old is unlinked so any write up
+    // through unlink — even one preserving t3_hub_managed: true — is rescued).
+    const rescueIfMutated = (sourcePath) => {
+      let unchanged = false;
+      try {
+        const check = readUtf8FromFdAtZero(stagedFd);
+        unchanged =
+          check.st.nlink === 1 &&
+          check.raw !== null &&
+          Buffer.compare(check.raw, stagedSnapRaw) === 0 &&
+          isHubManagedContent(check.text);
+      } catch {}
+      if (unchanged) return null;
+      return { changed: false, skippedUnmanaged: true, ...restoreWithMode(sourcePath) };
+    };
+    // POSIX note: Hub-managed files are published 0444 read-only so normal editors
+    // cannot acquire writable descriptors. If root/chmod+w pre-opened a writable fd
+    // without advisory locks, mutations up through staging cleanup are rescued as
+    // conflicts; mutations racing with or after function return survive intact in
+    // retired-agents (nlink >= 1) because POSIX has no mandatory fd write lock.
+    const finalizeRetired = () => {
+      const pre = rescueIfMutated(staged);
+      if (pre) return pre;
+      const { retiredPath } = retireStagedFile(staged, file, retiredDir);
+      if (ownsTmp) {
+        try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
+      }
+      if (retiredPath !== staged) {
+        try { fs.rmdirSync(stageDir); stageDirCleaned = true; } catch {}
+      }
+      const post = rescueIfMutated(retiredPath);
+      if (post) return post;
+      return null;
+    };
+    if (updating) {
+      const preLinkRescue = rescueIfMutated(staged);
+      if (preLinkRescue) return preLinkRescue;
+      try { fs.linkSync(tmp, file); }
+      catch (e) {
+        if (e && e.code === "EEXIST") {
+          const rescued = finalizeRetired();
+          if (rescued) return rescued;
+          return { changed: false, skippedUnmanaged: true };
+        }
+        const recovery = restoreWithMode(staged);
+        if (recovery.preservedPath) e.preservedPath = recovery.preservedPath;
+        throw e;
+      }
+      try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
+    }
+    const rescued = finalizeRetired();
+    if (rescued) return rescued;
+    const postTarget = lstatSafe(file);
+    if (updating) {
+      if (!postTarget || !postTarget.isFile() || postTarget.ino !== publishedIno) {
+        return { changed: false, skippedUnmanaged: true };
+      }
+    } else if (postTarget !== null) {
+      return { changed: false, skippedUnmanaged: true };
+    }
+    return { changed: true, skippedUnmanaged: false };
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+    try { if (stagedFd !== null) fs.closeSync(stagedFd); } catch {}
+    try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+    // Never recursively clean: an un-restorable original must survive here.
+    if (!stageDirCleaned) {
+      try { fs.rmdirSync(stageDir); } catch {}
+    }
+  }
+}
+function replaceManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
+  const { changed, ...result } = stageManagedFile(file, text, mode, retiredDir, expectedSnap);
+  return { file, written: changed, ...result };
+}
+function recordUnmanagedConflict(result, id, skippedUnmanaged, conflicts) {
+  if (!result || !result.skippedUnmanaged) return;
+  if (!skippedUnmanaged.includes(result.file)) skippedUnmanaged.push(result.file);
+  if (!conflicts.some(c => c.id === id && c.path === result.file)) {
+    conflicts.push({ id, path: result.file, reason: "unmanaged-user-file", ...(result.preservedPath ? { preservedPath: result.preservedPath } : {}) });
+  }
+}
+const HUB_AGENT_MARKER = "t3_hub_managed: true";
+const HUB_AGENT_HTML_MARKER = "<!-- managed-by: t3-hub -->";
+
+// Ownership is destructive authority, so parse a conservative YAML subset
+// rather than searching for a marker in otherwise unvalidated text. Support
+// block mappings/sequences, quoted/plain scalars, flow collections and |/>;
+// reject ambiguous YAML features (tags, aliases, complex/merge keys) outright.
+function parseOwnershipFrontmatter(source) {
+  const fail = () => { throw new Error("invalid ownership YAML"); };
+  const incomplete = {};
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\ufffe\uffff]/.test(source)) fail();
+  const lines = source.split(/\r?\n/);
+  const plainKey = key => /^[\p{L}_][\p{L}\p{N}_. -]*$/u.test(key) && !/^(?:true|false|null|yes|no|on|off)$/i.test(key);
+  function scalar(text) {
+    let p = 0;
+    const ws = () => {
+      while (p < text.length) {
+        if (text[p] === "\t") fail();
+        if (text[p] === " " || text[p] === "\n") p += 1;
+        else if (text[p] === "#" && (p === 0 || /[ \n]/.test(text[p - 1]))) { while (p < text.length && text[p] !== "\n") p += 1; }
+        else break;
+      }
+    };
+    function quoted() {
+      const quote = text[p++];
+      let out = "";
+      while (p < text.length) {
+        const ch = text[p++];
+        if (ch === quote) {
+          if (quote === "'" && text[p] === "'") { out += "'"; p += 1; continue; }
+          return out;
+        }
+        if (quote === '"' && ch === "\\") {
+          if (p >= text.length) throw incomplete;
+          const escape = text[p++];
+          const escapes = { "0": "\0", a: "\x07", b: "\b", t: "\t", "\t": "\t", n: "\n", v: "\v", f: "\f", r: "\r", e: "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", N: "\u0085", _: "\u00a0", L: "\u2028", P: "\u2029" };
+          if (Object.hasOwn(escapes, escape)) out += escapes[escape];
+          else if (/[xuU]/.test(escape)) {
+            const size = escape === "x" ? 2 : escape === "u" ? 4 : 8;
+            const hex = text.slice(p, p + size), cp = parseInt(hex, 16);
+            if (hex.length !== size || !/^[0-9a-f]+$/i.test(hex) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) fail();
+            out += String.fromCodePoint(cp); p += size;
+          } else if (escape === "\n") { while (text[p] === " " || text[p] === "\t") p += 1; }
+          else fail();
+        } else out += ch;
+      }
+      throw incomplete;
+    }
+    function value(flow, depth) {
+      if (depth > 128) fail();
+      ws();
+      if (p >= text.length) throw incomplete;
+      if (text[p] === '"' || text[p] === "'") return quoted();
+      if (text[p] === "[" || text[p] === "{") {
+        const mapping = text[p++] === "{", close = mapping ? "}" : "]";
+        const result = mapping ? new Map() : [];
+        ws();
+        if (text[p] === close) { p += 1; return result; }
+        while (p < text.length) {
+          if (mapping) {
+            let key;
+            if (text[p] === '"' || text[p] === "'") key = quoted();
+            else {
+              const start = p;
+              while (p < text.length && !/[:\s,\[\]{}]/.test(text[p])) p += 1;
+              key = text.slice(start, p);
+              if (!plainKey(key)) fail();
+            }
+            ws();
+            if (text[p++] !== ":" || result.has(key)) fail();
+            result.set(key, value(true, depth + 1));
+          } else result.push(value(true, depth + 1));
+          ws();
+          if (text[p] === close) { p += 1; return result; }
+          if (p >= text.length) throw incomplete;
+          if (text[p++] !== ",") fail();
+          ws();
+          if (text[p] === close) { p += 1; return result; }
+        }
+        throw incomplete;
+      }
+      const start = p;
+      while (p < text.length && text[p] !== "\n" && !(flow && /[,\]}]/.test(text[p]))) {
+        if (text[p] === "#" && (p === start || /\s/.test(text[p - 1]))) break;
+        if (/[\t\[\]{}]/.test(text[p]) || (flow && /[:?]/.test(text[p])) || (text[p] === ":" && /[\s,\]}]/.test(text[p + 1] || " "))) fail();
+        p += 1;
+      }
+      const raw = text.slice(start, p).trim();
+      if (!raw || /^[,!&*|>@`%]|^[-?:](?:\s|$)/.test(raw)) fail();
+      return raw === "true" ? true : raw === "false" ? false : raw;
+    }
+    const result = value(false, 0);
+    ws();
+    if (p !== text.length) fail();
+    return result;
+  }
+  const mapping = text => text.match(/^((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[\p{L}_][\p{L}\p{N}_. -]*)) *:(?: +|$)(.*)$/u);
+  function entry(index) {
+    while (index < lines.length && /^[ \t]*(?:#.*)?$/.test(lines[index])) index += 1;
+    if (index === lines.length) return null;
+    const indent = lines[index].match(/^ */)[0].length;
+    if (lines[index][indent] === "\t") fail();
+    return { index, indent, text: lines[index].slice(indent) };
+  }
+  function readValue(raw, index, indent, depth) {
+    const plain = raw.replace(/[ \t]+#.*$/, "").trim();
+    if (!plain || plain.startsWith("#")) {
+      const child = entry(index + 1);
+      if (child && child.indent > indent) return block(child.index, child.indent, depth + 1);
+      return { value: null, next: index + 1 };
+    }
+    if (/^[|>]/.test(plain)) {
+      if (raw.includes("\t")) fail();
+      if (!/^[|>](?:[1-9][+-]?|[+-][1-9]?)?$/.test(plain)) fail();
+      const explicit = plain.match(/[1-9]/);
+      let next = index + 1, contentIndent = explicit ? indent + Number(explicit[0]) : null;
+      for (; next < lines.length; next += 1) {
+        if (!lines[next].trim()) continue;
+        const spaces = lines[next].match(/^ */)[0].length;
+        if (spaces <= indent) break;
+        if (contentIndent === null) contentIndent = spaces;
+        if (spaces < contentIndent) fail();
+      }
+      // Block prose is opaque; brackets/quotes inside it are not YAML tokens.
+      return { value: "", next };
+    }
+    let text = raw;
+    for (let next = index + 1; ; next += 1) {
+      try { return { value: scalar(text), next }; }
+      catch (e) {
+        if (e !== incomplete || next >= lines.length) fail();
+        text += "\n" + lines[next];
+      }
+    }
+  }
+  function block(index, indent, depth) {
+    if (depth > 128) fail();
+    const sequence = /^-(?:[ \t]|$)/.test(lines[index].slice(indent));
+    const result = sequence ? [] : new Map();
+    let next = index;
+    while (true) {
+      const item = entry(next);
+      if (!item || item.indent < indent) return { value: result, next: item ? item.index : lines.length };
+      if (item.indent !== indent) fail();
+      const isList = /^-(?:[ \t]|$)/.test(item.text);
+      if (isList !== sequence) fail();
+      let parsed;
+      if (sequence) {
+        if (/^-[ \t]*\t/.test(item.text)) fail();
+        const rest = item.text.slice(1).replace(/^[ \t]+/, "");
+        if (mapping(rest) || /^-(?:[ \t]|$)/.test(rest)) {
+          const original = lines[item.index];
+          lines[item.index] = " ".repeat(indent + 2) + rest;
+          try { parsed = block(item.index, indent + 2, depth + 1); }
+          finally { lines[item.index] = original; }
+        } else parsed = readValue(rest, item.index, indent, depth);
+        result.push(parsed.value);
+      } else {
+        const pair = mapping(item.text);
+        if (!pair) fail();
+        const quotedKey = pair[1].startsWith('"') || pair[1].startsWith("'");
+        const key = quotedKey ? scalar(pair[1]) : pair[1].trim();
+        if (!quotedKey && !plainKey(key)) fail();
+        if (key === "<<" || result.has(key)) fail();
+        parsed = readValue(pair[2], item.index, indent, depth);
+        result.set(key, parsed.value);
+      }
+      next = parsed.next;
+    }
+  }
+  const first = entry(0);
+  if (!first) return new Map();
+  if (first.indent !== 0) fail();
+  const parsed = block(first.index, 0, 0);
+  if (!(parsed.value instanceof Map) || entry(parsed.next)) fail();
+  return parsed.value;
+}
+function isHubManagedContent(content) {
+  if (typeof content !== "string") return false;
+  let frontmatter = null;
+  if (/^---(?:\r?\n|$)/.test(content)) {
+    frontmatter = content.match(/^---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m);
+    if (!frontmatter) return false;
+    try {
+      const fields = parseOwnershipFrontmatter(frontmatter[1]);
+      if (fields.has("t3_hub_managed")) return fields.get("t3_hub_managed") === true;
+    } catch { return false; }
+  }
+  // Legacy HTML ownership is valid only as a standalone first line, or
+  // the first line immediately following the opening frontmatter block.
+  const firstBody = frontmatter ? content.slice(frontmatter[0].length) : content;
+  return firstBody.split(/\r?\n/, 1)[0] === HUB_AGENT_HTML_MARKER;
+}
+function isHubManagedAgentFile(filePath) {
+  try { assertNoSymlinkPath(filePath); return isHubManagedContent(fs.readFileSync(filePath, "utf8")); } catch { return false; }
 }
 function slugify(raw) {
   let s = String(raw ?? "").trim();
@@ -159,6 +756,7 @@ function listModelCatalog(homeDir) {
   };
 }
 
+const ANTI_SWARM_IRON_LAW = "严禁进入蜂窝(Swarm)或指挥官(Orchestrator)模式，严禁递归派发通用研发子代理。";
 const DEFAULT_SUBAGENTS = [
   {
     id: "explorer",
@@ -169,7 +767,7 @@ const DEFAULT_SUBAGENTS = [
     model: "muse-ember-1.0",
     effort: "max",
     description: "只读阅读、查找代码、梳理调用链与排查故障证据，不修改代码",
-    systemPrompt: "你作为只读调查子代理（explorer），专注于阅读源码、检索调用链、核查日志与配置证据。严格只读，不修改业务代码；汇报时明确区分“已确认事实”与“待验证假设”。",
+    systemPrompt: "你作为只读调查子代理（explorer），专注于阅读源码、检索调用链、核查日志与配置证据。严格只读，不修改业务代码；汇报时明确区分“已确认事实”与“待验证假设”。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -182,7 +780,7 @@ const DEFAULT_SUBAGENTS = [
     model: "muse-ember-1.0",
     effort: "max",
     description: "范围明确的功能开发、Bug 修复、配套测试与校验闭环",
-    systemPrompt: "你作为研发执行子代理（worker），在划定的文件边界内完成功能实现或缺陷修复，必须编写并运行对应测试确认转绿后再回传精简结论与修改位置。",
+    systemPrompt: "你作为研发执行子代理（worker），在划定的文件边界内完成功能实现或缺陷修复，必须编写并运行对应测试确认转绿后再回传精简结论与修改位置。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -195,7 +793,7 @@ const DEFAULT_SUBAGENTS = [
     model: "muse-ember-1.0",
     effort: "max",
     description: "资料整理、对照需求查漏、跨信息综合分析与通用独立任务",
-    systemPrompt: "你作为通用协助子代理（default），负责资料归纳、需求核对与跨源信息整理，输出结构清晰、结论先行。",
+    systemPrompt: "你作为通用协助子代理（default），负责资料归纳、需求核对与跨源信息整理，输出结构清晰、结论先行。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -208,7 +806,7 @@ const DEFAULT_SUBAGENTS = [
     model: "gpt-6.1-sol",
     effort: "xhigh",
     description: "worker 两次未果升级接管，或跨 3+ 模块核心契约与复杂架构攻关",
-    systemPrompt: "你作为高难攻关子代理（worker-pro），负责解决跨模块复杂契约、并发状态机或疑难根因，先定位根因不变量再做最小可靠修复并完成回归验证。",
+    systemPrompt: "你作为高难攻关子代理（worker-pro），负责解决跨模块复杂契约、并发状态机或疑难根因，先定位根因不变量再做最小可靠修复并完成回归验证。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -221,7 +819,7 @@ const DEFAULT_SUBAGENTS = [
     model: "gpt-6.1-sol",
     effort: "max",
     description: "前端界面、交互动效、主题适配与桌面+窄屏真实渲染核验",
-    systemPrompt: "你作为前端设计子代理（frontend），负责高品味界面实现、深浅主题适配与响应式布局，交付前必须完成桌面端与窄屏真实渲染核验，确保零溢出。",
+    systemPrompt: "你作为前端设计子代理（frontend），负责高品味界面实现、深浅主题适配与响应式布局，交付前必须完成桌面端与窄屏真实渲染核验，确保零溢出。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -234,7 +832,7 @@ const DEFAULT_SUBAGENTS = [
     model: "gpt-6.1-terra",
     effort: "max",
     description: "边界/并发难测用例、LCU 桌面电脑操控测试与发布前核验（不改业务源码）",
-    systemPrompt: "你作为测试与核验子代理（qa），负责编写边界/并发回归测试、执行桌面操控（LCU）真实交互验证与发布前检查，严禁直接修改业务源码。",
+    systemPrompt: "你作为测试与核验子代理（qa），负责编写边界/并发回归测试、执行桌面操控（LCU）真实交互验证与发布前检查，严禁直接修改业务源码。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -247,7 +845,7 @@ const DEFAULT_SUBAGENTS = [
     model: "gpt-6.1-terra",
     effort: "high",
     description: "独立只读代码审查与发布前终审，仅报告高置信度真实缺陷",
-    systemPrompt: "你作为独立只读审查子代理（code-review），严格只读审查变更代码与关联上下文，仅报告 confidence >= 80 的逻辑缺陷、安全漏洞、并发风险或回归隐患。",
+    systemPrompt: "你作为独立只读审查子代理（code-review），严格只读审查变更代码与关联上下文，仅报告 confidence >= 80 的逻辑缺陷、安全漏洞、并发风险或回归隐患。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -280,6 +878,86 @@ function configItems(raw, withMemory = true) {
 
 const VALID_PROVIDERS = ["muse", "codex", "pi", "antigravity", "claudeAgent"];
 const VALID_ROLES = ["research", "implementation", "general", "design", "test", "review"];
+
+const ORCHESTRATOR_START = "<!-- T3_HUB_ORCHESTRATOR_START -->";
+const ORCHESTRATOR_END = "<!-- T3_HUB_ORCHESTRATOR_END -->";
+const AGY_MODELS = {
+  carbon: { id: "gemini-4-carbon", label: "Orchestrator (Carbon)", badge: "New", desc: "极速敏锐总控主帅 · 低延迟拆单调度与全局把控" },
+  argon: { id: "gemini-4-argon", label: "Orchestrator (Argon)", badge: "New", desc: "深谋远虑总控主帅 · 超复杂跨模块架构推演与防漏决策" },
+};
+function normalizeOrchestrationConfig(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  let orchestratorMode = String(src.orchestratorMode ?? "off").toLowerCase();
+  if (!["off","carbon","argon"].includes(orchestratorMode)) orchestratorMode = "off";
+  let swarmMode = String(src.swarmMode ?? "auto").toLowerCase();
+  if (!["auto","on","off"].includes(swarmMode)) swarmMode = "auto";
+  let maxParallelAgents = src.maxParallelAgents != null ? Number(src.maxParallelAgents) : 6;
+  if (!Number.isInteger(maxParallelAgents) || maxParallelAgents < 1 || maxParallelAgents > 20) {
+    if (Number.isFinite(maxParallelAgents)) maxParallelAgents = Math.max(1, Math.min(20, Math.floor(maxParallelAgents)));
+    else maxParallelAgents = 6;
+  }
+  let autoWorktreeIsolation = typeof src.autoWorktreeIsolation === "boolean" ? src.autoWorktreeIsolation : true;
+  let strictCommanderOnly = src.strictCommanderOnly;
+  if (strictCommanderOnly == null) {
+    strictCommanderOnly = (orchestratorMode !== "off" || swarmMode === "on");
+  } else {
+    strictCommanderOnly = Boolean(strictCommanderOnly);
+  }
+  // If active modes but strict not set, enforce true (spec default auto true)
+  // If explicitly toggling off, keep as set.
+  const agyModels = src.agyModels && typeof src.agyModels === "object" ? { ...AGY_MODELS, ...src.agyModels } : { ...AGY_MODELS };
+  // Ensure cloned
+  agyModels.carbon = { ...AGY_MODELS.carbon, ...(agyModels.carbon || {}) };
+  agyModels.argon = { ...AGY_MODELS.argon, ...(agyModels.argon || {}) };
+  return { orchestratorMode, swarmMode, strictCommanderOnly: Boolean(strictCommanderOnly), maxParallelAgents, autoWorktreeIsolation: Boolean(autoWorktreeIsolation), agyModels };
+}
+const SUBAGENT_STOP_HEADER = `<SUBAGENT-STOP>
+[T3_TOP_LEVEL_MAIN_SESSION_ONLY]
+本蜂窝（Swarm）/ 指挥官（Orchestrator）规则仅对 T3 Code 用户直接对话的顶层主会话（parentThreadId == null）生效！
+一旦当前上下文是被 delegate_task 派发的子智能体（提示词含 Act as the ... sub-agent、relationshipToParent === "subagent"、环境变量含 T3_SUBAGENT_ROLE，或当前扮演 explorer/worker/default/worker-pro/frontend/qa/code-review 任一子角色），下方所有指挥官与蜂窝规则立即 100% 失效，严禁再次调用 delegate_task 裂变子代理或把自己变成蜂窝，必须亲自完成交办任务！严禁进入蜂窝(Swarm)或指挥官(Orchestrator)模式，严禁递归派发通用研发子代理。
+</SUBAGENT-STOP>`;
+function buildOrchestrationDirective(cfg) {
+  const c = normalizeOrchestrationConfig(cfg);
+  const active = c.orchestratorMode !== "off" || c.swarmMode === "on";
+  const modeLabel = c.orchestratorMode === "carbon" ? "Orchestrator (Carbon) · gemini-4-carbon" : c.orchestratorMode === "argon" ? "Orchestrator (Argon) · gemini-4-argon" : c.swarmMode === "on" ? "蜂群并发 /swarm" : "未启用";
+  const lines = [];
+  lines.push(SUBAGENT_STOP_HEADER);
+  lines.push(ORCHESTRATOR_START);
+  lines.push("## 主帅总控与蜂群并发 (T3 Hub Orchestrator)");
+  lines.push("");
+  lines.push("当前模式：" + modeLabel + " / swarmMode=" + c.swarmMode + " / maxParallelAgents=" + c.maxParallelAgents + " / strictCommanderOnly=" + (c.strictCommanderOnly ? "true" : "false") + " / autoWorktreeIsolation=" + (c.autoWorktreeIsolation ? "true" : "false"));
+  lines.push("");
+  lines.push("主帅军规（严格纯主帅模式）：");
+  lines.push("1. 先输出/更新进度清单：主会话必须先输出并持续更新任务进度清单（TODO/看板），拆单明确、拍板决策后再派发。");
+  lines.push("2. 严禁亲自改业务代码，全部通过 `delegate_task` 按 7 角色（explorer / worker / default / worker-pro / frontend / qa / code-review）派单；蜂群模式（swarmMode=on）下将独立子任务一次性并行派发，最大并行 " + c.maxParallelAgents + " 个。");
+  lines.push("3. 仅当 worker -> worker-pro 均失败时主帅才亲自兜底；主帅只做排版规划、拍板决策、拆解任务单、更新进度看板与结果验收。");
+  if (c.autoWorktreeIsolation) lines.push("- 多路并发写不同模块或同仓冲突风险时，自动启用工作树隔离（autoWorktreeIsolation=true）。");
+  lines.push("");
+  lines.push("AGY 主脑档位：");
+  lines.push("- Carbon: Orchestrator (Carbon) · gemini-4-carbon · New · 极速敏锐总控主帅 · 低延迟拆单调度与全局把控");
+  lines.push("- Argon: Orchestrator (Argon) · gemini-4-argon · New · 深谋远虑总控主帅 · 超复杂跨模块架构推演与防漏决策");
+  lines.push("");
+  lines.push(ORCHESTRATOR_END);
+  return lines.join("\n") + "\n";
+}
+function buildSlashCommandPrompt(mode) {
+  const cfg = normalizeOrchestrationConfig({});
+  const m = String(mode || "").toLowerCase();
+  const header = SUBAGENT_STOP_HEADER + "\n";
+  if (m === "swarm" || m === "/swarm") {
+    return header + "/swarm\n[蜂群并发] 启用 /swarm 全火力蜂群并发：独立子任务一次性并行派发（maxParallelAgents=" + cfg.maxParallelAgents + "）。主会话只做排版规划、拍板决策、拆解任务单、更新进度看板与结果验收；严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅当 worker -> worker-pro 均失败时主帅才亲自兜底。";
+  }
+  if (m === "carbon" || m === "orchestrator-carbon" || m === "[orchestrator carbon 纯主帅模式]") {
+    return header + "[Orchestrator Carbon 纯主帅模式]\n启用 Orchestrator (Carbon) · gemini-4-carbon：“极速敏锐总控主帅”。主会话先输出/更新进度清单，严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅 worker -> worker-pro 均失败时主帅兜底。";
+  }
+  if (m === "argon" || m === "orchestrator-argon" || m === "[orchestrator argon 纯主帅模式]") {
+    return header + "[Orchestrator Argon 纯主帅模式]\n启用 Orchestrator (Argon) · gemini-4-argon：“深谋远虑总控主帅”。主会话先输出/更新进度清单，严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单；仅 worker -> worker-pro 均失败时主帅兜底。";
+  }
+  if (m === "plan" || m === "/plan") {
+    return header + "/plan 输出/更新进度清单并拆解任务单；主会话严禁亲自改业务代码，全部通过 delegate_task 按 7 角色派单，蜂群模式下独立子任务一次性并行派发。";
+  }
+  return header + String(mode || "");
+}
 
 function optionsForSubagent(item) {
   const prov = item.providerInstanceId;
@@ -437,6 +1115,118 @@ function createSubagentsManager(opts = {}) {
   const PROJECT_START = "<!-- t3-hub-project-subagents:start -->";
   const PROJECT_END = "<!-- t3-hub-project-subagents:end -->";
 
+  const orchestrationConfigPath = () => path.join(hubDir, "orchestration-config.json");
+  const activeOrchestrationPath = () => path.join(hubDir, "ACTIVE_ORCHESTRATION_MODE.md");
+  function getOrchestrationConfig() {
+    const pfile = orchestrationConfigPath();
+    if (!fileExists(pfile)) {
+      return normalizeOrchestrationConfig(null);
+    }
+    const raw = readJsonFile(pfile, null);
+    if (!raw || typeof raw !== "object") return normalizeOrchestrationConfig(null);
+    return normalizeOrchestrationConfig(raw);
+  }
+  function removeOrchestratorBlockFromFile(filePath) {
+    return transformTextFileAtomic(filePath, (existing) => {
+      const sIdx = existing.indexOf(ORCHESTRATOR_START);
+      const eIdx = existing.indexOf(ORCHESTRATOR_END);
+      if (sIdx === -1 || eIdx === -1 || eIdx < sIdx) return null;
+      const before = existing.slice(0, sIdx);
+      let after = existing.slice(eIdx + ORCHESTRATOR_END.length);
+      if (after.startsWith("\r\n")) after = after.slice(2);
+      else if (after.startsWith("\n")) after = after.slice(1);
+      const next = before + after;
+      return next === existing ? null : next;
+    }, { createIfMissing: false });
+  }
+  function syncOrchestrationDirectiveToHosts(args = {}) {
+    const cfg = getOrchestrationConfig();
+    const active = cfg.orchestratorMode !== "off" || cfg.swarmMode === "on";
+    const directive = buildOrchestrationDirective(cfg);
+    // Always update hub managed file ACTIVE_ORCHESTRATION_MODE.md
+    try {
+      safeMkdir(path.dirname(activeOrchestrationPath()));
+      const content = active ? "# Orchestration Mode\n\n" + directive : "# Orchestration Mode (disabled)\n\nOrchestrator 未启用（orchestratorMode=off, swarmMode=" + cfg.swarmMode + "）。启用 Orchestrator (Carbon/Argon) 或 /swarm 时此处将同步军规指令。\n";
+      let existingActive = "";
+      try { if (fileExists(activeOrchestrationPath())) existingActive = fs.readFileSync(activeOrchestrationPath(), "utf8"); } catch {}
+      if (existingActive !== content) writeTextAtomic(activeOrchestrationPath(), content);
+    } catch {}
+    // Hosts: allow args.hosts or args.hostRulePaths or args.extraSyncPaths
+    let hosts = null;
+    if (Array.isArray(args.hosts)) hosts = args.hosts;
+    else if (Array.isArray(args.hostRulePaths)) hosts = args.hostRulePaths;
+    else if (Array.isArray(args.extraSyncPaths)) hosts = args.extraSyncPaths;
+    else if (Array.isArray(args.host)) hosts = args.host;
+    else hosts = [];
+    const seen = new Set();
+    const isSubagentDir = (p) => {
+      const norm = p.replace(/\\/g, "/");
+      if (norm.includes("/.claude/agents/") || norm.endsWith("/.claude/agents")) return true;
+      if (norm.includes("/hub/subagents") || norm.includes("/.t3/hub/subagents")) return true;
+      // 通用：任何 agents/ 或 subagents/ 目录均拒绝
+      if (/\/\.claude\/agents(\/|$)/.test(norm)) return true;
+      if (/\/subagents(\/|$)/.test(norm)) return true;
+      if (/\/agents\/[^\/]+\.md$/.test(norm) && norm.includes(".claude")) return true;
+      return false;
+    };
+    for (const h of hosts) {
+      if (typeof h !== "string") continue;
+      const fp = path.isAbsolute(h) ? h : path.resolve(String(h));
+      if (seen.has(fp)) continue;
+      seen.add(fp);
+      // 严防：绝不向子代理目录写入蜂窝/指挥官指令
+      if (isSubagentDir(fp)) continue;
+      safeMkdir(path.dirname(fp));
+      if (active) {
+        // Inject idempotently; also avoid recreating if file does not exist? Still create to ensure marker present.
+        injectIntoFile(fp, directive, ORCHESTRATOR_START, ORCHESTRATOR_END);
+      } else {
+        removeOrchestratorBlockFromFile(fp);
+      }
+    }
+    // If no explicit hosts provided, sync to default CLI global files inside homeDir/hubDir if they exist or hub dir already exists, but only when not isolating via test hostRulePaths.
+    // To avoid polluting real HOME in unit tests, we only sync defaults when hosts length ===0 and no isolated flag? Tests that pass hostRulePaths will have hosts non-empty, so this branch not taken.
+    // When hosts empty (production update via updateOrchestrationConfig without explicit hosts), sync to default CLI targets if they exist or are already present in tmp home/hub.
+    if (hosts.length === 0) {
+      const defaults = [
+        path.join(homeDir, ".codex", "AGENTS.md"),
+        path.join(homeDir, ".pi", "agent", "AGENTS.md"),
+        path.join(homeDir, ".config", "muse", "AGENTS.md"),
+        path.join(homeDir, ".claude", "CLAUDE.md"),
+        path.join(hubDir, "global-AGENTS.md"),
+      ];
+      for (const t of defaults) {
+        // Only sync if file already exists or parent dir exists (avoid stray creation)
+        if (fileExists(t) || dirExists(path.dirname(t))) {
+          if (active) injectIntoFile(t, directive, ORCHESTRATOR_START, ORCHESTRATOR_END);
+          else removeOrchestratorBlockFromFile(t);
+        }
+      }
+    }
+    return { ok: true, config: cfg, active, directive };
+  }
+  function updateOrchestrationConfig(patch = {}, opts = {}) {
+    const pfile = orchestrationConfigPath();
+    const current = fileExists(pfile) ? readJsonFile(pfile, {}) : {};
+    const merged = { ...current, ...(patch || {}) };
+    // Remove hostRulePaths/hosts from merged before persisting
+    const hostRulePaths = opts.hostRulePaths || opts.hosts || opts.extraSyncPaths || merged.hostRulePaths || merged.hosts || null;
+    delete merged.hostRulePaths;
+    delete merged.hosts;
+    delete merged.host;
+    // Also remove nested hostRulePaths key if present
+    const normalized = normalizeOrchestrationConfig(merged);
+    writeJsonFileAtomic(pfile, normalized);
+    // Sync respecting explicit hosts; do not pollute defaults if hostRulePaths were provided
+    const syncArgs = {};
+    if (Array.isArray(hostRulePaths)) syncArgs.hosts = hostRulePaths;
+    else if (Array.isArray(patch?.hostRulePaths)) syncArgs.hosts = patch.hostRulePaths;
+    else if (Array.isArray(opts.hosts)) syncArgs.hosts = opts.hosts;
+    // Call sync; if no explicit hosts, sync will handle default existing files
+    const syncResult = syncOrchestrationDirectiveToHosts(syncArgs);
+    return { ok: true, config: normalized, ...syncResult };
+  }
+
   function renderBlock(items, isProject) {
     const enabled = items.filter((i) => i.enabled !== false).slice().sort((a, b) => a.id.localeCompare(b.id));
     const start = isProject ? PROJECT_START : GLOBAL_START;
@@ -474,80 +1264,281 @@ function createSubagentsManager(opts = {}) {
   }
 
   function backupOnce(file) {
+    assertNoSymlinkPath(file);
     const bak = file + ".bak-t3hub";
-    if (fileExists(file) && !fileExists(bak)) {
-      try { fs.copyFileSync(file, bak); } catch {}
+    assertNoSymlinkPath(bak);
+    const bakStat = lstatSafe(bak);
+    if (bakStat) {
+      if (!bakStat.isFile()) throw new Error("unsafe non-regular backup file: " + bak);
+      return;
+    }
+    if (lstatSafe(file)) {
+      try {
+        fs.copyFileSync(file, bak, fs.constants.COPYFILE_EXCL);
+      } catch (e) {
+        if (e && e.code === "EEXIST") {
+          const st2 = lstatSafe(bak);
+          if (!st2 || !st2.isFile()) throw new Error("unsafe non-regular backup file: " + bak);
+          return;
+        }
+        if (e && e.code === "ENOENT") return;
+        throw e;
+      }
     }
   }
 
+  function transformTextFileAtomic(filePath, transformFn, tOpts = {}) {
+    const createIfMissing = tOpts.createIfMissing !== false;
+    const doBackup = Boolean(tOpts.backup);
+    const retiredDir = path.join(hubDir, "retired-agents");
+    assertNoSymlinkPath(filePath);
+    if (createIfMissing) safeMkdir(path.dirname(filePath));
+    else if (!dirExists(path.dirname(filePath))) return { changed: false };
+    const lockPath = filePath + ".t3hub.lock";
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      acquireT3HubLock(lockPath);
+      try {
+        assertNoSymlinkPath(filePath);
+        const st = lstatSafe(filePath);
+        if (!st) {
+          if (!createIfMissing) return { changed: false };
+          const next = transformFn("");
+          if (next === null || next === "") return { changed: false };
+          const tmp = filePath + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+          let fd = null;
+          let ownsTmp = false;
+          let publishedIno = null;
+          try {
+            fd = fs.openSync(tmp, "wx", 0o600);
+            ownsTmp = true;
+            fs.writeSync(fd, next, 0, "utf8");
+            try { fs.fsyncSync(fd); } catch {}
+            try { fs.fchmodSync(fd, 0o644); } catch {}
+            publishedIno = fs.fstatSync(fd).ino;
+            fs.closeSync(fd);
+            fd = null;
+            assertNoSymlinkPath(filePath);
+            fs.linkSync(tmp, filePath);
+            try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
+          } catch (e) {
+            try { if (fd !== null) fs.closeSync(fd); } catch {}
+            try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+            if (e && e.code === "EEXIST") continue;
+            throw e;
+          }
+          const post = lstatSafe(filePath);
+          if (!post || !post.isFile() || post.ino !== publishedIno) continue;
+          return { changed: true };
+        }
+        if (!st.isFile()) throw new Error("unsafe non-regular file: " + filePath);
+        if (st.nlink !== 1) throw new Error("refusing to clobber multi-linked file: " + filePath);
+        let rawPre = null;
+        let origMode = st.mode & 0o777;
+        let rfd = null;
+        try {
+          rfd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+          const snapPre = readUtf8FromFdAtZero(rfd);
+          if (!snapPre.st.isFile() || snapPre.st.ino !== st.ino || snapPre.st.nlink !== 1 || snapPre.raw === null) {
+            continue;
+          }
+          origMode = snapPre.st.mode & 0o777;
+          rawPre = snapPre.raw;
+        } catch (e) {
+          if (e && e.code === "ENOENT") continue;
+          throw e;
+        } finally {
+          try { if (rfd !== null) fs.closeSync(rfd); } catch {}
+        }
+        if (doBackup) backupOnce(filePath);
+        const existing = rawPre.toString("utf8");
+        const next = transformFn(existing);
+        if (next === null || next === existing) return { changed: false };
+        const stageDir = fs.mkdtempSync(filePath + ".stage-");
+        const tmp = path.join(stageDir, "new");
+        const staged = path.join(stageDir, "old");
+        let fd = null;
+        let stagedFd = null;
+        let ownsTmp = false;
+        let publishedIno = null;
+        let retryCas = false;
+        try {
+          fd = fs.openSync(tmp, "wx", 0o600);
+          ownsTmp = true;
+          fs.writeSync(fd, next, 0, "utf8");
+          try { fs.fsyncSync(fd); } catch {}
+          try { fs.fchmodSync(fd, origMode); } catch {}
+          publishedIno = fs.fstatSync(fd).ino;
+          fs.closeSync(fd);
+          fd = null;
+          assertNoSymlinkPath(filePath);
+          try { fs.renameSync(filePath, staged); }
+          catch (e) {
+            if (e && e.code === "ENOENT") { retryCas = true; }
+            else throw e;
+          }
+          if (!retryCas) {
+            let snapStaged = null;
+            try {
+              stagedFd = fs.openSync(staged, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+              snapStaged = readUtf8FromFdAtZero(stagedFd);
+            } catch (e) {
+              try { if (stagedFd !== null) fs.closeSync(stagedFd); } catch {}
+              stagedFd = null;
+              const recovery = restoreStagedFile(staged, filePath);
+              if (recovery && recovery.preservedPath) e.preservedPath = recovery.preservedPath;
+              throw e;
+            }
+            if (!snapStaged.st.isFile() || snapStaged.st.ino !== st.ino || snapStaged.st.nlink !== 1 || snapStaged.raw === null || Buffer.compare(snapStaged.raw, rawPre) !== 0) {
+              fs.closeSync(stagedFd);
+              stagedFd = null;
+              const recovery = restoreStagedFile(staged, filePath);
+              if (recovery && recovery.preservedPath) {
+                const err = new Error("concurrent modification conflict updating: " + filePath + " (preserved at " + recovery.preservedPath + ")");
+                err.preservedPath = recovery.preservedPath;
+                throw err;
+              }
+              retryCas = true;
+            } else {
+              try {
+                assertNoSymlinkPath(filePath);
+                fs.linkSync(tmp, filePath);
+                try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
+              } catch (e) {
+                if (e && e.code === "EEXIST") {
+                  let eexistSnap = null;
+                  let eexistErr = null;
+                  try { eexistSnap = readUtf8FromFdAtZero(stagedFd); }
+                  catch (re) { eexistErr = re; }
+                  finally {
+                    try { if (stagedFd !== null) fs.closeSync(stagedFd); } catch {}
+                    stagedFd = null;
+                  }
+                  if (eexistErr || !eexistSnap || !eexistSnap.st.isFile() || eexistSnap.raw === null || Buffer.compare(eexistSnap.raw, rawPre) !== 0) {
+                    const recovery = restoreStagedFile(staged, filePath);
+                    const err = eexistErr || new Error("concurrent modification conflict updating: " + filePath + (recovery && recovery.preservedPath ? " (preserved at " + recovery.preservedPath + ")" : ""));
+                    if (recovery && recovery.preservedPath) err.preservedPath = recovery.preservedPath;
+                    throw err;
+                  }
+                  retireStagedFile(staged, filePath, retiredDir);
+                  retryCas = true;
+                } else {
+                  fs.closeSync(stagedFd);
+                  stagedFd = null;
+                  const recovery = restoreStagedFile(staged, filePath);
+                  if (recovery && recovery.preservedPath) e.preservedPath = recovery.preservedPath;
+                  throw e;
+                }
+              }
+              if (!retryCas) {
+                const { retiredPath } = retireStagedFile(staged, filePath, retiredDir);
+                let postSnap = null;
+                let postReadErr = null;
+                try {
+                  postSnap = readUtf8FromFdAtZero(stagedFd);
+                } catch (e) {
+                  postReadErr = e;
+                } finally {
+                  try { if (stagedFd !== null) fs.closeSync(stagedFd); } catch {}
+                  stagedFd = null;
+                }
+                if (postReadErr || !postSnap || !postSnap.st.isFile() || postSnap.raw === null || Buffer.compare(postSnap.raw, rawPre) !== 0) {
+                  const cur = lstatSafe(filePath);
+                  if (cur && cur.isFile() && cur.ino === publishedIno) {
+                    const rb = path.join(stageDir, "rollback");
+                    try {
+                      assertNoSymlinkPath(filePath);
+                      fs.renameSync(filePath, rb);
+                      const rbStat = lstatSafe(rb);
+                      if (rbStat && rbStat.ino !== publishedIno) {
+                        restoreStagedFile(rb, filePath);
+                      } else {
+                        try { fs.unlinkSync(rb); } catch {}
+                      }
+                    } catch {}
+                  }
+                  const recovery = restoreStagedFile(retiredPath, filePath);
+                  const err = postReadErr || new Error("concurrent in-place modification detected updating: " + filePath);
+                  if (recovery && recovery.preservedPath) err.preservedPath = recovery.preservedPath;
+                  throw err;
+                }
+                const postTarget = lstatSafe(filePath);
+                if (!postTarget || !postTarget.isFile() || postTarget.ino !== publishedIno) {
+                  retryCas = true;
+                }
+              }
+            }
+          }
+        } finally {
+          try { if (fd !== null) fs.closeSync(fd); } catch {}
+          try { if (stagedFd !== null) fs.closeSync(stagedFd); } catch {}
+          try { if (ownsTmp) fs.unlinkSync(tmp); } catch {}
+          try { fs.rmdirSync(stageDir); } catch {}
+        }
+        if (retryCas) continue;
+        return { changed: true };
+      } finally {
+        releaseT3HubLock(lockPath);
+      }
+    }
+    throw new Error("concurrent modification conflict updating: " + filePath);
+  }
+
   function injectIntoFile(filePath, block, startMarker, endMarker) {
-    safeMkdir(path.dirname(filePath));
-    let existing = "";
-    if (fileExists(filePath)) {
-      try { existing = fs.readFileSync(filePath, "utf8"); } catch { existing = ""; }
-    }
-    backupOnce(filePath);
-    const sIdx = existing.indexOf(startMarker);
-    const eIdx = existing.indexOf(endMarker);
-    let next = "";
-    if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
-      const before = existing.slice(0, sIdx);
-      let after = existing.slice(eIdx + endMarker.length);
-      // The block already ends with a trailing "\n"; consume the one
-      // newline it contributed so repeated saves stay byte-identical.
-      if (after.startsWith("\r\n")) after = after.slice(2);
-      else if (after.startsWith("\n")) after = after.slice(1);
-      next = before + block + after;
-    } else {
-      next = (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + block;
-    }
-    // Avoid churn if already identical
-    if (next === existing) return { changed: false };
-    writeTextAtomic(filePath, next);
-    return { changed: true };
+    return transformTextFileAtomic(filePath, (existing) => {
+      const sIdx = existing.indexOf(startMarker);
+      const eIdx = existing.indexOf(endMarker);
+      let next = "";
+      if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
+        const before = existing.slice(0, sIdx);
+        let after = existing.slice(eIdx + endMarker.length);
+        // The block already ends with a trailing "\n"; consume the one
+        // newline it contributed so repeated saves stay byte-identical.
+        if (after.startsWith("\r\n")) after = after.slice(2);
+        else if (after.startsWith("\n")) after = after.slice(1);
+        next = before + block + after;
+      } else {
+        next = (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + block;
+      }
+      return next === existing ? null : next;
+    }, { backup: true, createIfMissing: true });
   }
 
   function resolveExcludePath(projectRoot) {
     if (!projectRoot || !dirExists(projectRoot)) return null;
     const gitPath = path.join(projectRoot, ".git");
+    assertNoSymlinkPath(gitPath);
     const st = lstatSafe(gitPath);
     if (!st) return null;
     if (st.isDirectory()) return path.join(gitPath, "info", "exclude");
     if (st.isFile()) {
-      try {
-        const content = fs.readFileSync(gitPath, "utf8").trim();
-        const m = content.match(/^gitdir:\s*(.+)$/m);
-        if (m) {
-          let gd = m[1].trim();
-          if (!path.isAbsolute(gd)) gd = path.resolve(path.dirname(gitPath), gd);
-          return path.join(gd, "info", "exclude");
-        }
-      } catch {}
+      const content = fs.readFileSync(gitPath, "utf8").trim();
+      const m = content.match(/^gitdir:\s*(.+)$/m);
+      if (m) {
+        let gd = m[1].trim();
+        if (!path.isAbsolute(gd)) gd = path.resolve(path.dirname(gitPath), gd);
+        return path.join(gd, "info", "exclude");
+      }
     }
     return null;
   }
   function ensureExcludeEntry(projectRoot, entry) {
     const excl = resolveExcludePath(projectRoot);
     if (!excl) return;
-    safeMkdir(path.dirname(excl));
-    let existing = "";
-    try { existing = fs.readFileSync(excl, "utf8"); } catch {}
-    const lines = existing.split(/\r?\n/);
-    if (!lines.includes(entry)) {
+    transformTextFileAtomic(excl, (existing) => {
+      const lines = existing.split(/\r?\n/);
+      if (lines.includes(entry)) return null;
       lines.push(entry);
-      const out = lines.join("\n").replace(/\n+$/, "") + "\n";
-      writeTextAtomic(excl, out);
-    }
+      return lines.join("\n").replace(/\n+$/, "") + "\n";
+    }, { createIfMissing: true });
   }
   function removeExcludeEntry(projectRoot, entry) {
     const excl = resolveExcludePath(projectRoot);
     if (!excl) return;
-    let existing = "";
-    try { existing = fs.readFileSync(excl, "utf8"); } catch { return; }
-    if (!existing.includes(entry)) return;
-    const lines = existing.split(/\r?\n/).filter((l) => l !== entry);
-    const out = lines.join("\n").replace(/\n+$/, "") + (existing.endsWith("\n") ? "\n" : "");
-    writeTextAtomic(excl, out);
+    transformTextFileAtomic(excl, (existing) => {
+      if (!existing || !existing.includes(entry)) return null;
+      const lines = existing.split(/\r?\n/).filter((l) => l !== entry);
+      return lines.join("\n").replace(/\n+$/, "") + (existing.endsWith("\n") ? "\n" : "");
+    }, { createIfMissing: false });
   }
 
   function writeClaudeAgentFile(dir, item) {
@@ -555,15 +1546,79 @@ function createSubagentsManager(opts = {}) {
     const file = path.join(dir, item.id + ".md");
     assertContained(dir, file);
     safeMkdir(dir);
-    const fm = `---\nname: ${item.id}\ndescription: ${String(item.description || item.id).replace(/^["']|["']$/g, "").replace(/\n/g, " ")}\n---\n\n${item.systemPrompt || ""}\n\n${memoryInstruction(item)}\n`;
-    writeTextAtomic(file, fm);
-    return file;
+    assertNoSymlinkPath(file);
+    const st = lstatSafe(file);
+    if (st && !st.isFile()) return { file, written: false, skippedUnmanaged: true };
+    const modelLine = item.model ? `\nmodel: ${yamlDoubleQuotedScalar(item.model)}` : "";
+    const fm = `---\nname: ${yamlDoubleQuotedScalar(item.id)}\ndescription: ${yamlDoubleQuotedScalar(item.description || item.id)}${modelLine}\n${HUB_AGENT_MARKER}\n---\n\n${item.systemPrompt || ""}\n\n${memoryInstruction(item)}\n`;
+    if (!isHubManagedContent(fm)) throw new Error("generated frontmatter failed ownership check: " + file);
+    const baseMode = existingFileMode(file) ?? 0o644;
+    const mode = (baseMode & 0o555) || 0o444;
+    const existsNow = fileExists(file);
+    if (!existsNow) {
+      try {
+        const pub = writeNewFileExclusive(file, fm, mode);
+        if (pub && pub.replacedConcurrently) return { file, written: false, skippedUnmanaged: true };
+        return { file, written: true, skippedUnmanaged: false };
+      } catch (e) {
+        if (!e || e.code !== "EEXIST") throw e;
+        return { file, written: false, skippedUnmanaged: true };
+      }
+    }
+    const preSnap = readRegularSnapshot(file);
+    if (!preSnap.missing && (preSnap.unsafe || !isHubManagedContent(preSnap.text))) {
+      return { file, written: false, skippedUnmanaged: true };
+    }
+    const lockPath = file + ".t3hub.lock";
+    acquireT3HubLock(lockPath);
+    try {
+      assertNoSymlinkPath(file);
+      const lockSnap = readRegularSnapshot(file);
+      if (lockSnap.missing) {
+        try {
+          const pub = writeNewFileExclusive(file, fm, mode);
+          if (pub && pub.replacedConcurrently) return { file, written: false, skippedUnmanaged: true };
+          return { file, written: true, skippedUnmanaged: false };
+        }
+        catch (e) {
+          if (e && e.code === "EEXIST") return { file, written: false, skippedUnmanaged: true };
+          throw e;
+        }
+      }
+      if (preSnap.missing || lockSnap.unsafe || !isHubManagedContent(lockSnap.text)) {
+        return { file, written: false, skippedUnmanaged: true };
+      }
+      if (lockSnap.ino !== preSnap.ino || Buffer.compare(lockSnap.raw, preSnap.raw) !== 0) {
+        return { file, written: false, skippedUnmanaged: true };
+      }
+      return replaceManagedFile(file, fm, mode, path.join(hubDir, "retired-agents"), lockSnap);
+    } finally {
+      releaseT3HubLock(lockPath);
+    }
   }
   function removeClaudeAgentFile(dir, id) {
     assertSafeSubagentId(String(id));
     const file = path.join(dir, id + ".md");
     assertContained(dir, file);
-    try { if (fileExists(file)) fs.unlinkSync(file); } catch {}
+    assertNoSymlinkPath(file);
+    const preSnap = readRegularSnapshot(file);
+    if (preSnap.missing) return { file, removed: false, skippedUnmanaged: false };
+    if (preSnap.unsafe || !isHubManagedContent(preSnap.text)) return { file, removed: false, skippedUnmanaged: true };
+    const lockPath = file + ".t3hub.lock";
+    acquireT3HubLock(lockPath);
+    try {
+      assertNoSymlinkPath(file);
+      const lockSnap = readRegularSnapshot(file);
+      if (lockSnap.missing) return { file, removed: false, skippedUnmanaged: false };
+      if (lockSnap.unsafe || !isHubManagedContent(lockSnap.text)) return { file, removed: false, skippedUnmanaged: true };
+      if (lockSnap.ino !== preSnap.ino || Buffer.compare(lockSnap.raw, preSnap.raw) !== 0) {
+        return { file, removed: false, skippedUnmanaged: true };
+      }
+      const { changed, ...result } = stageManagedFile(file, undefined, undefined, path.join(hubDir, "retired-agents"), lockSnap);
+      return { file, removed: changed, ...result };
+    } finally {
+      releaseT3HubLock(lockPath);
+    }
   }
 
   function injectGlobal(allGlobal, extraSyncPaths = opts.extraSyncPaths || []) {
@@ -587,30 +1642,31 @@ function createSubagentsManager(opts = {}) {
     // Also sync to .claude/agents for enabled globals
     const enabled = allGlobal.filter((i) => i.enabled !== false);
     safeMkdir(claudeAgentsRoot);
-    for (const it of enabled) writeClaudeAgentFile(claudeAgentsRoot, it);
+    const skippedUnmanaged = [];
+    const conflicts = [];
+    for (const it of enabled) {
+      const res = writeClaudeAgentFile(claudeAgentsRoot, it);
+      recordUnmanagedConflict(res, it.id, skippedUnmanaged, conflicts);
+    }
     // Clean up disabled/removed agents that had files but now disabled.
-    try {
-      const existingFiles = fs.readdirSync(claudeAgentsRoot).filter((f) => f.endsWith(".md"));
-      const enabledIds = new Set(enabled.map((i) => i.id));
-      for (const f of existingFiles) {
-        const id = f.slice(0, -3);
-        // Only remove files that look Hub-managed (contain subagent frontmatter) and no longer enabled.
-        // We remove if id was previously a builtin or if file is ours. Conservative: if id not in enabled and file contains "<!-- t3-hub" or "name:" we still track.
-        // For correctness, remove files for ids that were previously written (we had them before).
-        // Here we only remove when id matches a known builtin or previously tracked.
-        // Simplest: if id not in enabledIds and file was created by Hub (check for "t3-hub" or known seed), remove.
-        // To avoid deleting user agents, only remove if id is in DEFAULT set or file contains systemPrompt of that id.
-        // We'll remove when id is not enabled and its file would be Hub-managed: check DEFAULT ids.
-        const isDefault = DEFAULT_SUBAGENTS.some((d) => d.id === id);
-        if (!enabledIds.has(id) && isDefault) {
-          removeClaudeAgentFile(claudeAgentsRoot, id);
+    // Hard guard: only Hub-managed files may be deleted; user files always preserved.
+    let existingGlobalFiles = [];
+    try { existingGlobalFiles = fs.readdirSync(claudeAgentsRoot).filter((f) => f.endsWith(".md")); }
+    catch (e) { if (!e || e.code !== "ENOENT") throw e; }
+    const enabledGlobalIds = new Set(enabled.map((i) => i.id));
+    for (const f of existingGlobalFiles) {
+      const id = f.slice(0, -3);
+      if (!enabledGlobalIds.has(id)) {
+        const full = path.join(claudeAgentsRoot, f);
+        if (isHubManagedAgentFile(full)) {
+          recordUnmanagedConflict(removeClaudeAgentFile(claudeAgentsRoot, id), id, skippedUnmanaged, conflicts);
         }
       }
-    } catch {}
-    return block;
+    }
+    return { block, skippedUnmanaged, conflicts };
   }
 
-  function injectProject(projectRoot, allProjectItems, globalItems) {
+  function injectProject(projectRoot, allProjectItems, globalItems, injectOpts = {}) {
     // Effective project items for block: enabled project items + overrides applied? Spec says project block rendered from effective.
     // We render from project-scoped effective: use projectItems (enabled) as source for the project block, since global block already covers globals.
     // However spec says "Also write <projectRoot>/.claude/agents/<id>.md" for enabled global subagents when global, and for project we write for enabled project agents.
@@ -621,36 +1677,35 @@ function createSubagentsManager(opts = {}) {
     const claudeAgentsDir = path.join(projectRoot, ".claude", "agents");
     const enabled = allProjectItems.filter((i) => i.enabled !== false);
     safeMkdir(claudeAgentsDir);
+    const skippedUnmanaged = [];
+    const conflicts = [];
     for (const it of enabled) {
-      writeClaudeAgentFile(claudeAgentsDir, it);
-      ensureExcludeEntry(projectRoot, `.claude/agents/${it.id}.md`);
+      const res = writeClaudeAgentFile(claudeAgentsDir, it);
+      recordUnmanagedConflict(res, it.id, skippedUnmanaged, conflicts);
+      if (!res || !res.skippedUnmanaged) {
+        ensureExcludeEntry(projectRoot, `.claude/agents/${it.id}.md`);
+      }
     }
-    // Remove disabled/deleted project agents
-    try {
-      const enabledIds = new Set(enabled.map((i) => i.id));
-      const existing = dirExists(claudeAgentsDir) ? fs.readdirSync(claudeAgentsDir).filter((f) => f.endsWith(".md")) : [];
-      for (const f of existing) {
-        const id = f.slice(0, -3);
-        if (!enabledIds.has(id)) {
-          // Remove file only if its id was in projectItems (disabled/deleted) - we have full list
-          const known = allProjectItems.some((it) => it.id === id);
-          // Also check if id was previously enabled but now deleted - we can just remove if file exists and not enabled and we are the owner.
-          // Conservative: remove when known disabled or when we previously had it as enabled but now not.
-          // Since we don't have previous list, remove if not enabled and file is in our project dir: we manage it.
-          removeClaudeAgentFile(claudeAgentsDir, id);
-          if (known) removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
-          else {
-            // For deleted items, entry also needs removal - caller will have removed from allProjectItems, so known false.
-            // Still remove exclude for that id because project no longer has it.
-            // We call removeExclude for any id no longer enabled? Let's attempt.
-            // But caller for delete will also remove exclude.
-          }
+    // Remove disabled/deleted project agents. Hard guard: only managed files.
+    let existingProjFiles = [];
+    try { existingProjFiles = dirExists(claudeAgentsDir) ? fs.readdirSync(claudeAgentsDir).filter((f) => f.endsWith(".md")) : []; }
+    catch (e) { if (!e || e.code !== "ENOENT") throw e; }
+    const enabledIds = new Set(enabled.map((i) => i.id));
+    const skipRemoveIds = injectOpts && injectOpts.skipRemoveIds ? injectOpts.skipRemoveIds : null;
+    for (const f of existingProjFiles) {
+      const id = f.slice(0, -3);
+      if (!enabledIds.has(id) && !(skipRemoveIds && skipRemoveIds.has(id))) {
+        const known = allProjectItems.some((it) => it.id === id);
+        const full = path.join(claudeAgentsDir, f);
+        const managed = isHubManagedAgentFile(full);
+        if (managed) {
+          const res = removeClaudeAgentFile(claudeAgentsDir, id);
+          recordUnmanagedConflict(res, id, skippedUnmanaged, conflicts);
+          if (known && !res.skippedUnmanaged) removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
         }
       }
-      // Also ensure excludes for deleted ids are removed: if a project item was deleted, its id won't be in allProjectItems.
-      // Handle in caller delete path.
-    } catch {}
-    return block;
+    }
+    return { block, skippedUnmanaged, conflicts };
   }
 
   function listSubagents(args = {}) {
@@ -691,6 +1746,8 @@ function createSubagentsManager(opts = {}) {
     validateItem(normalized, catalog);
     let saved;
     let renderedMarkdownBlock;
+    let syncSkippedUnmanaged = [];
+    let syncConflicts = [];
     if (scope === "global") {
       let items = readGlobal();
       const idx = items.findIndex((x) => x.id === normalized.id);
@@ -711,7 +1768,8 @@ function createSubagentsManager(opts = {}) {
         items.push(normalized);
       }
       writeGlobal(items);
-      renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
+      const syncRes = injectGlobal(items, args.extraSyncPaths);
+      if (typeof syncRes === "string") { renderedMarkdownBlock = syncRes; } else { renderedMarkdownBlock = syncRes.block; syncSkippedUnmanaged = syncRes.skippedUnmanaged || []; syncConflicts = syncRes.conflicts || []; }
       saved = items.find((x) => x.id === normalized.id);
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
@@ -725,13 +1783,14 @@ function createSubagentsManager(opts = {}) {
       }
       writeProject(projectRoot, items);
       const globalItems = readGlobal();
-      renderedMarkdownBlock = injectProject(projectRoot, items, globalItems);
+      const syncRes = injectProject(projectRoot, items, globalItems);
+      if (typeof syncRes === "string") { renderedMarkdownBlock = syncRes; } else { renderedMarkdownBlock = syncRes.block; syncSkippedUnmanaged = syncRes.skippedUnmanaged || []; syncConflicts = syncRes.conflicts || []; }
       saved = items.find((x) => x.id === normalized.id);
     } else {
       throw new Error("invalid scope: " + scope);
     }
     // Also ensure global block is re-injected when project changes? No.
-    return { ok: true, scope, projectRoot: scope === "project" ? projectRoot : null, item: saved, renderedMarkdownBlock };
+    return { ok: true, scope, projectRoot: scope === "project" ? projectRoot : null, item: saved, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
   }
 
   function deleteSubagent(args = {}) {
@@ -741,6 +1800,11 @@ function createSubagentsManager(opts = {}) {
     if (!id) throw new Error("id required");
     assertSafeSubagentId(id);
     let renderedMarkdownBlock;
+    let syncSkippedUnmanaged = [];
+    let syncConflicts = [];
+    function unwrapSync(res) {
+      if (typeof res === "string") { renderedMarkdownBlock = res; } else { renderedMarkdownBlock = res.block; syncSkippedUnmanaged = res.skippedUnmanaged || []; syncConflicts = res.conflicts || []; }
+    }
     if (scope === "global") {
       let items = readGlobal();
       const idx = items.findIndex((x) => x.id === id);
@@ -752,14 +1816,14 @@ function createSubagentsManager(opts = {}) {
         if (def) {
           items[idx] = { ...def };
           writeGlobal(items);
-          renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
-          return { ok: true, scope, id, deleted: false, reset: true, item: items[idx], renderedMarkdownBlock };
+          unwrapSync(injectGlobal(items, args.extraSyncPaths));
+          return { ok: true, scope, id, deleted: false, reset: true, item: items[idx], renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
         }
       }
       items = items.filter((x) => x.id !== id);
       writeGlobal(items);
-      renderedMarkdownBlock = injectGlobal(items, args.extraSyncPaths);
-      return { ok: true, scope, id, deleted: true, renderedMarkdownBlock };
+      unwrapSync(injectGlobal(items, args.extraSyncPaths));
+      return { ok: true, scope, id, deleted: true, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
       let items = readProject(projectRoot);
@@ -767,16 +1831,14 @@ function createSubagentsManager(opts = {}) {
       if (idx === -1) return { ok: true, scope, id, deleted: false, projectRoot };
       items = items.filter((x) => x.id !== id);
       writeProject(projectRoot, items);
-      // Clean file and exclude
+      // Clean file and exclude (guarded: only managed files removed)
       const claudeAgentsDir = path.join(projectRoot, ".claude", "agents");
-      removeClaudeAgentFile(claudeAgentsDir, id);
-      removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
+      const rmRes1 = removeClaudeAgentFile(claudeAgentsDir, id);
+      if (rmRes1 && !rmRes1.skippedUnmanaged) removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
       const globalItems = readGlobal();
-      renderedMarkdownBlock = injectProject(projectRoot, items, globalItems);
-      // injectProject already handles removal, but ensure the just-deleted id is cleaned (it removed via not-enabled check above using known? we need to manually ensure)
-      removeClaudeAgentFile(claudeAgentsDir, id);
-      removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
-      return { ok: true, scope, id, deleted: true, projectRoot, renderedMarkdownBlock };
+      unwrapSync(injectProject(projectRoot, items, globalItems, { skipRemoveIds: new Set([id]) }));
+      recordUnmanagedConflict(rmRes1, id, syncSkippedUnmanaged, syncConflicts);
+      return { ok: true, scope, id, deleted: true, projectRoot, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
     }
     throw new Error("invalid scope: " + scope);
   }
@@ -821,7 +1883,7 @@ function createSubagentsManager(opts = {}) {
     return { ok: true, matched: true, item, target: { providerInstanceId: item.providerInstanceId, model: item.model, options: optionsForSubagent(item) } };
   }
 
-  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, listModelCatalog: () => listModelCatalog(homeDir) };
+  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, getOrchestrationConfig, updateOrchestrationConfig, syncOrchestrationDirectiveToHosts, buildOrchestrationDirective, buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode), listModelCatalog: () => listModelCatalog(homeDir) };
 }
 
 let _singleton = null;
@@ -833,6 +1895,9 @@ function listSubagents(a) { return getDefaultSubagentsManager().listSubagents(a 
 function saveSubagent(a) { return getDefaultSubagentsManager().saveSubagent(a || {}); }
 function deleteSubagent(a) { return getDefaultSubagentsManager().deleteSubagent(a || {}); }
 
+function getOrchestrationConfigExport() { return getDefaultSubagentsManager().getOrchestrationConfig(); }
+function updateOrchestrationConfigExport(patch, opts) { return getDefaultSubagentsManager().updateOrchestrationConfig(patch || {}, opts || {}); }
+function syncOrchestrationDirectiveToHostsExport(args) { return getDefaultSubagentsManager().syncOrchestrationDirectiveToHosts(args || {}); }
 module.exports = {
   createSubagentsManager,
   listModelCatalog,
@@ -843,4 +1908,12 @@ module.exports = {
   listSubagents,
   saveSubagent,
   deleteSubagent,
+  getOrchestrationConfig: getOrchestrationConfigExport,
+  updateOrchestrationConfig: updateOrchestrationConfigExport,
+  syncOrchestrationDirectiveToHosts: syncOrchestrationDirectiveToHostsExport,
+  buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode),
+  buildOrchestrationDirective: (cfg) => buildOrchestrationDirective(cfg),
+  AGY_MODELS,
+  ORCHESTRATOR_START,
+  ORCHESTRATOR_END,
 };

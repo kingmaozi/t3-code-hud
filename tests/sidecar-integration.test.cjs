@@ -463,7 +463,7 @@ function extractHubRpc(rendererSrc) {
 }
 
 describe("CSP-free embedded bundle + bridge-first RPC", () => {
-  it("(a) embedded bundle mounts 9-tab v3 Hub and replaces pre-existing Hub without eval", async () => {
+  it("(a) embedded bundle mounts 4-tab v3 Hub and replaces pre-existing Hub without eval", async () => {
     const rendererSrc = fs.readFileSync(path.join(REPO, "src", "renderer-ui.js"), "utf8");
     const drawerSrc = fs.readFileSync(path.join(REPO, "src", "hub-drawer-ui.js"), "utf8");
     // Embedded guard: no fetch/eval when __t3HubDrawerEmbedded is truthy.
@@ -476,7 +476,7 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     // Backward compat: eval branch still exists for non-embedded path.
     assert.ok(rendererSrc.includes("if (!window.__t3HubDrawerEmbedded)"));
     // Keep the complete top-level navigation in its intended order.
-    const expectedTabs = ["board", "plugins", "mcp", "skills", "memory", "subagents", "hooks", "settings", "agents"];
+    const expectedTabs = ["memory", "skills", "subagents", "settings", "board"];
     for (const tab of expectedTabs) {
       assert.ok(drawerSrc.includes(`"${tab}"`), `drawer defines tab ${tab}`);
     }
@@ -524,7 +524,7 @@ describe("CSP-free embedded bundle + bridge-first RPC", () => {
     vm.createContext(sandbox);
     vm.runInContext(drawerSrc, sandbox);
     assert.ok(oldDestroyed, "pre-existing Hub destroyed");
-    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 9-tab Hub mounted");
+    assert.ok(sandbox.window.__t3SidecarHub && sandbox.window.__t3SidecarHub !== oldHub, "new 4-tab Hub mounted");
     assert.equal(typeof sandbox.window.__t3SidecarHub.snapshot, "function");
     assert.equal(typeof sandbox.window.__t3SidecarHub.destroy, "function");
     assert.equal(typeof sandbox.window.__t3MountSidecarHub, "function");

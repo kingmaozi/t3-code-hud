@@ -125,6 +125,38 @@ const BUILTIN_UPSTREAM_MCPS = [
   { name: "fetch", command: "uvx", args: ["mcp-server-fetch"] },
   { name: "github", url: "https://api.githubcopilot.com/mcp/" },
 ];
+const CANONICAL_HOSTS = ["antigravity", "muse", "codex", "pi", "claude"];
+function normalizeAgentHost(input) {
+  if (typeof input !== "string") return null;
+  const s = input.trim().toLowerCase();
+  if (s === "agy" || s === "antigravity") return "antigravity";
+  if (CANONICAL_HOSTS.includes(s)) return s;
+  if (s === "all") return "all";
+  return null;
+}
+function agyRootFor(homeDir) { return path.join(homeDir, ".t3", "userdata", "providers", "antigravity"); }
+function agyConfigFilesFor(homeDir) {
+  const out = [];
+  try { for (const inst of listDirs(agyRootFor(homeDir))) { const f = path.join(inst, "config", "mcp_config.json"); if (fileExists(f)) out.push(f); } } catch {}
+  const gem = path.join(homeDir, ".gemini", "antigravity", "mcp_config.json");
+  if (fileExists(gem) && !out.includes(gem)) out.push(gem);
+  out.sort((a, b) => { try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; } });
+  return out;
+}
+function primaryAgyConfigFileFor(homeDir) {
+  const files = agyConfigFilesFor(homeDir);
+  if (files.length) return files[0];
+  const insts = listDirs(agyRootFor(homeDir));
+  if (insts.length) {
+    insts.sort((a, b) => { try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; } });
+    return path.join(insts[0], "config", "mcp_config.json");
+  }
+  return path.join(agyRootFor(homeDir), "default", "config", "mcp_config.json");
+}
+function primaryAgySkillsDirFor(homeDir) {
+  const f = primaryAgyConfigFileFor(homeDir);
+  return path.join(path.dirname(f), "skills");
+}
 
 function stripTomlCommentOutsideQuotes(line) {
   let inDouble = false;
@@ -289,15 +321,223 @@ function isHubMcpPath(p) {
   return Array.isArray(p) && p.length >= 2 && p[0] === "mcp_servers" && isTomlHubKey(p[1]);
 }
 
-function isUnsupportedMcpDefinition(currentPath, kv) {
+function isUnsupportedMcpDefinition(currentPath, kv, matches = isHubMcpPath) {
   if (!kv || !Array.isArray(kv.path)) return false;
   if (currentPath.length === 0) {
-    if (kv.path.length === 1 && kv.path[0] === "mcp_servers" && kv.isInlineTable) return true;
-    if (kv.path.length >= 2 && kv.path[0] === "mcp_servers" && isTomlHubKey(kv.path[1])) return true;
+    // A root value (including [] or an inline table) cannot be extended by a
+    // generated [mcp_servers.t3_hub] table, even though the input TOML is legal.
+    if (kv.path.length === 1 && kv.path[0] === "mcp_servers") return true;
+    if (matches(kv.path)) return true;
   } else if (currentPath.length === 1 && currentPath[0] === "mcp_servers") {
-    if (kv.path.length >= 1 && isTomlHubKey(kv.path[0])) return true;
+    if (matches(["mcp_servers", ...kv.path])) return true;
   }
   return false;
+}
+
+// Validate the entire document before any native write, including sections that
+// will be removed. A delimiter scan alone cannot detect bad scalars, missing
+// commas, duplicate keys, or table/value collisions. No values are evaluated.
+function validateTomlDocument(raw) {
+  const text = raw.replace(/\r\n/g, "\n");
+  let i = 0;
+  const fail = () => { throw new Error("malformed native MCP config: invalid TOML at character " + i); };
+  const table = (origin) => ({ kind: "table", origin, entries: new Map() });
+  const root = table("explicit");
+  let current = root;
+  const ws = () => { while (text[i] === " " || text[i] === "\t") i++; };
+  function comment() {
+    if (text[i] !== "#") return;
+    while (i < text.length && text[i] !== "\n") {
+      const cp = text.codePointAt(i);
+      if ((cp < 32 && cp !== 9) || cp === 127 || (cp >= 0xD800 && cp <= 0xDFFF)) fail();
+      i += cp > 0xFFFF ? 2 : 1;
+    }
+  }
+  function arrayWs() {
+    while (i < text.length) {
+      ws(); comment();
+      if (text[i] !== "\n") break;
+      i++;
+    }
+  }
+  function string(key = false) {
+    const quote = text[i];
+    const multi = !key && text.startsWith(quote.repeat(3), i);
+    i += multi ? 3 : 1;
+    let decoded = "";
+    while (i < text.length) {
+      if (text[i] === quote) {
+        let count = 1;
+        if (multi) while (text[i + count] === quote) count++;
+        if (!multi || count >= 3) {
+          if (count > 5) fail();
+          i += count;
+          return decoded;
+        }
+        i += count;
+        continue;
+      }
+      if (quote === '"' && text[i] === "\\") {
+        i++;
+        if (multi) {
+          const start = i;
+          ws();
+          if (text[i] === "\n") {
+            while (/[ \t\n]/.test(text[i] || "\0")) i++;
+            continue;
+          }
+          i = start;
+        }
+        const escapes = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" };
+        const escape = text[i++];
+        if (Object.hasOwn(escapes, escape)) { if (key) decoded += escapes[escape]; }
+        else if (escape === "u" || escape === "U") {
+          const width = escape === "u" ? 4 : 8;
+          const hex = text.slice(i, i + width);
+          if (hex.length !== width || !/^[0-9a-fA-F]+$/.test(hex)) fail();
+          const cp = parseInt(hex, 16);
+          if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) fail();
+          if (key) decoded += String.fromCodePoint(cp);
+          i += width;
+        } else fail();
+        continue;
+      }
+      const cp = text.codePointAt(i);
+      if ((cp < 32 && cp !== 9 && !(multi && cp === 10)) || cp === 127 || (cp >= 0xD800 && cp <= 0xDFFF)) fail();
+      const width = cp > 0xFFFF ? 2 : 1;
+      if (key) decoded += text.slice(i, i + width);
+      i += width;
+    }
+    fail();
+  }
+  function keyPath() {
+    const parts = [];
+    while (i < text.length) {
+      ws();
+      if (text[i] === '"' || text[i] === "'") parts.push(string(true));
+      else {
+        const start = i;
+        while (/[A-Za-z0-9_-]/.test(text[i] || "")) i++;
+        if (i === start) fail();
+        parts.push(text.slice(start, i));
+      }
+      ws();
+      if (text[i] !== ".") return parts;
+      i++;
+    }
+    fail();
+  }
+  function assign(target, keys) {
+    for (const key of keys.slice(0, -1)) {
+      if (!target.entries.has(key)) target.entries.set(key, table("dotted"));
+      target = target.entries.get(key);
+      // Dotted assignments may only traverse tables introduced implicitly or
+      // by earlier dotted keys, never reopen an explicitly declared child.
+      if (target.kind !== "table" || target.origin === "explicit") fail();
+      if (target.origin === "implicit") target.origin = "dotted";
+    }
+    const key = keys[keys.length - 1];
+    if (target.entries.has(key)) fail();
+    // Inline tables/arrays are sealed values: later dotted keys cannot extend them.
+    target.entries.set(key, { kind: "value" });
+  }
+  function header(keys, isArray) {
+    let target = root;
+    for (let k = 0; k < keys.length; k++) {
+      const key = keys[k], last = k === keys.length - 1;
+      let node = target.entries.get(key);
+      if (last) {
+        if (isArray) {
+          if (node && node.kind !== "array-table") fail();
+          if (!node) { node = { kind: "array-table" }; target.entries.set(key, node); }
+          node.latest = table("explicit");
+          current = node.latest;
+        } else {
+          if (node && (node.kind !== "table" || node.origin !== "implicit")) fail();
+          if (!node) { node = table("explicit"); target.entries.set(key, node); }
+          node.origin = "explicit";
+          current = node;
+        }
+      } else {
+        if (!node) { node = table("implicit"); target.entries.set(key, node); }
+        if (node.kind === "array-table") node = node.latest;
+        if (node.kind !== "table") fail();
+        target = node;
+      }
+    }
+  }
+  function validScalar(token) {
+    if (/^(?:true|false|[+-]?(?:inf|nan))$/.test(token)) return true;
+    if (/^[+-]?(?:0|[1-9](?:_?[0-9])*)$/.test(token) ||
+        /^0(?:x[0-9a-fA-F](?:_?[0-9a-fA-F])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)$/.test(token)) return true;
+    const integer = "(?:0|[1-9](?:_?[0-9])*)", digits = "[0-9](?:_?[0-9])*";
+    if (new RegExp("^[+-]?" + integer + "(?:\\." + digits + "(?:[eE][+-]?" + digits + ")?|[eE][+-]?" + digits + ")$").test(token)) return true;
+    const date = "(\\d{4})-(\\d{2})-(\\d{2})", time = "(\\d{2}):(\\d{2}):(\\d{2})(?:\\.\\d+)?";
+    const validDate = (y, m, d) => {
+      const year = +y, month = +m, day = +d;
+      const days = [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
+    };
+    const validTime = (h, m, s) => +h <= 23 && +m <= 59 && +s <= 59;
+    let match = token.match(new RegExp("^" + date + "$"));
+    if (match) return validDate(...match.slice(1));
+    match = token.match(new RegExp("^" + time + "$"));
+    if (match) return validTime(...match.slice(1));
+    match = token.match(new RegExp("^" + date + "[Tt ]" + time + "(?:[Zz]|([+-])(\\d{2}):(\\d{2}))?$"));
+    return !!match && validDate(...match.slice(1, 4)) && validTime(...match.slice(4, 7)) &&
+      (!match[7] || (+match[8] <= 23 && +match[9] <= 59));
+  }
+  function value(depth = 0) {
+    if (depth > 128) fail(); // Bound recursion on adversarial nesting.
+    ws();
+    if (text[i] === '"' || text[i] === "'") { string(); return; }
+    if (text[i] === "[") {
+      i++; arrayWs();
+      if (text[i] === "]") { i++; return; }
+      while (i < text.length) {
+        value(depth + 1); arrayWs();
+        if (text[i] === "]") { i++; return; }
+        if (text[i++] !== ",") fail();
+        arrayWs();
+        if (text[i] === "]") { i++; return; }
+      }
+      fail();
+    }
+    if (text[i] === "{") {
+      const target = table("inline");
+      i++; ws();
+      if (text[i] === "}") { i++; return; }
+      while (i < text.length) {
+        const keys = keyPath();
+        if (text[i++] !== "=") fail();
+        value(depth + 1); assign(target, keys); ws();
+        if (text[i] === "}") { i++; return; }
+        if (text[i++] !== ",") fail();
+        ws(); // Inline tables do not permit a trailing comma or free newlines.
+      }
+      fail();
+    }
+    const start = i;
+    while (i < text.length && !/[\n#,\]}]/.test(text[i])) i++;
+    if (!validScalar(text.slice(start, i).replace(/[ \t]+$/, ""))) fail();
+  }
+  while (i < text.length) {
+    arrayWs();
+    if (i === text.length) break;
+    if (text[i] === "[") {
+      const isArray = text[i + 1] === "[";
+      i += isArray ? 2 : 1;
+      const keys = keyPath();
+      if (text[i++] !== "]" || (isArray && text[i++] !== "]")) fail();
+      header(keys, isArray);
+    } else {
+      const keys = keyPath();
+      if (text[i++] !== "=") fail();
+      value(); assign(current, keys);
+    }
+    ws(); comment();
+    if (i < text.length && text[i++] !== "\n") fail();
+  }
 }
 
 function createMcpRouter(opts = {}) {
@@ -314,7 +554,9 @@ function createMcpRouter(opts = {}) {
   }
   function writeState(s) { writeJsonFile(statePath, s); }
   function readRegistry() {
-    const r = readJsonFile(registryPath, []);
+    return registryEntries(readJsonFile(registryPath, []));
+  }
+  function registryEntries(r) {
     if (Array.isArray(r)) return r;
     if (r && typeof r === "object" && Array.isArray(r.servers)) return r.servers;
     if (r && typeof r === "object" && r.mcpServers && typeof r.mcpServers === "object") return Object.entries(r.mcpServers).map(([name, v]) => ({ name, ...(v || {}) }));
@@ -322,6 +564,509 @@ function createMcpRouter(opts = {}) {
     return [];
   }
   function writeRegistry(list) { writeJsonFileSecure(registryPath, list); }
+  // Native host files are user-owned: only ENOENT permits initialization.
+  // Discovery may tolerate bad files; every mutation must use these strict reads.
+  function readNativeText(file) {
+    let raw;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch (readError) {
+      if (readError.code === "ENOENT") return { exists: false, raw: "", mode: 0o600, corrupted: false, readError: null };
+      return { exists: true, raw: null, corrupted: true, readError };
+    }
+    // A failure after a successful read is never evidence of a missing file.
+    try {
+      const st = fs.statSync(file);
+      return { exists: true, raw, mode: st.mode & 0o777, corrupted: false, readError: null };
+    } catch (readError) { return { exists: true, raw, corrupted: true, readError }; }
+  }
+  function assertNativeReadable(file, state) {
+    if (state.corrupted) {
+      const reason = state.readError;
+      throw new Error("malformed or unreadable native MCP config: " + file + " (" +
+        (reason?.code || reason?.name || "invalid data") + ": " + (reason?.message || "expected a plain object") + ")", { cause: reason });
+    }
+    return state;
+  }
+  function backupNativeOnce(file, backup) {
+    try { fs.statSync(file); } catch (err) { if (err.code === "ENOENT") return; throw err; }
+    let st;
+    try { st = fs.lstatSync(backup); } catch (err) { if (err.code !== "ENOENT") throw err; }
+    if (st) {
+      if (!st.isFile()) throw new Error("unsafe native MCP backup: " + backup);
+      fs.chmodSync(backup, 0o600);
+      return;
+    }
+    // Propagate copy/chmod failures; never overwrite without a successful backup.
+    fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+    try { fs.chmodSync(backup, 0o600); }
+    catch (err) {
+      // A failed backup must not be mistaken for a successful one on retry.
+      fs.unlinkSync(backup);
+      throw err;
+    }
+  }
+  function backupOnceHub(file) {
+    backupNativeOnce(file, file + ".t3hub.bak");
+  }
+  function museMcpPath() { return path.join(homeDir, ".config", "muse", "settings.json"); }
+  function piMcpPath() { return path.join(homeDir, ".pi", "agent", "mcp.json"); }
+  function claudeMcpPath() { return path.join(homeDir, ".claude", "mcp.json"); }
+  function claudeJsonFallback() { return path.join(homeDir, ".claude.json"); }
+  function codexConfigPath() { return path.join(homeDir, ".codex", "config.toml"); }
+  function writableAgyMcpFile() { return primaryAgyConfigFileFor(homeDir); }
+  function writableMcpFileForAgent(agent) {
+    if (agent === "antigravity") return writableAgyMcpFile();
+    if (agent === "muse") return museMcpPath();
+    if (agent === "codex") return codexConfigPath();
+    if (agent === "pi") return piMcpPath();
+    if (agent === "claude") return claudeMcpPath();
+    throw new Error("invalid agent");
+  }
+  function parseCodexMcpEntries() {
+    const file = codexConfigPath();
+    let raw = "";
+    try { raw = fs.readFileSync(file, "utf8"); } catch { return new Map(); }
+    const map = new Map();
+    let current = null;
+    let currentIsEnv = false;
+    const lines = raw.split(/\r?\n/);
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const header = parseTomlTableHeader(line);
+      if (header && !header.isArrayTable) {
+        const p = header.path;
+        if (p.length >= 2 && p[0] === "mcp_servers") {
+          current = p[1];
+          currentIsEnv = p.length >= 3 && p[2] === "env";
+          if (!currentIsEnv) {
+            const k = normKey(current);
+            if (!map.has(k)) map.set(k, { name: current, command: null, args: [], env: {}, url: null, cwd: null, headers: undefined, transport: null, enabled: true, rawName: current });
+            else { map.get(k).name = map.get(k).name || current; }
+          }
+        } else { current = null; currentIsEnv = false; }
+        continue;
+      }
+      if (header && header.isArrayTable) { current = null; continue; }
+      const kv = parseTomlKeyValue(line);
+      if (!kv || current === null) continue;
+      const k = normKey(current);
+      let entry = map.get(k);
+      if (!entry) { entry = { name: current, command: null, args: [], env: {}, url: null, cwd: null, headers: undefined, transport: null, enabled: true, rawName: current }; map.set(k, entry); }
+      if (currentIsEnv) {
+        // env table: single key = value
+        const key = kv.path[0];
+        const rhs = line.slice(kv.valueStart);
+        const val = parseTomlStringValue(rhs);
+        if (val !== undefined) entry.env[key] = val;
+        continue;
+      }
+      const key = kv.path[0];
+      const rhs = line.slice(kv.valueStart);
+      if (key === "command") { const v = parseTomlStringValue(rhs); if (v !== undefined) entry.command = v; }
+      else if (key === "args") { const arr = parseTomlStringArray(rhs); if (arr) entry.args = arr; }
+      else if (key === "url") { const v = parseTomlStringValue(rhs); if (v !== undefined) entry.url = v; }
+      else if (key === "enabled") { const t = rhs.trim().split(/\s|#/)[0]; if (t === "false") entry.enabled = false; else if (t === "true") entry.enabled = true; }
+      else if (key === "disabled") { const t = rhs.trim().split(/\s|#/)[0]; if (t === "true") entry.enabled = false; else if (t === "false") entry.enabled = true; }
+      else if (key === "transport") { const v = parseTomlStringValue(rhs); if (v !== undefined) entry.transport = v; }
+      else if (key === "cwd") { const v = parseTomlStringValue(rhs); if (v !== undefined) entry.cwd = v; }
+      else if (key === "env") {
+        const envObj = parseTomlInlineTable(rhs);
+        if (envObj) Object.assign(entry.env, envObj);
+      } else if (key === "headers") {
+        const h = parseTomlInlineTable(rhs);
+        if (h) entry.headers = h;
+      }
+    }
+    return map;
+  }
+  function parseTomlStringValue(rhs) {
+    const s = String(rhs).trim();
+    if (!s) return undefined;
+    const noComment = stripTomlCommentOutsideQuotes(s);
+    const t = noComment.trim();
+    if (t.startsWith('"')) {
+      try { return JSON.parse(t); } catch { return t.replace(/^"|"$/g, ""); }
+    }
+    if (t.startsWith("'")) return t.replace(/^'|'$/g, "");
+    return t.split(/\s|#/)[0];
+  }
+  function parseTomlStringArray(rhs) {
+    const s = String(rhs).trim();
+    const noComment = stripTomlCommentOutsideQuotes(s).trim();
+    if (!noComment.startsWith("[") || !noComment.endsWith("]")) return null;
+    const inner = noComment.slice(1, -1).trim();
+    if (!inner) return [];
+    const out = [];
+    const re = /"((?:\\.|[^"\\])*)"|'([^']*)'/g;
+    let m;
+    while ((m = re.exec(inner)) !== null) {
+      if (m[1] !== undefined) { try { out.push(JSON.parse('"' + m[1] + '"')); } catch { out.push(m[1]); } }
+      else out.push(m[2]);
+    }
+    return out;
+  }
+  function parseTomlInlineTable(rhs) {
+    const s = stripTomlCommentOutsideQuotes(String(rhs)).trim();
+    if (!s.startsWith("{") || !s.endsWith("}")) return null;
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return {};
+    const out = {};
+    // split top-level commas
+    let depth = 0, inS = false, inD = false, start = 0;
+    const parts = [];
+    for (let i = 0; i < inner.length; i++) {
+      const c = inner[i];
+      if (inD) { if (c === "\\") i++; else if (c === '"') inD = false; continue; }
+      if (inS) { if (c === "'") inS = false; continue; }
+      if (c === '"') inD = true;
+      else if (c === "'") inS = true;
+      else if (c === "{") depth++;
+      else if (c === "}") depth--;
+      else if (c === "," && depth === 0) { parts.push(inner.slice(start, i)); start = i + 1; }
+    }
+    parts.push(inner.slice(start));
+    for (const partRaw of parts) {
+      const part = partRaw.trim();
+      if (!part) continue;
+      const eq = part.indexOf("=");
+      if (eq < 0) continue;
+      const kRaw = part.slice(0, eq).trim();
+      const vRaw = part.slice(eq + 1).trim();
+      const k = kRaw.startsWith('"') ? (() => { try { return JSON.parse(kRaw); } catch { return kRaw.replace(/^"|"$/g, ""); } })() : kRaw.replace(/^'|'$/g, "");
+      const v = parseTomlStringValue(vRaw);
+      if (v !== undefined) out[k] = v;
+    }
+    return out;
+  }
+  function collectNativeMcpStates() {
+    const states = new Map();
+    function ensure(norm) { if (!states.has(norm)) states.set(norm, { name: norm, def: null, agents: { antigravity: false, muse: false, codex: false, pi: false, claude: false }, defs: {} }); return states.get(norm); }
+    // JSON hosts: antigravity (all instances + fallback), muse, pi, claude (mcp.json + .claude.json)
+    const jsonHosts = [
+      { agent: "muse", files: [museMcpPath()] },
+      { agent: "pi", files: [piMcpPath()] },
+      { agent: "claude", files: [claudeMcpPath(), claudeJsonFallback()] },
+      { agent: "antigravity", files: agyConfigFilesFor(homeDir) },
+    ];
+    for (const { agent, files } of jsonHosts) {
+      for (const file of files) {
+        const raw = readJsonFile(file, null);
+        if (!raw || typeof raw !== "object") continue;
+        const servers = raw.mcpServers;
+        if (!servers || typeof servers !== "object" || Array.isArray(servers)) continue;
+        for (const [name, v] of Object.entries(servers)) {
+          if (isHubName(name)) continue;
+          const cfg = v && typeof v === "object" ? v : {};
+          const disabled = cfg.disabled === true;
+          const k = normKey(name);
+          const e = ensure(k);
+          if (!e.name || e.name === k) e.name = name;
+          e.agents[agent] = !disabled;
+          if (!e.def || !cfg.disabled) e.def = { name, ...cfg };
+          e.defs[agent] = { name, ...cfg };
+        }
+      }
+    }
+    const codexMap = parseCodexMcpEntries();
+    for (const [k, ent] of codexMap) {
+      if (isHubName(ent.name)) continue;
+      const e = ensure(k);
+      e.agents.codex = ent.enabled !== false;
+      e.defs.codex = { name: ent.name, command: ent.command, args: ent.args, env: ent.env, url: ent.url, cwd: ent.cwd, headers: ent.headers, transport: ent.transport };
+      if (!e.def) e.def = e.defs.codex;
+    }
+    return states;
+  }
+  function readJsonFileForToggle(file) {
+    const state = readNativeText(file);
+    if (state.corrupted || !state.exists) return { ...state, obj: null };
+    try {
+      const obj = JSON.parse(state.raw);
+      const plain = value => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+      if (!plain(obj) || (Object.hasOwn(obj, "mcpServers") && !plain(obj.mcpServers))) {
+        throw new TypeError("expected a plain object with an optional plain-object mcpServers");
+      }
+      return { ...state, obj };
+    } catch (readError) { return { ...state, obj: null, corrupted: true, readError }; }
+  }
+  function atomicWriteNative(file, text, mode = 0o600) {
+    safeMkdir(path.dirname(file));
+    const tmp = file + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2, 8);
+    const fd = fs.openSync(tmp, "wx", mode);
+    try {
+      try { fs.writeFileSync(fd, text, "utf8"); fs.fchmodSync(fd, mode); }
+      finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, file);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (err) { if (err.code !== "ENOENT") throw err; }
+    }
+  }
+  function ensureNativeBackups(file) {
+    backupOnceHub(file);
+    backupOnce(file);
+  }
+  // Strict three-phase batch committer shared by syncRouterToClis, toggle-all and setServerAgents.
+  // Phase 1 (Prepare) is done by the caller: every target's original bytes/mode is
+  // read, fully parsed/validated, and its new text is computed and re-validated
+  // in memory before this function is called.
+  // Phase 2 (Backup All): complete every required backup before any write.
+  // Phase 3 (Commit All with Rollback): atomically write each target; on any
+  // write error restore already-committed targets from Phase 1 bytes/mode.
+  function batchCommitHostWrites(prepared) {
+    if (!prepared || prepared.length === 0) return;
+    // Phase 2 — Backup All. Snapshot pre-existing backup files so a failure
+    // can clean up only backups created by this batch; no host file is modified yet.
+    const preBackupExists = new Map();
+    for (const entry of prepared) {
+      if (!entry.state.exists) continue;
+      const hubBak = entry.file + ".t3hub.bak";
+      const normalBak = entry.file + ".bak-t3hub";
+      if (!preBackupExists.has(hubBak)) {
+        try { fs.lstatSync(hubBak); preBackupExists.set(hubBak, true); }
+        catch (err) { if (err.code === "ENOENT") preBackupExists.set(hubBak, false); else throw err; }
+      }
+      if (!preBackupExists.has(normalBak)) {
+        try { fs.lstatSync(normalBak); preBackupExists.set(normalBak, true); }
+        catch (err) { if (err.code === "ENOENT") preBackupExists.set(normalBak, false); else throw err; }
+      }
+    }
+    try {
+      for (const entry of prepared) {
+        if (!entry.state.exists) continue;
+        ensureNativeBackups(entry.file);
+      }
+    } catch (err) {
+      // No host file has been written yet — remove backups created by this batch.
+      const backupCleanupFailures = [];
+      for (const [bak, existed] of preBackupExists) {
+        if (existed) continue;
+        try { fs.unlinkSync(bak); }
+        catch (cleanupErr) {
+          if (!cleanupErr || cleanupErr.code !== "ENOENT") {
+            backupCleanupFailures.push({ file: bak, error: cleanupErr?.message || String(cleanupErr), code: cleanupErr?.code });
+          }
+        }
+      }
+      if (backupCleanupFailures.length) {
+        const details = backupCleanupFailures.map(f => `${f.file}: ${f.error}`).join("; ");
+        const failure = new Error(`${err.message || String(err)}; backup cleanup failed: ${details}`, { cause: err });
+        failure.code = err.code;
+        failure.backupCleanupFailures = backupCleanupFailures;
+        throw failure;
+      }
+      throw err;
+    }
+    // Phase 3 — Commit All with Rollback.
+    const committed = [];
+    try {
+      for (const entry of prepared) {
+        atomicWriteNative(entry.file, entry.text, entry.writeMode ?? entry.state.mode);
+        committed.push(entry);
+      }
+    } catch (err) {
+      // Restore already-committed targets from Phase 1 bytes/mode (reverse order).
+      const rollbackFailures = [];
+      for (let i = committed.length - 1; i >= 0; i--) {
+        const entry = committed[i];
+        try {
+          if (entry.state.exists) {
+            atomicWriteNative(entry.file, entry.state.raw, entry.state.mode);
+          } else {
+            try { fs.unlinkSync(entry.file); } catch (e) { if (e.code !== "ENOENT") throw e; }
+          }
+        } catch (rollbackError) {
+          rollbackFailures.push({ file: entry.file, error: rollbackError.message || String(rollbackError), code: rollbackError.code });
+        }
+      }
+      const unrolledSet = new Set(rollbackFailures.map(failure => failure.file));
+      const backupCleanupFailures = [];
+      for (const [bak, existed] of preBackupExists) {
+        if (existed) continue;
+        const ownerFile = bak.endsWith(".t3hub.bak") || bak.endsWith(".bak-t3hub") ? bak.slice(0, -10) : "";
+        if (ownerFile && unrolledSet.has(ownerFile)) continue;
+        try { fs.unlinkSync(bak); }
+        catch (cleanupErr) {
+          if (!cleanupErr || cleanupErr.code !== "ENOENT") {
+            backupCleanupFailures.push({ file: bak, error: cleanupErr?.message || String(cleanupErr), code: cleanupErr?.code });
+          }
+        }
+      }
+      if (rollbackFailures.length || backupCleanupFailures.length) {
+        const parts = [err.message || String(err)];
+        if (rollbackFailures.length) {
+          parts.push("rollback failed: " + rollbackFailures.map(failure => `${failure.file}: ${failure.error}`).join("; "));
+        }
+        if (backupCleanupFailures.length) {
+          parts.push("backup cleanup failed: " + backupCleanupFailures.map(failure => `${failure.file}: ${failure.error}`).join("; "));
+        }
+        const failure = new Error(parts.join("; "), { cause: err });
+        failure.code = err.code;
+        failure.rollbackFailures = rollbackFailures;
+        failure.unrolledTargets = rollbackFailures.map(entry => entry.file);
+        failure.backupCleanupFailures = backupCleanupFailures;
+        throw failure;
+      }
+      throw err;
+    }
+  }
+  function prepareJsonHostWrite(agent, serverName, definitionOrNull) {
+    const file = writableMcpFileForAgent(agent);
+    const state = assertNativeReadable(file, readJsonFileForToggle(file));
+    const next = state.obj ? JSON.parse(JSON.stringify(state.obj)) : {};
+    next.mcpServers = next.mcpServers || {};
+    if (definitionOrNull === null) {
+      delete next.mcpServers[serverName];
+    } else {
+      const clean = { ...definitionOrNull };
+      delete clean.name;
+      delete clean.__source;
+      delete clean.__sourceLabel;
+      delete clean.sources;
+      delete clean.pluginId;
+      delete clean.installed;
+      delete clean.title;
+      delete clean.groupTitle;
+      delete clean.icon;
+      delete clean.builtin;
+      if (agent === "antigravity") clean.disabled = false;
+      next.mcpServers[serverName] = clean;
+    }
+    if (!state.exists && definitionOrNull === null) return null;
+    const after = JSON.stringify(next, null, 2) + "\n";
+    // Validate the freshly generated JSON text.
+    const parsed = JSON.parse(after);
+    const plain = v => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+    if (!plain(parsed) || (Object.hasOwn(parsed, "mcpServers") && !plain(parsed.mcpServers))) {
+      throw new TypeError("expected a plain object with an optional plain-object mcpServers");
+    }
+    if (state.raw === after) return null;
+    return { file, text: after, state };
+  }
+  function prepareCodexHostWrite(serverName, definitionOrNull) {
+    const file = codexConfigPath();
+    const state = assertNativeReadable(file, readNativeText(file));
+    const matches = p => p.length >= 2 && p[0] === "mcp_servers" && normKey(p[1]) === normKey(serverName);
+    const updated = rewriteCodexToml(state.raw, matches, definitionOrNull === null ? "" : formatCodexMcpEntry(serverName, definitionOrNull));
+    if (updated === null) throw new Error("malformed or unsupported native MCP config: " + file);
+    validateTomlDocument(updated);
+    if (state.raw === updated) return null;
+    return { file, text: updated, state };
+  }
+  function writeJsonHostEntry(agent, serverName, definitionOrNull) {
+    const file = writableMcpFileForAgent(agent);
+    const state = assertNativeReadable(file, readJsonFileForToggle(file));
+    const next = state.obj || {};
+    next.mcpServers = next.mcpServers || {};
+    if (definitionOrNull === null) {
+      delete next.mcpServers[serverName];
+    } else {
+      // For enabling, ensure entry written preserving shape; for antigravity ensure disabled false
+      const clean = { ...definitionOrNull };
+      delete clean.name;
+      delete clean.__source; delete clean.__sourceLabel; delete clean.sources; delete clean.pluginId; delete clean.installed; delete clean.title; delete clean.groupTitle; delete clean.icon; delete clean.builtin;
+      // Remove null/undefined transient fields for cleaner file? keep as-is except strip runtime
+      if (agent === "antigravity") clean.disabled = false;
+      next.mcpServers[serverName] = clean;
+    }
+    if (!state.exists && definitionOrNull === null) return;
+    const after = JSON.stringify(next, null, 2) + "\n";
+    if (state.raw === after) return;
+    if (state.exists) ensureNativeBackups(file);
+    atomicWriteNative(file, after, state.mode);
+  }
+  function formatCodexMcpEntry(serverName, def) {
+    const key = serverName;
+    const header = `[mcp_servers.${isTomlBareKey(key) ? key : JSON.stringify(key)}]\n`;
+    let body = "";
+    if (def.command) body += `command = ${JSON.stringify(def.command)}\n`;
+    if (def.url) body += `url = ${JSON.stringify(def.url)}\n`;
+    const args = Array.isArray(def.args) ? def.args : (def.args ? [def.args] : []);
+    if (args.length) body += `args = [${args.map(a => JSON.stringify(String(a))).join(", ")}]\n`;
+    if (def.transport) body += `transport = ${JSON.stringify(def.transport)}\n`;
+    if (def.cwd) body += `cwd = ${JSON.stringify(def.cwd)}\n`;
+    if (def.env && typeof def.env === "object" && Object.keys(def.env).length) {
+      const parts = Object.entries(def.env).map(([k, v]) => `${isTomlBareKey(k) ? k : JSON.stringify(k)} = ${JSON.stringify(String(v))}`);
+      body += `env = { ${parts.join(", ")} }\n`;
+    }
+    if (def.headers && typeof def.headers === "object" && Object.keys(def.headers).length) {
+      const parts = Object.entries(def.headers).map(([k, v]) => `${isTomlBareKey(k) ? k : JSON.stringify(k)} = ${JSON.stringify(String(v))}`);
+      body += `headers = { ${parts.join(", ")} }\n`;
+    }
+    body += `enabled = true\n`;
+    return header + body;
+  }
+  function isTomlBareKey(k) { return /^[A-Za-z0-9_-]+$/.test(String(k)); }
+  function writeCodexMcpEntry(serverName, definitionOrNull) {
+    const file = codexConfigPath();
+    const state = assertNativeReadable(file, readNativeText(file));
+    const matches = p => p.length >= 2 && p[0] === "mcp_servers" && normKey(p[1]) === normKey(serverName);
+    const updated = rewriteCodexToml(state.raw, matches, definitionOrNull === null ? "" : formatCodexMcpEntry(serverName, definitionOrNull));
+    if (updated === null) throw new Error("malformed or unsupported native MCP config: " + file);
+    if (state.raw !== updated) {
+      backupOnceHub(file);
+      backupOnce(file);
+      atomicWriteNative(file, updated, state.mode);
+    }
+  }
+  function readValidatedRegistry() {
+    const state = assertNativeReadable(registryPath, readNativeText(registryPath));
+    let registry;
+    try {
+      const raw = state.exists ? JSON.parse(state.raw) : [];
+      const plain = value => value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+      if (!Array.isArray(raw) && !plain(raw)) throw new TypeError("expected a registry array or object");
+      if (Array.isArray(raw) && raw.some(entry => !plain(entry))) throw new TypeError("expected plain registry entry objects");
+      if (!Array.isArray(raw)) {
+        const allowedKeys = new Set(["servers", "mcpServers", "version", "updatedAt"]);
+        for (const k of Object.keys(raw)) {
+          if (!allowedKeys.has(k)) throw new TypeError("unexpected registry top-level key: " + k);
+        }
+        if (Object.hasOwn(raw, "servers")) {
+          if (!Array.isArray(raw.servers) || raw.servers.some(entry => !plain(entry))) throw new TypeError("expected a registry servers array of objects");
+        }
+        if (Object.hasOwn(raw, "mcpServers")) {
+          if (!plain(raw.mcpServers)) throw new TypeError("expected a registry mcpServers object");
+          for (const [k, v] of Object.entries(raw.mcpServers)) {
+            if (!k.trim() || !plain(v)) throw new TypeError("expected plain-object mcpServers entries");
+          }
+        }
+      }
+      registry = registryEntries(raw);
+      if (registry.some(entry => !plain(entry) || typeof entry.name !== "string" || !entry.name.trim())) {
+        throw new TypeError("expected named registry entries");
+      }
+    } catch (readError) {
+      assertNativeReadable(registryPath, { ...state, corrupted: true, readError });
+    }
+    return { state, registry };
+  }
+  function prepareRegistryAbsorb(def, canonicalName) {
+    // Registry absorption participates in the same Prepare/Backup/Commit as hosts.
+    // Discovery's tolerant reads must never turn a damaged registry into [].
+    const { state, registry } = readValidatedRegistry();
+    const norm = normKey(canonicalName);
+    if (registry.some(e => normKey(e.name) === norm)) return null;
+    const plain = {
+      name: canonicalName,
+      transport: def.transport || (def.url ? "http" : "stdio"),
+      command: def.command || null,
+      args: Array.isArray(def.args) ? def.args : (def.args ? [def.args] : []),
+      env: def.env && typeof def.env === "object" ? def.env : {},
+      url: def.url || null,
+      cwd: def.cwd || undefined,
+      headers: def.headers || undefined,
+      title: def.title,
+      groupTitle: def.groupTitle,
+      icon: def.icon,
+      pluginId: def.pluginId || null,
+      installed: true,
+    };
+    registry.push(plain);
+    return { file: registryPath, state, text: JSON.stringify(registry, null, 2) + "\n", writeMode: 0o600 };
+  }
 
   function collectFromFile(file, sourceKey, sourceLabel) {
     const out = [];
@@ -368,8 +1113,21 @@ function createMcpRouter(opts = {}) {
       [path.join(homeDir, ".claude", "mcp.json"), "claude"],
       [path.join(homeDir, ".zcode", "cli", "mcp.json"), "zcode"],
     ]) for (const server of collectFromFile(file, source, source)) mergeDefinition(byName, { ...server, pluginId: null, installed: true }, true);
+    // Claude read-only fallback ~/.claude.json
+    { const fb = path.join(homeDir, ".claude.json"); if (fileExists(fb)) for (const server of collectFromFile(fb, "claude", "claude")) mergeDefinition(byName, { ...server, pluginId: null, installed: true }, true); }
+    // Codex TOML: [mcp_servers.<name>] (enabled=false => off)
+    try {
+      const codexMap = parseCodexMcpEntries();
+      for (const [_, ent] of codexMap) {
+        if (isHubName(ent.name)) continue;
+        const def = { name: ent.name, command: ent.command, args: ent.args, env: ent.env, url: ent.url, cwd: ent.cwd, headers: ent.headers, transport: ent.transport || (ent.url ? "http" : "stdio"), __source: "codex", __sourceLabel: "codex" };
+        mergeDefinition(byName, { ...def, pluginId: null, installed: true }, true);
+      }
+    } catch {}
     const agyRoot = path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
     for (const inst of listDirs(agyRoot)) for (const server of collectFromFile(path.join(inst, "config", "mcp_config.json"), "agy", "agy")) mergeDefinition(byName, { ...server, pluginId: null, installed: true }, true);
+    // AGY gemini fallback (read-only)
+    { const gem = path.join(homeDir, ".gemini", "antigravity", "mcp_config.json"); if (fileExists(gem) && !agyConfigFilesFor(homeDir).includes(gem)) for (const server of collectFromFile(gem, "agy", "agy")) mergeDefinition(byName, { ...server, pluginId: null, installed: true }, true); }
     // Keep old imports readable, but upstream templates and plugin discovery never depend on Magpie.
     const magpie = readJsonFile(path.join(homeDir, ".config", "magpie", "library.json"), null);
     if (Array.isArray(magpie?.mcp)) for (const server of magpie.mcp) add({ ...server, installed: true, __source: "magpie", __sourceLabel: "magpie" });
@@ -419,6 +1177,7 @@ function createMcpRouter(opts = {}) {
     const cache = readJsonFile(probeCachePath, {}) || {};
     const byName = discoverServerDefinitions();
     const registryNames = new Set(readRegistry().map(s => normKey(s.name)));
+    const nativeStates = collectNativeMcpStates();
     const state = readState();
     const globalModes = state.mcpModes?.global || {};
     const projModes = projectRoot ? (state.mcpModes?.projects?.[projectRoot] || {}) : {};
@@ -426,6 +1185,24 @@ function createMcpRouter(opts = {}) {
       const mode = modeFor(projModes, s.name) || modeFor(globalModes, s.name) || "off";
       const env = s.env && typeof s.env === "object" ? Object.keys(s.env) : [];
       const hasSecrets = env.some((k) => isSecretKey(k));
+      const norm = normKey(s.name);
+      const nativeEntry = nativeStates.get(norm);
+      const inRegistry = registryNames.has(norm);
+      const inNative = !!nativeEntry;
+      const agentStates = nativeEntry ? { ...nativeEntry.agents } : { antigravity: false, muse: false, codex: false, pi: false, claude: false };
+      const enabledCount = Object.values(agentStates).filter(Boolean).length;
+      const enabled = enabledCount > 0 || mode !== "off";
+      const legacySource = s.__source || "hub";
+      let mappedSource;
+      if (legacySource === "magpie") mappedSource = "magpie";
+      else if (inNative && inRegistry) mappedSource = "both";
+      else if (inNative && !inRegistry) mappedSource = "native";
+      else if (!inNative && inRegistry) mappedSource = "hub";
+      else if (s.builtin && !inRegistry && !inNative) mappedSource = "builtin";
+      else if (legacySource === "plugin") mappedSource = "hub";
+      else if (["pi", "muse", "claude", "codex", "agy", "zcode"].includes(legacySource)) mappedSource = "native";
+      else if (legacySource === "builtin") mappedSource = "builtin";
+      else mappedSource = legacySource;
       return {
         name: s.name,
         title: s.title || s.name, groupTitle: s.groupTitle || s.__sourceLabel || "MCP",
@@ -437,8 +1214,11 @@ function createMcpRouter(opts = {}) {
         args: redactArgs(Array.isArray(s.args) ? s.args : []),
         url: s.url ? redactUrl(s.url) : null,
         agents: s.agents || null,
-        source: s.__source || "hub",
+        source: mappedSource,
         sourceLabel: s.__sourceLabel || "hub",
+        agentStates,
+        enabledCount,
+        enabled,
         mode: ALLOWED_MODES.includes(mode) ? mode : "off",
         hasSecrets,
         summary: redactSummary(s),
@@ -455,6 +1235,132 @@ function createMcpRouter(opts = {}) {
         return false;
       })();
     return { ok: true, routerRegistered, items };
+  }
+
+  function getAgentMatrix(args = {}) {
+    const result = listMcpServers(args);
+    const matrix = result.items.map((it) => ({ name: it.name, source: it.source, enabled: it.enabled, enabledCount: it.enabledCount, agentStates: it.agentStates }));
+    return { ok: true, matrix, items: result.items, routerRegistered: result.routerRegistered };
+  }
+  const listServers = listMcpServers;
+
+  function resolveServerDefinition(identifier) {
+    if (typeof identifier !== "string" || !identifier) return null;
+    const byName = discoverServerDefinitions();
+    const norm = normKey(identifier);
+    for (const s of byName.values()) if (normKey(s.name) === norm) return s;
+    return null;
+  }
+  function resolveDefinitionForToggle({ id, name } = {}) {
+    const ident = name || id;
+    if (!ident || typeof ident !== "string") throw new Error("id or name required");
+    if (isHubName(ident)) throw new Error("cannot toggle t3_hub");
+    readValidatedRegistry();
+    const def = resolveServerDefinition(ident);
+    // Fallback to native state definition for native-only entries already covered (discover includes native), but also check collectNativeMcpStates for completeness
+    if (def) return def;
+    const nativeStates = collectNativeMcpStates();
+    const nat = nativeStates.get(normKey(ident));
+    if (nat && nat.def) return { name: nat.def.name || ident, ...nat.def, __source: "native", __sourceLabel: "native" };
+    throw new Error("server not found: " + ident);
+  }
+  function definitionForWrite(def) {
+    const clean = { ...def };
+    delete clean.__source; delete clean.__sourceLabel; delete clean.sources; delete clean.builtin; delete clean.pluginId; delete clean.installed; delete clean.groupTitle; delete clean.icon; delete clean.title;
+    return clean;
+  }
+  function preflightAgentWrites(def, agents) {
+    // Batch toggles must reject every read/parse/layout error before an earlier
+    // host can be backed up or changed by the single-host writers below.
+    for (const agent of CANONICAL_HOSTS) {
+      const file = writableMcpFileForAgent(agent);
+      if (agent === "codex") {
+        const state = assertNativeReadable(file, readNativeText(file));
+        const matches = p => p.length >= 2 && p[0] === "mcp_servers" && normKey(p[1]) === normKey(def.name);
+        const section = agents[agent] ? formatCodexMcpEntry(def.name, definitionForWrite(def)) : "";
+        if (rewriteCodexToml(state.raw, matches, section) === null) {
+          throw new Error("unsupported native MCP config: " + file);
+        }
+      } else assertNativeReadable(file, readJsonFileForToggle(file));
+    }
+  }
+  function toggleServerForAgent({ id, name, agent, enabled } = {}) {
+    const canonicalAgent = normalizeAgentHost(agent);
+    if (!canonicalAgent) throw new Error("invalid agent");
+    if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+    const def = resolveDefinitionForToggle({ id, name });
+    const canonicalName = def.name;
+    {
+      // Single-host and all-host toggles share the registry transaction boundary.
+      const prepared = [];
+      const toWrite = definitionForWrite(def);
+      const jsonEntry = {};
+      if (toWrite.command !== undefined && toWrite.command !== null) jsonEntry.command = toWrite.command;
+      if (Array.isArray(toWrite.args)) jsonEntry.args = toWrite.args;
+      if (toWrite.url) jsonEntry.url = toWrite.url;
+      if (toWrite.env && typeof toWrite.env === "object") jsonEntry.env = toWrite.env;
+      if (toWrite.cwd) jsonEntry.cwd = toWrite.cwd;
+      if (toWrite.headers) jsonEntry.headers = toWrite.headers;
+      if (toWrite.transport) jsonEntry.transport = toWrite.transport;
+      for (const a of canonicalAgent === "all" ? CANONICAL_HOSTS : [canonicalAgent]) {
+        if (a === "codex") {
+          prepared.push(enabled ? prepareCodexHostWrite(canonicalName, toWrite) : prepareCodexHostWrite(canonicalName, null));
+        } else {
+          prepared.push(enabled ? prepareJsonHostWrite(a, canonicalName, jsonEntry) : prepareJsonHostWrite(a, canonicalName, null));
+        }
+      }
+      if (enabled) prepared.push(prepareRegistryAbsorb({ ...def, ...toWrite }, canonicalName));
+      // Phase 2/3 — Backup All then Commit All with Rollback.
+      batchCommitHostWrites(prepared.filter(Boolean));
+    }
+    return { ok: true, name: canonicalName, agent: canonicalAgent, enabled };
+  }
+  function setServerAgents({ id, name, agents } = {}) {
+    const ident = name || id;
+    if (!ident || typeof ident !== "string") throw new Error("id required");
+    if (agents === null || agents === undefined) throw new Error("agents required");
+    const def = resolveDefinitionForToggle({ id: ident, name: ident });
+    const canonicalName = def.name;
+    let map = {};
+    if (Array.isArray(agents)) {
+      for (const a of agents) {
+        const c = normalizeAgentHost(a);
+        if (!c || c === "all") throw new Error("invalid agent");
+        map[c] = true;
+      }
+      for (const c of CANONICAL_HOSTS) if (!(c in map)) map[c] = false;
+    } else if (agents && typeof agents === "object") {
+      for (const [k, v] of Object.entries(agents)) {
+        const c = normalizeAgentHost(k);
+        if (!c || c === "all") throw new Error("invalid agent");
+        map[c] = !!v;
+      }
+      for (const c of CANONICAL_HOSTS) if (!(c in map)) map[c] = false;
+    } else throw new Error("agents must be array or object");
+    // Phase 1 — Prepare all hosts before any backup/write.
+    const prepared = [];
+    const toWrite = definitionForWrite(def);
+    const jsonEntry = {};
+    if (toWrite.command !== undefined && toWrite.command !== null) jsonEntry.command = toWrite.command;
+    if (Array.isArray(toWrite.args)) jsonEntry.args = toWrite.args;
+    if (toWrite.url) jsonEntry.url = toWrite.url;
+    if (toWrite.env && typeof toWrite.env === "object") jsonEntry.env = toWrite.env;
+    if (toWrite.cwd) jsonEntry.cwd = toWrite.cwd;
+    if (toWrite.headers) jsonEntry.headers = toWrite.headers;
+    if (toWrite.transport) jsonEntry.transport = toWrite.transport;
+    for (const c of CANONICAL_HOSTS) {
+      if (c === "codex") {
+        prepared.push(map[c] ? prepareCodexHostWrite(canonicalName, toWrite) : prepareCodexHostWrite(canonicalName, null));
+      } else {
+        prepared.push(map[c] ? prepareJsonHostWrite(c, canonicalName, jsonEntry) : prepareJsonHostWrite(c, canonicalName, null));
+      }
+    }
+    if (Object.values(map).some(Boolean)) {
+      prepared.push(prepareRegistryAbsorb({ ...def, ...toWrite }, canonicalName));
+    }
+    // Phase 2/3 — Backup All then Commit All with Rollback, including the registry.
+    batchCommitHostWrites(prepared.filter(Boolean));
+    return { ok: true, name: canonicalName, agents: map };
   }
 
   function activeModes(state, name) {
@@ -599,126 +1505,124 @@ function createMcpRouter(opts = {}) {
   }
 
   function backupOnce(file) {
-    const backup = file + ".bak-t3hub";
-    if (fileExists(file) && !fileExists(backup)) { fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL); fs.chmodSync(backup, 0o600); }
+    backupNativeOnce(file, file + ".bak-t3hub");
   }
-  function syncRouterToClis() {
-    const synced = [], skipped = [];
-    function rewriteCodexToml(raw) {
-      const lines = raw.split(/\r?\n/);
-      const kept = [];
-      let inHub = false;
-      let stringMode = null; // Single-line or multiline basic/literal strings.
-      let arrayDepth = 0, braceDepth = 0;
-      const valueDelimiters = [];
-      let currentPath = [];
-      for (const line of lines) {
-        // A header/key can only begin between complete statements. In particular,
-        // ["x"] inside an array is a value, even when it occupies a whole line.
-        const atStatementStart = stringMode === null && arrayDepth === 0 && braceDepth === 0;
-        let i = 0;
-        if (atStatementStart) {
-          if (/^\s*(?:#|$)/.test(line)) {
-            if (!inHub) kept.push(line);
-            continue;
-          }
-          if (/^\s*\[/.test(line)) {
-            const header = parseTomlTableHeader(line);
-            if (!header) return null;
-            if (header.isArrayTable && ((header.path.length === 1 && header.path[0] === "mcp_servers") || isHubMcpPath(header.path))) return null;
-            currentPath = header.path;
-            inHub = isHubMcpPath(currentPath);
-            if (!inHub) kept.push(line);
-            continue; // Header brackets are never value delimiters.
-          }
-          const kv = parseTomlKeyValue(line);
-          if (!kv || !line.slice(kv.valueStart).trim() || /^\s*#/.test(line.slice(kv.valueStart))) return null;
-          if (!inHub && isUnsupportedMcpDefinition(currentPath, kv)) return null;
-          i = kv.valueStart;
+  function rewriteCodexToml(raw, matches = isHubMcpPath, section = `[mcp_servers.t3_hub]\ncommand = ${JSON.stringify(routerBin)}\nargs = []\n`) {
+    // Validate before any layout-based early return: null means valid but
+    // unsupported TOML, never a malformed document that sync may silently skip.
+    validateTomlDocument(raw);
+    const lines = raw.split(/\r?\n/);
+    const kept = [];
+    let inHub = false;
+    let stringMode = null; // Single-line or multiline basic/literal strings.
+    let arrayDepth = 0, braceDepth = 0;
+    const valueDelimiters = [];
+    let currentPath = [];
+    for (const line of lines) {
+      // A header/key can only begin between complete statements. In particular,
+      // ["x"] inside an array is a value, even when it occupies a whole line.
+      const atStatementStart = stringMode === null && arrayDepth === 0 && braceDepth === 0;
+      let i = 0;
+      if (atStatementStart) {
+        if (/^\s*(?:#|$)/.test(line)) {
+          if (!inHub) kept.push(line);
+          continue;
         }
-        while (i < line.length) {
-          const c = line[i];
-          if (stringMode) {
-            const basic = stringMode[0] === '"';
-            if (basic && c === "\\") { i += 2; continue; }
-            if (stringMode.length === 3 && c === stringMode[0]) {
-              let end = i;
-              while (line[end] === c) end++;
-              const count = end - i;
-              if (count >= 3) {
-                // TOML permits one or two content quotes beside the terminator.
-                if (count > 5) return null;
-                stringMode = null;
-              }
-              i = end;
-              continue;
-            }
-            if (stringMode.length === 1 && c === stringMode) stringMode = null;
-            i++;
-            continue;
-          }
-          if (c === "#") break;
-          if (c === '"' || c === "'") {
-            stringMode = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
-            i += stringMode.length;
-            continue;
-          }
-          if (c === "[" || c === "{") {
-            valueDelimiters.push(c);
-            if (c === "[") arrayDepth++; else braceDepth++;
-          } else if (c === "]" || c === "}") {
-            const opening = c === "]" ? "[" : "{";
-            if (valueDelimiters.pop() !== opening) return null;
-            if (c === "]") arrayDepth--; else braceDepth--;
-          }
-          i++;
+        if (/^\s*\[/.test(line)) {
+          const header = parseTomlTableHeader(line);
+          if (!header) return null;
+          if (header.isArrayTable && ((header.path.length === 1 && header.path[0] === "mcp_servers") || matches(header.path))) return null;
+          currentPath = header.path;
+          inHub = matches(currentPath);
+          if (!inHub) kept.push(line);
+          continue; // Header brackets are never value delimiters.
         }
-        // Only multiline strings may span physical lines.
-        if (stringMode && stringMode.length === 1) return null;
-        if (!inHub) kept.push(line);
+        const kv = parseTomlKeyValue(line);
+        if (!kv || !line.slice(kv.valueStart).trim() || /^\s*#/.test(line.slice(kv.valueStart))) return null;
+        if (!inHub && isUnsupportedMcpDefinition(currentPath, kv, matches)) return null;
+        i = kv.valueStart;
       }
-      if (stringMode !== null || arrayDepth !== 0 || braceDepth !== 0) return null;
-      const section = `[mcp_servers.t3_hub]\ncommand = ${JSON.stringify(routerBin)}\nargs = []\n`;
-      const prefix = kept.join("\n").trimEnd();
-      return (prefix ? prefix + "\n\n" : "") + section;
+      while (i < line.length) {
+        const c = line[i];
+        if (stringMode) {
+          const basic = stringMode[0] === '"';
+          if (basic && c === "\\") { i += 2; continue; }
+          if (stringMode.length === 3 && c === stringMode[0]) {
+            let end = i;
+            while (line[end] === c) end++;
+            const count = end - i;
+            if (count >= 3) {
+              // TOML permits one or two content quotes beside the terminator.
+              if (count > 5) return null;
+              stringMode = null;
+            }
+            i = end;
+            continue;
+          }
+          if (stringMode.length === 1 && c === stringMode) stringMode = null;
+          i++;
+          continue;
+        }
+        if (c === "#") break;
+        if (c === '"' || c === "'") {
+          stringMode = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+          i += stringMode.length;
+          continue;
+        }
+        if (c === "[" || c === "{") {
+          valueDelimiters.push(c);
+          if (c === "[") arrayDepth++; else braceDepth++;
+        } else if (c === "]" || c === "}") {
+          const opening = c === "]" ? "[" : "{";
+          if (valueDelimiters.pop() !== opening) return null;
+          if (c === "]") arrayDepth--; else braceDepth--;
+        }
+        i++;
+      }
+      // Only multiline strings may span physical lines.
+      if (stringMode && stringMode.length === 1) return null;
+      if (!inHub) kept.push(line);
     }
+    if (stringMode !== null || arrayDepth !== 0 || braceDepth !== 0) return null;
+    const prefix = kept.join("\n").trimEnd();
+    const updated = section ? (prefix ? prefix + "\n\n" : "") + section : (prefix ? prefix + "\n" : "");
+    validateTomlDocument(updated);
+    return updated;
+  }
 
-    const cfgPath = path.join(homeDir, ".codex", "config.toml");
+  function syncRouterToClis() {
+    const synced = [], skipped = [], writes = [];
+    // Preflight every target before touching any native file. Read/parse failures
+    // must be visible to callers rather than a successful sync of an empty object.
+    const cfgPath = codexConfigPath();
+    const codexState = assertNativeReadable(cfgPath, readNativeText(cfgPath));
+    const updated = rewriteCodexToml(codexState.raw);
     if (!dirExists(path.dirname(cfgPath))) skipped.push(cfgPath);
     else {
-      const raw = fileExists(cfgPath) ? fs.readFileSync(cfgPath, "utf8") : "";
-      const updated = rewriteCodexToml(raw);
-      if (updated === null) {
-        skipped.push(cfgPath);
-      } else {
-        if (raw !== updated) {
-          backupOnce(cfgPath);
-          safeMkdir(path.dirname(cfgPath));
-          const tmp = cfgPath + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, updated, { mode: 0o600 }); fs.chmodSync(tmp, 0o600); fs.renameSync(tmp, cfgPath);
-        }
-        fs.chmodSync(cfgPath, 0o600); synced.push(cfgPath);
+      if (updated === null) skipped.push(cfgPath); // Unsupported TOML stays untouched.
+      else {
+        if (codexState.raw !== updated) writes.push({ file: cfgPath, text: updated, state: codexState });
+        synced.push(cfgPath);
       }
     }
-    function syncJson(file) {
+    function prepareJson(file) {
+      const state = assertNativeReadable(file, readJsonFileForToggle(file));
       if (!dirExists(path.dirname(file))) { skipped.push(file); return; }
-      const obj = readJsonFile(file, null);
-      if (fileExists(file) && (!obj || typeof obj !== "object" || Array.isArray(obj))) { skipped.push(file); return; }
-      const next = obj || {};
-      if (next.mcpServers && (typeof next.mcpServers !== "object" || Array.isArray(next.mcpServers))) { skipped.push(file); return; }
+      const next = state.obj || {};
       const before = JSON.stringify(next);
       next.mcpServers ||= {};
       for (const name of Object.keys(next.mcpServers)) if (isHubName(name)) delete next.mcpServers[name];
       next.mcpServers.t3_hub = { command: routerBin, args: [] };
-      if (!fileExists(file) || JSON.stringify(next) !== before) { backupOnce(file); writeJsonFileSecure(file, next); }
-      else fs.chmodSync(file, 0o600);
+      if (!state.exists || JSON.stringify(next) !== before) writes.push({ file, text: JSON.stringify(next, null, 2) + "\n", state });
       synced.push(file);
     }
-    syncJson(path.join(homeDir, ".pi", "agent", "mcp.json"));
-    syncJson(path.join(homeDir, ".config", "muse", "settings.json"));
-    syncJson(path.join(homeDir, ".claude", "mcp.json"));
-    syncJson(path.join(homeDir, ".zcode", "cli", "mcp.json"));
-    for (const inst of listDirs(path.join(homeDir, ".t3", "userdata", "providers", "antigravity"))) syncJson(path.join(inst, "config", "mcp_config.json"));
+    prepareJson(piMcpPath());
+    prepareJson(museMcpPath());
+    prepareJson(claudeMcpPath());
+    prepareJson(path.join(homeDir, ".zcode", "cli", "mcp.json"));
+    for (const inst of listDirs(path.join(homeDir, ".t3", "userdata", "providers", "antigravity"))) prepareJson(path.join(inst, "config", "mcp_config.json"));
+    // Shared strict three-phase batch committer: Backup All -> Commit All with Rollback.
+    batchCommitHostWrites(writes);
     return { ok: true, syncedTargets: synced, skippedTargets: skipped };
   }
 
@@ -987,7 +1891,7 @@ function createMcpRouter(opts = {}) {
   }
   const autoSyncHosts = syncRouterToClis;
 
-  return { homeDir, hubDir, statePath, registryPath, listMcpServers, setPluginMcpScope, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis, autoSyncHosts, probeMcpServers, discoverServerDefinitions, discoverDefinitions };
+  return { homeDir, hubDir, statePath, registryPath, listMcpServers, listServers, getAgentMatrix, toggleServerForAgent, setServerAgents, setPluginMcpScope, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis, autoSyncHosts, probeMcpServers, discoverServerDefinitions, discoverDefinitions };
 }
 
 let _router = null;
@@ -1002,8 +1906,12 @@ function autoSyncHosts() { return getDefaultMcpRouter().autoSyncHosts(); }
 function probeMcpServers(args) { return getDefaultMcpRouter().probeMcpServers(args || {}); }
 function discoverServerDefinitions(opts) { return getDefaultMcpRouter().discoverServerDefinitions(opts || {}); }
 
+function getAgentMatrix(args) { return getDefaultMcpRouter().getAgentMatrix(args || {}); }
+function listServers(args) { return getDefaultMcpRouter().listServers(args || {}); }
+function toggleServerForAgent(args) { return getDefaultMcpRouter().toggleServerForAgent(args || {}); }
+function setServerAgents(args) { return getDefaultMcpRouter().setServerAgents(args || {}); }
 module.exports = {
   createMcpRouter, redactSummary, redactArgs, redactUrl, ALLOWED_MODES, BUILTIN_UPSTREAM_MCPS, probeMcpServers, autoSyncHosts,
-  listMcpServers, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis,
-  discoverServerDefinitions, getDefaultMcpRouter, parseTomlTableHeader,
+  listMcpServers, listServers, getAgentMatrix, toggleServerForAgent, setServerAgents, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis,
+  discoverServerDefinitions, getDefaultMcpRouter, parseTomlTableHeader, CANONICAL_HOSTS, normalizeAgentHost,
 };

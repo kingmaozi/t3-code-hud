@@ -13,7 +13,7 @@ function readJsonFile(file, fallback) {
 function writeJsonFile(file, obj) {
   safeMkdir(path.dirname(file));
   const tmp = file + ".tmp-" + process.pid;
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
   fs.renameSync(tmp, file);
 }
 function listDirs(dir) {
@@ -26,6 +26,30 @@ function listDirs(dir) {
 function dirExists(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
 function fileExists(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
 function lstatSafe(p) { try { return fs.lstatSync(p); } catch { return null; } }
+const CANONICAL_HOSTS = ["antigravity", "muse", "codex", "pi", "claude"];
+function normalizeAgentHost(input) {
+  if (typeof input !== "string") return null;
+  const s = input.trim().toLowerCase();
+  if (s === "agy" || s === "antigravity") return "antigravity";
+  if (CANONICAL_HOSTS.includes(s)) return s;
+  if (s === "all") return "all";
+  return null;
+}
+function agyRootFor(homeDir) { return path.join(homeDir, ".t3", "userdata", "providers", "antigravity"); }
+function agyConfigFilesFor(homeDir) {
+  const out = [];
+  try { for (const inst of listDirs(agyRootFor(homeDir))) { const f = path.join(inst, "config", "mcp_config.json"); if (fileExists(f)) out.push(f); } } catch {}
+  out.sort((a, b) => { try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; } });
+  return out;
+}
+function primaryAgyConfigFileFor(homeDir) {
+  const files = agyConfigFilesFor(homeDir);
+  if (files.length) return files[0];
+  const insts = listDirs(agyRootFor(homeDir));
+  if (insts.length) { insts.sort((a, b) => { try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; } }); return path.join(insts[0], "config", "mcp_config.json"); }
+  return path.join(agyRootFor(homeDir), "default", "config", "mcp_config.json");
+}
+function primaryAgySkillsDirFor(homeDir) { return path.join(path.dirname(primaryAgyConfigFileFor(homeDir)), "skills"); }
 
 function parseSkillMd(skillFile) {
   let raw = "";
@@ -53,7 +77,7 @@ function parseSkillMd(skillFile) {
   return { name, description };
 }
 
-function cpDirRecursive(src, dest) {
+function cpDirRecursive(src, dest, destRoot = dest) {
   if (!dirExists(src)) return false;
   safeMkdir(dest);
   for (const entry of fs.readdirSync(src)) {
@@ -61,11 +85,12 @@ function cpDirRecursive(src, dest) {
     const s = path.join(src, entry), d = path.join(dest, entry);
     const st = lstatSafe(s);
     if (!st) continue;
-    if (st.isDirectory() && !st.isSymbolicLink()) cpDirRecursive(s, d);
-    else if (st.isSymbolicLink()) {
-      const t = fs.readlinkSync(s);
-      fs.symlinkSync(t, d);
-    } else fs.copyFileSync(s, d);
+    // Imported bundles must be self-contained. Never copy links that can later
+    // redirect SKILL.md, marker writes or recursive copies outside the store.
+    if (st.isSymbolicLink()) continue;
+    assertSafeFsPath(destRoot, d);
+    if (st.isDirectory()) cpDirRecursive(s, d, destRoot);
+    else fs.copyFileSync(s, d);
   }
   return true;
 }
@@ -124,9 +149,36 @@ function assertSafeSkillId(id) {
   if (id.includes("..")) throw new Error("invalid skill id");
 }
 function assertContained(parentDir, childPath) {
-  const parent = path.resolve(String(parentDir));
-  const child = path.resolve(String(childPath));
-  if (!child.startsWith(parent + path.sep)) throw new Error("invalid skill id: path escapes parent");
+  assertSafeFsPath(parentDir, childPath, { allowLeafSymlink: true });
+}
+// Shared store invariant: lexical containment, no symlink ancestors, and real
+// containment of existing parents. A leaf link may only be renamed/unlinked.
+function assertSafeFsPath(baseDir, targetPath, { allowLeafSymlink = false } = {}) {
+  const base = path.resolve(baseDir), target = path.resolve(targetPath);
+  const inside = (root, p) => p !== root && p.startsWith(root + path.sep);
+  if (!inside(base, target)) throw new Error("unsafe path: escapes parent");
+  let current = target;
+  while (true) {
+    let st;
+    try { st = fs.lstatSync(current); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (st?.isSymbolicLink() && !(current === target && allowLeafSymlink)) throw new Error("unsafe path: symbolic link");
+    if (current === base) break;
+    current = path.dirname(current);
+  }
+  if (fs.existsSync(base) && fs.existsSync(path.dirname(target))) {
+    const realBase = fs.realpathSync(base), realParent = fs.realpathSync(path.dirname(target));
+    // A flat store's direct child has parent === base; the target is always strict.
+    if (realParent !== realBase && !inside(realBase, realParent)) throw new Error("unsafe path: real parent escapes store");
+    const st = lstatSafe(target);
+    if (st && !st.isSymbolicLink() && !inside(realBase, fs.realpathSync(target))) throw new Error("unsafe path: real target escapes store");
+  }
+  return target;
+}
+function packageDirectoryName(id) {
+  if (typeof id !== "string") throw new Error("invalid package id");
+  const parts = id.split("/");
+  if (parts.length < 1 || parts.length > 2 || parts.some(p => !/^[A-Za-z0-9_.-]{1,255}$/.test(p) || p === "." || p === ".." || p.startsWith("-"))) throw new Error("invalid package id");
+  return parts.join("__");
 }
 function isHubManagedCmdFile(p) {
   const st = lstatSafe(p);
@@ -227,8 +279,9 @@ function findSkillDirsRecursive(root, maxDepth = 4) {
   const out = [];
   function walk(dir, depth) {
     if (depth > maxDepth) return;
+    try { assertSafeFsPath(path.dirname(root), dir); } catch { return; }
     if (!dirExists(dir)) return;
-    if (fileExists(path.join(dir, "SKILL.md"))) out.push(dir);
+    try { assertSafeFsPath(dir, path.join(dir, "SKILL.md")); if (fileExists(path.join(dir, "SKILL.md"))) out.push(dir); } catch {}
     if (depth >= maxDepth) return;
     for (const child of listDirs(dir)) {
       if (path.basename(child) === ".git") continue;
@@ -243,40 +296,43 @@ function parseGitHubInput(repoInput, opts = {}) {
   if (typeof repoInput !== "string") return null;
   const input = repoInput.trim();
   if (!input) return null;
-  if (/[;\n\r$`&|\\<>(){}!'"*?~]/.test(input)) return null;
+  if (/[;\0\n\r$`&|\\<>(){}!'"*?~]/.test(input)) return null;
   if (input.startsWith("-")) return null;
   if (input.startsWith("file://")) {
     try {
       const p = decodeURIComponent(new URL(input).pathname);
       const base = path.basename(p.replace(/\/$/, ""));
-      if (!base) return null;
+      try { packageDirectoryName(base); } catch { return null; }
       return { owner: "local", repo: base, subpath: "", cloneUrl: p, isLocal: true, pkgId: "local__" + base };
     } catch { return null; }
   }
   if (path.isAbsolute(input) || input.startsWith("./") || input.startsWith("../") || input.startsWith("~/")) {
     const p = input.startsWith("~/") ? path.join(os.homedir(), input.slice(2)) : input;
     const base = path.basename(path.resolve(p).replace(/\/$/, ""));
-    if (!base) return null;
+    try { packageDirectoryName(base); } catch { return null; }
     return { owner: "local", repo: base, subpath: "", cloneUrl: path.resolve(p), isLocal: true, pkgId: "local__" + base };
   }
   const gh = input.match(/^https:\/\/github\.com\/([^\/]+)\/([^\/\.]+?)(?:\.git)?(?:\/tree\/([^\/]+)(?:\/(.*))?)?\/?$/);
   if (gh) {
     const owner = gh[1], repo = gh[2];
-    if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) return null;
-    if (owner.startsWith("-") || repo.startsWith("-")) return null;
+    try { packageDirectoryName(owner + "/" + repo); } catch { return null; }
     const subpath = gh[4] ? gh[4].replace(/^\/+|\/+$/g, "") : "";
+    if (subpath && subpath.split("/").some(p => !/^[A-Za-z0-9_.-]+$/.test(p) || p === "." || p === "..")) return null;
     return { owner, repo, subpath, cloneUrl: `https://github.com/${owner}/${repo}.git`, isLocal: false, pkgId: `${owner}__${repo}` };
   }
   const short = input.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/);
   if (short) {
     const owner = short[1], repo = short[2];
-    if (owner.startsWith("-") || repo.startsWith("-")) return null;
+    try { packageDirectoryName(owner + "/" + repo); } catch { return null; }
     return { owner, repo, subpath: "", cloneUrl: `https://github.com/${owner}/${repo}.git`, isLocal: false, pkgId: `${owner}__${repo}` };
   }
   if (opts.allowCloneUrl) {
     if (input.startsWith("https://") || input.startsWith("git@")) {
       const m = input.match(/([^\/:]+)\/([^\/]+?)(?:\.git)?$/);
-      if (m) return { owner: m[1], repo: m[2], subpath: "", cloneUrl: input, isLocal: false, pkgId: `${m[1]}__${m[2]}` };
+      if (m) {
+        try { packageDirectoryName(m[1] + "/" + m[2]); } catch { return null; }
+        return { owner: m[1], repo: m[2], subpath: "", cloneUrl: input, isLocal: false, pkgId: `${m[1]}__${m[2]}` };
+      }
     }
   }
   return null;
@@ -298,29 +354,193 @@ function createSkillsManager(opts = {}) {
   const codexCacheDir = path.join(codexDir, "plugins", "cache");
   const agyRoot = path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
 
+  function assertHubPath(target, options) {
+    if (path.resolve(target).startsWith(path.resolve(homeDir) + path.sep)) assertSafeFsPath(homeDir, target, options);
+    return assertSafeFsPath(hubDir, target, options);
+  }
+  function pluginBoundary(pluginDir, storeRoot) {
+    try {
+      const plugin = path.resolve(pluginDir);
+      if (!storeRoot) {
+        const stores = [
+          path.join(hubDir, "plugins"), path.join(homeDir, "plugins"), codexCacheDir,
+          ...[".zcode/cli/plugins", ".claude/plugins"].flatMap(p => [p, p + "/cache", p + "/marketplaces"]).map(p => path.join(homeDir, p)),
+          ...[".config/muse/plugins", ".muse/plugins", ".pi/agent/plugins", ".pi/plugins", ".gemini/antigravity/plugins"].map(p => path.join(homeDir, p)),
+        ];
+        const agyRelative = path.relative(agyRoot, plugin).split(path.sep);
+        if (agyRelative.length > 2 && agyRelative[0] !== ".." && agyRelative[1] === "plugins") stores.push(path.join(agyRoot, agyRelative[0], "plugins"));
+        // Select the owning store before resolving links; a cache may not borrow
+        // the wider plugins directory's authority to reach a sibling store.
+        storeRoot = stores.map(p => path.resolve(p)).sort((a, b) => b.length - a.length)
+          .find(p => plugin === p || plugin.startsWith(p + path.sep));
+      }
+      if (!storeRoot) return null;
+      storeRoot = path.resolve(storeRoot);
+      if (!plugin.startsWith(storeRoot + path.sep)) return null;
+      assertSafeFsPath(homeDir, storeRoot);
+      const realStoreRoot = fs.realpathSync(storeRoot);
+      const realPlugin = fs.realpathSync(plugin);
+      if (!realPlugin.startsWith(realStoreRoot + path.sep) || !fs.statSync(realPlugin).isDirectory()) return null;
+      // Internal version aliases are permitted, but no component may leave its store.
+      let current = storeRoot;
+      for (const part of path.relative(storeRoot, plugin).split(path.sep)) {
+        current = path.join(current, part);
+        if (!fs.realpathSync(current).startsWith(realStoreRoot + path.sep)) return null;
+      }
+      return { realStoreRoot, realPlugin };
+    } catch { return null; }
+  }
+  function packagePath(id, options) {
+    const target = path.resolve(hubPackagesDir, packageDirectoryName(id));
+    assertHubPath(target, options);
+    return assertSafeFsPath(hubPackagesDir, target, options);
+  }
+  function packageDirs() {
+    try {
+      assertHubPath(path.join(hubPackagesDir, ".store-check"));
+      return listDirs(hubPackagesDir).filter(dir => { try { packagePath(path.basename(dir)); return true; } catch { return false; } });
+    } catch { return []; }
+  }
+  function containedSkillFile(dir) {
+    try { return fileExists(assertSafeFsPath(dir, path.join(dir, "SKILL.md"))); } catch { return false; }
+  }
+  function canonicalPath(id) {
+    assertSafeSkillId(id);
+    const target = path.resolve(hubSkillsDir, id);
+    assertHubPath(target);
+    assertSafeFsPath(hubSkillsDir, target);
+    assertSafeFsPath(target, path.join(target, "SKILL.md"));
+    assertSafeFsPath(target, path.join(target, MANAGED_DIR_MARKER));
+    return target;
+  }
+  function preflightSkillPaths(id, projectRoot, targets = []) {
+    canonicalPath(id);
+    assertHubPath(hubStatePath);
+    assertSafeFsPath(homeDir, lockPath);
+    for (const dir of [agentsSkillsDir, claudeSkillsDir, ...targets.map(agentSkillsDir)]) {
+      assertSafeFsPath(homeDir, path.resolve(dir, id), { allowLeafSymlink: true });
+    }
+    if (projectRoot) for (const rel of [".agents/skills", ".claude/skills", ".codex/skills", ".claude/commands"]) {
+      assertSafeFsPath(projectRoot, path.resolve(projectRoot, rel, id + (rel.endsWith("commands") ? ".md" : "")), { allowLeafSymlink: true });
+    }
+  }
+
   function readHubState() {
+    assertHubPath(hubStatePath);
     const s = readJsonFile(hubStatePath, {});
     if (!s || typeof s !== "object") return {};
     return s;
   }
-  function writeHubState(state) { writeJsonFile(hubStatePath, state); }
+  function writeHubState(state) { assertHubPath(hubStatePath); writeJsonFile(hubStatePath, state); }
 
   function disabledSkillIds() {
     const out = new Set();
-    const cfg = path.join(codexDir, "config.toml");
-    let raw = "";
-    try { raw = fs.readFileSync(cfg, "utf8"); } catch { return out; }
-    const blocks = raw.split("[[skills.config]]");
-    for (let i = 1; i < blocks.length; i++) {
-      const b = blocks[i];
-      const nm = b.match(/name\s*=\s*"([^"]+)"/);
-      const dis = b.match(/disabled\s*=\s*(true|false)/);
-      if (nm && dis && dis[1] === "true") out.add(nm[1]);
-    }
+    try {
+      const cfg = path.join(codexDir, "config.toml");
+      let raw = "";
+      try { raw = fs.readFileSync(cfg, "utf8"); } catch { return out; }
+      const blocks = raw.split("[[skills.config]]");
+      for (let i = 1; i < blocks.length; i++) {
+        const b = blocks[i];
+        const nm = b.match(/name\s*=\s*"([^"]+)"/);
+        const dis = b.match(/disabled\s*=\s*(true|false)/);
+        const en = b.match(/enabled\s*=\s*(true|false)/);
+        if (!nm) continue;
+        const isDisabled = (dis && dis[1] === "true") || (en && en[1] === "false");
+        if (isDisabled) out.add(nm[1]);
+      }
+    } catch {}
     return out;
+  }
+  function codexSkillsPathMap() {
+    const map = new Map();
+    try {
+      const cfg = path.join(codexDir, "config.toml");
+      let raw = "";
+      try { raw = fs.readFileSync(cfg, "utf8"); } catch { return map; }
+      const blocks = raw.split("[[skills.config]]");
+      for (let i = 1; i < blocks.length; i++) {
+        const b = blocks[i];
+        const nm = b.match(/name\s*=\s*"([^"]+)"/);
+        const pm = b.match(/path\s*=\s*"([^"]+)"/);
+        if (nm && pm) map.set(nm[1], pm[1]);
+        else if (nm) map.set(nm[1], null);
+      }
+    } catch {}
+    return map;
+  }
+  function skillDirForAgent(agent, homeDir = this?.homeDir) {
+    // overridden per closure below; placeholder for global use not called
+    return "";
+  }
+  function agentSkillsDir(agent) {
+    if (agent === "antigravity") return primaryAgySkillsDirFor(homeDir);
+    if (agent === "muse") return path.join(homeDir, ".config", "muse", "skills");
+    if (agent === "codex") return path.join(codexDir, "skills");
+    if (agent === "pi") return path.join(homeDir, ".pi", "agent", "skills");
+    if (agent === "claude") return path.join(claudeSkillsDir);
+    if (agent === "zcode") return path.join(zcodeSkillsDir);
+    return null;
+  }
+  function allAgySkillsDirs() {
+    const dirs = [];
+    try { for (const inst of listDirs(agyRoot)) { dirs.push(path.join(inst, "config", "skills")); for (const arch of listDirs(inst)) if (path.basename(arch).startsWith("skills-archived-")) dirs.push(arch); } } catch {}
+    if (!dirs.length) dirs.push(primaryAgySkillsDirFor(homeDir));
+    return dirs;
+  }
+  function collectSkillSets() {
+    const sets = {
+      antigravity: new Set(),
+      muse: new Set(),
+      codex: new Set(),
+      pi: new Set(),
+      claude: new Set(),
+      shared: new Set(),
+    };
+    function addFromDir(dir, set) {
+      if (!dirExists(dir)) return;
+      for (const d of listDirs(dir)) {
+        const id = path.basename(d);
+        try { if (fileExists(path.join(d, "SKILL.md"))) set.add(id); } catch {}
+      }
+    }
+    for (const dir of allAgySkillsDirs()) addFromDir(dir, sets.antigravity);
+    addFromDir(path.join(homeDir, ".config", "muse", "skills"), sets.muse);
+    addFromDir(path.join(homeDir, ".pi", "agent", "skills"), sets.pi);
+    addFromDir(claudeSkillsDir, sets.claude);
+    addFromDir(path.join(codexDir, "skills"), sets.codex);
+    addFromDir(agentsSkillsDir, sets.shared);
+    const disabled = disabledSkillIds();
+    const pathMap = codexSkillsPathMap();
+    // apply codex path overrides: if path exists and not disabled, treat as present
+    for (const [skillId, p] of pathMap.entries()) {
+      if (!p) continue;
+      if (disabled.has(skillId)) continue;
+      const expanded = p.startsWith("~/") ? path.join(homeDir, p.slice(2)) : p;
+      if (fileExists(path.join(expanded, "SKILL.md"))) sets.codex.add(skillId);
+    }
+    // disabled remove
+    for (const id of disabled) sets.codex.delete(id);
+    return sets;
+  }
+  function agentStatesForSkill(id, sets = collectSkillSets()) {
+    let muse = sets.muse.has(id) || sets.shared.has(id);
+    let pi = sets.pi.has(id) || sets.shared.has(id);
+    const sharedViaAgentsDir = sets.shared.has(id) && (muse || pi);
+    return {
+      agentStates: {
+        antigravity: sets.antigravity.has(id),
+        muse,
+        codex: sets.codex.has(id),
+        pi,
+        claude: sets.claude.has(id),
+      },
+      sharedViaAgentsDir: !!sharedViaAgentsDir,
+    };
   }
 
   function readLock() {
+    assertSafeFsPath(homeDir, lockPath);
     const raw = readJsonFile(lockPath, null);
     if (!raw) return { version: 3, skills: {} };
     if (Array.isArray(raw)) { const skills = {}; for (const e of raw) { if (e && e.id) skills[e.id] = e; } return { version: 3, skills }; }
@@ -328,11 +548,11 @@ function createSkillsManager(opts = {}) {
     if (typeof raw === "object") return { version: raw.version || 3, skills: raw };
     return { version: 3, skills: {} };
   }
-  function writeLock(lock) { writeJsonFile(lockPath, lock); }
+  function writeLock(lock) { assertSafeFsPath(homeDir, lockPath); writeJsonFile(lockPath, lock); }
 
   function ensureCanonical(skillId) {
     assertSafeSkillId(skillId);
-    const dest = path.join(hubSkillsDir, skillId);
+    const dest = canonicalPath(skillId);
     assertContained(hubSkillsDir, dest);
     if (dirExists(dest) && fileExists(path.join(dest, "SKILL.md"))) { stampManagedDir(dest); return dest; }
     const candidates = [
@@ -353,7 +573,7 @@ function createSkillsManager(opts = {}) {
         return dest;
       }
     }
-    for (const pd of listDirs(hubPackagesDir)) {
+    for (const pd of packageDirs()) {
       const found = findSkillDirsRecursive(pd, 4).find((d) => path.basename(d) === skillId);
       if (found) {
         if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
@@ -361,7 +581,7 @@ function createSkillsManager(opts = {}) {
         stampManagedDir(dest);
         return dest;
       }
-      if (fileExists(path.join(pd, "SKILL.md")) && path.basename(pd) === skillId) {
+      if (containedSkillFile(pd) && path.basename(pd) === skillId) {
         if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
         cpDirRecursive(pd, dest);
         stampManagedDir(dest);
@@ -370,15 +590,19 @@ function createSkillsManager(opts = {}) {
     }
     if (dirExists(codexCacheDir)) {
       for (const mp of listDirs(codexCacheDir)) for (const pl of listDirs(mp)) {
-        const cands = [pl];
-        cands.push(path.join(pl, "skills", skillId));
-        for (const c of cands) if (fileExists(path.join(c, "SKILL.md"))) {
+        const boundary = pluginBoundary(pl, codexCacheDir);
+        if (!boundary) continue;
+        const { realPlugin } = boundary;
+        const cands = [realPlugin, path.join(realPlugin, "skills", skillId)];
+        for (const c of cands) {
+          try { assertSafeFsPath(realPlugin, path.join(c, "SKILL.md")); } catch { continue; }
+          if (!containedSkillFile(c)) continue;
           if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
           cpDirRecursive(c, dest);
           stampManagedDir(dest);
           return dest;
         }
-        const alt = findSkillDirsRecursive(pl, 4).find((d) => path.basename(d) === skillId);
+        const alt = findSkillDirsRecursive(realPlugin, 4).find((d) => path.basename(d) === skillId);
         if (alt) {
           if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
           cpDirRecursive(alt, dest);
@@ -415,11 +639,11 @@ function createSkillsManager(opts = {}) {
     if (st.isSymbolicLink()) return;
     assertContained(path.dirname(p), p);
     if (st.isDirectory()) {
-      const dest = path.join(hubSkillsDir, skillId);
+      const dest = canonicalPath(skillId);
       assertContained(hubSkillsDir, dest);
       if (!dirExists(dest)) { safeMkdir(hubSkillsDir); cpDirRecursive(p, dest); stampManagedDir(dest); }
     } else if (st.isFile()) {
-      const dest = path.join(hubSkillsDir, skillId);
+      const dest = canonicalPath(skillId);
       assertContained(hubSkillsDir, dest);
       safeMkdir(hubSkillsDir);
       if (!dirExists(dest)) { safeMkdir(dest); fs.copyFileSync(p, path.join(dest, path.basename(p))); stampManagedDir(dest); }
@@ -459,7 +683,7 @@ function createSkillsManager(opts = {}) {
     if (changed || !existing) {
       const out = lines.join("\n").replace(/\n+$/, "") + "\n";
       const tmp = excl + ".tmp-" + process.pid;
-      fs.writeFileSync(tmp, out, "utf8");
+      fs.writeFileSync(tmp, out, { encoding: "utf8", flag: "wx" });
       fs.renameSync(tmp, excl);
     }
   }
@@ -472,7 +696,7 @@ function createSkillsManager(opts = {}) {
     const byId = new Map();
     const state = readHubState();
     const { discoverPluginDirectories, pluginDetails } = require("./hub-plugins.cjs");
-    const pluginRoots = discoverPluginDirectories({ homeDir, hubDir }).filter(d => pluginDetails(d).composite);
+    const pluginRoots = discoverPluginDirectories({ homeDir, hubDir }).filter(d => pluginBoundary(d) && pluginDetails(d).composite);
     const compositeRoots = new Set(pluginRoots.map(d => { try { return fs.realpathSync(d); } catch { return d; } }));
     function addItem(it) {
       if (!it || !it.id) return;
@@ -491,8 +715,30 @@ function createSkillsManager(opts = {}) {
       }
       return null;
     }
-    function mkItem(id, dir, source, sourceLabel) {
-      const meta = parseSkillMd(path.join(dir, "SKILL.md"));
+    function mkItem(id, dir, source, sourceLabel, pluginDir, realStoreRoot) {
+      const skillMdPath = path.join(dir, "SKILL.md");
+      try {
+        if (pluginDir) {
+          const realBase = fs.realpathSync(pluginDir);
+          if (realStoreRoot && !realBase.startsWith(realStoreRoot + path.sep)) return null;
+          const rel = path.relative(path.resolve(pluginDir), skillMdPath);
+          const absReal = path.resolve(realBase, rel);
+          assertSafeFsPath(realBase, absReal);
+          const st = fs.lstatSync(absReal);
+          if (!st.isFile() || st.isSymbolicLink()) return null;
+          const realSkill = fs.realpathSync(absReal);
+          if (!(realSkill !== realBase && realSkill.startsWith(realBase + path.sep))) return null;
+          if (realStoreRoot && !realSkill.startsWith(realStoreRoot + path.sep)) return null;
+        } else {
+          assertSafeFsPath(dir, skillMdPath);
+          const st = fs.lstatSync(skillMdPath);
+          if (!st.isFile() || st.isSymbolicLink()) return null;
+          const realBase = fs.realpathSync(dir);
+          const realSkill = fs.realpathSync(skillMdPath);
+          if (!(realSkill !== realBase && realSkill.startsWith(realBase + path.sep))) return null;
+        }
+      } catch { return null; }
+      const meta = parseSkillMd(skillMdPath);
       const lockEntry = lockSkills[id] || {};
       return {
         id, name: meta.name || id, description: meta.description || "", fromCompositePlugin: !!compositeRoot(dir) || !!(state.skills?.[id]?.sourceDir && compositeRoot(state.skills[id].sourceDir)),
@@ -502,25 +748,75 @@ function createSkillsManager(opts = {}) {
         updatable: !!(lockEntry.repoUrl || lockEntry.repo || lockEntry.url),
       };
     }
-    for (const d of listDirs(hubSkillsDir)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "github", "hub"));
-    for (const pd of listDirs(hubPackagesDir)) {
-      if (fileExists(path.join(pd, "SKILL.md"))) { const id = path.basename(pd); addItem(mkItem(id, pd, "github", path.basename(pd))); }
-      for (const sd of findSkillDirsRecursive(pd, 4)) { const id = path.basename(sd); if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(id, sd, "github", path.basename(pd))); }
+    for (const d of listDirs(hubSkillsDir)) {
+      try { canonicalPath(path.basename(d)); } catch { continue; }
+      if (containedSkillFile(d)) addItem(mkItem(path.basename(d), d, "github", "hub"));
     }
-    for (const plugin of pluginRoots) for (const sd of listDirs(path.join(plugin, "skills"))) if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(path.basename(sd), sd, "github", path.basename(plugin)));
+    for (const pd of packageDirs()) {
+      if (containedSkillFile(pd)) { const id = path.basename(pd); addItem(mkItem(id, pd, "github", path.basename(pd), pd)); }
+      for (const sd of findSkillDirsRecursive(pd, 4)) { const id = path.basename(sd); addItem(mkItem(id, sd, "github", path.basename(pd), pd)); }
+    }
+    for (const plugin of pluginRoots) {
+      const boundary = pluginBoundary(plugin);
+      if (!boundary) continue;
+      const { realPlugin, realStoreRoot } = boundary;
+      try {
+        assertSafeFsPath(realPlugin, path.resolve(realPlugin, "skills"));
+      } catch { continue; }
+      for (const sd of listDirs(path.join(plugin, "skills"))) {
+        const skillMdPath = path.join(sd, "SKILL.md");
+        try {
+          const rel = path.relative(path.resolve(plugin), skillMdPath);
+          const absReal = path.resolve(realPlugin, rel);
+          assertSafeFsPath(realPlugin, absReal);
+          const st = fs.lstatSync(absReal);
+          if (!st.isFile() || st.isSymbolicLink()) continue;
+          const realSkill = fs.realpathSync(absReal);
+          if (!(realSkill !== realPlugin && realSkill.startsWith(realPlugin + path.sep))) continue;
+        } catch { continue; }
+        addItem(mkItem(path.basename(sd), sd, "github", path.basename(plugin), plugin, realStoreRoot));
+      }
+    }
     if (dirExists(codexCacheDir)) {
       for (const mp of listDirs(codexCacheDir)) for (const pl of listDirs(mp)) {
+        const boundary = pluginBoundary(pl, codexCacheDir);
+        if (!boundary) continue;
+        const { realStoreRoot } = boundary;
         const plugId = path.basename(pl);
-        if (fileExists(path.join(pl, "SKILL.md"))) addItem(mkItem(plugId, pl, "codex-market", `${path.basename(mp)}/${plugId}`));
+        addItem(mkItem(plugId, pl, "codex-market", `${path.basename(mp)}/${plugId}`, pl, realStoreRoot));
         for (const root of [pl, ...listDirs(pl)]) {
+          const rootBoundary = pluginBoundary(root, codexCacheDir);
+          if (!rootBoundary) continue;
+          const realRoot = rootBoundary.realPlugin;
           const inner = path.join(root, "skills");
-          if (dirExists(inner)) for (const sd of listDirs(inner)) if (fileExists(path.join(sd, "SKILL.md"))) addItem(mkItem(path.basename(sd), sd, "codex-market", `${path.basename(mp)}/${plugId}`));
+          if (!dirExists(inner)) continue;
+          let absInner;
+          try {
+            absInner = path.join(realRoot, "skills");
+            assertSafeFsPath(realRoot, absInner);
+          } catch { continue; }
+          for (const sd of listDirs(inner)) {
+            const skillMdPath = path.join(sd, "SKILL.md");
+            try {
+              const rel = path.relative(path.resolve(root), skillMdPath);
+              const absReal = path.resolve(realRoot, rel);
+              assertSafeFsPath(realRoot, absReal);
+              const st = fs.lstatSync(absReal);
+              if (!st.isFile() || st.isSymbolicLink()) continue;
+              const realSkill = fs.realpathSync(absReal);
+              if (!realSkill.startsWith(realRoot + path.sep) || !realSkill.startsWith(realStoreRoot + path.sep)) continue;
+            } catch { continue; }
+            addItem(mkItem(path.basename(sd), sd, "codex-market", `${path.basename(mp)}/${plugId}`, root, realStoreRoot));
+          }
         }
       }
     }
     if (dirExists(agentsSkillsDir)) for (const d of listDirs(agentsSkillsDir)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "global", "global"));
     if (dirExists(zcodeSkillsDir)) for (const d of listDirs(zcodeSkillsDir)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "zcode", "zcode"));
     if (dirExists(claudeSkillsDir)) for (const d of listDirs(claudeSkillsDir)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "claude", "claude"));
+    if (dirExists(path.join(homeDir, ".config", "muse", "skills"))) for (const d of listDirs(path.join(homeDir, ".config", "muse", "skills"))) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "muse", "muse"));
+    if (dirExists(path.join(homeDir, ".pi", "agent", "skills"))) for (const d of listDirs(path.join(homeDir, ".pi", "agent", "skills"))) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "pi", "pi"));
+    if (dirExists(path.join(codexDir, "skills"))) for (const d of listDirs(path.join(codexDir, "skills"))) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "codex", "codex"));
     if (dirExists(agyRoot)) {
       for (const inst of listDirs(agyRoot)) {
         const roots = [path.join(inst, "config", "skills")];
@@ -532,6 +828,7 @@ function createSkillsManager(opts = {}) {
       const ps = [path.join(projectRoot, ".agents", "skills"), path.join(projectRoot, ".claude", "skills")];
       for (const base of ps) if (dirExists(base)) for (const d of listDirs(base)) if (fileExists(path.join(d, "SKILL.md"))) addItem(mkItem(path.basename(d), d, "project", "project"));
     }
+    const sets = collectSkillSets();
     const items = [...byId.values()].map((it) => {
       const g = path.join(agentsSkillsDir, it.id);
       const isGlobalActive = dirExists(g) && !disabled.has(it.id);
@@ -539,7 +836,10 @@ function createSkillsManager(opts = {}) {
       let scope = "off";
       if (isGlobalActive) scope = "global";
       else if (isProject) scope = "project";
-      return { ...it, scope, updatable: !!(it.repoUrl || it.source === "codex-market" || it.source === "github") };
+      const { agentStates, sharedViaAgentsDir } = agentStatesForSkill(it.id, sets);
+      const enabledCount = Object.values(agentStates).filter(Boolean).length;
+      const enabled = enabledCount > 0 || scope !== "off";
+      return { ...it, scope, updatable: !!(it.repoUrl || it.source === "codex-market" || it.source === "github"), agentStates, enabledCount, enabled, sharedViaAgentsDir };
     }).filter(it => args.includePluginBundled === true || !it.fromCompositePlugin || it.scope !== "off").sort((a, b) => a.id.localeCompare(b.id));
     return { ok: true, projectRoot: projectRoot || null, items };
   }
@@ -566,6 +866,7 @@ function createSkillsManager(opts = {}) {
     if (scope === "project" && (!projectRoot || !path.isAbsolute(projectRoot))) throw new Error("projectRoot required for project scope");
     if (projectRoot && !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be absolute");
     if (args.sourceDir && (!path.isAbsolute(args.sourceDir) || !fileExists(path.join(args.sourceDir, "SKILL.md")))) throw new Error("sourceDir must be an absolute skill directory");
+    preflightSkillPaths(id, projectRoot);
     safeMkdir(hubSkillsDir);
     const globalLink = path.join(agentsSkillsDir, id);
     const claudeLink = path.join(claudeSkillsDir, id);
@@ -642,6 +943,215 @@ function createSkillsManager(opts = {}) {
     return { ok: true, item: { ...item, scope } };
   }
 
+  function backupOnceHub(file) {
+    const bak = file + ".t3hub.bak";
+    if (fileExists(file) && !fileExists(bak)) { try { fs.copyFileSync(file, bak); fs.chmodSync(bak, 0o600); } catch {} }
+  }
+  function findSkillSourceDir(skillId) {
+    assertSafeSkillId(skillId);
+    const candidates = [
+      path.join(hubSkillsDir, skillId),
+      path.join(agentsSkillsDir, skillId),
+      path.join(path.join(homeDir, ".config", "muse", "skills"), skillId),
+      path.join(path.join(homeDir, ".pi", "agent", "skills"), skillId),
+      path.join(path.join(codexDir, "skills"), skillId),
+      path.join(claudeSkillsDir, skillId),
+      path.join(zcodeSkillsDir, skillId),
+    ];
+    for (const dir of allAgySkillsDirs()) candidates.push(path.join(dir, skillId));
+    for (const c of candidates) {
+      try {
+        const st = lstatSafe(c);
+        if (!st) continue;
+        const real = st.isSymbolicLink() ? fs.realpathSync(c) : c;
+        if (fileExists(path.join(real, "SKILL.md"))) return real;
+      } catch {}
+    }
+    // search packages and plugins recursively
+    for (const pd of packageDirs()) {
+      const found = findSkillDirsRecursive(pd, 4).find(d => path.basename(d) === skillId);
+      if (found && fileExists(path.join(found, "SKILL.md"))) return found;
+    }
+    try {
+      const { discoverPluginDirectories, pluginDetails } = require("./hub-plugins.cjs");
+      for (const plug of discoverPluginDirectories({ homeDir, hubDir })) {
+        const boundary = pluginBoundary(plug);
+        if (!boundary) continue;
+        const det = pluginDetails(boundary.realPlugin);
+        for (const sd of det.skillDirs) if (path.basename(sd) === skillId && fileExists(path.join(sd, "SKILL.md"))) return sd;
+      }
+    } catch {}
+    return null;
+  }
+  function ensureSkillCanonical(skillId) {
+    assertSafeSkillId(skillId);
+    const dest = canonicalPath(skillId);
+    assertContained(hubSkillsDir, dest);
+    if (dirExists(dest) && fileExists(path.join(dest, "SKILL.md"))) { stampManagedDir(dest); return dest; }
+    const src = findSkillSourceDir(skillId);
+    if (src) {
+      if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
+      const real = (() => { try { return fs.realpathSync(src); } catch { return src; } })();
+      cpDirRecursive(real, dest);
+      stampManagedDir(dest);
+      return dest;
+    }
+    // fallback to existing ensureCanonical (creates empty)
+    return ensureCanonical(skillId);
+  }
+  function fixCodexSkillsDisabled(skillId) {
+    const cfg = path.join(codexDir, "config.toml");
+    assertSafeFsPath(homeDir, cfg);
+    let raw = "";
+    try { raw = fs.readFileSync(cfg, "utf8"); } catch { return; }
+    if (!raw.includes("[[skills.config]]")) return;
+    const lines = raw.split(/\r?\n/);
+    const out = [];
+    let inTarget = false;
+    let needsFix = false;
+    let nameSeen = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.trim().startsWith("[[skills.config]]")) {
+        inTarget = true;
+        nameSeen = false;
+        out.push(line);
+        continue;
+      }
+      if (inTarget && line.trim().startsWith("[")) { inTarget = false; }
+      if (inTarget) {
+        const nm = line.match(/name\s*=\s*"([^"]+)"/);
+        if (nm) nameSeen = nm[1] === skillId;
+        if (nameSeen) {
+          if (line.match(/disabled\s*=\s*true/)) { out.push(line.replace(/disabled\s*=\s*true/, "disabled = false")); needsFix = true; continue; }
+          if (line.match(/enabled\s*=\s*false/)) { out.push(line.replace(/enabled\s*=\s*false/, "enabled = true")); needsFix = true; continue; }
+        }
+      }
+      out.push(line);
+    }
+    if (needsFix) {
+      backupOnceHub(cfg);
+      const tmp = cfg + ".tmp-" + process.pid;
+      fs.writeFileSync(tmp, out.join("\n"), { mode: 0o600, flag: "wx" });
+      fs.renameSync(tmp, cfg);
+      try { fs.chmodSync(cfg, 0o600); } catch {}
+    }
+  }
+  function addCodexSkillsDisabled(skillId) {
+    const cfg = path.join(codexDir, "config.toml");
+    assertSafeFsPath(homeDir, cfg);
+    let raw = "";
+    try { raw = fs.readFileSync(cfg, "utf8"); } catch { raw = ""; }
+    if (raw.includes(`name = "${skillId}"`) || raw.includes(`name = '${skillId}'`)) return;
+    backupOnceHub(cfg);
+    safeMkdir(path.dirname(cfg));
+    const prefix = raw.trim() ? raw.replace(/\n+$/, "\n") + "\n" : "";
+    const block = `[[skills.config]]\nname = "${String(skillId).replace(/"/g, '\\"')}"\ndisabled = true\n`;
+    const tmp = cfg + ".tmp-" + process.pid;
+    fs.writeFileSync(tmp, prefix + block, { mode: 0o600, flag: "wx" });
+    fs.renameSync(tmp, cfg);
+    try { fs.chmodSync(cfg, 0o600); } catch {}
+  }
+  function toggleSkillForAgent({ id, name, agent, enabled } = {}) {
+    const skillId = id || name;
+    if (!skillId || typeof skillId !== "string") throw new Error("id or name required");
+    assertSafeSkillId(skillId);
+    const canonicalAgent = normalizeAgentHost(agent);
+    if (!canonicalAgent) throw new Error("invalid agent");
+    if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+    const targets = canonicalAgent === "all" ? CANONICAL_HOSTS : [canonicalAgent];
+    preflightSkillPaths(skillId, null, targets);
+    if (targets.includes("codex")) assertSafeFsPath(homeDir, path.join(codexDir, "config.toml"));
+    const canonical = ensureSkillCanonical(skillId);
+    // ensure canonical points to hub dir for symlink creation
+    const hubCanonical = path.join(hubSkillsDir, skillId);
+    assertContained(hubSkillsDir, hubCanonical);
+    if (!dirExists(hubCanonical) || !fileExists(path.join(hubCanonical, "SKILL.md"))) {
+      // fallback src already copied above canonical is hubCanonical itself
+    }
+    const effectiveSource = dirExists(hubCanonical) && fileExists(path.join(hubCanonical, "SKILL.md")) ? hubCanonical : canonical;
+    let sharedViaAgentsDir = false;
+    let hint = null;
+    for (const ag of targets) {
+      const dir = agentSkillsDir(ag);
+      if (!dir) throw new Error("invalid agent");
+      const linkPath = path.join(dir, skillId);
+      assertContained(dir, linkPath);
+      safeMkdir(dir);
+      if (enabled) {
+        ensureSymlink(effectiveSource, linkPath, hubDir);
+        if (ag === "codex") fixCodexSkillsDisabled(skillId);
+        // shared detection
+        if (ag === "muse" || ag === "pi") {
+          if (dirExists(path.join(agentsSkillsDir, skillId)) && fileExists(path.join(agentsSkillsDir, skillId, "SKILL.md"))) {
+            sharedViaAgentsDir = true;
+          }
+        }
+      } else {
+        const st = lstatSafe(linkPath);
+        if (!st) {
+          // no link to remove; for codex still mark disabled via config if needed
+          if (ag === "codex") addCodexSkillsDisabled(skillId);
+          continue;
+        }
+        if (st.isSymbolicLink()) {
+          if (isHubManagedSymlink(linkPath, hubDir)) fs.unlinkSync(linkPath);
+          else {
+            // external symlink: backup then unlink
+            fs.renameSync(linkPath, backupPathFor(linkPath));
+          }
+        } else if (st.isDirectory()) {
+          if (isManagedDir(linkPath)) fs.rmSync(linkPath, { recursive: true, force: true });
+          else {
+            // Real dir: backup migrate to hub canonical then remove
+            const canonicalPath = hubCanonical;
+            if (!dirExists(canonicalPath)) { safeMkdir(path.dirname(canonicalPath)); cpDirRecursive(linkPath, canonicalPath); stampManagedDir(canonicalPath); }
+            else {
+              // backup unmanaged dir to backupPath and keep canonical intact
+              const bak = backupPathFor(linkPath);
+              fs.renameSync(linkPath, bak);
+            }
+            // after copy, remove the original location (already moved or copied)
+            if (lstatSafe(linkPath)) {
+              // if symlink case not, removePath logic
+            }
+            if (dirExists(linkPath)) fs.rmSync(linkPath, { recursive: true, force: true });
+          }
+        } else if (st.isFile()) {
+          // file at target: backup
+          backupUnmanagedFile(linkPath);
+        }
+        // For muse/pi shared skill: hint
+        if (ag === "muse" || ag === "pi") {
+          if (dirExists(path.join(agentsSkillsDir, skillId)) && fileExists(path.join(agentsSkillsDir, skillId, "SKILL.md"))) {
+            sharedViaAgentsDir = true;
+            if (!hint) hint = "共享目录 ~/.agents/skills 与 Muse/Pi 共享同一入口，单独关闭 " + ag + " 需迁移到 Hub 规范库后拆分，当前仅移除专属软链，共享目录仍保持启用。";
+          }
+        }
+        // For codex, adding disabled entry ensures disable persists even if other source path exists
+        if (ag === "codex") {
+          // after removing symlink, also ensure disabled config so it stays off
+          try { addCodexSkillsDisabled(skillId); } catch {}
+        }
+      }
+    }
+    // persist hub state hint
+    const state = readHubState();
+    state.skills = state.skills || {};
+    if (!state.skills[skillId]) state.skills[skillId] = {};
+    state.skills[skillId].updatedAt = new Date().toISOString();
+    if (sharedViaAgentsDir) state.skills[skillId].sharedViaAgentsDir = true;
+    if (hint) state.skills[skillId].migrationHint = hint;
+    writeHubState(state);
+    const listed = listAssets({});
+    const item = listed.items.find(i => i.id === skillId);
+    const result = { ok: true, id: skillId, agent: canonicalAgent, enabled, sharedViaAgentsDir };
+    if (hint) result.hint = hint;
+    if (item) result.item = item;
+    return result;
+  }
+  function listSkills(args = {}) { return listAssets(args); }
+
   async function importFromGitHub(args = {}) {
     const { repoInput } = args;
     const scope = args.scope || "project";
@@ -650,8 +1160,10 @@ function createSkillsManager(opts = {}) {
     if (!parsed) throw new Error("invalid repo input");
     if (!["off", "project", "global"].includes(scope)) throw new Error("invalid scope");
     if (scope === "project" && (!projectRoot || !dirExists(projectRoot))) throw new Error("projectRoot required for project scope");
+    const pkgDir = packagePath(parsed.pkgId);
+    assertSafeFsPath(pkgDir, path.join(pkgDir, ".git"));
+    assertHubPath(path.join(hubSkillsDir, ".store-check"));
     safeMkdir(hubPackagesDir); safeMkdir(hubSkillsDir);
-    const pkgDir = path.join(hubPackagesDir, parsed.pkgId);
     if (dirExists(pkgDir) && dirExists(path.join(pkgDir, ".git"))) {
       await execFileAsync("git", ["pull", "--ff-only"], { cwd: pkgDir });
     } else if (dirExists(pkgDir)) {
@@ -660,7 +1172,10 @@ function createSkillsManager(opts = {}) {
     } else {
       await execFileAsync("git", ["clone", "--depth", "1", parsed.cloneUrl, pkgDir]);
     }
-    const searchRoot = parsed.subpath ? path.join(pkgDir, parsed.subpath) : pkgDir;
+    // git is asynchronous: revalidate the store before every subsequent FS use.
+    packagePath(parsed.pkgId);
+    assertSafeFsPath(pkgDir, path.join(pkgDir, ".git"));
+    const searchRoot = parsed.subpath ? assertSafeFsPath(pkgDir, path.resolve(pkgDir, parsed.subpath)) : pkgDir;
     let skillDirs = findSkillDirsRecursive(searchRoot, 5);
     if (skillDirs.length === 0 && dirExists(pkgDir)) skillDirs = findSkillDirsRecursive(pkgDir, 5);
     const imported = [];
@@ -668,7 +1183,7 @@ function createSkillsManager(opts = {}) {
       let id = path.basename(sd);
       if (sd === pkgDir) id = parsed.repo;
       try { assertSafeSkillId(id); } catch { continue; }
-      const dest = path.join(hubSkillsDir, id);
+      const dest = canonicalPath(id);
       assertContained(hubSkillsDir, dest);
       if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
       cpDirRecursive(sd, dest);
@@ -687,20 +1202,22 @@ function createSkillsManager(opts = {}) {
 
   async function updatePackage(args = {}) {
     const { id } = args;
-    if (!id) throw new Error("id required");
-    const pkgId = String(id).replace("/", "__");
+    const pkgId = packageDirectoryName(id);
+    const target = packagePath(id);
     const dirs = listDirs(hubPackagesDir);
     const exact = dirs.find((d) => path.basename(d) === pkgId);
     if (!exact) return { ok: false, error: "Package not found: " + id };
-    const pkgDir = exact;
+    const pkgDir = target;
+    assertSafeFsPath(pkgDir, path.join(pkgDir, ".git"));
     if (!dirExists(path.join(pkgDir, ".git"))) throw new Error("not a git package: " + pkgId);
     await execFileAsync("git", ["pull", "--ff-only"], { cwd: pkgDir });
+    packagePath(id);
     const skillDirs = findSkillDirsRecursive(pkgDir, 5);
     const updated = [];
     for (const sd of skillDirs) {
       const sid = sd === pkgDir ? path.basename(pkgDir).split("__").pop() : path.basename(sd);
       try { assertSafeSkillId(sid); } catch { continue; }
-      const dest = path.join(hubSkillsDir, sid);
+      const dest = canonicalPath(sid);
       assertContained(hubSkillsDir, dest);
       if (lstatSafe(dest)) clearIncompleteCanonical(dest, hubDir);
       cpDirRecursive(sd, dest);
@@ -713,9 +1230,13 @@ function createSkillsManager(opts = {}) {
   async function removePackage(args = {}) {
     const { id } = args;
     const projectRoot = args.projectRoot || null;
-    if (!id) throw new Error("id required");
-    const pkgId = String(id).replace("/", "__");
-    const pkgDir = path.join(hubPackagesDir, pkgId);
+    const pkgId = packageDirectoryName(id);
+    const pkgDir = packagePath(id, { allowLeafSymlink: true });
+    const st = lstatSafe(pkgDir);
+    if (st?.isSymbolicLink()) {
+      fs.unlinkSync(pkgDir);
+      return { ok: true, package: pkgId, removedSkills: [] };
+    }
     let skillIds = [];
     if (dirExists(pkgDir)) {
       skillIds = findSkillDirsRecursive(pkgDir, 5).map((d) => (d === pkgDir ? path.basename(pkgDir).split("__").pop() : path.basename(d)));
@@ -727,7 +1248,8 @@ function createSkillsManager(opts = {}) {
     for (const sid of skillIds) {
       try { setSkillScope({ id: sid, scope: "off", projectRoot }); } catch {}
     }
-    if (dirExists(pkgDir)) fs.rmSync(pkgDir, { recursive: true, force: true });
+    packagePath(id);
+    if (st?.isDirectory()) fs.rmSync(pkgDir, { recursive: true, force: true });
     return { ok: true, package: pkgId, removedSkills: skillIds };
   }
 
@@ -838,7 +1360,7 @@ function createSkillsManager(opts = {}) {
     return { ok: true, content, tokens: estimateTokens(content) };
   }
 
-  return { homeDir, hubDir, listAssets, setSkillScope, importFromGitHub, updatePackage, removePackage, getAgentsMd, saveAgentsMd, injectSoftRoute };
+  return { homeDir, hubDir, listAssets, listSkills, toggleSkillForAgent, setSkillScope, importFromGitHub, updatePackage, removePackage, getAgentsMd, saveAgentsMd, injectSoftRoute };
 }
 
 let _singleton = null;
@@ -854,11 +1376,14 @@ async function removePackage(args) { return getDefaultSkillsManager().removePack
 function getAgentsMd(args) { return getDefaultSkillsManager().getAgentsMd(args || {}); }
 function saveAgentsMd(args) { return getDefaultSkillsManager().saveAgentsMd(args || {}); }
 function injectSoftRoute(args) { return getDefaultSkillsManager().injectSoftRoute(args || {}); }
+function listSkills(args) { return getDefaultSkillsManager().listSkills(args || {}); }
+function toggleSkillForAgent(args) { return getDefaultSkillsManager().toggleSkillForAgent(args || {}); }
 
 module.exports = {
+  assertSafeFsPath,
   createSkillsManager,
   parseGitHubInput,
-  listAssets, setSkillScope, importFromGitHub, updatePackage, removePackage,
+  listAssets, listSkills, toggleSkillForAgent, setSkillScope, importFromGitHub, updatePackage, removePackage,
   getAgentsMd, saveAgentsMd, injectSoftRoute,
   getDefaultSkillsManager,
   default: getDefaultSkillsManager(),
