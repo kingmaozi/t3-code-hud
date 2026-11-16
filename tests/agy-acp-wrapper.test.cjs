@@ -117,20 +117,17 @@ for (const py of interpreters()) {
     assert.match(r.out, /"id":1/);
   });
 
-  test(`${tag}: -32603 retry swallows first error and forwards success`, async () => {
+  test(`${tag}: -32603 is forwarded and the connection handles later requests`, async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-test-"));
     const body = [
       "import sys,json",
-      "cnt={}",
       "for line in sys.stdin.buffer:",
       " line=line.strip()",
       " if not line: continue",
       " msg=json.loads(line); mid=msg.get('id'); method=msg.get('method')",
       " if method=='authenticate':",
-      "  cnt[mid]=cnt.get(mid,0)+1",
-      "  if cnt[mid]==1: sys.stdout.buffer.write((json.dumps({'id':mid,'error':{'code':-32603,'message':'Internal error'}})+'\\n').encode()); sys.stdout.buffer.flush()",
-      "  else: sys.stdout.buffer.write((json.dumps({'id':mid,'result':{'ok':True}})+'\\n').encode()); sys.stdout.buffer.flush()",
-      " else: sys.stdout.buffer.write((json.dumps({'id':mid,'result':{}})+'\\n').encode()); sys.stdout.buffer.flush()",
+      "  sys.stdout.buffer.write((json.dumps({'id':mid,'error':{'code':-32603,'message':'Internal error'}})+'\\n').encode()); sys.stdout.buffer.flush()",
+      " else: sys.stdout.buffer.write((json.dumps({'id':mid,'result':{'ok':True}})+'\\n').encode()); sys.stdout.buffer.flush()",
       "",
     ].join("\n");
     const child = makeChild(tmp, body);
@@ -156,7 +153,7 @@ for (const py of interpreters()) {
       });
       proc.stdin.write('{"id":7,"method":"authenticate","params":{}}\n');
       proc.stdin.write('{"id":8,"method":"session/new","params":{}}\n');
-      // Keep stdin open until the retried success line arrives, then EOF.
+      // Keep stdin open until both independent responses arrive, then EOF.
       const iv = setInterval(() => {
         if (out.includes('"ok": true') || out.includes('"ok":true')) {
           clearInterval(iv);
@@ -166,7 +163,7 @@ for (const py of interpreters()) {
     });
     assert.equal(code, 0);
     assert.ok(out.includes('"ok": true') || out.includes('"ok":true'), `out=${out}`);
-    assert.ok(!out.includes("-32603"), `first -32603 must be swallowed; out=${out}`);
+    assert.equal(out.split("-32603").length - 1, 1, `original error must pass exactly once; out=${out}`);
   });
 
   test(`${tag}: SIGTERM to wrapper is forwarded; wrapper exits 143 (no hang, no -6)`, async () => {
@@ -399,8 +396,8 @@ test("review:3 new zero-byte session db is preserved (never deleted)", async () 
   assert.ok(!diag.includes(leakName), `diag must not record private filenames; diag=${diag}`);
 });
 
-// 4. Side effect during backoff cancels retry and forwards original error.
-test("review:4 side-effect during backoff cancels retry (error forwarded, no resend)", async () => {
+// A following notification must not be swallowed after an error response.
+test("review:4 setup error and subsequent notification are forwarded without replay", async () => {
   const py = BREW;
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-review4-"));
   const countFile = path.join(tmp, "auth-count");
@@ -434,23 +431,168 @@ test("review:4 side-effect during backoff cancels retry (error forwarded, no res
   proc.stdout.setEncoding("utf-8");
   proc.stdout.on("data", (d) => (out += d));
   const code = await new Promise((resolve, reject) => {
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       proc.kill("SIGKILL");
       reject(new Error("review4 timed out"));
     }, 15000);
-    proc.on("close", (c) => resolve(c));
+    proc.on("close", (c) => { clearTimeout(timer); resolve(c); });
     proc.stdin.write('{"id":7,"method":"authenticate","params":{}}\n');
     setTimeout(() => {
       try {
         proc.stdin.end();
       } catch {}
-    }, 2500);
+    }, 700);
   });
   assert.equal(code, 0, `code=${code} out=${out}`);
   assert.ok(out.includes("-32603"), `original error must be forwarded on cancel; out=${out}`);
   assert.ok(!out.includes('"ok": true') && !out.includes('"ok":true'), `must not resend; out=${out}`);
+  assert.ok(out.includes("session/update"), `notification must be forwarded; out=${out}`);
   assert.equal(Number(fs.readFileSync(countFile, "utf-8").trim()), 1, "child must see exactly one request");
 });
+
+for (const py of interpreters()) {
+  const tag = py === BREW ? "homebrew" : "xcode";
+
+  for (const method of ["authenticate", "session/new", "session/load", "session/resume", "session/prompt"]) {
+  test(`${tag}: ${method} internal error is returned without replay`, async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-new-no-replay-"));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+    const child = makeChild(tmp, [
+      "import json, select, sys",
+      "first=json.loads(sys.stdin.buffer.readline())",
+      "print(json.dumps({'id':first['id'],'error':{'code':-32603,'message':'fixture'}}),flush=True)",
+      "readable,_,_=select.select([sys.stdin.buffer],[],[],.8)",
+      "extra=json.loads(sys.stdin.buffer.readline()) if readable else None",
+      "print(json.dumps({'method':'fixture/report','params':{'extra':extra is not None}}),flush=True)",
+    ].join("\n"));
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(py, [WRAPPER], { env: { ...process.env, AGY_WRAPPER_REAL_BIN: child, AGY_WRAPPER_LOG_PATH: "", AGY_WRAPPER_BACKOFFS: ".05" }, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "", err = "";
+      proc.stdout.on("data", (d) => { out += d; }); proc.stderr.on("data", (d) => { err += d; });
+      proc.stdin.on("error", () => {});
+      const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("session/new no replay timed out")); }, 6000);
+      proc.on("error", reject); proc.on("close", (code) => { clearTimeout(timer); resolve({ code, out, err }); });
+      proc.stdin.write(JSON.stringify({ id: 1, method, params: {} }) + "\n");
+    });
+    const messages = result.out.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(result.code, 0, result.err);
+    assert.equal(messages.filter((msg) => msg.id === 1 && msg.error?.code === -32603).length, 1, result.out);
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.extra, false, result.out);
+  });
+  }
+
+  test(`${tag}: setup error bytes are forwarded verbatim`, async () => {
+    const wire = ' { "jsonrpc" : "2.0", "id" : 1, "error" : { "code" : -32603, "message" : "fixture", "data" : {"x":1} } }  \n';
+    const childBody = `import os,sys\nsys.stdin.buffer.readline()\nos.write(1,${JSON.stringify(wire)}.encode())\n`;
+    const result = await runWrapper(py, childBody, '{"id":1,"method":"authenticate"}\n');
+    assert.equal(result.code, 0, result.err);
+    assert.equal(result.out, wire);
+  });
+
+  test(`${tag}: oversized setup error is returned without a partial retry`, async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-large-no-replay-"));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+    const child = makeChild(tmp, [
+      "import json, select, sys",
+      "first=json.loads(sys.stdin.buffer.readline())",
+      "print(json.dumps({'id':first['id'],'error':{'code':-32603,'message':'fixture'}}),flush=True)",
+      "readable,_,_=select.select([sys.stdin.buffer],[],[],.8)",
+      "extra=json.loads(sys.stdin.buffer.readline()) if readable else None",
+      "print(json.dumps({'method':'fixture/report','params':{'extra':extra is not None}}),flush=True)",
+    ].join("\n"));
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(py, [WRAPPER], { env: { ...process.env, AGY_WRAPPER_REAL_BIN: child, AGY_WRAPPER_LOG_PATH: "", AGY_WRAPPER_BACKOFFS: ".05" }, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "", err = "";
+      proc.stdout.on("data", (d) => { out += d; }); proc.stderr.on("data", (d) => { err += d; });
+      proc.stdin.on("error", () => {});
+      const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("oversized setup no replay timed out")); }, 6000);
+      proc.on("error", reject); proc.on("close", (code) => { clearTimeout(timer); resolve({ code, out, err }); });
+      proc.stdin.write(JSON.stringify({ id: 1, method: "authenticate", params: { payload: "x".repeat(65536) } }) + "\n");
+    });
+    const messages = result.out.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(result.code, 0, result.err);
+    assert.equal(messages.filter((msg) => msg.id === 1 && msg.error?.code === -32603).length, 1, result.out);
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.extra, false, result.out);
+  });
+
+  test(`${tag}: setup error and notification survive blocked child stdin without replay`, async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-retry-stdin-race-"));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+    const errorSeen = path.join(tmp, "client-saw-error");
+    const child = makeChild(tmp, [
+      "import json, os, select, sys, time",
+      `error_seen=${JSON.stringify(errorSeen)}`,
+      "first=json.loads(sys.stdin.buffer.readline())",
+      "print(json.dumps({'type':'fixture/ready'}),flush=True)",
+      "print(json.dumps({'id':first['id'],'error':{'code':-32603,'message':'fixture'}}),flush=True)",
+      "assert select.select([sys.stdin.buffer],[],[],4)[0], 'large request never arrived'",
+      "time.sleep(.45)",
+      "print(json.dumps({'method':'session/update','params':{'fixture':True}}),flush=True)",
+      "deadline=time.monotonic()+1.5",
+      "while not os.path.exists(error_seen) and time.monotonic()<deadline: time.sleep(.01)",
+      "before_read=os.path.exists(error_seen)",
+      "other=json.loads(sys.stdin.buffer.readline())",
+      "readable,_,_=select.select([sys.stdin.buffer],[],[],.6)",
+      "extra=json.loads(sys.stdin.buffer.readline()) if readable else None",
+      "print(json.dumps({'method':'fixture/report','params':{'other':other.get('method'),'extra':extra is not None,'beforeRead':before_read}}),flush=True)",
+    ].join("\n"));
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(py, [WRAPPER], { env: { ...process.env, AGY_WRAPPER_REAL_BIN: child, AGY_WRAPPER_LOG_PATH: "", AGY_WRAPPER_BACKOFFS: ".10" }, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "", err = "", sentLarge = false;
+      proc.stdout.on("data", (d) => {
+        out += d;
+        if (out.includes("-32603") && !fs.existsSync(errorSeen)) fs.writeFileSync(errorSeen, "");
+        if (!sentLarge && out.includes("fixture/ready")) {
+          sentLarge = true;
+          proc.stdin.write(JSON.stringify({ id: 2, method: "session/prompt", params: { payload: "x".repeat(2_000_000) } }) + "\n");
+        }
+      });
+      proc.stderr.on("data", (d) => { err += d; }); proc.stdin.on("error", () => {});
+      const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("retry stdin race timed out")); }, 8000);
+      proc.on("error", reject); proc.on("close", (code) => { clearTimeout(timer); resolve({ code, out, err }); });
+      proc.stdin.write('{"id":1,"method":"authenticate","params":{}}\n');
+    });
+    const messages = result.out.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(result.code, 0, result.err);
+    assert.ok(messages.some((msg) => msg.method === "session/update"), result.out);
+    assert.equal(messages.filter((msg) => msg.id === 1 && msg.error?.code === -32603).length, 1, result.out);
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.other, "session/prompt", result.out);
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.extra, false, result.out);
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.beforeRead, true, "original error must be forwarded before the blocked request is read");
+  });
+
+  test(`${tag}: slow output reader does not cause setup replay before queued notification`, async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-retry-slow-output-"));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+    const child = makeChild(tmp, [
+      "import json, select, sys",
+      "first=json.loads(sys.stdin.buffer.readline()); second=json.loads(sys.stdin.buffer.readline())",
+      "print(json.dumps({'id':first['id'],'error':{'code':-32603,'message':'fixture'}}),flush=True)",
+      "print(json.dumps({'id':second['id'],'result':{'payload':'x'*600000}}),flush=True)",
+      "print(json.dumps({'method':'session/update','params':{'fixture':True}}),flush=True)",
+      "readable,_,_=select.select([sys.stdin.buffer],[],[],.8)",
+      "extra=json.loads(sys.stdin.buffer.readline()) if readable else None",
+      "print(json.dumps({'method':'fixture/report','params':{'extra':extra is not None}}),flush=True)",
+    ].join("\n"));
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(py, [WRAPPER], { env: { ...process.env, AGY_WRAPPER_REAL_BIN: child, AGY_WRAPPER_LOG_PATH: "", AGY_WRAPPER_BACKOFFS: ".05" }, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "", err = "";
+      proc.stdout.on("data", (d) => { out += d; }); proc.stdout.pause();
+      proc.stderr.on("data", (d) => { err += d; }); proc.stdin.on("error", () => {});
+      const resume = setTimeout(() => proc.stdout.resume(), 1200);
+      const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("slow output setup test timed out")); }, 7000);
+      proc.on("error", reject); proc.on("close", (code) => { clearTimeout(timer); clearTimeout(resume); resolve({ code, out, err }); });
+      proc.stdin.write('{"id":1,"method":"authenticate","params":{}}\n');
+      proc.stdin.write('{"id":2,"method":"other/query","params":{}}\n');
+    });
+    const messages = result.out.trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(result.code, 0, result.err);
+    assert.equal(messages.filter((msg) => msg.id === 1 && msg.error?.code === -32603).length, 1);
+    assert.equal(messages.find((msg) => msg.id === 2)?.result.payload.length, 600000);
+    assert.ok(messages.some((msg) => msg.method === "session/update"));
+    assert.equal(messages.find((msg) => msg.method === "fixture/report")?.params.extra, false);
+  });
+}
 
 // 5a. Sensitive stderr never persisted to diag file (forwarding preserved).
 test("review:5a sensitive stderr is forwarded but never persisted verbatim", async () => {
@@ -607,18 +749,18 @@ for (const py of interpreters()) {
     assert.match(result.stdout,/late-cancel=143/);
   });
 }
-test('retry created while stdout drains is awaited before normal exit',async t=>{
+test('stdout pump drains a setup error after child exit',async t=>{
  const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'agy-drain-retry-'));t.after(()=>fs.rmSync(tmp,{recursive:true,force:true}));
- const ready=path.join(tmp,'retry-creating');
+ const ready=path.join(tmp,'stdout-pump-started');
  const child=makeChild(tmp,`import sys,os,time\nsys.stdin.buffer.readline()\nos.write(1,b'{"id":1,"error":{"code":-32603}}\\n')\nwhile not os.path.exists(${JSON.stringify(ready)}): time.sleep(.01)\nos._exit(3)\n`);
  const loader=path.join(tmp,'loader.py');
- fs.writeFileSync(loader,`import threading,time,runpy\noriginal=threading.Thread.__init__\ndef intercept(self,*args,**kwargs):\n target=kwargs.get('target')\n if getattr(target,'__name__','')=='_retry_worker':\n  open(${JSON.stringify(ready)},'w').close()\n  time.sleep(.3)\n  def delayed():\n   time.sleep(.3)\n   target()\n  kwargs['target']=delayed\n original(self,*args,**kwargs)\nthreading.Thread.__init__=intercept\nrunpy.run_path(${JSON.stringify(WRAPPER)},run_name='__main__')\n`);
+ fs.writeFileSync(loader,`import threading,time,runpy\noriginal=threading.Thread.__init__\ndef intercept(self,*args,**kwargs):\n target=kwargs.get('target')\n if getattr(target,'__name__','')=='pump_stdout':\n  def delayed():\n   open(${JSON.stringify(ready)},'w').close()\n   time.sleep(.3)\n   target()\n  kwargs['target']=delayed\n original(self,*args,**kwargs)\nthreading.Thread.__init__=intercept\nrunpy.run_path(${JSON.stringify(WRAPPER)},run_name='__main__')\n`);
  const result=await new Promise((resolve,reject)=>{
   const proc=spawn(BREW,[loader],{env:{...process.env,AGY_WRAPPER_REAL_BIN:child,AGY_WRAPPER_LOG_PATH:'',AGY_WRAPPER_BACKOFFS:'.01'},stdio:['pipe','pipe','pipe']});
   let out='',err='';proc.stdout.on('data',d=>out+=d);proc.stderr.on('data',d=>err+=d);
   const timer=setTimeout(()=>{proc.kill('SIGKILL');reject(new Error('retry drain timed out'));},6000);
   proc.on('error',reject);proc.on('close',code=>{clearTimeout(timer);resolve({code,out,err});});
-  proc.stdin.on('error',()=>{});proc.stdin.write('{"id":1,"method":"session/new"}\n');
+  proc.stdin.on('error',()=>{});proc.stdin.write('{"id":1,"method":"authenticate"}\n');
  });
  assert.equal(result.code,3,result.err);assert.match(result.out,/"code":-32603/);
 });

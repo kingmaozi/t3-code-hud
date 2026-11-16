@@ -1,13 +1,10 @@
 #!/opt/homebrew/bin/python3
 """Resilient stdio JSON-RPC wrapper around sibling agy_acp_server.par.
 
-Automatically retries transient -32603 Internal error failures (caused by
-upstream proxy RemoteDisconnected drops to *.googleapis.com) on idempotent
-session-setup RPCs (authenticate, session/new, session/resume, session/load)
-against the already-running ACP server process, counts (never deletes) newly
-leaked 0-byte conversation .db files from failed session/new attempts, and
-preserves all stdout/stderr auth handshakes and streaming protocol semantics
-verbatim.
+Forwards ACP messages without automatically replaying failed requests: an
+Internal error cannot establish that the server had no side effects. Counts
+(never deletes) newly leaked 0-byte conversation .db files and preserves
+stdout/stderr streaming semantics.
 
 Hardened on macOS to:
 1) Run under Homebrew CLI python3 instead of Xcode's GUI Python.app (3.9.6),
@@ -22,7 +19,7 @@ Hardened on macOS to:
    but persisted only as an event kind (never full text). Child exit codes
    always propagate verbatim (128+signum for signal deaths); os._exit is used
    only to skip the finalization crash, never to mask a failure. Normal exit
-   drains pumps/retry workers fully; forced cancel uses a bounded drain.
+   drains output pumps fully; forced cancel uses a bounded drain.
 """
 
 import datetime
@@ -41,8 +38,6 @@ try:
 except Exception:
     pass
 
-SETUP_METHODS = frozenset(("authenticate", "session/new", "session/resume", "session/load"))
-DEFAULT_BACKOFFS = (0.25, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
 MAX_LOG_BYTES = 512 * 1024
 
 SECRET_PATTERNS = (
@@ -78,17 +73,6 @@ def stderr_event_kind(raw):
     if any(p.search(text) for p in SECRET_PATTERNS) or SECRET_LIKE_RE.search(text):
         return "secret_like"
     return "line"
-
-
-def parse_backoffs():
-    raw = os.environ.get("AGY_WRAPPER_BACKOFFS", "").strip()
-    if not raw:
-        return DEFAULT_BACKOFFS
-    try:
-        vals = tuple(float(x.strip()) for x in raw.split(",") if x.strip())
-        return vals if vals else DEFAULT_BACKOFFS
-    except ValueError:
-        return DEFAULT_BACKOFFS
 
 
 def conversations_dir():
@@ -201,19 +185,9 @@ class DiagnosticLogger(object):
                 pass
 
 
-class SetupState(object):
-    def __init__(self, method, raw_bytes, pre_dbs):
-        self.method = method
-        self.raw_bytes = raw_bytes
-        self.pre_dbs = pre_dbs
-        self.attempt = 0
-        self.emitted_side_effect = False
-
-
 def main():
     real_dir = os.path.dirname(os.path.realpath(__file__))
     real_bin = os.environ.get("AGY_WRAPPER_REAL_BIN") or os.path.join(real_dir, "agy_acp_server.par")
-    backoffs = parse_backoffs()
     conv_dir = conversations_dir()
     diag = DiagnosticLogger()
 
@@ -229,17 +203,14 @@ def main():
     child_stdin_lock = threading.Lock()
     stdout_write_lock = threading.Lock()
     stderr_write_lock = threading.Lock()
-    inflight_setup = {}
-    stdin_eof = threading.Event()
+    inflight_new = {}
     cancel_requested = threading.Event()
     cancel_signum = [None]
-    retry_threads = []
     child_stdin_closed = [False]
 
     shutdown_watchdog_started = threading.Event()
 
     def forward_signal(signum, _frame):
-        stdin_eof.set()
         cancel_requested.set()
         if cancel_signum[0] is None:
             cancel_signum[0] = signum
@@ -318,45 +289,6 @@ def main():
             except OSError:
                 pass
 
-    def schedule_retry(key, st, delay, last_error_raw):
-        def _retry_worker():
-            def _cancel_and_forward():
-                with state_lock:
-                    popped = inflight_setup.pop(key, None)
-                if popped is st:
-                    write_client_stdout(last_error_raw)
-                else:
-                    # Already terminal: forward error so the client never
-                    # hangs waiting for a response that will never arrive.
-                    write_client_stdout(last_error_raw)
-
-            if stdin_eof.wait(timeout=delay) or child.poll() is not None:
-                _cancel_and_forward()
-                return
-            with state_lock:
-                current = inflight_setup.get(key)
-                if current is not st:
-                    return
-                if st.emitted_side_effect:
-                    # A notification landed during backoff: do not resend a
-                    # non-idempotent setup. Forward the original error.
-                    inflight_setup.pop(key, None)
-                    cancelled = True
-                elif st.method == "session/new":
-                    st.pre_dbs = snapshot_dbs(conv_dir)
-                    cancelled = False
-                else:
-                    cancelled = False
-            if cancelled:
-                write_client_stdout(last_error_raw)
-                return
-            if not write_child_stdin(st.raw_bytes):
-                _cancel_and_forward()
-
-        t = threading.Thread(target=_retry_worker, daemon=True)
-        retry_threads.append(t)
-        t.start()
-
     def pump_stdin():
         try:
             for raw in iter_fd_lines(0):
@@ -369,14 +301,13 @@ def main():
                     if isinstance(msg, dict):
                         method = msg.get("method")
                         req_id = msg.get("id")
-                        if req_id is not None and method in SETUP_METHODS:
-                            pre_dbs = snapshot_dbs(conv_dir) if method == "session/new" else set()
+                        if method == "session/new" and isinstance(req_id, (str, int, float)):
+                            pre_dbs = snapshot_dbs(conv_dir)
                             with state_lock:
-                                inflight_setup[req_key(req_id)] = SetupState(method, raw, pre_dbs)
+                                inflight_new[req_key(req_id)] = pre_dbs
                 if not write_child_stdin(raw):
                     break
         finally:
-            stdin_eof.set()
             close_child_stdin()
 
     def pump_stdout():
@@ -403,51 +334,11 @@ def main():
         if not isinstance(msg, dict):
             write_client_stdout(raw)
             return
-        if "method" in msg:
-            with state_lock:
-                for st in inflight_setup.values():
-                    st.emitted_side_effect = True
-            write_client_stdout(raw)
-            return
-        if "id" in msg:
+        if "method" not in msg and isinstance(msg.get("id"), (str, int, float)):
             key = req_key(msg["id"])
             with state_lock:
-                st = inflight_setup.get(key)
-                if st is not None:
-                    err = msg.get("error")
-                    err_code = err.get("code") if isinstance(err, dict) else None
-                    can_retry = (
-                        err_code == -32603
-                        and not st.emitted_side_effect
-                        and st.attempt < len(backoffs)
-                        and not stdin_eof.is_set()
-                    )
-                    if can_retry:
-                        delay = backoffs[st.attempt]
-                        st.attempt += 1
-                        attempt_num = st.attempt
-                        method_name = st.method
-                        pre_dbs = st.pre_dbs
-                    else:
-                        inflight_setup.pop(key, None)
-                        attempt_num = None
-                        method_name = st.method
-                        pre_dbs = st.pre_dbs
-                        is_terminal_err = isinstance(err, dict)
-                else:
-                    attempt_num = None
-                    method_name = None
-                    pre_dbs = None
-                    is_terminal_err = False
-            if st is not None and attempt_num is not None:
-                counted = count_new_zero_byte_dbs(conv_dir, pre_dbs) if method_name == "session/new" else 0
-                diag.write(
-                    f"retrying {method_name} (attempt {attempt_num}/{len(backoffs)} in {delay}s) "
-                    f"after -32603 Internal error; zero_byte_dbs={counted}"
-                )
-                schedule_retry(key, st, delay, raw)
-                return
-            if st is not None and is_terminal_err and method_name == "session/new":
+                pre_dbs = inflight_new.pop(key, None)
+            if pre_dbs is not None and isinstance(msg.get("error"), dict):
                 counted = count_new_zero_byte_dbs(conv_dir, pre_dbs)
                 diag.write(f"terminal error on session/new; zero_byte_dbs={counted}")
         write_client_stdout(raw)
@@ -476,7 +367,6 @@ def main():
             break
         except InterruptedError:
             continue
-    stdin_eof.set()
     # A cancellation may arrive AFTER child.wait() or during a slow-client
     # drain. Recheck on every bounded join instead of committing to an
     # uncancellable join() based on a single earlier snapshot.
@@ -493,10 +383,6 @@ def main():
 
     drain_thread(t_out)
     drain_thread(t_err)
-    # Only stdout creates retry threads. Snapshot AFTER it has drained so
-    # a retry scheduled concurrently with child exit cannot be omitted.
-    for t in list(retry_threads):
-        drain_thread(t)
     if cancel_signum[0] is not None:
         exit_code = 128 + cancel_signum[0]
     elif rc >= 0:
