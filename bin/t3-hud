@@ -43,7 +43,16 @@ fi
 cmd="${1:-launch}"
 
 get_main_pid() {
-  ps -ax -o pid=,command= | awk -v bin="$T3_BIN" 'index($0, bin) && !/Helper/ && !/bin\.mjs/ && !/bootstrap\.cjs/ && !/sidecar/ && !/awk/ { if (!found) { print $1; found=1 } }'
+  # Scripts and inline evaluations use the same executable as a Node runtime.
+  ps -ax -o pid=,command= | awk -v bin="$T3_BIN" '
+    { pid=$1; command=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command) }
+    index(command, bin) == 1 &&
+      (length(command) == length(bin) || substr(command, length(bin)+1, 1) == " ") &&
+      command !~ /\.[cm]?js([[:space:]]|$)/ &&
+      command !~ /(^|[[:space:]])(-e|-p|--eval|--print)([[:space:]=]|$)/ &&
+      command !~ /(^|[[:space:]])--type=/ {
+        if (!found) { print pid; found=1 }
+      }'
 }
 
 rpc_file_for_pid() {

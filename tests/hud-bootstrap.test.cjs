@@ -148,3 +148,25 @@ test('two main hooks publish separate RPC records and preserve existing legacy R
  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'rpc-20202.json'),'utf8')).pid,20202);
  assert.equal(fs.readFileSync(path.join(dir,'rpc.json'),'utf8'),'existing legacy record');
 });
+
+test('get_main_pid ignores Electron helper, script and inline-eval processes but finds the real app', async t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'hud-main-pid-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const fakeBin=path.join(root,'bin');fs.mkdirSync(fakeBin);
+ const psOutput=path.join(root,'ps-output.txt');
+ const helpers=`1300 ${electron} -e console.log(1)\n1301 ${electron} --eval=console.log(1)\n1302 ${electron} --print console.log(1)\n1303 ${electron} /Users/fixture/project/server.js\n1304 ${electron} /Users/fixture/project/server.cjs\n1305 ${electron} /Users/fixture/project/server.mjs\n1306 ${electron} --type=renderer\n1307 ${electron}X --inspect=9229\n1308 /tmp/launcher ${electron} --inspect=9229\n1309 ${electron} /Users/fixture/.t3/hud-plugin/hub-bridge.cjs\n1310 ${electron} /Users/fixture/.t3/hud-plugin/hud-health.cjs\n`;
+ fs.writeFileSync(psOutput,helpers+`96619 ${electron} --inspect=127.0.0.1:9229\n`);
+ const fakePs=path.join(fakeBin,'ps');fs.writeFileSync(fakePs,'#!/bin/sh\ncat "$FIXTURE_PS_OUTPUT"\n',{mode:0o755});
+ const functionMatch=bin.match(/get_main_pid\(\) \{[\s\S]*?\n\}/);
+ assert.ok(functionMatch,'extract the production get_main_pid shell function');
+ const current=functionMatch[0];
+ const runFunction=async fn=>{
+  const script=`T3_BIN='${electron}'\n${fn}\nget_main_pid`;
+  const result=await run('bash',['-c',script],{env:{...process.env,PATH:`${fakeBin}:${process.env.PATH}`,FIXTURE_PS_OUTPUT:psOutput}});
+  return result.stdout.trim();
+ };
+ assert.equal(await runFunction(current),'96619','with the production exclusions, the Electron main process is selected');
+ fs.writeFileSync(psOutput,helpers);
+ assert.equal(await runFunction(current),'','helper, script, inline-eval and unrelated wrapper processes are not the app main process');
+ fs.writeFileSync(psOutput,`96620 ${electron}\n`);
+ assert.equal(await runFunction(current),'96620','a normal T3 process without startup flags is still found');
+});

@@ -897,6 +897,112 @@ test("plan stays outside React card and follows its geometry, hiding when discon
   assert.doesNotMatch(drawerSource, /anchor\.card\.appendChild\(liveBoard\)/);
 });
 
+test("plan board stays in place near the window bottom and never shifts beside the card", () => {
+  const { ui, card } = relationFixture();
+  const board = ui.nodes.get("#t3-hub-live-board");
+  let bottom = 730;
+  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom, width: 320, height: bottom - 400 });
+  ui.state.boardExpanded = false;
+  ui.positionConversationTools();
+  assert.equal(board.hidden, false);
+  assert.equal(board.style.left, "930px");
+  assert.equal(board.style.top, "729px");
+  assert.equal(board.style.maxHeight, "63px");
+  ui.state.boardExpanded = true;
+  ui.positionConversationTools();
+  assert.equal(board.style.top, "729px", "expanding must not move the header");
+  assert.equal(board.style.left, "930px");
+  bottom = 790;
+  ui.positionConversationTools();
+  assert.equal(board.hidden, true, "with no room for its toolbar, the board must not cover native controls");
+  assert.equal(board.parentElement, ui.root);
+});
+
+test("a short viewport shows the full-plan link instead of a nearly invisible expanded step", () => {
+  const { ui, card } = relationFixture();
+  const board = ui.nodes.get("#t3-hub-live-board"), toggle = node();
+  board.querySelector = (selector) => selector === ".hub-board-toggle" ? toggle : null;
+  let bottom = 730;
+  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 400, bottom, width: 320, height: bottom - 400 });
+  ui.state.boardExpanded = true;
+  for (const edge of [730, 713]) {
+    bottom = edge;
+    ui.positionConversationTools();
+    assert.equal(board.hidden, false);
+    assert.equal(board.classList.contains("is-space-limited"), true);
+    assert.equal(toggle.getAttribute("aria-expanded"), "false");
+    assert.equal(ui.state.boardExpanded, true, "space restrictions must not change the saved preference");
+  }
+  bottom = 650;
+  ui.positionConversationTools();
+  assert.equal(board.classList.contains("is-space-limited"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true", "expansion resumes when space returns");
+  assert.equal(ui.state.boardExpanded, true);
+  ui.renderLiveBoard();
+  assert.match(board.innerHTML, /在 Hub 查看完整计划/);
+  assert.match(drawerSource, /is-space-limited \.hub-board-content\{display:none/);
+});
+
+test("narrow inspector can be found without accepting an unscoped left-side title", () => {
+  const { ui, sidebar, card, label } = relationFixture();
+  ui.sandbox.innerWidth = 600;
+  card.getBoundingClientRect = () => ({ left: 270, right: 590, top: 90, bottom: 450, width: 320, height: 360 });
+  label.getBoundingClientRect = () => ({ left: 280, right: 380, top: 120, bottom: 138, width: 100, height: 18 });
+  assert.equal(ui.findSessionRelationsCard().card, card);
+  sidebar.querySelectorAll = () => [];
+  ui.sandbox.document.body.querySelectorAll = () => [label];
+  assert.equal(ui.findSessionRelationsCard(), null);
+});
+
+test("plan opens downwards below a content-sized inspector without moving its header", () => {
+  const { ui, card } = relationFixture();
+  const board = ui.nodes.get("#t3-hub-live-board");
+  const viewport = node();
+  ui.sandbox.innerHeight = 998;
+  viewport.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 100, bottom: 501, width: 320, height: 401 });
+  card.closest = (selector) => selector.startsWith("aside,") ? viewport : null;
+  card.getBoundingClientRect = () => ({ left: 930, right: 1250, top: 140, bottom: 477, width: 320, height: 337 });
+  ui.state.boardExpanded = false;
+  ui.positionConversationTools();
+  assert.equal(board.hidden, false);
+  assert.equal(board.style.top, "476px");
+  assert.equal(board.style.maxHeight, "514px");
+  ui.state.boardExpanded = true;
+  ui.positionConversationTools();
+  assert.equal(board.style.top, "476px", "expanding must only grow downwards");
+  assert.equal(board.style.maxHeight, "514px");
+  assert.equal(board.parentElement, ui.root);
+  assert.match(drawerSource, /#t3-hub-live-board\{[^}]*display:flex[^}]*flex-direction:column/);
+  assert.match(drawerSource, /#t3-hub-live-board \.hub-board-content\{[^}]*min-height:0[^}]*overflow:auto/);
+});
+
+test("progress defaults to open even after the old version saved it collapsed", () => {
+  const legacy = { getItem: (key) => key === "t3-hub-board-expanded" ? "false" : null, setItem() {} };
+  const oldUi = { snapshot: () => ({ boardExpanded: false }), destroy() {} };
+  assert.equal(harness(undefined, { localStorage: legacy, window: { __t3SidecarHub: oldUi } }).state.boardExpanded, true);
+  const migrated = { getItem: (key) => key === "t3-hub-board-expanded-v2" ? "false" : null, setItem() {} };
+  assert.equal(harness(undefined, { localStorage: migrated }).state.boardExpanded, false, "a new explicit collapse is remembered");
+});
+
+test("plan scrolling survives polling and geometry updates but resets for a new thread", () => {
+  const { ui } = relationFixture();
+  const board = ui.nodes.get("#t3-hub-live-board");
+  let scroll = { scrollTop: 220 }, html = "";
+  board.dataset.threadId = "thread-a";
+  board.querySelector = (selector) => selector === ".hub-board-content" ? scroll : null;
+  Object.defineProperty(board, "innerHTML", { get: () => html, set: (value) => { html = value; scroll = { scrollTop: 0 }; } });
+  Object.defineProperty(board.style, "maxHeight", { set: (value) => { if (value === "none") scroll.scrollTop = Math.min(scroll.scrollTop, 180); } });
+  ui.state.threadId = "thread-a";
+  ui.state.boardExpanded = true;
+  ui.renderLiveBoard();
+  assert.equal(scroll.scrollTop, 220, "poll redraw must retain the user's scroll position");
+  ui.positionConversationTools();
+  assert.equal(scroll.scrollTop, 220, "resizing must retain the user's scroll position");
+  ui.state.threadId = "thread-b";
+  ui.renderLiveBoard();
+  assert.equal(scroll.scrollTop, 0, "new threads start at the top");
+});
+
 test("0/0 stays visible, inline plan supports check/add/Studio/theme actions, and subagent lists never repeat", () => {
   const { ui } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
@@ -916,13 +1022,32 @@ test("0/0 stays visible, inline plan supports check/add/Studio/theme actions, an
 test("thread IDs follow threads, _chat, hash, UUID, then current context", () => {
   const ui = harness();
   const uuid = "4cdaf1fc-2929-415a-b055-3c06ef547683";
-  for (const [pathname, hash, expected] of [["/threads/thread-a", "", "thread-a"], ["/_chat/thread-b", "", "thread-b"], ["/", "#/threads/hash-thread", "hash-thread"], [`/workspace/${uuid}`, "", uuid]]) {
+  for (const [pathname, hash, expected] of [["/threads/thread-a", "", "thread-a"], ["/_chat/thread-b", "", "thread-b"], ["/", "#/threads/hash-thread", "hash-thread"], [`/threads/${uuid}`, "", uuid], [`/workspace/${uuid}`, "", "__NEW__"]]) {
     Object.assign(ui.sandbox.location, { pathname, hash });
     assert.equal(ui.currentThreadId(), expected);
   }
   Object.assign(ui.sandbox.location, { pathname: "/", hash: "" });
   ui.state.context = { threadId: "context-thread" };
   assert.equal(ui.currentThreadId(), "context-thread");
+});
+
+test("native two-UUID routes use the thread UUID; drafts and project-only routes never reuse stale context", async () => {
+  const calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { steps: [] }; });
+  const project = "6ee0c274-d218-41d6-b277-cbfc803dfbc0";
+  const thread = "3972c780-3288-4f8b-9990-c6cd999f70ba";
+  ui.state.context = { threadId: "stale-thread" };
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${project}/${thread}`, href: `t3code://app/#/${project}/${thread}` });
+  assert.equal(ui.currentThreadId(), thread);
+  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: ui.currentThreadId() });
+  await ui.pollBoard();
+  const call = calls.find((entry) => entry.action === "board:get");
+  assert.equal(call.payload.threadId, thread);
+  assert.equal(call.payload.strictThreadMatch, true);
+  for (const hash of [`#/draft/${project}`, `#/draft/${project}/${thread}`, `#/${project}`, `#/projects/${project}`, `#/${project}/new`, `#/projects/${project}/new`, `#/workspace/${project}/new`, `#/projects/${project}/draft/${thread}`]) {
+    ui.sandbox.location.hash = hash;
+    assert.equal(ui.currentThreadId(), "__NEW__", `${hash} must not look up another thread`);
+  }
 });
 
 test("route changes clear old plans and artifacts synchronously, request the new thread, and reject late old replies", async () => {

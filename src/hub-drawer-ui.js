@@ -64,7 +64,8 @@
       width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
       resourceFilters: initial?.resourceFilters || {},
       memoryScope: initial?.memoryScope || "smart",
-      boardExpanded: initial?.boardExpanded ?? storageGet("t3-hub-board-expanded") === "true",
+      // Migrate the old collapsed default; preserve new explicit choices.
+      boardExpanded: storageGet("t3-hub-board-expanded-v2") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-board-expanded-v2") === "true"),
       boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "",
       orchestrationDraft: initial?.orchestrationDraft || null,
       dreamSaving: false, dreamRunning: false, memoryImporting: false, embedTrimming: false,
@@ -87,7 +88,7 @@
       subagentCustom: initial?.subagentCustom || {},
       modelChoice: "", customModel: "", useMirror: false,
       mcpAddOpen: false, mcpForm: { kind: "form", name: "", transport: "stdio", command: "", args: "", url: "", json: "" },
-      freshModes: {}, syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
+      syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
     };
     if (!tabKeys.includes(state.tab)) state.tab = "memory";
     if (!["global", "project"].includes(state.scope)) state.scope = "global";
@@ -247,7 +248,7 @@
         #t3-hub-drawer.is-compact{grid-template-columns:156px minmax(0,1fr)}.hub-header{grid-column:1/-1;padding:20px 24px 16px;border-bottom:1px solid var(--hub-border)}.hub-title-row,.hub-row{display:flex;align-items:center;gap:9px;min-width:0}.hub-title-row{gap:11px}.hub-brand{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-grow{min-width:0;flex:1}.hub-title{font-size:17px;font-weight:650;letter-spacing:-.5px;line-height:1.4}.hub-version{font-size:10px;color:var(--hub-muted);font-weight:450;margin-left:5px}.hub-kicker{color:var(--hub-secondary);font-size:11px;margin-top:2px}.hub-icon-btn{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--hub-secondary)!important}.hub-icon-btn:hover{background:var(--hud-hover);color:var(--hub-ink)!important}.hub-scope-bar{display:flex;gap:8px;align-items:center;margin-top:15px}.hub-scope-select{max-width:280px}.hub-shortcut{font-size:10px;color:var(--hub-muted);margin-left:auto}.hub-context{display:flex;align-items:center;min-width:0;margin-top:10px;font-size:10px;color:var(--hub-secondary)}.hub-context-status{display:flex;gap:6px;align-items:center;overflow:hidden}.hub-context-status>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.hub-widths{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px}.hub-widths button{font-size:10px!important;padding:4px 8px;border:0;border-radius:5px;background:transparent;color:var(--hub-secondary)}.hub-widths button.is-active{background:var(--hub-active);color:var(--hub-on-active)}
         .hub-tabs{grid-column:1;grid-row:2;display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:18px 11px;overflow:auto;background:var(--hub-bg-subtle);border-right:1px solid var(--hub-border)}.hub-tab{display:flex;gap:10px;align-items:center;text-align:left;padding:10px 11px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--hub-secondary)!important;font-size:11px!important;line-height:1.5;white-space:nowrap}.hub-tab:hover{background:var(--hud-hover)}.hub-tab[aria-selected=true]{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-tab-count{margin-left:auto;font-size:9px;opacity:.65;font-variant-numeric:tabular-nums}.hub-content{grid-column:2;grid-row:2;min-width:0;min-height:0;padding:26px 28px 32px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--hub-border) transparent}.hub-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 8px;font-size:15px;font-weight:620;letter-spacing:-.2px}.hub-count{font-size:10px;font-weight:450;color:var(--hub-secondary);font-variant-numeric:tabular-nums}.hub-description{font-size:11px;line-height:1.8;color:var(--hub-secondary);margin:0 0 20px}.hub-card{padding:16px;border:1px solid var(--hub-border);border-radius:12px;background:var(--hub-bg);margin-bottom:12px;min-width:0}.hub-card-top{display:flex;gap:11px;align-items:flex-start;min-width:0}.hub-card-name{font-size:12px;font-weight:600;line-height:1.65;overflow-wrap:anywhere}.hub-card-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:4px}.hub-card-description{color:var(--hub-secondary);font-size:11px;line-height:1.75;margin:8px 0 12px;overflow-wrap:anywhere}.hub-badge,.hub-capability{display:inline-flex;gap:4px;align-items:center;border:1px solid var(--hub-border);border-radius:5px;padding:1px 6px;color:var(--hub-secondary);font-size:9px;line-height:1.7;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-capabilities{display:flex;gap:5px;flex-wrap:wrap;margin:8px 0}.hub-badge>span{overflow:hidden;text-overflow:ellipsis}.hub-asset-icon,.hub-brand-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;position:relative;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);color:var(--hub-ink);overflow:hidden}.hub-brand-icon>img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;filter:none!important}.hub-brand-icon.has-image>svg{opacity:0}.hub-brand-icon.is-small{width:24px;height:24px;border-radius:6px}.hub-brand-icon.is-small>img{inset:2px;width:calc(100% - 4px);height:calc(100% - 4px)}.hub-connection-dot{position:absolute;right:2px;bottom:2px;width:5px;height:5px;border-radius:50%;background:var(--hub-muted);box-shadow:0 0 0 2px var(--hub-bg)}.hub-connection-dot.is-connected{background:var(--hub-ink)}
         .hub-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 11px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);font-size:11px!important;line-height:1.4;white-space:nowrap}.hub-btn:hover:not(:disabled){background:var(--hud-hover)}.hub-btn.hub-primary{background:var(--hub-active);border-color:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-btn.hub-primary:hover:not(:disabled){opacity:.85;background:var(--hub-active)}.hub-btn.hub-small{font-size:10px!important;min-height:27px;padding:5px 9px}.hub-btn.is-busy{pointer-events:none;opacity:.65}.hub-spinner{display:inline-block;flex:none;width:12px;height:12px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:hub-spin .7s linear infinite}@keyframes hub-spin{to{transform:rotate(360deg)}}
-        .hub-input,.hub-select,.hub-editor{display:block;width:100%;min-width:0;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);color:var(--hub-ink);padding:9px 11px;font-size:11px!important;line-height:1.6}.hub-input::placeholder,.hub-editor::placeholder{color:var(--hub-muted)}.hub-select{padding-right:25px;text-overflow:ellipsis;cursor:pointer}.hub-field{display:block;font-size:10px;color:var(--hub-secondary);margin-bottom:13px;min-width:0}.hub-field>:is(input,textarea,select){margin-top:6px}.hub-editor{font:11px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:175px;resize:vertical;overflow-wrap:anywhere;tab-size:2}.hub-search{position:relative;margin:14px 0}.hub-search>svg{position:absolute;top:50%;left:11px;transform:translateY(-50%);color:var(--hub-muted)}.hub-search .hub-input{padding-left:34px;background:var(--hub-bg-subtle)}.hub-hint{display:flex;gap:6px;align-items:flex-start;font-size:10px;color:var(--hub-secondary);line-height:1.8;overflow-wrap:anywhere}.hub-filters{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0 15px}.hub-pill{border:1px solid transparent;border-radius:6px;padding:5px 9px;font-size:10px!important;background:transparent;color:var(--hub-secondary)!important;white-space:nowrap}.hub-pill:hover{background:var(--hud-hover)}.hub-pill.is-active,.hub-segments>button.is-active{background:var(--hub-active);color:var(--hub-on-active)!important}.hub-pill-count{font-size:9px;opacity:.6;margin-left:4px}.hub-segments{display:flex;gap:3px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-segments>button{display:inline-flex;gap:5px;align-items:center;justify-content:center;flex:1;min-width:0;font-size:10px!important;line-height:1.5;white-space:nowrap;border:0;border-radius:5px;background:transparent;padding:6px 8px;color:var(--hub-secondary)}.hub-segments>button:hover:not(.is-active){background:var(--hud-hover)}.hub-resource-filters{padding:0 0 18px;border-bottom:1px solid var(--hub-border);margin-bottom:4px}.hub-agent-filters{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.hub-agent-filters .hub-pill{display:inline-flex;gap:5px;align-items:center}.hub-filter-bottom{display:flex;gap:8px;margin-top:10px}.hub-filter-bottom .hub-search{flex:1;min-width:0;margin:0}.hub-filter-bottom .hub-select{width:94px;font-size:10px!important}.hub-resource-row{display:grid;grid-template-columns:32px minmax(0,1fr);column-gap:12px;padding:19px 0;border-bottom:1px solid var(--hub-border);min-width:0}.hub-resource-row .hub-card-description{margin:4px 0 0}.hub-resource-row .hub-resource-toggle{grid-column:2;margin-top:12px;justify-self:start}.hub-resource-toggle{display:flex;gap:7px;align-items:center;min-width:0;max-width:100%}.hub-resource-toggle>.hub-btn{font-size:9px!important;min-height:26px;padding:4px 8px}.hub-agent-toggle{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-agent-toggle button{display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:0;border:0;border-radius:5px;padding:5px 7px;background:transparent;color:var(--hub-secondary);font-size:9px!important;line-height:1.4;white-space:nowrap}.hub-agent-toggle button[aria-pressed=true]{background:var(--hub-active);color:var(--hub-on-active)}.hub-agent-mark{width:12px;height:12px;flex:none}.hub-library-tabs{display:flex;gap:6px;border-bottom:1px solid var(--hub-border);margin-bottom:18px;padding-bottom:12px}.hub-market-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,245px),1fr));gap:12px;margin-top:18px}.hub-market-card{margin:0;display:flex;flex-direction:column;align-items:stretch}.hub-market-card>.hub-btn{align-self:flex-start;margin-top:auto}.hub-market-card .hub-card-description{min-height:38px}.hub-market-card .hub-capabilities{margin-bottom:16px}.hub-resource-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.hub-mcp-name{font-weight:600;font-size:12px;overflow-wrap:anywhere}.hub-mcp-detail{color:var(--hub-secondary);font-size:10px;margin-top:5px;overflow-wrap:anywhere}.hub-mcp-row-options{display:flex;gap:7px;margin-top:9px}.hub-mode-pill{width:auto;max-width:200px;padding:4px 20px 4px 8px;font-size:9px!important}.hub-live{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--hub-secondary)}.hub-status-strip{border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:12px;margin:12px 0}.hub-status-items{display:flex;gap:12px;flex-wrap:wrap}.hub-status-item{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--hub-secondary)}
+        .hub-input,.hub-select,.hub-editor{display:block;width:100%;min-width:0;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);color:var(--hub-ink);padding:9px 11px;font-size:11px!important;line-height:1.6}.hub-input::placeholder,.hub-editor::placeholder{color:var(--hub-muted)}.hub-select{padding-right:25px;text-overflow:ellipsis;cursor:pointer}.hub-field{display:block;font-size:10px;color:var(--hub-secondary);margin-bottom:13px;min-width:0}.hub-field>:is(input,textarea,select){margin-top:6px}.hub-editor{font:11px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:175px;resize:vertical;overflow-wrap:anywhere;tab-size:2}.hub-search{position:relative;margin:14px 0}.hub-search>svg{position:absolute;top:50%;left:11px;transform:translateY(-50%);color:var(--hub-muted)}.hub-search .hub-input{padding-left:34px;background:var(--hub-bg-subtle)}.hub-hint{display:flex;gap:6px;align-items:flex-start;font-size:10px;color:var(--hub-secondary);line-height:1.8;overflow-wrap:anywhere}.hub-filters{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0 15px}.hub-pill{border:1px solid transparent;border-radius:6px;padding:5px 9px;font-size:10px!important;background:transparent;color:var(--hub-secondary)!important;white-space:nowrap}.hub-pill:hover{background:var(--hud-hover)}.hub-pill.is-active,.hub-segments>button.is-active{background:var(--hub-active);color:var(--hub-on-active)!important}.hub-pill-count{font-size:9px;opacity:.6;margin-left:4px}.hub-segments{display:flex;gap:3px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-segments>button{display:inline-flex;gap:5px;align-items:center;justify-content:center;flex:1;min-width:0;font-size:10px!important;line-height:1.5;white-space:nowrap;border:0;border-radius:5px;background:transparent;padding:6px 8px;color:var(--hub-secondary)}.hub-segments>button:hover:not(.is-active){background:var(--hud-hover)}.hub-resource-filters{padding:0 0 18px;border-bottom:1px solid var(--hub-border);margin-bottom:4px}.hub-agent-filters{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.hub-agent-filters .hub-pill{display:inline-flex;gap:5px;align-items:center}.hub-filter-bottom{display:flex;gap:8px;margin-top:10px}.hub-filter-bottom .hub-search{flex:1;min-width:0;margin:0}.hub-filter-bottom .hub-select{width:94px;font-size:10px!important}.hub-resource-row{display:grid;grid-template-columns:32px minmax(0,1fr);column-gap:12px;padding:19px 0;border-bottom:1px solid var(--hub-border);min-width:0}.hub-resource-row .hub-card-description{margin:4px 0 0}.hub-resource-row .hub-resource-toggle{grid-column:2;margin-top:12px;justify-self:start}.hub-resource-toggle{display:flex;flex-wrap:wrap;gap:7px;align-items:center;min-width:0;max-width:100%}.hub-resource-toggle-label{flex:0 0 100%}.hub-resource-toggle>.hub-btn{font-size:9px!important;min-height:26px;padding:4px 8px}.hub-agent-toggle{display:flex;flex-wrap:wrap;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-agent-toggle button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;gap:4px;min-width:0;border:0;border-radius:5px;padding:5px 7px;background:transparent;color:var(--hub-secondary);font-size:9px!important;line-height:1.4;white-space:nowrap}.hub-agent-toggle button[aria-pressed=true]{background:var(--hub-active);color:var(--hub-on-active)}.hub-agent-mark{width:12px;height:12px;flex:none}.hub-library-tabs{display:flex;gap:6px;border-bottom:1px solid var(--hub-border);margin-bottom:18px;padding-bottom:12px}.hub-market-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,245px),1fr));gap:12px;margin-top:18px}.hub-market-card{margin:0;display:flex;flex-direction:column;align-items:stretch}.hub-market-card>.hub-btn{align-self:flex-start;margin-top:auto}.hub-market-card .hub-card-description{min-height:38px}.hub-market-card .hub-capabilities{margin-bottom:16px}.hub-resource-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.hub-mcp-name{font-weight:600;font-size:12px;overflow-wrap:anywhere}.hub-mcp-detail{color:var(--hub-secondary);font-size:10px;margin-top:5px;overflow-wrap:anywhere}.hub-mcp-row-options{display:flex;gap:7px;margin-top:9px}.hub-mode-pill{width:auto;max-width:200px;padding:4px 20px 4px 8px;font-size:9px!important}.hub-live{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--hub-secondary)}.hub-status-strip{border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:12px;margin:12px 0}.hub-status-items{display:flex;gap:12px;flex-wrap:wrap}.hub-status-item{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--hub-secondary)}
         .hub-form-panel,.hub-import,.hub-new-memory{padding:15px;background:var(--hub-bg-subtle);border:1px solid var(--hub-border);border-radius:10px;margin:14px 0}.hub-import-title{font-size:11px;font-weight:550;display:flex;gap:7px;margin-bottom:10px}.hub-import-grid{display:grid;grid-template-columns:minmax(0,1fr) 94px auto;gap:7px}.hub-import .hub-hint{margin-top:8px}.hub-form-grid,.hub-subagent-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.hub-custom-toggle{margin:4px 0 14px}.hub-editor-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:12px}.hub-confirm-delete{border:1px solid var(--hub-border);padding:10px;border-radius:8px;background:var(--hub-bg-subtle);font-size:10px;margin-top:10px}.hub-confirm-delete .hub-row{margin-top:8px}.hub-hook-card .hub-card-description{margin-bottom:13px}.hub-hook-command{display:block;white-space:pre-wrap;overflow-wrap:anywhere;font-size:10px;padding:10px;background:var(--hub-bg-subtle);margin:10px 0;border-radius:6px}.hub-group-heading{font-size:11px;margin:22px 0 10px}.hub-hook-group{margin-bottom:20px}.hub-switch{width:30px;height:18px;border:1px solid var(--hub-border);border-radius:20px;position:relative;flex:none;background:var(--hub-bg-subtle);padding:2px}.hub-switch>span{display:block;width:12px;height:12px;border-radius:50%;background:var(--hub-muted);transition:transform .15s}.hub-switch[aria-checked=true]{background:var(--hub-active);border-color:var(--hub-active)}.hub-switch[aria-checked=true]>span{background:var(--hub-on-active);transform:translateX(12px)}
         .hub-engine{background:var(--hub-bg-subtle);padding:18px;margin:0 0 26px}.hub-engine-label{font-size:9px;letter-spacing:1.2px;font-weight:650;color:var(--hub-secondary)}.hub-engine-status{display:flex;gap:6px;align-items:center;font-size:11px;font-weight:550;margin:12px 0 7px;flex-wrap:wrap}.hub-engine-model{font-size:10px;color:var(--hub-secondary);overflow-wrap:anywhere;margin-bottom:14px}.hub-engine-controls{display:flex;align-items:stretch;gap:7px}.hub-engine-controls>.hub-select{flex:1}.hub-engine-controls>.hub-btn{font-size:10px!important}.hub-checkbox{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--hub-secondary);margin-top:12px}.hub-checkbox input{accent-color:var(--hub-active);margin:0;width:13px;height:13px}.hub-progress-label{display:flex;justify-content:space-between;font-size:10px;color:var(--hub-secondary);margin:12px 0 6px}.hub-progress-track{height:4px;background:var(--hub-border);border-radius:5px;overflow:hidden}.hub-progress-fill{height:100%;background:var(--hub-ink);border-radius:5px;transition:width .3s}.indeterminate .hub-progress-fill{animation:hub-pulse 1.4s ease infinite}.hub-worktree-bar{margin:15px 0}.hub-worktree-bar .hub-segments{flex-wrap:wrap}.hub-worktree-bar .hub-segments>button{flex:1 1 42%;white-space:normal}.hub-worktree-caption{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:8px;color:var(--hub-secondary);font-size:10px}.hub-project-picker{display:flex;gap:8px;align-items:center;margin:12px 0}.hub-project-picker .hub-select{flex:1}.hub-memory-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.hub-memory-card{padding:0}.hub-memory-open{display:block;width:100%;text-align:left;padding:14px;border:0;background:transparent;border-radius:11px}.hub-memory-open:hover{background:var(--hud-hover)}.hub-memory-detail{padding:14px;border-top:1px solid var(--hub-border)}.hub-memory-date{margin-left:auto;font-size:9px;color:var(--hub-muted)}.hub-memory-hits{font-size:9px;color:var(--hub-secondary)}.hub-detail-meta{display:flex;gap:7px;align-items:center;font-size:9px;color:var(--hub-secondary);margin-top:8px}.hub-memory-history{padding:0 14px 12px}.hub-history-toggle{border:0;background:transparent;font-size:10px!important;color:var(--hub-secondary)}.hub-history-entry{padding:9px 0;border-top:1px solid var(--hub-border);font-size:10px}.hub-history-agent{font-size:9px;color:var(--hub-secondary)}
         .hub-subagent-scopes{display:flex;gap:8px;margin:18px 0}.hub-subagent-scope{flex:1;min-width:0;text-align:left;border:1px solid var(--hub-border);border-radius:9px;background:transparent;padding:10px 12px;font-size:11px!important}.hub-subagent-scope[aria-pressed=true]{background:var(--hub-bg-subtle);border-color:var(--hub-ink)}.hub-subagent-scope small{display:block;color:var(--hub-secondary);font-size:9px;margin-top:3px}.hub-subagent-heading{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:20px 0 10px}.hub-subagent-heading h3{font-size:13px;margin:0}.hub-subagent-heading h3>span{font-size:10px;color:var(--hub-secondary);margin-left:7px;font-weight:400}.hub-subagent-list{border:1px solid var(--hub-border);border-radius:11px;overflow:hidden}.hub-subagent-card{padding:16px;border-bottom:1px solid var(--hub-border);min-width:0}.hub-subagent-card:last-child{border-bottom:0}.hub-subagent-main{display:grid;grid-template-columns:28px minmax(0,1fr);gap:9px;align-items:center}.hub-subagent-summary{min-width:0;text-align:left;border:0;background:transparent;padding:0}.hub-subagent-name{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;font-weight:600}.hub-tool-badge{font-size:8px;line-height:1.5;font-weight:400;padding:2px 5px;border:1px solid var(--hub-border);border-radius:4px;color:var(--hub-secondary)}.hub-subagent-desc{display:block;font-size:10px;color:var(--hub-secondary);line-height:1.7;margin-top:3px;overflow-wrap:anywhere}.hub-subagent-controls{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1.3fr) minmax(0,.8fr);gap:6px;grid-column:2}.hub-subagent-controls .hub-select{font-size:10px!important;padding:7px 20px 7px 8px}.hub-subagent-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin:10px 0 0 37px}.hub-memory-policy{width:170px;padding:5px 18px 5px 7px;font-size:9px!important}.hub-subagent-edit{display:inline-flex;gap:4px;align-items:center;margin-left:auto;font-size:9px!important;border:0;background:transparent;padding:3px 0;color:var(--hub-secondary)!important}.hub-subagent-expand{display:none}.hub-subagent-expand.is-expanded{display:block}.hub-subagent-editor{border-top:1px solid var(--hub-border);margin-top:14px;padding-top:14px}.hub-subagent-custom{padding:12px;border:1px solid var(--hub-border);border-radius:8px;margin-top:10px}.hub-subagent-note{display:flex;align-items:flex-start;gap:6px;margin-top:14px;font-size:10px;color:var(--hub-secondary);line-height:1.8}.hub-commander{padding:18px;background:var(--hub-bg-subtle)}.hub-commander-title{font-size:14px;font-weight:600;margin-bottom:4px}.hub-commander .hub-description{margin-bottom:16px}.hub-commander-note{padding:10px 12px;border-left:2px solid var(--hub-ink);font-size:10px;line-height:1.9;color:var(--hub-secondary);margin:12px 0 16px}.hub-control-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-top:1px solid var(--hub-border)}.hub-control-row strong{font-size:11px;font-weight:550;display:block}.hub-control-row small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:3px}.hub-range{display:flex;align-items:center;gap:8px;max-width:170px}.hub-range input[type=range]{width:100px;accent-color:var(--hub-active)}.hub-range input[type=number]{width:49px;padding:5px;font-size:10px!important}
@@ -269,8 +270,18 @@
         .hub-theme-switcher{display:flex;align-items:center;gap:5px;flex:none;padding:3px}
         .hub-theme-dot{width:14px;height:14px;min-width:14px;padding:0;border:1px solid var(--hub-border);border-radius:50%;background:var(--hub-swatch)!important;cursor:pointer}
         .hub-theme-dot[aria-pressed=true]{outline:2px solid var(--hub-accent);outline-offset:2px}
-        .hub-board-toolbar{display:flex;align-items:center;gap:8px;min-width:0}
+        #t3-hub-live-board{display:flex;flex-direction:column;min-height:0}
+        #t3-hub-live-board .hub-board-content{flex:0 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}
+        .hub-board-toolbar{display:flex;align-items:center;flex-wrap:wrap;flex:none;gap:8px;min-width:0}
         .hub-board-toolbar .hub-icon-btn{width:22px;height:22px}
+        .hub-board-open-label{display:none}
+        .is-space-limited .hub-board-content{display:none}
+        .is-space-limited .hub-board-toolbar{flex-wrap:nowrap}
+        .is-space-limited :is(.hub-theme-switcher,.hub-board-toggle>span:last-child,.hub-icon-btn svg){display:none}
+        .is-space-limited .hub-board-toggle{width:auto;min-width:0}
+        .is-space-limited .hub-board-toggle>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .is-space-limited .hub-icon-btn{display:inline-flex;width:auto;height:22px;padding:0 2px;white-space:nowrap}
+        .is-space-limited .hub-board-open-label{display:inline;font-size:9px}
         #t3-hub-live-board .hub-board-steps{gap:9px}#t3-hub-live-board .hub-step-text{overflow-wrap:anywhere}
         #t3-hub-live-board .hub-board-add{margin-top:14px;gap:5px}#t3-hub-live-board .hub-board-add .hub-input{padding:6px 8px;font-size:10px!important}
         #t3-hub-live-board .hub-board-add .hub-btn{padding:4px 7px;min-height:28px}
@@ -456,36 +467,60 @@
       const safe = /^(?:https?:\/\/[^\s/]+|data:image\/(?:png|jpeg|webp|gif|svg\+xml)[;,])/i.test(url) && !/[\u0000-\u001f\u007f]/.test(url);
       return `<span class="hub-brand-icon ${small ? "is-small" : ""} ${safe ? "has-image" : ""}">${icon(kind === "mcp" ? "plug" : "skill", small ? 14 : 18)}${safe ? `<img src="${esc(url)}" alt="${esc(item.displayName || item.title || item.name || item.id || "")}" referrerpolicy="no-referrer" data-dark-icon="${!!(state.dark && item.iconDarkDataUri)}" loading="lazy" decoding="async">` : ""}${kind === "mcp" ? `<i class="hub-connection-dot ${item.connected === true ? "is-connected" : ""}"></i>` : ""}</span>`;
     }
-    function agentEnabled(item, host) {
-      for (const source of [item.agents, item.agentStates, item.enabledAgents, item.hosts, item.agentStatus, item.perAgent]) {
-        if (Array.isArray(source)) {
-          const entry = source.find((value) => host.aliases.includes(typeof value === "string" ? value : value.id || value.agent || value.providerInstanceId));
-          if (entry !== undefined) return typeof entry === "string" ? true : entry.enabled ?? entry.active ?? entry.installed ?? false;
-          if (source.every((value) => typeof value === "string")) return false;
-        } else if (source && typeof source === "object") {
-          for (const alias of host.aliases) if (Object.prototype.hasOwnProperty.call(source, alias)) {
-            const value = source[alias];
-            return typeof value === "object" && value !== null ? value.enabled ?? value.active ?? value.installed ?? false : value === true || value === "enabled";
-          }
+    function agentActivationState(item, host) {
+      // Only explicit per-Agent state can confirm enabled or disabled. Static
+      // discovery metadata such as `agents` describes availability, not the
+      // contents of the host's current MCP config.
+      const field = ["agentStates", "agentStatus", "perAgent", "enabledAgents"].find((key) => Object.prototype.hasOwnProperty.call(item, key));
+      if (!field) return null;
+      const source = item[field];
+      if (Array.isArray(source)) {
+        const entry = source.find((value) => host.aliases.includes(typeof value === "string" ? value : value?.id || value?.agent || value?.providerInstanceId));
+        if (entry !== undefined) {
+          if (typeof entry === "string") return true;
+          if (!entry || typeof entry !== "object") return null;
+          for (const key of ["enabled", "active", "installed"]) if (Object.prototype.hasOwnProperty.call(entry, key)) return typeof entry[key] === "boolean" ? entry[key] : null;
+          return null;
         }
+        // A non-empty string array is an explicit enabled-host list; an empty
+        // array has no host-level status and remains unknown.
+        if (source.length > 0 && source.every((value) => typeof value === "string")) return false;
+        return null;
       }
-      // Absence of per-host truth is unknown; never infer five enabled hosts.
-      return false;
+      if (!source || typeof source !== "object") return null;
+      for (const alias of host.aliases) if (Object.prototype.hasOwnProperty.call(source, alias)) {
+        const value = source[alias];
+        if (typeof value === "boolean") return value;
+        if (typeof value === "string") return value === "enabled" ? true : value === "disabled" || value === "off" ? false : null;
+        if (!value || typeof value !== "object") return null;
+        for (const key of ["enabled", "active", "installed"]) if (Object.prototype.hasOwnProperty.call(value, key)) return typeof value[key] === "boolean" ? value[key] : null;
+        return null;
+      }
+      return null;
+    }
+    function agentEnabled(item, host) {
+      return agentActivationState(item, host) === true;
     }
     function resourceFilter(domain) { return state.resourceFilters[domain] ||= { agent: "all", status: "all" }; }
     function resourceMatches(item, domain) {
       const filter = resourceFilter(domain);
-      const enabled = filter.agent === "all" ? agentHosts.some((host) => agentEnabled(item, host)) : agentEnabled(item, agentHosts.find((host) => host.id === filter.agent) || agentHosts[0]);
-      return filter.status === "all" || (filter.status === "enabled" ? enabled : !enabled);
+      const states = filter.agent === "all" ? agentHosts.map((host) => agentActivationState(item, host)) : [agentActivationState(item, agentHosts.find((host) => host.id === filter.agent) || agentHosts[0])];
+      const enabled = states.includes(true) ? true : states.every((value) => value === false) ? false : null;
+      return filter.status === "all" || (filter.status === "enabled" ? enabled === true : enabled === false);
     }
     function resourceFilters(domain, queryName, query) {
       const filter = resourceFilter(domain);
-      return `<div class="hub-resource-filters"><div class="hub-agent-filters" role="group" aria-label="Filter by Agent"><button type="button" class="hub-pill ${filter.agent === "all" ? "is-active" : ""}" data-action="resource-filter" data-domain="${domain}" data-agent="all" aria-pressed="${filter.agent === "all"}">${esc(tr("全部", "All"))}</button>${agentHosts.map((host) => `<button type="button" class="hub-pill ${filter.agent === host.id ? "is-active" : ""}" data-action="resource-filter" data-domain="${domain}" data-agent="${host.id}" aria-pressed="${filter.agent === host.id}">${agentMark(host.id)}${host.label}</button>`).join("")}</div><div class="hub-filter-bottom"><div class="hub-search">${icon("search", 13)}<input class="hub-input" name="${queryName}" value="${esc(query)}" placeholder="${esc(tr("搜索名称、描述…", "Search name, description…"))}" aria-label="${esc(tr("搜索资源", "Search resources"))}"></div><select class="hub-select" name="resource-status" data-domain="${domain}" aria-label="${esc(tr("启用状态", "Enabled status"))}">${[["all", "全部", "All"], ["enabled", "已启用", "Enabled"], ["disabled", "未启用", "Disabled"]].map(([value, zh, en]) => `<option value="${value}" ${filter.status === value ? "selected" : ""}>${esc(tr(zh, en))}</option>`).join("")}</select></div></div>`;
+      const selected = agentHosts.find((host) => host.id === filter.agent);
+      const statusScope = selected ? tr(`${selected.label} 的启用状态`, `${selected.label} status`) : tr("任一 Agent 的启用状态", "Enabled in any agent");
+      return `<div class="hub-resource-filters"><div class="hub-hint">${esc(tr("查看谁的启用状态：", "View status for: "))}${esc(selected?.label || tr("所有 Agent", "All agents"))}${esc(tr("。选单个 Agent 后，“已启用/未启用”按它筛选；未启用项仍可直接点行内 Agent 添加。", ". With one agent selected, the enabled filter applies to it. Disabled entries stay visible so you can enable them below."))}</div><div class="hub-agent-filters" role="group" aria-label="${esc(tr("查看谁的启用状态", "View which agent's status"))}"><button type="button" class="hub-pill ${filter.agent === "all" ? "is-active" : ""}" data-action="resource-filter" data-domain="${domain}" data-agent="all" aria-pressed="${filter.agent === "all"}">${esc(tr("所有 Agent", "All agents"))}</button>${agentHosts.map((host) => `<button type="button" class="hub-pill ${filter.agent === host.id ? "is-active" : ""}" data-action="resource-filter" data-domain="${domain}" data-agent="${host.id}" aria-pressed="${filter.agent === host.id}">${agentMark(host.id)}${host.label}</button>`).join("")}</div><div class="hub-filter-bottom"><div class="hub-search">${icon("search", 13)}<input class="hub-input" name="${queryName}" value="${esc(query)}" placeholder="${esc(tr("搜索名称、描述…", "Search name, description…"))}" aria-label="${esc(tr("搜索资源", "Search resources"))}"></div><select class="hub-select" name="resource-status" data-domain="${domain}" aria-label="${esc(statusScope)}">${[["all", "全部状态", "All statuses"], ["enabled", "已启用", "Enabled"], ["disabled", "未启用", "Not enabled"]].map(([value, zh, en]) => `<option value="${value}" ${filter.status === value ? "selected" : ""}>${esc(tr(zh, en))}</option>`).join("")}</select></div></div>`;
     }
     function agentToggleRow(item, domain) {
       const id = String(item.id || item.name), all = agentHosts.every((host) => agentEnabled(item, host));
       const attrs = `data-domain="${domain}" data-id="${esc(id)}" data-name="${esc(item.name || id)}"`;
-      return `<div class="hub-resource-toggle" role="group" aria-label="${esc(item.displayName || item.name || id)} · ${esc(tr("五宿主启用", "Agent activation"))}"><button type="button" class="hub-btn hub-small" data-action="resource-toggle-all" ${attrs} data-enabled="${!all}" aria-pressed="${all}" ${item.unavailable ? "disabled" : ""}>${esc(tr("全部", "All"))}</button><div class="hub-agent-toggle">${agentHosts.map((host) => { const enabled = !!agentEnabled(item, host); return `<button type="button" data-action="resource-toggle" ${attrs} data-agent="${host.id}" data-enabled="${!enabled}" aria-pressed="${enabled}" title="${esc(`${host.label} · ${enabled ? tr("已启用", "Enabled") : tr("未启用", "Disabled")}`)}" ${item.unavailable ? "disabled" : ""}>${agentMark(host.id)}<span>${host.label}</span></button>`; }).join("")}</div></div>`;
+      const isMcp = domain === "mcp";
+      const label = isMcp ? tr("启用到 Agent（该 Agent 的各项目共用）", "Enable for agents (shared across their projects)") : tr("启用到 Agent", "Enable for agents");
+      const allAction = all ? tr("从全部 Agent 配置移除", "Remove from all agent configs") : tr("写入全部 Agent 配置", "Add to all agent configs");
+      return `<div class="hub-resource-toggle" role="group" aria-label="${esc(item.displayName || item.name || id)} · ${esc(label)}"><span class="hub-hint hub-resource-toggle-label">${esc(label)}</span><button type="button" class="hub-btn hub-small" data-action="resource-toggle-all" ${attrs} data-enabled="${!all}" aria-label="${esc(allAction)}" title="${esc(allAction)}" aria-pressed="${all}" ${item.unavailable ? "disabled" : ""}>${esc(tr("全部 Agent", "All agents"))}</button><div class="hub-agent-toggle">${agentHosts.map((host) => { const activation = agentActivationState(item, host), enabled = activation === true, unknown = activation === null; const action = unknown ? tr(`${host.label} 状态未知；点击可写入配置`, `${host.label} status unknown; click to add it to config`) : enabled ? tr(`从 ${host.label} 配置移除`, `Remove from ${host.label}`) : tr(`启用到 ${host.label}`, `Enable for ${host.label}`); const pressed = unknown ? "mixed" : String(enabled); return `<button type="button" data-action="resource-toggle" ${attrs} data-agent="${host.id}" data-enabled="${!enabled}" aria-label="${esc(action)}" aria-pressed="${pressed}" title="${esc(action)}" ${item.unavailable ? "disabled" : ""}>${agentMark(host.id)}<span>${host.label}</span>${unknown ? `<span class="hub-agent-unknown">${esc(tr("未知", "Unknown"))}</span>` : ""}</button>`; }).join("")}</div></div>`;
     }
     async function toggleResource(element, all = false) {
       const { domain, id, name, agent } = element.dataset;
@@ -497,13 +532,34 @@
         const targets = all ? agentHosts.map((host) => host.id) : [agent];
         const results = await Promise.allSettled(targets.map((host) => request(`${domain}:toggleAgent`, { id, name, agent: host, enabled, projectRoot })));
         if (disposed || version !== contextVersion) return;
-        cache[domain] = await request(`${domain}:list`, { projectRoot });
+        let refreshed;
+        try { refreshed = await request(`${domain}:list`, { projectRoot }); }
+        catch (error) {
+          if (disposed || version !== contextVersion) return;
+          const succeeded = results.filter((result) => result.status === "fulfilled").length;
+          toast(tr(`已提交 ${succeeded}/${targets.length} 个 Agent 配置，但暂时无法读取确认状态：${errorText(error)}`, `${succeeded}/${targets.length} agent configs were submitted, but their status could not be confirmed: ${errorText(error)}`), true);
+          return;
+        }
         if (disposed || version !== contextVersion) return;
+        cache[domain] = refreshed;
         invalidateSlashCache();
         if (state.tab === domain || domain === "mcp" && state.tab === "skills" && state.libraryView === "mcp") renderTab();
         const failed = results.filter((result) => result.status === "rejected");
-        if (failed.length) throw new Error(`${tr("部分宿主未更新", "Some agents were not updated")} (${failed.length}/${targets.length}) · ${errorText(failed[0].reason)}`);
-        toast(tr("宿主配置已更新", "Agent configuration updated"));
+        const confirmedItem = domain === "mcp"
+          ? mcpServers().find((item) => item.name === name || item.name === id)
+          : items(cache[domain], ["items", "skills"]).find((item) => String(item.id || item.name) === String(id || name));
+        const confirmed = targets.filter((host) => !!confirmedItem && agentActivationState(confirmedItem, agentHosts.find((entry) => entry.id === host) || agentHosts[0]) === enabled);
+        if (failed.length || confirmed.length !== targets.length) {
+          const detail = failed[0]?.reason ? ` · ${errorText(failed[0].reason)}` : "";
+          toast(tr(`配置已提交 ${confirmed.length}/${targets.length} 个 Agent，状态尚未全部确认${detail}`, `${confirmed.length}/${targets.length} agent configs submitted; some states could not be confirmed${detail}`), true);
+          return;
+        }
+        const labels = targets.map((host) => agentHosts.find((entry) => entry.id === host)?.label || host).join("、");
+        if (domain === "mcp") {
+          toast(enabled
+            ? tr(`已写入 ${labels} 的 MCP 配置；该 Agent 的各项目共用，新会话通常会读取。`, `Added to ${labels} MCP config; shared across that agent's projects and usually read by new sessions.`)
+            : tr(`已从 ${labels} 的 MCP 配置移除。`, `Removed from ${labels} MCP config.`));
+        } else toast(tr(`已更新 ${labels} 的技能配置。`, `Skill config updated for ${labels}.`));
       } catch (error) { if (!disposed && version === contextVersion) toast(errorText(error), true); }
       finally { if (row?.isConnected) { delete row.dataset.busy; row.querySelectorAll("button").forEach((button) => { button.disabled = false; }); } }
     }
@@ -558,7 +614,6 @@
       root.querySelector("#t3-hub-skill-list").innerHTML = errors.skills ? inlineError(errors.skills) : !cache.skills ? loading() : !filtered.length ? empty(tr("没有匹配的技能", "No matching skills"), tr("更换筛选条件，或导入一个技能。", "Change filters or import a skill."), "skill") : filtered.map((item) => `<article class="hub-resource-row">${brandIcon(item)}<div class="hub-grow"><div class="hub-card-name">${esc(item.displayName || item.name || item.id)}</div><div class="hub-hint">${esc(sourceLabel(item.source, item.sourceLabel))}</div><p class="hub-card-description">${esc(item.shortDescription || item.description || tr("暂无描述", "No description available"))}</p>${item.updatable ? `<div class="hub-editor-actions">${button("update-skill", tr("更新", "Update"), { small: true, icon: "refresh", attrs: `data-id="${esc(item.id)}"` })}${button("remove-skill", tr("移除技能包", "Remove package"), { small: true, attrs: `data-id="${esc(item.id)}"` })}</div><div data-skill-confirm class="hub-confirm-delete" hidden>${esc(tr("移除整个来源技能包及其启用链接？", "Remove this package and its activation links?"))}<div class="hub-row">${button("confirm-remove-skill", tr("确认移除", "Remove"), { small: true, attrs: `data-id="${esc(item.id)}"` })}${button("cancel-remove-skill", tr("取消", "Cancel"), { small: true })}</div></div>` : ""}</div>${agentToggleRow(item, "skills")}</article>`).join("");
     }
 
-    const mcpModes = () => [["off", tr("关闭", "Off")], ["project-lazy", tr("本项目·懒加载 (省Token)", "Project · Lazy (saves tokens)")], ["project-direct", tr("本项目·直连", "Project · Direct")], ["global-lazy", tr("全局·懒加载", "Global · Lazy")], ["global-direct", tr("全局·直连", "Global · Direct")]];
     const providerDefaults = [
       { id: "muse", label: "Muse" }, { id: "codex", label: "Codex" }, { id: "pi", label: "Pi·Magpie" },
       { id: "antigravity", label: "Antigravity" }, { id: "claudeAgent", label: "Claude" },
@@ -747,9 +802,8 @@
       for (const key of ["upstream", "upstreamCatalog", "catalog", "groups"]) items(data, [key]).forEach((entry) => add(entry));
       return [...byName.values()];
     }
-    function mcpMode(server) { return server.mode || (server.enabled ? `${defaultScope()}-lazy` : "off"); }
     function renderMcp() {
-      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务", "MCP servers"))}</span>${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}</div><p class="hub-description">${esc(tr("按宿主连接工具，按需加载。开关状态来自各宿主配置。", "Connect tools per agent, on demand, with live host configuration."))}</p>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}${button("sync-mcp", tr("同步五宿主", "Sync agents"), { small: true })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
+      content.innerHTML = `${librarySegments()}<div class="hub-section-heading"><span>${esc(tr("MCP 服务", "MCP servers"))}</span>${button("probe-mcp", tr("检测连通性", "Probe connections"), { small: true, icon: "refresh" })}</div><p class="hub-description">${esc(tr("选择要启用这个 MCP 的 Agent，Hub 会写入它的 MCP 配置。配置对该 Agent 的各个项目共用；新会话通常会读取，当前会话是否立即更新取决于 Agent。", "Choose which agents to enable this MCP for. Hub writes to each agent's MCP config, shared across that agent's projects. New sessions usually read it; current-session refresh depends on the agent."))}</p>${resourceFilters("mcp", "mcpQuery", state.mcpQuery)}<div class="hub-editor-actions">${button("toggle-mcp-add", tr("添加 MCP", "Add MCP"), { small: true, icon: "plus", attrs: `aria-expanded="${state.mcpAddOpen}"` })}${button("sync-mcp", tr("同步五宿主", "Sync agents"), { small: true })}</div><div class="hub-form-panel" id="t3-hub-mcp-form" ${state.mcpAddOpen ? "" : "hidden"}></div><div id="t3-hub-mcp-list"></div>`;
       renderMcpForm(); renderMcpList();
     }
     function renderMcpForm() {
@@ -766,9 +820,10 @@
       const query = state.mcpQuery.trim().toLowerCase();
       const servers = mcpServers().filter((server) => resourceMatches(server, "mcp") && (!query || `${server.name} ${server.displayName} ${server.groupTitle} ${server.description || ""}`.toLowerCase().includes(query)));
       node.innerHTML = servers.map((server) => {
-        const mode = mcpMode(server), summary = redact(server.summary || server.url || [server.command, ...items(server, ["args"])].filter(Boolean).join(" "));
+        const summary = redact(server.summary || server.url || [server.command, ...items(server, ["args"])].filter(Boolean).join(" "));
         const removable = server.removable === true || !server.builtin && !server.readonly && ["custom", "hub"].includes(server.source);
-        return `<article class="hub-resource-row hub-mcp-row" data-mcp-name="${esc(server.name)}">${brandIcon(server, "mcp")}<div class="hub-grow"><div class="hub-resource-title"><span class="hub-mcp-name">${esc(server.displayName || server.title || server.name)}</span><span class="hub-badge">${esc(server.connected === true ? tr("已连接", "Connected") : server.connected === false ? tr("未连接", "Disconnected") : tr("按需唤醒", "On demand"))}</span></div><p class="hub-card-description">${esc(server.shortDescription || server.description || summary || tr("工具服务", "Tool server"))}</p><div class="hub-mcp-row-options"><select class="hub-select hub-mode-pill" name="mcp-mode" data-name="${esc(server.name)}" aria-label="${esc(server.name)} ${esc(tr("连接模式", "Connection mode"))}">${mcpModes().map(([value, label]) => `<option value="${value}" ${mode === value ? "selected" : ""} ${value.startsWith("project-") && projectDisabled() ? "disabled" : ""}>${esc(label)}</option>`).join("")}</select>${removable ? `<button type="button" class="hub-icon-btn" data-action="remove-mcp" data-name="${esc(server.name)}" aria-label="${esc(tr("移除", "Remove"))} ${esc(server.name)}">${icon("trash", 12)}</button>` : ""}</div><div class="hub-confirm-delete" data-mcp-confirm hidden>${esc(tr("移除此自定义 MCP？", "Remove this custom MCP?"))}<div class="hub-row">${button("confirm-remove-mcp", tr("移除", "Remove"), { small: true, attrs: `data-name="${esc(server.name)}"` })}${button("cancel-remove-mcp", tr("取消", "Cancel"), { small: true })}</div></div></div>${agentToggleRow(server, "mcp")}</article>`;
+        const connectionLabel = server.connected === true ? tr("已连接", "Connected") : server.connected === false ? tr("未连接", "Disconnected") : tr("尚未检测", "Not checked");
+        return `<article class="hub-resource-row hub-mcp-row" data-mcp-name="${esc(server.name)}">${brandIcon(server, "mcp")}<div class="hub-grow"><div class="hub-resource-title"><span class="hub-mcp-name">${esc(server.displayName || server.title || server.name)}</span><span class="hub-badge">${esc(connectionLabel)}</span></div><p class="hub-card-description">${esc(server.shortDescription || server.description || summary || tr("工具服务", "Tool server"))}</p><div class="hub-mcp-row-options">${removable ? `<button type="button" class="hub-icon-btn" data-action="remove-mcp" data-name="${esc(server.name)}" aria-label="${esc(tr("移除", "Remove"))} ${esc(server.name)}">${icon("trash", 12)}</button>` : ""}</div><div class="hub-confirm-delete" data-mcp-confirm hidden>${esc(tr("移除此自定义 MCP？", "Remove this custom MCP?"))}<div class="hub-row">${button("confirm-remove-mcp", tr("移除", "Remove"), { small: true, attrs: `data-name="${esc(server.name)}"` })}${button("cancel-remove-mcp", tr("取消", "Cancel"), { small: true })}</div></div></div>${agentToggleRow(server, "mcp")}</article>`;
       }).join("") || empty(tr("没有匹配的 MCP", "No matching MCP servers"));
     }
     function mcpGroupTitle(name) {
@@ -1208,19 +1263,24 @@
       const title = /^(会话关系|Session relationships|之前的智能体|Previous agents)$/i;
       const seen = new Set();
       for (const scope of [...scopes, document.body].filter(Boolean)) {
+        const scopedInspector = scope !== document.body;
         for (const label of scope.querySelectorAll('h2,h3,h4,[role="heading"],span,p,div,button')) {
           if (seen.has(label)) continue;
           seen.add(label);
           if (label.closest(excluded) || !title.test(label.textContent.trim()) || [...label.children].some((child) => title.test(child.textContent.trim()))) continue;
           const rect = label.getBoundingClientRect();
-          if (!label.getClientRects().length || rect.width <= 0 || rect.left < innerWidth * .5 || getComputedStyle(label).visibility === "hidden") continue;
+          // Only relax the right-side guard inside an inspector.
+          if (!label.getClientRects().length || rect.width <= 0 ||
+              (scopedInspector ? rect.right <= innerWidth * .3 : rect.left < innerWidth * .5) ||
+              getComputedStyle(label).visibility === "hidden") continue;
           let section = label;
           for (let card = label.parentElement, depth = 0; card && card !== document.body && depth < 12; card = card.parentElement, depth++) {
             if (card.closest(excluded)) break;
             const box = card.getBoundingClientRect(), css = getComputedStyle(card);
             const rounded = parseFloat(css.borderRadius || css.borderTopLeftRadius) >= 8;
             const bordered = (parseFloat(css.borderTopWidth) > 0 && css.borderTopStyle !== "none") || (css.boxShadow && css.boxShadow !== "none") || parseFloat(css.outlineWidth) > 0;
-            if (rounded && bordered && box.width >= 160 && box.width < innerWidth * .55) return { card, section };
+            const maxWidth = scopedInspector ? innerWidth : innerWidth * .55;
+            if (rounded && bordered && box.width >= 160 && box.width < maxWidth && box.right > innerWidth * .75) return { card, section };
             section = card;
           }
         }
@@ -1247,10 +1307,23 @@
       if (!hidden) {
         const rect = anchor.card.getBoundingClientRect();
         const clip = anchor.viewport?.getBoundingClientRect();
-        hidden = !rect.width || !rect.height || rect.bottom <= 0 || rect.top >= innerHeight || rect.left >= innerWidth || rect.right <= 0 ||
-          (clip && (rect.bottom <= clip.top || rect.bottom >= clip.bottom || rect.right <= clip.left || rect.left >= clip.right));
+        const bounds = {
+          top: Math.max(0, clip?.top ?? 0), bottom: Math.min(innerHeight, clip?.bottom ?? innerHeight),
+          left: Math.max(0, clip?.left ?? 0), right: Math.min(innerWidth, clip?.right ?? innerWidth),
+        };
+        hidden = !rect.width || !rect.height || bounds.bottom <= bounds.top || bounds.right <= bounds.left ||
+          rect.bottom <= bounds.top || rect.top >= bounds.bottom || rect.right <= bounds.left || rect.left >= bounds.right;
         if (!hidden) {
-          Object.assign(liveBoard.style, { left: `${rect.left}px`, width: `${rect.width}px`, top: `${rect.bottom - 1}px`, maxHeight: `${Math.max(0, Math.min(innerHeight, clip?.bottom ?? innerHeight) - rect.bottom + 1)}px` });
+          const left = Math.max(rect.left, bounds.left), right = Math.min(rect.right, bounds.right);
+          const top = Math.max(0, rect.bottom - 1);
+          // The inspector can shrink to content; use the window bottom.
+          const maxHeight = Math.max(0, innerHeight - top - 8);
+          // Never cover native controls when even the toolbar cannot fit.
+          const limited = maxHeight < 120;
+          liveBoard.classList.toggle("is-space-limited", limited);
+          liveBoard.querySelector(".hub-board-toggle")?.setAttribute("aria-expanded", String(state.boardExpanded && !limited));
+          hidden = maxHeight < 48;
+          if (!hidden) Object.assign(liveBoard.style, { left: `${left}px`, width: `${right - left}px`, top: `${top}px`, maxHeight: `${maxHeight}px` });
         }
       }
       liveBoard.hidden = !!hidden;
@@ -1289,13 +1362,17 @@
     function renderLiveBoard() {
       if (!liveBoard) return;
       const board = boardData();
+      const threadId = state.threadId || "";
+      const scrollTop = liveBoard.dataset.threadId === threadId ? liveBoard.querySelector(".hub-board-content")?.scrollTop ?? 0 : 0;
       // A poll must not replace an input (or a checkbox) under the user's hands.
       if (document.activeElement?.matches('input[name="board-step-draft"]') && liveBoard.contains(document.activeElement) && liveBoard.dataset.threadId === (state.threadId || "")) { positionConversationTools(); return; }
-      liveBoard.dataset.threadId = state.threadId || "";
+      liveBoard.dataset.threadId = threadId;
       liveBoard.classList.toggle("is-collapsed", !state.boardExpanded);
-      liveBoard.innerHTML = `<div class="hub-board-toolbar"><button type="button" class="hub-board-toggle" data-action="toggle-board" aria-expanded="${state.boardExpanded}"><span>${icon("check", 12)} ${esc(tr("计划进度", "Plan progress"))} ${board.progress.completed}/${board.progress.total}</span><span aria-hidden="true">${state.boardExpanded ? "−" : "+"}</span></button>${themeSwitcher()}<button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub Studio 中打开", "Open in Hub Studio"))}" title="Hub Studio">${icon("hub", 13)}</button></div>${state.boardExpanded ? `<div class="hub-board-content">${boardMarkup(true, true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("+ 添加本会话步骤", "+ Add a step to this thread"))}" aria-label="${esc(tr("添加本会话步骤", "Add a thread step"))}">${button("board-add", tr("添加", "Add"), { small: true, icon: "plus" })}</div></div>` : ""}`;
+      liveBoard.innerHTML = `<div class="hub-board-toolbar"><button type="button" class="hub-board-toggle" data-action="toggle-board" aria-expanded="${state.boardExpanded}"><span>${icon("check", 12)} ${esc(tr("计划进度", "Plan progress"))} ${board.progress.completed}/${board.progress.total}</span><span aria-hidden="true">${state.boardExpanded ? "−" : "+"}</span></button>${themeSwitcher()}<button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 13)}<span class="hub-board-open-label">${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}</span></button></div>${state.boardExpanded ? `<div class="hub-board-content">${boardMarkup(true, true)}<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}" placeholder="${esc(tr("+ 添加本会话步骤", "+ Add a step to this thread"))}" aria-label="${esc(tr("添加本会话步骤", "Add a thread step"))}">${button("board-add", tr("添加", "Add"), { small: true, icon: "plus" })}</div></div>` : ""}`;
       applyTheme();
       positionConversationTools();
+      const scroller = liveBoard.querySelector(".hub-board-content");
+      if (scroller) scroller.scrollTop = scrollTop;
     }
     function artifactMarkup() {
       if (!state.artifact) return "";
@@ -1898,7 +1975,12 @@
     }
     function currentThreadId() {
       const paths = [location.hash?.slice(1), location.pathname, routeHint()].filter(Boolean);
+      const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
       for (const path of paths) {
+        // Draft and project-only routes must not inherit another thread.
+        if (/(?:^|\/)(?:draft)(?:\/|[?#]|$)/i.test(path) || /(?:^|\/)new\/?(?:[?#]|$)/i.test(path) ||
+            new RegExp(`^\\/?(?:projects?|workspaces?)\\/${uuid}\\/?(?:[?#]|$)`, "i").test(path) ||
+            new RegExp(`^\\/?${uuid}\\/?(?:[?#]|$)`, "i").test(path)) return "__NEW__";
         const match = path.match(/(?:^|\/)(?:threads|_chat)\/([^/?#]+)/i);
         if (match) {
           try {
@@ -1910,6 +1992,9 @@
             return match[1];
           }
         }
+        // Native routes use /<project UUID>/<thread UUID>.
+        const native = path.match(new RegExp(`^\\/?${uuid}\\/(${uuid})(?:[/?#]|$)`, "i"));
+        if (native) return native[1];
       }
       for (const path of paths) {
         const match = path.match(/(?:^|\/)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i);
@@ -1970,7 +2055,6 @@
         state.hookDraft = null;
         state.supersedeItems = [];
         state.selectedMemory = null;
-        state.freshModes = {};
         if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
       } else if (!state.projectRoot) {
         state.scope = "global";
@@ -2211,7 +2295,10 @@
       else if (action === "resource-filter") { resourceFilter(target.dataset.domain).agent = target.dataset.agent; renderTab(); }
       else if (action === "resource-toggle") toggleResource(target);
       else if (action === "resource-toggle-all") toggleResource(target, true);
-      else if (action === "toggle-board") { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-board-expanded", state.boardExpanded); renderLiveBoard(); }
+      else if (action === "toggle-board") {
+        if (liveBoard.classList.contains("is-space-limited")) { switchTab("board"); setOpen(true); }
+        else { state.boardExpanded = !state.boardExpanded; storageSet("t3-hub-board-expanded-v2", state.boardExpanded); renderLiveBoard(); }
+      }
       else if (action === "board-background") { state.boardBackground = !state.boardBackground; renderLiveBoard(); if (state.tab === "board") renderBoardTab(); }
       else if (action === "board-add") updateBoard(target, "add");
       else if (action === "board-step") updateBoard(target, "toggle", Number(target.dataset.index));
@@ -2262,7 +2349,6 @@
       else if (action === "remove-skill") target.closest(".hub-card,.hub-resource-row").querySelector("[data-skill-confirm]").hidden = false;
       else if (action === "cancel-remove-skill") target.closest("[data-skill-confirm]").hidden = true;
       else if (action === "confirm-remove-skill") removeSkill(id, target);
-      else if (action === "toggle-mcp") setMcpMode(target.dataset.name, target.dataset.mode === "off" ? `${defaultScope()}-lazy` : "off", target);
       else if (action === "probe-mcp") probeMcp(target);
       else if (action === "remove-mcp") target.closest(".hub-mcp-row").querySelector("[data-mcp-confirm]").hidden = false;
       else if (action === "cancel-remove-mcp") target.closest("[data-mcp-confirm]").hidden = true;
@@ -2409,7 +2495,6 @@
       else if (name?.startsWith("hook-") && state.hookDraft) state.hookDraft[name.slice(5)] = input.value;
       else if (name === "new-memory-supersedes") { drafts.__new ||= {}; drafts.__new.supersedes = input.value; }
       else if (name === "importScope") state.importScope = input.value;
-      else if (name === "mcp-mode") setMcpMode(input.dataset.name, input.value, input);
       else if (name === "mcp-transport") { state.mcpForm.transport = input.value; renderMcpForm(); }
       else if (name === "embed-model") { state.modelChoice = input.value; renderEngine(); }
       else if (name === "useMirror") state.useMirror = input.checked;
@@ -2607,25 +2692,6 @@
       await busy(`update:${id}`, element, async () => {
         await request("skills:updatePackage", { id: skillPackageId(id), projectRoot: state.projectRoot });
         if (!disposed) { toast(tr("已检查并更新技能", "Skill checked and updated")); cache.skills = null; if (state.tab === "skills") await loadTab(true); }
-      });
-    }
-    async function setMcpMode(name, mode, element) {
-      const projectRoot = state.projectRoot;
-      if (mode.startsWith("project-") && !projectRoot) return;
-      const old = mcpServers().find((server) => server.name === name)?.mode || "off";
-      await busy(`mode:${name}`, element, async () => {
-        try {
-          await request("mcp:setMode", { name, mode, projectRoot });
-          if (disposed || state.projectRoot !== projectRoot) return;
-          const server = mcpServers().find((entry) => entry.name === name);
-          if (server) {
-            const all = mcpServers().map((entry) => entry.name === name ? { ...entry, mode } : entry);
-            cache.mcp = { ...cache.mcp, items: all };
-          }
-          state.freshModes[name] = true;
-          renderMcpList(); renderChrome();
-          toast(tr("免重启已生效", "Applied without restarting"));
-        } catch (error) { if (element?.isConnected) element.value = old; throw error; }
       });
     }
     async function saveMcp(element) {
