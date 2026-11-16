@@ -60,7 +60,7 @@ cd t3-code-hud
 ./install.sh
 ```
 
-然后启用一次优雅重启：
+等正在执行的任务结束后，重启启用：
 
 ```bash
 t3-hud restart
@@ -73,7 +73,7 @@ t3-hud restart
 ## 常用命令
 
 ```bash
-t3-hud start     # 启动挂载 HUD 的 T3（原版运行中自动无缝重启）
+t3-hud start     # 启动挂载 HUD 的 T3（已有原版运行时保留任务，不自动重启）
 t3-hud restart   # 优雅重启并重新挂载
 t3-hud reload    # 零重启热更新 UI 与后端逻辑
 t3-hud status    # PID + 挂载状态 + 语言配置
@@ -141,3 +141,11 @@ curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/uninstal
 ## 许可证
 
 [MIT](../LICENSE)
+
+### 启动验收与可选的 AGY wrapper 修复
+
+`start` 会保留已经运行但未挂载的 T3，只有明确执行 `restart` 才重启。`status` 同时核对进程与带鉴权的本机 RPC；安装文件不等于当前窗口已生效。以后从 **T3 Code HUD.app** 启动；直接打开原版应用不会加载 HUD。
+
+macOS ARM64 上的 Antigravity wrapper 退出崩溃可使用独立的 `scripts/agy-acp-wrapper-install.py` 修复，先用 `--check` 检查。安装器要求 `/opt/homebrew/bin/python3` 可执行，替换前备份，不修改提供商绑定，也不重启进程。新启动的 wrapper 才使用修复代码；旧进程仍使用旧代码。回退时恢复对应 wrapper 备份。
+
+运行连接记录按进程保存在 `run/rpc-<pid>.json`。旧 `rpc.json` 只兼容显式热重载；旧版状态接口无法核实窗口挂载，所以状态保持“就绪未确认”，重启加载新版 hook 后才能完整验收。

@@ -37,7 +37,8 @@ function reloadBackend() {
 const PRELOAD_BRIDGE_PATH = path.join(__dirname, "preload-bridge.cjs");
 const RENDERER_UI_PATH = path.join(__dirname, "renderer-ui.js");
 const HUD_RUN_DIR = path.join(os.homedir(), ".t3", "hud-plugin", "run");
-const RPC_INFO_FILE = path.join(HUD_RUN_DIR, "rpc.json");
+// Per-process records prevent a second launch from replacing the active RPC.
+const RPC_INFO_FILE = path.join(HUD_RUN_DIR, `rpc-${process.pid}.json`);
 
 let httpFallbackConfig = null;
 let lastInjectError = null;
@@ -74,46 +75,27 @@ function ensureRunDir() {
 
 function writeRpcInfo() {
   ensureRunDir();
+  const temp = `${RPC_INFO_FILE}.tmp`;
   try {
-    const st = fs.lstatSync(RPC_INFO_FILE);
-    if (st.isSymbolicLink()) {
-      try {
-        fs.unlinkSync(RPC_INFO_FILE);
-      } catch {}
-    } else {
-      try {
-        fs.unlinkSync(RPC_INFO_FILE);
-      } catch {}
-    }
-  } catch {}
-  try {
-    fs.writeFileSync(
-      RPC_INFO_FILE,
-      JSON.stringify({
-        ...httpFallbackConfig,
-        adminToken,
-        rpcToken,
-        pid: process.pid,
-      }),
-      { flag: "wx", mode: 0o600 }
-    );
+    fs.writeFileSync(temp, JSON.stringify({ ...httpFallbackConfig, adminToken, rpcToken, pid: process.pid }),
+      { flag: "wx", mode: 0o600 });
+    fs.renameSync(temp, RPC_INFO_FILE);
   } catch {
-    try {
-      fs.rmSync(RPC_INFO_FILE, { force: true });
-    } catch {}
-    try {
-      fs.writeFileSync(
-        RPC_INFO_FILE,
-        JSON.stringify({
-          ...httpFallbackConfig,
-          adminToken,
-          rpcToken,
-          pid: process.pid,
-        }),
-        { flag: "wx", mode: 0o600 }
-      );
-    } catch {}
-  }
+    // Failure leaves readiness unconfirmed; never touch another PID's record.
+  } finally { try { fs.unlinkSync(temp); } catch {} }
+}
+
+const MOUNT_CHECK = "Boolean(window.__t3HudInitialized && document.getElementById('t3-hud-topbar') && window.__t3SidecarHub && document.getElementById('t3-sidecar-hub-root'))";
+async function isWindowMounted(win) {
+  let timer;
+  try {
+    if (win.isDestroyed() || win.webContents.isDestroyed() || win.webContents.isLoading()) return false;
+    return (await Promise.race([
+      win.webContents.executeJavaScript(MOUNT_CHECK, true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), 400); }),
+    ])) === true;
+  } catch { return false; }
+  finally { clearTimeout(timer); }
 }
 
 function captureT3Origin() {
@@ -277,14 +259,12 @@ function startLoopbackFallbackServer() {
             res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
             return;
           }
-          const wins = electron.BrowserWindow.getAllWindows().map((w) => ({
-            id: w.id,
-            title: w.getTitle(),
-            url: w.webContents.getURL(),
-            loading: w.webContents.isLoading(),
-          }));
+          const wins = await Promise.all(getMainWindows().map(async w => ({
+            id: w.id, title: w.getTitle(), url: w.webContents.getURL(), loading: w.webContents.isLoading(),
+            mounted: await isWindowMounted(w),
+          })));
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, pid: process.pid, lastInjectError, windows: wins }));
+          res.end(JSON.stringify({ ok: true, pid: process.pid, lastInjectError, mounted: wins.some(w => w.mounted), windows: wins }));
           return;
         }
 

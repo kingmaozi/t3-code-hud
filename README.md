@@ -64,7 +64,7 @@ cd t3-code-hud
 ./install.sh
 ```
 
-Then enable (one graceful restart):
+When running tasks have finished, enable with one restart:
 
 ```bash
 t3-hud restart
@@ -77,7 +77,7 @@ t3-hud restart
 ## CLI commands
 
 ```bash
-t3-hud start     # Launch T3 with HUD (gracefully restarts stock T3 if needed)
+t3-hud start     # Launch T3 with HUD; preserves an already-running unmounted T3
 t3-hud restart   # Graceful restart + remount HUD
 t3-hud reload    # Zero-restart hot-reload UI + backend logic (after editing sources)
 t3-hud status    # Show PID + mount state + language config
@@ -158,3 +158,11 @@ See [`src/main-hook.cjs`](src/main-hook.cjs), [`src/bootstrap.cjs`](src/bootstra
 ## License
 
 [MIT](LICENSE)
+
+### Startup readiness and optional AGY wrapper repair
+
+`start` never restarts an existing unmounted T3. Use `restart` only when active tasks can be interrupted. `status` checks the recorded PID against the authenticated loopback RPC; installing files alone does not activate the current window. Launch from **T3 Code HUD.app** for future sessions. Opening the original app directly does not load the HUD.
+
+For the macOS ARM64 Antigravity wrapper shutdown issue, the optional `scripts/agy-acp-wrapper-install.py` installs the canonical sibling wrapper, with backups. Run with `--check` first. It requires an executable Homebrew Python at `/opt/homebrew/bin/python3`. It does not change provider settings or restart existing processes. Newly spawned wrappers use the repaired code; already-running wrappers keep their previous code. Keep any existing custom wrapper backup for rollback.
+
+Runtime RPC records are now stored per process (`run/rpc-<pid>.json`). Legacy `rpc.json` is accepted for explicit hot reload only; its older status response cannot prove window readiness, so `status` remains unconfirmed until a restart loads the new hook.

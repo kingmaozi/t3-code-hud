@@ -38,6 +38,7 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/main-hook.cjs" \
    "$SCRIPT_DIR/src/preload-bridge.cjs" \
    "$SCRIPT_DIR/src/bootstrap.cjs" \
+   "$SCRIPT_DIR/src/hud-health.cjs" \
    "$SCRIPT_DIR/src/renderer-ui.js" \
    "$DEST_DIR/"
 
@@ -949,6 +950,13 @@ if [[ -f "$DEST_DIR/renderer-ui.js" && -f "$DEST_DIR/hub-drawer-ui.js" ]]; then
   chmod 0600 "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js" 2>/dev/null || true
 fi
 
+# Remove symlink hijack at BIN_DIR before copy: previous installs may have
+# left ~/.t3/bin/t3-hud as a symlink to ~/.t3/userdata/attachments/... .
+# cp to a symlink would follow it and update the stale userdata copy, leaving
+# BIN_DIR as an indirection instead of the canonical regular file.
+if [[ -L "$BIN_DIR/t3-hud" ]]; then
+  rm -f "$BIN_DIR/t3-hud"
+fi
 cp "$SCRIPT_DIR/bin/t3-hud" "$BIN_DIR/t3-hud"
 chmod +x "$BIN_DIR/t3-hud"
 if [[ -f "$SCRIPT_DIR/bin/t3-mcp-router" ]]; then cp "$SCRIPT_DIR/bin/t3-mcp-router" "$BIN_DIR/t3-mcp-router"; chmod +x "$BIN_DIR/t3-mcp-router"; fi
@@ -1166,8 +1174,15 @@ mkdir -p "$RUN_DIR"
 chmod 0700 "$RUN_DIR" 2>/dev/null || true
 
 # Hot-reload a live T3 Code window automatically when re-running install.sh.
-if [[ -f "$RUN_DIR/rpc.json" ]]; then
-  RPC_PID="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$RUN_DIR/rpc.json" 2>/dev/null | grep -o '[0-9]\+' | head -n 1 || true)"
+RPC_INFO_FILE="$RUN_DIR/rpc.json"
+if [[ -f "$RUN_DIR/active.pid" ]]; then
+  ACTIVE_PID="$(cat "$RUN_DIR/active.pid" 2>/dev/null || true)"
+  if [[ "$ACTIVE_PID" =~ ^[0-9]+$ && -f "$RUN_DIR/rpc-$ACTIVE_PID.json" ]]; then
+    RPC_INFO_FILE="$RUN_DIR/rpc-$ACTIVE_PID.json"
+  fi
+fi
+if [[ -f "$RPC_INFO_FILE" ]]; then
+  RPC_PID="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$RPC_INFO_FILE" 2>/dev/null | grep -o '[0-9]\+' | head -n 1 || true)"
   if [[ -n "${RPC_PID:-}" ]] && kill -0 "$RPC_PID" 2>/dev/null; then
     "$BIN_DIR/t3-hud" reload >/dev/null 2>&1 || true
   fi

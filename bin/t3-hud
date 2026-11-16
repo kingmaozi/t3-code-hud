@@ -46,6 +46,17 @@ get_main_pid() {
   ps -ax -o pid=,command= | awk -v bin="$T3_BIN" 'index($0, bin) && !/Helper/ && !/bin\.mjs/ && !/bootstrap\.cjs/ && !/sidecar/ && !/awk/ { if (!found) { print $1; found=1 } }'
 }
 
+rpc_file_for_pid() {
+  local candidate="$RUN_DIR/rpc-$1.json"
+  if [[ -f "$candidate" ]]; then echo "$candidate"; else echo "$RUN_DIR/rpc.json"; fi
+}
+
+# A marker is only a hint; require a live, authenticated main-process RPC.
+is_hud_mounted() {
+  env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" \
+    "$PLUGIN_DIR/hud-health.cjs" "$(rpc_file_for_pid "$1")" "$MARKER_FILE" "$1"
+}
+
 activate_t3() {
   osascript -e "tell application \"$T3_APP\" to activate" >/dev/null 2>&1 || true
 }
@@ -74,15 +85,21 @@ launch_enhanced() {
 }
 
 do_reload() {
+  local main_pid
+  main_pid="$(get_main_pid)"
+  [[ -n "$main_pid" ]] || { echo "[t3-hud] T3 未运行" >&2; return 1; }
+  local RPC_FILE
+  RPC_FILE="$(rpc_file_for_pid "$main_pid")"
   if [[ ! -f "$RPC_FILE" ]]; then
     echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
     exit 1
   fi
   ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
     const fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process");
-    const [pluginDir, rpcFile] = process.argv.slice(1);
+    const [pluginDir, rpcFile, expectedPid] = process.argv.slice(1);
     (async () => {
       const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
+      if (cfg.pid !== Number(expectedPid)) throw new Error("HUD RPC PID mismatch");
       const admTok = cfg.adminToken || cfg.token;
       // Always ensure hub-bridge is running and hot-reloaded, regardless of probe.
       const bridgeFile = path.join(pluginDir, "run", "hub-bridge.json");
@@ -139,7 +156,7 @@ do_reload() {
       }).then(r => r.json());
       console.log("[t3-hud] 热重载完成:", JSON.stringify(j));
     })().catch(e => { console.error(e); process.exit(1); });
-  ' "$PLUGIN_DIR" "$RPC_FILE"
+  ' "$PLUGIN_DIR" "$RPC_FILE" "$main_pid"
 }
 
 do_lang() {
@@ -161,7 +178,7 @@ do_lang() {
   ' "$CONFIG_FILE" "$lang_arg"
   echo "[t3-hud] Language set to: $lang_arg (config: $CONFIG_FILE)"
   # Reload UI if running
-  if [[ -f "$RPC_FILE" ]]; then
+  if [[ -n "$(get_main_pid)" ]]; then
     do_reload || true
   fi
 }
@@ -170,14 +187,13 @@ case "$cmd" in
   launch|start)
     MAIN_PID="$(get_main_pid)"
     if [[ -n "$MAIN_PID" ]]; then
-      if [[ -f "$MARKER_FILE" ]] && [[ "$(cat "$MARKER_FILE" 2>/dev/null || true)" == "$MAIN_PID" ]]; then
+      if is_hud_mounted "$MAIN_PID"; then
         activate_t3
         echo "[t3-hud] T3 Code (HUD 已挂载, PID $MAIN_PID) 正在运行，已切到前台。"
       else
-        echo "[t3-hud] 检测到原版 T3 Code 正在运行，正在无缝重启以挂载 HUD..."
-        quit_t3_gracefully
-        launch_enhanced
-        echo "[t3-hud] 启动完成！"
+        activate_t3
+        echo "[t3-hud] T3 Code 正在运行，但 HUD 尚未就绪。已保留现有任务；确认可中断后执行 t3-hud restart。" >&2
+        exit 1
       fi
     else
       launch_enhanced
@@ -201,10 +217,10 @@ case "$cmd" in
     echo "T3 应用: $T3_APP"
     echo "插件目录: $PLUGIN_DIR"
     if [[ -n "$MAIN_PID" ]]; then
-      if [[ -f "$MARKER_FILE" ]] && [[ "$(cat "$MARKER_FILE" 2>/dev/null || true)" == "$MAIN_PID" ]]; then
+      if is_hud_mounted "$MAIN_PID"; then
         echo "运行状态: 运行中 (PID $MAIN_PID, HUD 已挂载)"
       else
-        echo "运行状态: 原版运行中 (PID $MAIN_PID, HUD 未挂载 — 执行 't3-hud restart' 即可启用)"
+        echo "运行状态: T3 运行中 (PID $MAIN_PID, HUD 就绪未确认；旧版接口无法证明挂载。任务结束后可执行 t3-hud restart)"
       fi
     else
       echo "运行状态: 未运行"
