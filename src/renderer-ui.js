@@ -540,13 +540,13 @@
   function fallbackModelRate(model) {
     const m = String(model || "").trim().toLowerCase();
     if (m.includes("muse-ember")) return { input: 0.1 / 1e6, output: 0.5 / 1e6, cacheRead: 0.004 / 1e6, cacheWrite: 0.1 / 1e6 };
-    if (m.includes("muse-wonder")) return { input: 4.0 / 1e6, output: 20.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 4.0 / 1e6 };
+    if (m.includes("muse-wonder")) return { input: 5.4 / 1e6, output: 27 / 1e6, cacheRead: 0.54 / 1e6, cacheWrite: 5.4 / 1e6 };
     if (m.includes("opus")) return { input: 5.0 / 1e6, output: 25.0 / 1e6, cacheRead: 0.5 / 1e6, cacheWrite: 6.25 / 1e6 };
     if (m.includes("sonnet")) return { input: 3.0 / 1e6, output: 15.0 / 1e6, cacheRead: 0.3 / 1e6, cacheWrite: 3.75 / 1e6 };
     if (m.includes("gpt-6.1-terra")) return { input: 1.0 / 1e6, output: 5.0 / 1e6, cacheRead: 0.05 / 1e6, cacheWrite: 1.0 / 1e6 };
     if (m.includes("gpt-6") || m.includes("carbon") || m.includes("argon")) return { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.1 / 1e6, cacheWrite: 2.0 / 1e6 };
     if (m.includes("hydrogen")) return { input: 1.5 / 1e6, output: 7.5 / 1e6, cacheRead: 0.075 / 1e6, cacheWrite: 1.5 / 1e6 };
-    return { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 2.0 / 1e6 };
+    return { input: 5.4 / 1e6, output: 27 / 1e6, cacheRead: 0.54 / 1e6, cacheWrite: 5.4 / 1e6 };
   }
 
   function buildLocalProjectionFallback(remotePayload) {
@@ -757,14 +757,7 @@
   }
 
   // Distinct, clean Git swimlane colors that work well on both stock Light (#fff) and stock Dark (#000/#141414)
-  const LANE_COLORS = [
-    "#ea580c", // warm orange, primary lane
-    "#3b82f6", // blue
-    "#10b981", // emerald
-    "#8b5cf6", // violet
-    "#ec4899", // pink
-    "#eab308", // yellow
-  ];
+  const LANE_COLORS = ["var(--hud-fg)", "var(--hud-muted)", "#8e8e8e", "#b5b5b5", "#999999", "#666666"];
 
   function laneColor(lane) {
     return LANE_COLORS[Math.abs(lane) % LANE_COLORS.length];
@@ -861,7 +854,8 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   // ============================================================================
@@ -869,7 +863,7 @@
   // ============================================================================
   const I18N = {
     zh: {
-      cache: "累计缓存",
+      cache: "本轮缓存",
       sub: "子",
       weekLeft: "周余",
       graph: "图谱",
@@ -932,7 +926,7 @@
       remoteWorkspace: "当前会话运行在远程服务器，本地无法直接读取远端 Git 仓库",
     },
     en: {
-      cache: "Cache",
+      cache: "Turn Cache",
       sub: "sub",
       weekLeft: "Wk",
       graph: "Graph",
@@ -1110,7 +1104,7 @@
   styleEl.id = "t3-hud-styles";
   styleEl.textContent = `
     .t3-hud-composer-spaced {
-      padding-top: 32px !important;
+      padding-top: var(--t3-hud-composer-space, 29px) !important;
     }
 
     /* Hide T3's redundant right-sidebar quota & context sections while keeping React Fiber live */
@@ -1124,22 +1118,22 @@
       --hud-bg-solid: var(--popover, #ffffff);
       --hud-fg: var(--foreground, #262626);
       --hud-muted: var(--muted-foreground, #737373);
-      --hud-surface: var(--muted, #f4f4f5);
+      --hud-surface: var(--muted, #5d5d5d);
       --hud-border: var(--border, rgba(0, 0, 0, 0.1));
       --hud-hover: color-mix(in srgb, var(--foreground, #262626) 7%, transparent);
       --hud-shadow: 0 8px 30px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
-      --hud-emerald: #059669;
-      --hud-emerald-fill: linear-gradient(90deg, #10b981, #34d399);
-      --hud-blue: #2563eb;
-      --hud-blue-fill: linear-gradient(90deg, #3b82f6, #06b6d4);
-      --hud-cyan: #0284c7;
-      --hud-amber: #d97706;
-      --hud-amber-fill: linear-gradient(90deg, #f59e0b, #fbbf24);
-      --hud-orange: #ea580c;
-      --hud-orange-fill: linear-gradient(90deg, #f97316, #ef4444);
-      --hud-red: #dc2626;
-      --hud-red-fill: linear-gradient(90deg, #ef4444, #dc2626);
-      --hud-violet: #7c3aed;
+      --hud-emerald: #5d5d5d;
+      --hud-emerald-fill: var(--hud-fg);
+      --hud-blue: #5d5d5d;
+      --hud-blue-fill: var(--hud-fg);
+      --hud-cyan: #5d5d5d;
+      --hud-amber: #5d5d5d;
+      --hud-amber-fill: var(--hud-fg);
+      --hud-orange: #5d5d5d;
+      --hud-orange-fill: var(--hud-fg);
+      --hud-red: #5d5d5d;
+      --hud-red-fill: var(--hud-fg);
+      --hud-violet: #5d5d5d;
       font-family: -apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", system-ui, sans-serif;
       color: var(--hud-fg);
       pointer-events: none;
@@ -1156,13 +1150,13 @@
       --hud-border: var(--border, rgba(255, 255, 255, 0.12));
       --hud-hover: color-mix(in srgb, var(--foreground, #f5f5f5) 9%, transparent);
       --hud-shadow: 0 14px 40px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.35);
-      --hud-emerald: #34d399;
-      --hud-blue: #60a5fa;
-      --hud-cyan: #38bdf8;
-      --hud-amber: #fbbf24;
-      --hud-orange: #fb923c;
-      --hud-red: #f87171;
-      --hud-violet: #a78bfa;
+      --hud-emerald: #5d5d5d;
+      --hud-blue: #5d5d5d;
+      --hud-cyan: #5d5d5d;
+      --hud-amber: #5d5d5d;
+      --hud-orange: #5d5d5d;
+      --hud-red: #5d5d5d;
+      --hud-violet: #5d5d5d;
     }
 
     #t3-hud-topbar {
@@ -1293,12 +1287,12 @@
       flex: none;
     }
     .t3-hud-dot.running {
-      background: var(--hud-blue);
-      box-shadow: 0 0 0 2px color-mix(in srgb, var(--hud-blue) 16%, transparent);
+      background: var(--hud-fg);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--hud-fg) 16%, transparent);
       animation: t3HudPulse 1.2s ease-in-out infinite;
     }
     .t3-hud-dot.ready {
-      background: var(--hud-blue);
+      background: var(--hud-fg);
     }
     @keyframes t3HudPulse {
       0%, 100% { opacity: 1; transform: scale(1); }
@@ -1594,11 +1588,11 @@
       outline: none;
     }
     .t3-git-search:focus {
-      border-color: #3b82f6;
+      border-color: #5d5d5d;
     }
     #t3-hud-git-drawer button:focus-visible,
     .t3-git-row:focus-visible {
-      outline: 2px solid #3b82f6;
+      outline: 2px solid #5d5d5d;
       outline-offset: -2px;
     }
     .t3-git-status-badge {
@@ -1718,13 +1712,13 @@
     }
     .t3-git-ref.head {
       flex: none;
-      background: rgba(245, 158, 11, 0.14);
-      border-color: rgba(245, 158, 11, 0.55);
-      color: #b45309;
+      background: rgba(0, 0, 0, 0.04);
+      border-color: rgba(0, 0, 0, 0.12);
+      color: #5d5d5d;
       font-weight: 600;
     }
     html.dark .t3-git-ref.head {
-      color: #fbbf24;
+      color: #5d5d5d;
     }
 
     .t3-git-subj {
@@ -1823,10 +1817,10 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .t3-diff-add { color: #16a34a; }
-    .t3-diff-del { color: #dc2626; }
-    html.dark .t3-diff-add { color: #4ade80; }
-    html.dark .t3-diff-del { color: #f87171; }
+    .t3-diff-add { color: #5d5d5d; }
+    .t3-diff-del { color: #5d5d5d; }
+    html.dark .t3-diff-add { color: #5d5d5d; }
+    html.dark .t3-diff-del { color: #5d5d5d; }
     .t3-patch-box {
       margin-top: 8px;
       padding: 6px 8px;
@@ -1839,7 +1833,7 @@
       overflow-x: auto;
       white-space: pre;
     }
-    .t3-patch-hunk { color: #3b82f6; }
+    .t3-patch-hunk { color: #5d5d5d; }
     .t3-empty-msg {
       padding: 28px 16px;
       text-align: center;
@@ -1883,6 +1877,21 @@
       .t3-git-hdr-left .t3-git-symbol { display: none; }
       .t3-git-date, .t3-git-sha { padding: 0 5px; font-size: 10px; }
     }
+    /* OpenAI monochrome chrome. Quota is the sole semantic-color exception. */
+    #t3-hud-root{--hud-bg:#fff;--hud-bg-solid:#fff;--hud-fg:#0d0d0d;--hud-muted:#5d5d5d;--hud-surface:#f7f7f8;--hud-border:#ececec;--hud-hover:rgba(0,0,0,.04);--hud-emerald:var(--hud-fg);--hud-blue:var(--hud-fg);--hud-cyan:var(--hud-fg);--hud-amber:var(--hud-muted);--hud-orange:var(--hud-fg);--hud-red:var(--hud-fg);--hud-violet:var(--hud-fg);--hud-emerald-fill:var(--hud-fg);--hud-blue-fill:var(--hud-fg);--hud-amber-fill:var(--hud-fg);--hud-orange-fill:var(--hud-fg);--hud-red-fill:var(--hud-fg)}
+    .t3-hud-composer-spaced{padding-top:var(--t3-hud-composer-space,29px)!important}
+    #t3-hud-topbar{height:27px;padding:0 7px;border-radius:8px;background:var(--hud-bg-solid);backdrop-filter:none;-webkit-backdrop-filter:none;box-shadow:0 1px 3px #00000005;font-size:10px}
+    #t3-hud-git-btn{font-size:10px}.t3-hud-sub-badge{background:var(--hud-surface);color:var(--hud-muted)}#t3-hud-git-btn.active{background:var(--hud-fg);color:var(--hud-bg-solid)}#t3-hud-git-btn.active .t3-git-symbol{color:inherit}
+    #t3-hud-root .t3-quota-fill,#t3-hud-root #t3-hud-quota-bar{background:#10a37f}#t3-hud-root .t3-quota-val,#t3-hud-root #t3-hud-quota{color:#10a37f}
+    #t3-hud-root .t3-quota-fill.mid,#t3-hud-root .t3-quota-fill.warn,#t3-hud-root #t3-hud-quota-bar.mid,#t3-hud-root #t3-hud-quota-bar.warn{background:#d97706}#t3-hud-root .t3-quota-val.mid,#t3-hud-root .t3-quota-val.warn,#t3-hud-root #t3-hud-quota.mid,#t3-hud-root #t3-hud-quota.warn{color:#d97706}
+    #t3-hud-root .t3-quota-fill.err,#t3-hud-root #t3-hud-quota-bar.err{background:#dc2626}#t3-hud-root .t3-quota-val.err,#t3-hud-root #t3-hud-quota.err{color:#dc2626}
+    #t3-hud-root :is(.t3-diff-add,.t3-diff-del,.t3-patch-hunk){color:var(--hud-fg)}#t3-hud-root .t3-diff-add{font-weight:600}#t3-hud-root .t3-diff-del{opacity:.65}
+    #t3-hud-topbar.is-tight .t3-hud-compact-hide{display:none}#t3-hud-topbar.is-mini .t3-hud-metric:not(#t3-hud-cache-item):not(#t3-hud-quota-item):not(#t3-hud-ctx-item),#t3-hud-topbar.is-mini .t3-hud-sep{display:none}#t3-hud-topbar.is-mini{gap:6px}#t3-hud-topbar.is-mini #t3-hud-branch{max-width:54px}#t3-hud-topbar.is-mini #t3-hud-cache-lbl{display:inline;font-size:9px}
+    #t3-hud-root #t3-hud-topbar.has-quota #t3-hud-quota-item{display:inline-flex!important}#t3-hud-root #t3-hud-topbar:not(.has-quota) #t3-hud-quota-item{display:none!important}
+    @media(max-width:639px){#t3-hud-topbar{max-width:306px}#t3-hud-topbar .t3-hud-quota-track{width:18px}#t3-hud-popover{max-height:calc(100dvh - 120px);overflow:auto}}
+    @media(max-width:399px){#t3-hud-topbar.is-mini #t3-hud-git-btn,#t3-hud-topbar.is-mini .t3-hud-quota-track{display:none}#t3-hud-topbar.is-mini{gap:5px}}
+    @media(prefers-reduced-motion:reduce){#t3-hud-root *,#t3-hud-root *:before,#t3-hud-root *:after{animation:none!important;transition:none!important}}
+
   `;
   document.head.appendChild(styleEl);
 
@@ -1898,8 +1907,8 @@
         <span id="t3-hud-speed" class="val">-- tok/s</span>
       </div>
       <span class="t3-hud-sep"></span>
-      <div class="t3-hud-metric" data-hud-hover="stats">
-        <span class="lbl" id="t3-hud-cache-lbl">累计缓存</span>
+      <div id="t3-hud-cache-item" class="t3-hud-metric" data-hud-hover="stats">
+        <span class="lbl" id="t3-hud-cache-lbl">本轮缓存</span>
         <span id="t3-hud-cache" class="val">--%</span>
       </div>
       <span class="t3-hud-sep t3-hud-compact-hide"></span>
@@ -1967,6 +1976,29 @@
     </aside>
   `;
   document.body.appendChild(root);
+
+  const hudThemes = {
+    white: ["#ffffff", "#f8fafc", "#e2e8f0", "#0f172a", "#475569", "#2563eb"],
+    dark: ["#14161a", "#1e2128", "#2e333d", "#f8fafc", "#94a3b8", "#60a5fa"],
+    sky: ["#f4f9ff", "#eaf3ff", "#bfdbfe", "#0c4a6e", "#0369a1", "#0284c7"],
+    emerald: ["#f2fdf7", "#e6faef", "#a7f3d0", "#064e3b", "#047857", "#059669"],
+    violet: ["#faf7ff", "#f3e8ff", "#ddd6fe", "#3b0764", "#6d28d9", "#7c3aed"],
+  };
+  function syncHudTheme(event) {
+    let theme = event?.detail?.theme;
+    if (!theme) { try { theme = localStorage.getItem("t3-hub-theme"); } catch {} }
+    if (!Object.hasOwn(hudThemes, theme)) theme = "white";
+    const [bg, surface, border, ink, muted, accent] = hudThemes[theme];
+    const variables = { "hud-bg": bg, "hud-bg-solid": bg, "hud-surface": surface, "hud-border": border, "hud-fg": ink, "hud-muted": muted, "hud-accent": accent,
+      "hud-hover": theme === "dark" ? "#ffffff0f" : "#0f172a08", "hud-shadow": theme === "dark" ? "0 14px 40px #00000066" : "0 8px 30px #0f172a14,0 1px 3px #0f172a08" };
+    for (const [key, value] of Object.entries(variables)) root.style.setProperty(`--${key}`, value);
+    for (const color of ["emerald", "blue", "cyan", "violet"]) root.style.setProperty(`--hud-${color}`, accent);
+    root.dataset.theme = theme;
+    root.style.colorScheme = theme === "dark" ? "dark" : "light";
+  }
+  syncHudTheme();
+  window.addEventListener("t3-hub-theme-change", syncHudTheme);
+  window.addEventListener("storage", syncHudTheme);
   document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());
 
   const topbar = document.getElementById("t3-hud-topbar");
@@ -2041,12 +2073,29 @@
   function setComposerTopSpacing(stackEl) {
     if (spacedComposerStack && spacedComposerStack !== stackEl) {
       spacedComposerStack.classList.remove("t3-hud-composer-spaced");
+      spacedComposerStack.style.removeProperty("--t3-hud-composer-space");
       spacedComposerStack = null;
     }
     if (stackEl && !stackEl.classList.contains("t3-hud-composer-spaced")) {
       stackEl.classList.add("t3-hud-composer-spaced");
     }
+    if (stackEl) {
+      const spacing = `${(topbar.offsetHeight || 26) + 2}px`;
+      if (stackEl.style.getPropertyValue("--t3-hud-composer-space") !== spacing) stackEl.style.setProperty("--t3-hud-composer-space", spacing);
+    }
     spacedComposerStack = stackEl || null;
+  }
+
+  function findComposerSurface(shell) {
+    const editor = shell.querySelector('textarea,[contenteditable="true"],[contenteditable="plaintext-only"]');
+    for (let node = editor?.parentElement; node && shell.contains(node); node = node.parentElement) {
+      const css = getComputedStyle(node), rect = node.getBoundingClientRect();
+      const background = css.backgroundColor && !/^(transparent|rgba\(0,\s*0,\s*0,\s*0\))$/.test(css.backgroundColor);
+      const border = parseFloat(css.borderTopWidth) > 0 && css.borderTopStyle !== "none";
+      if (parseFloat(css.borderRadius || css.borderTopLeftRadius) >= 6 && (background || border) && rect.width >= 180 && rect.height >= 28) return node;
+      if (node === shell) break;
+    }
+    return shell;
   }
 
   // Audit: NEVER cover Settings, Non-Chat Routes, or Modals/Dialogs
@@ -2072,12 +2121,7 @@
     // 3) Composer check
     const shell = document.querySelector('[data-slot="composer-shell"]');
     if (!shell) return null;
-    let surface = null;
-    try {
-      surface = shell.querySelector("textarea")?.closest("div") || shell.children[0] || shell;
-    } catch {
-      surface = shell;
-    }
+    const surface = findComposerSurface(shell);
     let sRect = null;
     try {
       sRect = surface.getBoundingClientRect();
@@ -2165,23 +2209,24 @@
       lastLayoutState.hidden = false;
     }
 
-    const tbWidth = topbar.offsetWidth || 440;
+    const surface = composer ? findComposerSurface(composer) : null;
+    const sRect = surface?.getBoundingClientRect();
+    const available = Math.max(200, Math.min((sRect?.width || cRect?.width || innerWidth) - 16, innerWidth - 24));
+    topbar.classList.toggle("is-tight", available < 610);
+    topbar.classList.toggle("is-mini", available < 420);
+    topbar.style.maxWidth = `${available}px`;
+    const tbWidth = topbar.offsetWidth || 220;
     let nextTop = "";
     let nextLeft = "";
     let nextRight = "auto";
-
-    if (composer) {
+    if (composer && sRect?.width > 120) {
       const stackEl = composer.closest('[class*="group/composer-stack"]');
       setComposerTopSpacing(stackEl);
-      const inputSurface = composer.children[0] || composer;
-      const sRect = inputSurface.getBoundingClientRect();
-      if (sRect.width > 120) {
-        const centerLeft = (sRect.left + sRect.right - tbWidth) / 2;
-        const minLeft = cRect ? cRect.left + 8 : 12;
-        const maxLeft = cRect ? cRect.right - tbWidth - 8 : window.innerWidth - tbWidth - 12;
-        nextTop = `${Math.max(46, Math.round(sRect.top - 30))}px`;
-        nextLeft = `${Math.round(Math.max(minLeft, Math.min(maxLeft, centerLeft)))}px`;
-      }
+      const minLeft = Math.max(12, sRect.left + 8);
+      const idealLeft = sRect.left + (sRect.width - tbWidth) / 2;
+      nextLeft = `${Math.round(Math.max(minLeft, Math.min(innerWidth - 12 - tbWidth, idealLeft)))}px`;
+      const tbHeight = topbar.offsetHeight || 26;
+      nextTop = `${Math.max(42, Math.round(sRect.top - tbHeight - 2))}px`;
     }
 
     if (!nextTop && hRect) {
@@ -2309,15 +2354,9 @@
     return pct >= 90 ? "err" : pct >= 75 ? "warn" : pct >= 50 ? "mid" : "ok";
   }
 
-  function contextColor(pct) {
-    const tone = contextTone(pct);
-    return tone === "err" ? "var(--hud-red)" : tone === "warn" ? "var(--hud-orange)" : tone === "mid" ? "var(--hud-amber)" : "var(--hud-blue)";
-  }
-
-  function cacheColor(rate) {
-    if (rate == null || !Number.isFinite(rate)) return "var(--hud-fg)";
-    return rate >= 0.75 ? "var(--hud-emerald)" : rate >= 0.45 ? "var(--hud-cyan)" : "var(--hud-amber)";
-  }
+  // Context, cache, running state and Git stay monochrome. Only quota carries semantic color.
+  function contextColor() { return "var(--hud-fg)"; }
+  function cacheColor() { return "var(--hud-fg)"; }
 
   function computeQuotaAndContext(stats) {
     const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider } = readLiveT3State();
@@ -2387,7 +2426,7 @@
 
     const toWinItem = (w, prefix = "") => {
       const rem = Math.max(0, Math.min(100, Math.round(100 - (Number(w.usedPercent) || 0))));
-      const tone = rem > 50 ? "ok" : rem > 25 ? "mid" : rem > 10 ? "warn" : "err";
+      const tone = rem >= 50 ? "ok" : rem >= 20 ? "mid" : "err";
       const reset = formatResetShort(w.resetsAt);
       const rawLbl = String(w.label || w.id || "Quota").replace(" (shared)", "");
       return {
@@ -2619,14 +2658,14 @@
         : "";
     const subTokLine =
       s.cost.subagentCount > 0 && s.tokens.subagentTokens > 0
-        ? `<div class="t3-pop-row"><span>${escapeHtml(t("mainSubPrefix"))} (${s.cost.subagentCount})</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
+        ? `<div class="t3-pop-row"><span>${escapeHtml(t("mainSubPrefix"))} (${escapeHtml(s.cost.subagentCount)})</span><span>${formatCompactTokens(s.tokens.mainTotal)} / +${formatCompactTokens(s.tokens.subagentTokens)}</span></div>`
         : "";
 
     popover.innerHTML = `
       <div class="t3-pop-title">
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.title || t("untitled"))}</span>
         <span style="display:flex;align-items:center;gap:6px">
-          <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${s.turnCount} ${escapeHtml(t("rounds"))}</span>
+          <span style="color:var(--hud-muted);font-weight:400;font-size:10.5px;flex:none">${escapeHtml(s.turnCount)} ${escapeHtml(t("rounds"))}</span>
           <button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button>
         </span>
       </div>
@@ -2647,7 +2686,7 @@
       </div>
       ${
         s.cost.subagentCount > 0
-          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${s.cost.subagentCount})</span><span style="color:var(--hud-violet)">+${formatUsd(s.cost.subagentUsd)}</span></div>
+          ? `<div class="t3-pop-row"><span>${escapeHtml(t("subagents"))} (${escapeHtml(s.cost.subagentCount)})</span><span style="color:var(--hud-violet)">+${formatUsd(s.cost.subagentUsd)}</span></div>
              <div class="t3-pop-row"><span>${escapeHtml(t("totalCost"))}</span><span style="font-weight:700">${formatUsd(s.cost.withSubagentsUsd)}</span></div>`
           : ""
       }
@@ -2677,12 +2716,16 @@
       popover.style.top = `${Math.round(barRect.bottom + 6)}px`;
     }
     popover.classList.add("visible");
+    window.dispatchEvent(new CustomEvent("t3-hud-popover-change", { detail: { visible: true } }));
   }
 
   function hidePopoverDelayed() {
     clearTimeout(popoverHideTimer);
     popoverHideTimer = setTimeout(() => {
-      if (!popover.matches(":hover")) popover.classList.remove("visible");
+      if (!popover.matches(":hover")) {
+        popover.classList.remove("visible");
+        window.dispatchEvent(new CustomEvent("t3-hud-popover-change", { detail: { visible: false } }));
+      }
     }, 140);
   }
 
@@ -2704,6 +2747,7 @@
     latestStats = stats;
     const qInfo = computeQuotaAndContext(stats);
     const wk = qInfo.primaryWeekly;
+    topbar.classList.toggle("has-quota", !!wk);
 
     let nextDotClass;
     let nextSpeed;
@@ -2738,7 +2782,7 @@
       } else {
         nextSpeed = "-- tok/s";
       }
-      const rate = stats.cache.sessionRate ?? stats.cache.displayRate;
+      const rate = stats.cache.lastTurnRate ?? stats.cache.displayRate;
       nextCache = rate != null ? `${Math.round(rate * 100)}%` : "--%";
       nextCacheColor = cacheColor(rate);
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
@@ -2752,7 +2796,7 @@
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
       speedEl.textContent = nextSpeed;
-      speedEl.style.color = liveStreamTps != null && stats?.ok ? "var(--hud-blue)" : "var(--hud-fg)";
+      speedEl.style.color = "var(--hud-fg)";
       cacheEl.textContent = nextCache;
       cacheEl.style.color = nextCacheColor;
       tokensEl.textContent = nextTokens;
@@ -2821,7 +2865,7 @@
 
     const isHead = (commit.refs || []).some((r) => r.isHead || r.kind === "head");
     const nodeSvg = isHead
-      ? `<circle cx="${cx}" cy="${midY}" r="5.5" fill="var(--git-lane-bg)" stroke="#ea580c" stroke-width="1.5" /><circle cx="${cx}" cy="${midY}" r="2.6" fill="#ea580c" />`
+      ? `<circle cx="${cx}" cy="${midY}" r="5.5" fill="var(--git-lane-bg)" stroke="#5d5d5d" stroke-width="1.5" /><circle cx="${cx}" cy="${midY}" r="2.6" fill="#5d5d5d" />`
       : `<circle cx="${cx}" cy="${midY}" r="3.2" fill="${laneColor(lane)}" />`;
     return `<svg width="${width}" height="${rowH}" viewBox="0 0 ${width} ${rowH}" style="display:block" aria-hidden="true">${paths}${nodeSvg}</svg>`;
   }
@@ -3110,7 +3154,7 @@
     commitMsgEl.textContent = res.message || t("noMessage");
     const countSuffix = res.diffUnavailable ? "" : ` · ${(res.files || []).length} ${t("filesCount")}`;
     const emailPart = res.authorEmail ? ` <${res.authorEmail}>` : "";
-    commitMetaEl.textContent = `${res.authorName || ""}${emailPart} · ${res.hash.slice(0, 10)}${countSuffix}`;
+    commitMetaEl.textContent = `${res.authorName || ""}${emailPart} · ${String(res.hash || "").slice(0, 10)}${countSuffix}`;
 
     const filesHtml = (res.files || [])
       .map(
@@ -3118,8 +3162,8 @@
         <div class="t3-commit-file">
           <span class="t3-commit-file-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</span>
           <span style="flex:none">
-            ${f.added != null ? `<span class="t3-diff-add">+${f.added}</span>` : ""}
-            ${f.deleted != null ? ` <span class="t3-diff-del">-${f.deleted}</span>` : ""}
+            ${f.added != null ? `<span class="t3-diff-add">+${escapeHtml(f.added)}</span>` : ""}
+            ${f.deleted != null ? ` <span class="t3-diff-del">-${escapeHtml(f.deleted)}</span>` : ""}
           </span>
         </div>`
       )
@@ -3468,6 +3512,8 @@
     window.removeEventListener("hashchange", onRouteMaybeChanged);
     window.removeEventListener("popstate", onRouteMaybeChanged);
     window.removeEventListener("resize", scheduleLayoutSync);
+    window.removeEventListener("t3-hub-theme-change", syncHudTheme);
+    window.removeEventListener("storage", syncHudTheme);
     history.pushState = origPushState;
     history.replaceState = origReplaceState;
     document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());

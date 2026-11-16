@@ -412,6 +412,7 @@ test("memory drawer keeps the selected revision ID from history button through r
     memorySelection: () => "project", selectedMemoryRoot: () => "/sandbox/project", drafts: {},
     busy: async (key, element, action) => action(), request: async (action, payload) => calls.push({ action, payload }),
     disposed: false, renderChrome: () => {}, toast: () => {},
+    exactTimeMarkup: value => String(value || ""),
   };
   const ui = new Function(...Object.keys(dependencies), extract("renderMemoryHistory") + extract("rollbackMemory") + ";return {renderMemoryHistory, rollbackMemory};")(...Object.values(dependencies));
   const html = ui.renderMemoryHistory({ id: "memory", history: [{ version: 1, revisionId: "revision-a", content: "alpha" }, { version: 1, revisionId: "revision-b", content: "beta" }] });

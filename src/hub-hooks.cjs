@@ -219,16 +219,29 @@ function createHooksManager({ homeDir = process.env.HOME || os.homedir(), hubDir
 }
 
 // The optional builtins live in this module to keep installation self-contained.
+const HOOK_STDIN_MAX_BYTES = 1 * 1024 * 1024;
 async function runBuiltin(kind) {
   let text = "";
+  let stdinOverflow = false;
   if (process.stdin.isTTY) return;
   await new Promise(resolve => {
     const timer = setTimeout(resolve, 250);
     const done = () => { clearTimeout(timer); resolve(); };
     process.stdin.setEncoding("utf8");
-    process.stdin.on("data", chunk => { text += chunk; try { JSON.parse(text); done(); } catch {} });
+    process.stdin.on("data", chunk => {
+      if (stdinOverflow) return;
+      text += chunk;
+      if (text.length > HOOK_STDIN_MAX_BYTES || Buffer.byteLength(text, "utf8") > HOOK_STDIN_MAX_BYTES) {
+        stdinOverflow = true;
+        text = "";
+        done();
+        return;
+      }
+      try { JSON.parse(text); done(); } catch {}
+    });
     process.stdin.once("end", done); process.stdin.once("error", done);
   });
+  if (stdinOverflow) return;
   process.stdin.pause();
   let payload; try { payload = JSON.parse(text); } catch { return; }
   const input = payload.tool_input || {}, cwd = payload.cwd || process.cwd();

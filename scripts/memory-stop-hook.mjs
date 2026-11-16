@@ -34,6 +34,24 @@ function recentMemory(dir, since) {
   } catch {}
   return false;
 }
+function cleanupStaleNudges(hub) {
+  try {
+    const runDir = path.join(hub, 'run');
+    const thresholdMs = 7 * 24 * 60 * 60 * 1000;
+    let entries;
+    try { entries = fs.readdirSync(runDir, { withFileTypes: true }); } catch { return; }
+    const now = Date.now();
+    for (const ent of entries) {
+      try {
+        if (!ent.isFile()) continue;
+        if (!ent.name.startsWith('stop-nudge-') || !ent.name.endsWith('.json')) continue;
+        const full = path.join(runDir, ent.name);
+        const st = fs.statSync(full);
+        if (now - st.mtimeMs > thresholdMs) fs.unlinkSync(full);
+      } catch {}
+    }
+  } catch {}
+}
 function codeChanged(status) {
   const entries = status.split('\0');
   for (let i = 0; i < entries.length; i++) {
@@ -48,10 +66,12 @@ function codeChanged(status) {
 }
 
 try {
+  const hubEarly = process.env.T3_HUB_DIR || path.join(process.env.HOME || os.homedir(), '.t3', 'hub');
+  try { cleanupStaleNudges(hubEarly); } catch {}
   const payload = await readInput();
   if (!payload || payload.stop_hook_active === true) process.exit(0);
   const cwd = payload.cwd || process.env.T3_PROJECT_ROOT || process.cwd();
-  const hub = process.env.T3_HUB_DIR || path.join(process.env.HOME || os.homedir(), '.t3', 'hub');
+  const hub = hubEarly;
   // Include the child id so SubagentStop does not suppress the parent Stop nudge.
   const raw = String(payload.session_id || payload.thread_id || payload.transcript_path || cwd) + (payload.agent_id ? ':' + payload.agent_id : '');
   const key = raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) + '-' + createHash('sha256').update(raw).digest('hex').slice(0, 12);
