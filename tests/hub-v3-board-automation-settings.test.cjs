@@ -268,6 +268,7 @@ describe("hub-task-board: Hub MCP 打卡（Pi 通用保底）", () => {
     fs.mkdirSync(session, { recursive: true });
     fs.writeFileSync(path.join(session, "task.md"), "# brain 标题\n\n- [ ] brain 旧步骤\n", "utf8");
     fs.writeFileSync(path.join(session, "implementation_plan.md.metadata.json"), JSON.stringify({ summary: "脑产物", userFacing: true, updatedAt: "2026-11-14T00:00:00.000Z" }), "utf8");
+    fs.writeFileSync(path.join(session, "implementation_plan.md"), "# 脑产物\n", "utf8");
     const dbPath = buildT3Db(dir, (db) => {
       db.exec(`CREATE TABLE orchestration_v2_projection_provider_threads (thread_id TEXT, provider_session_id TEXT, payload_json TEXT)`);
       db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)").run("proj-1", "p", dir, "{}", "2026-11-15T00:00:00Z", "2026-11-15T00:00:00Z");
@@ -277,6 +278,7 @@ describe("hub-task-board: Hub MCP 打卡（Pi 通用保底）", () => {
     });
     const past = new Date("2020-01-01T00:00:00.000Z");
     fs.utimesSync(path.join(session, "task.md"), past, past);
+    fs.utimesSync(path.join(session, "implementation_plan.md"), past, past);
     const board = createTaskBoard({
       t3DbPath: dbPath,
       agyBrainDirs: [root],
@@ -499,12 +501,21 @@ describe("hub-host-settings: symlink preservation and unsafe path guards", () =>
 
   for (const spec of cases) {
     const [host, relativePath] = spec;
-    it(`${host} ${relativePath} updates the real file and preserves its symlink, mode and first backup`, (t) => {
+    it(host === "antigravity"
+      ? `${host} ${relativePath} rejects symlinks fail-closed across snapshot, read, and write`
+      : `${host} ${relativePath} updates the real file and preserves its symlink, mode and first backup`, (t) => {
       const f = setup(t, spec), mode = f.rule ? 0o604 : 0o640;
       fs.writeFileSync(f.target, f.before);
       fs.chmodSync(f.target, mode);
       const link = path.relative(path.dirname(f.file), f.target);
       fs.symlinkSync(link, f.file);
+      if (host === "antigravity") {
+        assert.throws(f.save, /unsafe symlink/i);
+        assertCorrupted(f, /unsafe symlink/i);
+        assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
+        assert.equal(fs.existsSync(f.file + ".t3hub.bak"), false);
+        return;
+      }
       f.save();
       f.save();
       assert.equal(fs.lstatSync(f.file).isSymbolicLink(), true);
@@ -896,7 +907,7 @@ describe("hub-task-board: project and draft isolation regressions", () => {
     for (const [query, text] of [[queryA, "A 草稿"], [queryB, "B 草稿"], [unscoped, "无项目草稿"]]) {
       board.updatePlan({ ...query, steps: [{ text, status: "pending" }] });
     }
-    assert.equal(fs.readdirSync(hubPlansDir).length, 3, "each scope has its own disk file");
+    assert.equal(fs.readdirSync(hubPlansDir).filter(name => name.endsWith(".json")).length, 3, "each scope has its own disk file");
     assert.equal(board.getBoardSnapshot(queryA).steps[0].text, "A 草稿");
     assert.equal(board.getBoardSnapshot(queryB).steps[0].text, "B 草稿");
     assert.equal(board.getBoardSnapshot(unscoped).steps[0].text, "无项目草稿");
@@ -944,7 +955,7 @@ describe("hub-task-board: project and draft isolation regressions", () => {
     board.updatePlan({ ...query, steps: [{ text: "原草稿" }] });
     assert.equal(board.getBoardSnapshot(alias).steps[0].text, "原草稿");
     board.updatePlan({ ...alias, steps: [{ text: "更新草稿" }] });
-    assert.equal(fs.readdirSync(hubPlansDir).length, 1);
+    assert.equal(fs.readdirSync(hubPlansDir).filter(name => name.endsWith(".json")).length, 1);
     assert.equal(board.getBoardSnapshot(query).steps[0].text, "更新草稿");
     assert.deepEqual(board.clearPlan(query), { deleted: 1 });
     assertEmpty(board.getBoardSnapshot(alias));
@@ -1049,6 +1060,277 @@ describe("hub-task-board: project and draft isolation regressions", () => {
   });
 });
 
+describe("hub-task-board: Issue #8 manual plan CAS", () => {
+  function fixture(t) {
+    const home = makeTmp("plan-cas"); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const opts = { homeDir: home, hubPlansDir: path.join(home, "plans"), agyBrainDirs: [], now: () => Date.parse("2026-11-16T12:00:00Z") };
+    return { home, opts, board: createTaskBoard(opts), second: createTaskBoard(opts) };
+  }
+  async function lockedWriter(t, opts, query, operation = "update") {
+    const script = `
+      const fs = require('node:fs');
+      const { createTaskBoard } = require(${JSON.stringify(require.resolve("../src/hub-task-board.cjs"))});
+      const method = ${JSON.stringify(operation === "update" ? "renameSync" : "unlinkSync")}, original = fs[method];
+      let held = false;
+      fs[method] = (...args) => {
+        if (!held && (method === 'renameSync' ? String(args[0]).includes('.tmp-') : String(args[0]).endsWith('.json'))) {
+          held = true; process.send('locked');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+        }
+        return original(...args);
+      };
+      const board = createTaskBoard(${JSON.stringify(opts)});
+      if (${JSON.stringify(operation)} === 'update') board.updatePlan({ ...${JSON.stringify(query)}, steps: [{ text: 'first writer' }] });
+      else board.clearPlan(${JSON.stringify(query)});
+    `;
+    const child = require("node:child_process").spawn(process.execPath, ["-e", script], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    let stderr = "";
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    const done = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal, stderr })));
+    t.after(async () => { if (child.exitCode === null) child.kill(); await done; });
+    await new Promise((resolve, reject) => {
+      child.once("message", message => message === "locked" ? resolve() : reject(new Error(`unexpected writer message: ${message}`)));
+      child.once("error", reject);
+      child.once("exit", code => reject(new Error(`writer exited before taking the lock: ${code}: ${stderr}`)));
+    });
+    return { done };
+  }
+
+  for (const scope of ["thread", "draft", "project"]) for (const operation of ["update", "clear"]) for (const change of ["created", "changed"]) {
+    it(`Issue #8 tail [1] ${scope} ${operation} rejects a ${change} non-winning legacy record`, (t) => {
+      const { home, opts, board } = fixture(t);
+      const query = scope === "thread" ? { threadId: "thread-a", projectRoot: home } : scope === "draft" ? { threadId: "__NEW__", projectRoot: home } : { projectRoot: home };
+      board.updatePlan({ ...query, steps: [{ text: "primary plan" }] });
+      const legacy = path.join(opts.hubPlansDir, "legacy-copy.json");
+      const record = { ...query, updatedAt: "2026-11-16T11:00:00Z", steps: [{ text: "legacy plan" }] };
+      if (change === "changed") fs.writeFileSync(legacy, JSON.stringify(record));
+      const seen = board.getBoardSnapshot(query);
+      fs.writeFileSync(legacy, JSON.stringify({ ...record, steps: [{ text: "unseen concurrent plan" }] }));
+      assert.equal(board.getBoardSnapshot(query).steps[0].text, "primary plan", "clock rollback must keep the legacy file outside the displayed winner");
+      const preserved = fs.readFileSync(legacy, "utf8");
+      assert.throws(() => operation === "update"
+        ? board.updatePlan({ ...query, expectedRevision: seen.planRevision, steps: [{ text: "stale overwrite" }] })
+        : board.clearPlan({ ...query, expectedRevision: seen.planRevision }), { code: "PLAN_CONFLICT" });
+      assert.equal(fs.readFileSync(legacy, "utf8"), preserved, "the unseen plan must survive stale operations");
+      assert.notEqual(board.getBoardSnapshot(query).planRevision, seen.planRevision);
+    });
+  }
+
+  it("Issue #8 tail [1] equal timestamps and duplicate filenames participate in the deterministic scope revision", (t) => {
+    const { opts, board } = fixture(t), query = { threadId: "thread-a" };
+    board.updatePlan({ ...query, steps: [{ text: "primary" }] });
+    const primary = path.join(opts.hubPlansDir, planFileKey(query) + ".json"), bytes = fs.readFileSync(primary);
+    const initial = board.getBoardSnapshot(query).planRevision, duplicate = path.join(opts.hubPlansDir, "z-legacy.json");
+    fs.writeFileSync(duplicate, bytes);
+    const duplicated = board.getBoardSnapshot(query).planRevision;
+    assert.notEqual(duplicated, initial, "an equal-timestamp, identical-content record is still a distinct scoped file");
+    const localRequire = require("node:module").createRequire(require.resolve("../src/hub-task-board.cjs")), guardedFs = Object.create(fs), module = { exports: {} };
+    guardedFs.readdirSync = (...args) => fs.readdirSync(...args).reverse();
+    require("node:vm").runInNewContext(fs.readFileSync(require.resolve("../src/hub-task-board.cjs"), "utf8"), { module, exports: module.exports, process, Buffer, require: name => name === "node:fs" ? guardedFs : localRequire(name) });
+    assert.equal(module.exports.createTaskBoard(opts).getBoardSnapshot(query).planRevision, duplicated, "filesystem enumeration order cannot change the revision");
+    fs.renameSync(duplicate, path.join(opts.hubPlansDir, "a-legacy.json"));
+    assert.notEqual(board.getBoardSnapshot(query).planRevision, duplicated, "canonical filenames are part of the revision");
+  });
+
+  for (const scope of ["thread", "draft", "project"]) it(`Issue #8 tail [1] a successful ${scope} update consolidates only its scoped legacy files`, (t) => {
+    const { home, opts, board } = fixture(t);
+    const query = scope === "thread" ? { threadId: "thread-a", projectRoot: home } : scope === "draft" ? { threadId: "__NEW__", projectRoot: home } : { projectRoot: home };
+    board.updatePlan({ ...query, steps: [{ text: "primary" }] });
+    for (const name of ["legacy-a.json", "legacy-b.json"]) fs.writeFileSync(path.join(opts.hubPlansDir, name), JSON.stringify({ ...query, updatedAt: "2026-11-16T11:00:00Z", steps: [{ text: name }] }));
+    const unrelated = path.join(opts.hubPlansDir, "other-project.json"), bytes = JSON.stringify({ ...query, projectRoot: path.join(home, "other"), steps: [{ text: "keep" }] });
+    fs.writeFileSync(unrelated, bytes);
+    const saved = board.updatePlan({ ...query, expectedRevision: board.getBoardSnapshot(query).planRevision, steps: [{ text: "consolidated" }] });
+    assert.deepEqual(fs.readdirSync(opts.hubPlansDir).filter(name => name.endsWith(".json")).sort(), [path.basename(unrelated), planFileKey(query) + ".json"].sort());
+    assert.equal(fs.readFileSync(unrelated, "utf8"), bytes);
+    assert.equal(board.getBoardSnapshot(query).planRevision, saved.planRevision); assert.equal(board.getBoardSnapshot(query).steps[0].text, "consolidated");
+  });
+  for (const scope of ["thread", "draft", "project"]) it(`${scope} snapshots expose stable content revisions and reject stale edits/clear`, (t) => {
+    const { home, board, second } = fixture(t);
+    const query = scope === "thread" ? { threadId: "thread-a" } : scope === "draft" ? { threadId: "__NEW__", projectRoot: home } : { projectRoot: home };
+    const absent = board.getBoardSnapshot(query);
+    assert.equal(absent.planRevision, "", "an absent manual slot must have an explicit version");
+    const saved = board.updatePlan({ ...query, expectedRevision: "", steps: [{ text: "A" }] });
+    const seen = board.getBoardSnapshot(query);
+    assert.match(seen.planRevision, /^[0-9a-f]{64}$/); assert.equal(saved.planRevision, seen.planRevision);
+    assert.equal(seen.planRevision, second.getBoardSnapshot(query).planRevision);
+    second.updatePlan({ ...query, steps: [{ text: "A" }, { text: "concurrent C" }] });
+    const latest = board.getBoardSnapshot(query);
+    assert.equal(seen.updatedAt, latest.updatedAt); assert.notEqual(seen.planRevision, latest.planRevision);
+    assert.throws(() => board.updatePlan({ ...query, expectedRevision: seen.planRevision, steps: [{ text: "A", status: "completed" }] }), { code: "PLAN_CONFLICT" });
+    assert.throws(() => board.clearPlan({ ...query, expectedRevision: seen.planRevision }), { code: "PLAN_CONFLICT" });
+    assert.ok(board.getBoardSnapshot(query).steps.some(s => s.text === "concurrent C"));
+    assert.deepEqual(board.clearPlan({ ...query, expectedRevision: latest.planRevision }), { deleted: 1 });
+    assert.equal(board.getBoardSnapshot(query).planRevision, "");
+    assert.throws(() => board.updatePlan({ ...query, expectedRevision: latest.planRevision, steps: [] }), { code: "PLAN_CONFLICT" }, "a deleted plan must not be resurrected by an old editor");
+    assert.deepEqual(board.clearPlan({ ...query, expectedRevision: "" }), { deleted: 0 });
+  });
+  it("strict expectedRevision/expectedUpdatedAt values never degrade into an unguarded write", (t) => {
+    const { board } = fixture(t), query = { threadId: "thread-a" };
+    board.updatePlan({ ...query, steps: [{ text: "keep" }] });
+    for (const value of [undefined, null, 1, false, "", "stale"]) {
+      assert.throws(() => board.updatePlan({ ...query, expectedRevision: value, steps: [] }), { code: "PLAN_CONFLICT" });
+      assert.throws(() => board.clearPlan({ ...query, expectedRevision: value }), { code: "PLAN_CONFLICT" });
+      assert.throws(() => board.clearPlan({ ...query, expectedUpdatedAt: value }), { code: "PLAN_CONFLICT" });
+    }
+    const seen = board.getBoardSnapshot(query);
+    board.updatePlan({ ...query, expectedUpdatedAt: seen.updatedAt, steps: [{ text: "timestamp-guarded" }] });
+    assert.throws(() => board.clearPlan({ ...query, expectedRevision: "wrong", expectedUpdatedAt: seen.updatedAt }), { code: "PLAN_CONFLICT" });
+    // MCP/old callers without expectations retain their full replacement API.
+    board.updatePlan({ ...query, steps: [{ text: "legacy replacement" }] });
+    assert.equal(board.getBoardSnapshot(query).steps[0].text, "legacy replacement");
+    assert.deepEqual(board.clearPlan(query), { deleted: 1 });
+  });
+  it("normalized JSON formatting/property order does not change the revision", (t) => {
+    const { opts, board } = fixture(t), query = { threadId: "thread-a" };
+    board.updatePlan({ ...query, steps: [{ id: "a", text: "A" }] });
+    const seen = board.getBoardSnapshot(query), file = path.join(opts.hubPlansDir, planFileKey(query) + ".json");
+    const record = JSON.parse(fs.readFileSync(file, "utf8"));
+    fs.writeFileSync(file, JSON.stringify(Object.fromEntries(Object.entries(record).reverse())));
+    assert.equal(board.getBoardSnapshot(query).planRevision, seen.planRevision);
+    board.updatePlan({ ...query, expectedRevision: seen.planRevision, steps: [{ text: "still editable" }] });
+  });
+  it("an abruptly exited writer cannot leave every later manual plan write permanently locked", (t) => {
+    const { opts, board } = fixture(t), query = { threadId: "thread-a" };
+    const saved = board.updatePlan({ ...query, steps: [{ text: "A" }] });
+    const script = `const fs=require('node:fs');const {createTaskBoard}=require(${JSON.stringify(require.resolve("../src/hub-task-board.cjs"))});fs.renameSync=()=>process.exit(0);createTaskBoard(${JSON.stringify(opts)}).updatePlan({threadId:'thread-a',steps:[{text:'interrupted'}]});`;
+    const child = require("node:child_process").spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 5000 });
+    assert.equal(child.status, 0, child.stderr);
+    assert.doesNotThrow(() => board.updatePlan({ ...query, expectedRevision: saved.planRevision, steps: [{ text: "recovered" }] }));
+    assert.equal(board.getBoardSnapshot(query).steps[0].text, "recovered");
+  });
+  for (const operation of ["update", "clear"]) it(`${operation} holds one scoped lock from CAS through mutation across processes`, async (t) => {
+    const { opts, board } = fixture(t), query = { threadId: "thread-a" };
+    board.updatePlan({ ...query, steps: [{ text: "A" }] });
+    const revision = board.getBoardSnapshot(query).planRevision;
+    const { done } = await lockedWriter(t, opts, query, operation);
+    assert.throws(() => board.updatePlan({ ...query, expectedRevision: revision, steps: [{ text: "racing writer" }] }), { code: "PLAN_CONFLICT" });
+    const child = await done; assert.equal(child.code, 0, child.stderr);
+    assert.equal(board.getBoardSnapshot(query).steps[0]?.text || "", operation === "update" ? "first writer" : "");
+  });
+
+  it("Issue #8 tail [4] same-scope MCP writes without expectedRevision wait and both succeed", async (t) => {
+    const { opts, board } = fixture(t), query = { threadId: "thread-a" };
+    board.updatePlan({ ...query, steps: [{ text: "initial" }] });
+    const { done } = await lockedWriter(t, opts, query);
+    assert.doesNotThrow(() => board.updatePlan({ ...query, steps: [{ text: "queued second writer" }] }));
+    const child = await done; assert.equal(child.code, 0, child.stderr);
+    assert.equal(board.getBoardSnapshot(query).steps[0].text, "queued second writer");
+  });
+
+  for (const dimension of ["thread", "project"]) it(`Issue #8 tail [4] unrelated ${dimension} scope never waits on another writer`, async (t) => {
+    const { home, opts, board } = fixture(t), query = { threadId: "thread-a", projectRoot: home };
+    board.updatePlan({ ...query, steps: [{ text: "initial" }] });
+    const { done } = await lockedWriter(t, opts, query);
+    const other = dimension === "thread" ? { ...query, threadId: "thread-b" } : { ...query, projectRoot: path.join(home, "other") };
+    const started = performance.now();
+    assert.doesNotThrow(() => board.updatePlan({ ...other, steps: [{ text: "unrelated writer" }] }));
+    assert.ok(performance.now() - started < 600, "an unrelated scope must finish while the first process still owns its lock");
+    assert.equal(board.getBoardSnapshot(other).steps[0].text, "unrelated writer");
+    const child = await done; assert.equal(child.code, 0, child.stderr);
+  });
+
+  for (const operation of ["update", "clear"]) for (const injected of [false, true]) it(`Issue #8 final [3] ${operation} bounds SQLite wait during 60s wall-clock rollback (${injected ? "injected" : "default"} monotonic clock)`, (t) => {
+    const { opts } = fixture(t), module = { exports: {} }, budgets = [];
+    const modulePath = require.resolve("../src/hub-task-board.cjs"), localRequire = require("node:module").createRequire(modulePath);
+    let wall = Date.now(), elapsed = 0, timeout = 0, attempts = 0, closed = false;
+    class LockDatabase {
+      exec(sql) {
+        const match = sql.match(/^PRAGMA busy_timeout=(\d+)/);
+        if (match) { timeout = Number(match[1]); budgets.push(timeout); }
+        if (sql === "BEGIN IMMEDIATE") {
+          if (++attempts > 3) throw new Error("unbounded retry guard");
+          const waited = attempts === 1 ? 1000 : timeout;
+          elapsed += waited; wall += waited;
+          if (attempts === 1) wall -= 60_000;
+          const error = new Error("database is locked"); error.errcode = 5; throw error;
+        }
+      }
+      close() { closed = true; }
+    }
+    class Clock extends Date { static now() { return wall; } }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8"), {
+      module, exports: module.exports, process, Buffer, Date: Clock,
+      Atomics: { wait(_array, _index, _value, delay) { elapsed += delay; wall += delay; } },
+      require: name => name === "node:sqlite" ? { DatabaseSync: LockDatabase } : name === "node:perf_hooks" ? { performance: { now: () => elapsed } } : localRequire(name),
+    });
+    const board = module.exports.createTaskBoard({ ...opts, ...(injected ? { monotonicNow: () => elapsed } : {}) });
+    let failure;
+    try { operation === "update" ? board.updatePlan({ threadId: "thread-a", steps: [{ text: "must not save" }] }) : board.clearPlan({ threadId: "thread-a" }); }
+    catch (error) { failure = error; }
+    assert.ok(budgets.length >= 2, "exercise contention and a retry after the clock rollback");
+    assert.ok(budgets.every(ms => ms >= 1 && ms <= 5000), `every SQLite budget must be bounded: ${budgets}`);
+    assert.ok(elapsed <= 5000, `the complete retry budget must stay within 5s, got ${elapsed}ms`);
+    assert.equal(failure?.code, "PLAN_LOCK_BUSY"); assert.equal(closed, true);
+    assert.equal(fs.readdirSync(opts.hubPlansDir).filter(name => name.endsWith(".json")).length, 0);
+  });
+
+  for (const maxWaitMs of [5000, 25]) for (const mode of ["fractional-entry", "fractional-retry", "rollback", "stalled"]) it(`Issue #8 recheck3 [3] ${mode} keeps every lock wait inside the ${maxWaitMs}ms budget`, (t) => {
+    const { opts } = fixture(t), module = { exports: {} }, budgets = [], delays = [];
+    const modulePath = require.resolve("../src/hub-task-board.cjs"), localRequire = require("node:module").createRequire(modulePath);
+    let elapsed = 0, reads = 0, attempts = 0, timeout = 0, closed = false;
+    const monotonicNow = () => {
+      reads++;
+      if (reads === 2 && mode === "fractional-entry") elapsed += 0.75;
+      if (mode === "rollback") return -reads * 1000;
+      return mode === "stalled" ? 0 : elapsed;
+    };
+    class LockDatabase {
+      exec(sql) {
+        const match = sql.match(/^PRAGMA busy_timeout=(\d+)$/);
+        if (match) {
+          timeout = Number(match[1]); budgets.push(timeout);
+          assert.ok(timeout >= 1 && timeout <= maxWaitMs, `bounded integer SQLite timeout: ${timeout}`);
+          if (mode.startsWith("fractional")) assert.ok(elapsed + timeout <= maxWaitMs, `spent ${elapsed}ms + configured ${timeout}ms exceeds ${maxWaitMs}ms`);
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          if (++attempts > 1 && !mode.startsWith("fractional")) return; // A broken clock cannot expand per-attempt budgets.
+          elapsed += mode === "fractional-retry" ? maxWaitMs - 0.5 : timeout;
+          const error = new Error("database is locked"); error.errcode = 5; throw error;
+        }
+      }
+      close() { closed = true; }
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.testWithPlansLock = withPlansLock;", {
+      module, exports: module.exports, process, Buffer,
+      Atomics: { wait(_array, _index, _value, delay) {
+        delays.push(delay);
+        if (mode.startsWith("fractional")) {
+          assert.ok(Number.isInteger(delay) && delay >= 1, "never spend a fractional remainder on retry backoff");
+          assert.ok(elapsed + delay <= maxWaitMs, "retry delay must fit the remaining total budget");
+        }
+        elapsed += delay;
+      } },
+      require: name => name === "node:sqlite" ? { DatabaseSync: LockDatabase } : localRequire(name),
+    });
+    const work = () => module.exports.testWithPlansLock(opts.hubPlansDir, { threadId: "thread-a" }, () => "acquired", { timeoutMs: maxWaitMs, monotonicNow });
+    if (mode.startsWith("fractional")) {
+      assert.throws(work, { code: "PLAN_LOCK_BUSY" });
+      assert.ok(elapsed <= maxWaitMs, `total consumed ${elapsed}ms exceeds ${maxWaitMs}ms`);
+      assert.equal(delays.length, 0, "sub-millisecond remaining budget must stop before retry");
+    } else assert.equal(work(), "acquired");
+    assert.ok(budgets.length); assert.equal(closed, true);
+  });
+
+  for (const exhausted of [false, true]) it(`Issue #8 tail [4] SQLite busy ${exhausted ? "exhaustion reports PLAN_LOCK_BUSY" : "retries preserve unversioned writes"}`, (t) => {
+    const { opts } = fixture(t), module = { exports: {} }, calls = [];
+    const modulePath = require.resolve("../src/hub-task-board.cjs"), localRequire = require("node:module").createRequire(modulePath);
+    let attempts = 0, closed = false, elapsed = 0;
+    class LockDatabase {
+      exec(sql) {
+        calls.push(sql);
+        if (/BEGIN IMMEDIATE/.test(sql) && (++attempts <= 2 || exhausted)) { elapsed += exhausted ? 5000 : 1; const error = new Error("database is locked"); error.errcode = 5; throw error; }
+      }
+      close() { closed = true; }
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8"), { module, exports: module.exports, process, Buffer, require: name => name === "node:sqlite" ? { DatabaseSync: LockDatabase } : localRequire(name) });
+    const board = module.exports.createTaskBoard({ ...opts, monotonicNow: () => elapsed }), write = () => board.updatePlan({ threadId: "thread-a", steps: [{ text: "retried" }] });
+    if (exhausted) assert.throws(write, { code: "PLAN_LOCK_BUSY" });
+    else { assert.doesNotThrow(write); assert.equal(attempts, 3); }
+    assert.ok(calls.some(sql => /PRAGMA\s+busy_timeout\s*=\s*5000/i.test(sql)), "the connection must configure SQLite's bounded wait");
+    assert.equal(closed, true);
+  });
+});
+
 describe("hub-task-board: dual-scope thread+project isolation regressions", () => {
   it("[P1] same non-__NEW__ threadId across two projectRoots preserves both files with isolated read and clear", (t) => {
     const dir = makeTmp("dual-scope");
@@ -1060,7 +1342,7 @@ describe("hub-task-board: dual-scope thread+project isolation regressions", () =
     const tid = "dup-t";
     board.updatePlan({ threadId: tid, projectRoot: projA, steps: [{ text: "A step", status: "pending" }] });
     board.updatePlan({ threadId: tid, projectRoot: projB, steps: [{ text: "B step", status: "pending" }] });
-    assert.equal(fs.readdirSync(hubPlansDir).length, 2, "each (threadId, projectRoot) must have its own disk file");
+    assert.equal(fs.readdirSync(hubPlansDir).filter(name => name.endsWith(".json")).length, 2, "each (threadId, projectRoot) must have its own disk file");
     // Isolated read
     const snapA = board.getBoardSnapshot({ threadId: tid, projectRoot: projA });
     assert.equal(snapA.steps.length, 1);
@@ -1115,5 +1397,631 @@ describe("hub-task-board: dual-scope thread+project isolation regressions", () =
     assert.equal(ownerClear.deleted, 0, "a scoped clear must not delete an unscoped legacy plan");
     const unscopedClear = board.clearPlan({ threadId: "t-foreign" });
     assert.equal(unscopedClear.deleted, 1, "only an unscoped clear removes the legacy plan");
+  });
+
+  it("Issue #8 recheck4 [2]: symlinked trusted-root ancestor (.gemini) is rejected in both listing and preview", async (t) => {
+    const dir = makeTmp("symlink-gemini-parent");
+    const outside = makeTmp("outside-home-brain");
+    t.after(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    });
+    const projectA = path.join(dir, "proj-a");
+    fs.mkdirSync(projectA, { recursive: true });
+    const dbPath = buildT3Db(dir, (db) => {
+      db.prepare("INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (?,?,?,?,?,?)")
+        .run("proj-1", "A", projectA, "{}", "2026-11-16T00:00:00Z", "2026-11-16T00:00:00Z");
+      insertThread(db, { threadId: "thread-a", title: "A", updatedAt: "2026-11-16T01:00:00Z" });
+    });
+    const actualSession = path.join(outside, "antigravity", "brain", "thread-a");
+    fs.mkdirSync(actualSession, { recursive: true });
+    fs.writeFileSync(path.join(actualSession, "task.md"), "# ONLY_ISOLATED_OUTSIDE\n- [ ] fixture\n", "utf8");
+    fs.symlinkSync(outside, path.join(dir, ".gemini"), "dir");
+    const brain = path.join(dir, ".gemini", "antigravity", "brain");
+    const board = createTaskBoard({ homeDir: dir, t3DbPath: dbPath, agyBrainDirs: [brain], hubPlansDir: path.join(dir, "hub-plans") });
+    const query = { threadId: "thread-a", projectRoot: projectA, strictThreadMatch: true };
+    const snapshot = board.getBoardSnapshot(query);
+    assert.deepEqual(snapshot.artifacts, [], "symlinked .gemini parent must not be listed");
+    assert.doesNotMatch(JSON.stringify(snapshot), /ONLY_ISOLATED_OUTSIDE/);
+    const { createArtifactAccess } = require("../src/hub-artifact-access.cjs");
+    const candidatePath = path.join(brain, "thread-a", "task.md");
+    const mockBoard = {
+      verifyArtifactScope: () => ({ ok: true }),
+      getBoardSnapshot: () => ({ artifacts: [{ name: "task.md", path: candidatePath }] }),
+    };
+    const access = createArtifactAccess({ homeDir: dir, board: mockBoard, open: async () => assert.fail("must never launch Finder") });
+    await assert.rejects(() => access({ ...query, path: candidatePath, operation: "preview" }), /安全确认|无法打开|已变化/);
+  });
+
+  it("Issue #8 recheck4 [5]: withPlansLock never exceeds timeoutMs even when monotonicNow stalls or rolls back", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-clock-budget");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    for (const mode of ["stalled", "rollback"]) {
+      let clockReads = 0, simulatedElapsedMs = 0;
+      const delays = [];
+      const fakeModule = { exports: {} };
+      class LockDatabase {
+        exec(sql) {
+          if (sql === "BEGIN IMMEDIATE") {
+            const error = new Error("database is locked");
+            error.errcode = 5;
+            throw error;
+          }
+        }
+        close() {}
+      }
+      const sandbox = {
+        module: fakeModule, exports: fakeModule.exports, process, Buffer,
+        Atomics: {
+          wait(_array, _index, _value, delay) {
+            delays.push(delay);
+            simulatedElapsedMs += delay;
+            assert.ok(simulatedElapsedMs <= 25, `${mode}: total backoff ${simulatedElapsedMs}ms must not exceed 25ms`);
+          },
+        },
+        require: (name) => name === "node:sqlite" ? { DatabaseSync: LockDatabase } : localRequire(name),
+      };
+      vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+      assert.throws(() => {
+        fakeModule.exports.reviewLock(path.join(dir, "lock-" + mode), { threadId: "fixture" }, () => {}, {
+          timeoutMs: 25,
+          monotonicNow: () => mode === "stalled" ? 0 : -(++clockReads) * 1000,
+        });
+      }, /PLAN_LOCK_BUSY/);
+      assert.ok(simulatedElapsedMs <= 25 && simulatedElapsedMs > 0);
+    }
+  });
+
+  it("Issue #8 recheck5 [3]: withPlansLock charges real SQLite BEGIN IMMEDIATE busy_timeout elapsed time even when monotonicNow stalls", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-sqlite-busy-elapsed");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    let perfMs = 1000, beginCount = 0;
+    const waitDelays = [];
+    const fakeModule = { exports: {} };
+    class BusyWaitDatabase {
+      exec(sql) {
+        if (sql === "BEGIN IMMEDIATE") {
+          beginCount++;
+          perfMs += 18;
+          const error = new Error("database is locked");
+          error.errcode = 5;
+          throw error;
+        }
+      }
+      close() {}
+    }
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      Atomics: {
+        wait(_array, _index, _value, delay) {
+          waitDelays.push(delay);
+          perfMs += delay;
+        },
+      },
+      require: (name) => {
+        if (name === "node:sqlite") return { DatabaseSync: BusyWaitDatabase };
+        if (name === "node:perf_hooks") return { performance: { now: () => perfMs } };
+        return localRequire(name);
+      },
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(path.join(dir, "busy.sqlite"), { threadId: "fixture" }, () => {}, {
+        timeoutMs: 25,
+        monotonicNow: () => 0,
+      });
+    }, /PLAN_LOCK_BUSY/);
+    assert.equal(beginCount, 1, "18ms BEGIN IMMEDIATE + 7ms clamped backoff exhausts 25ms budget without overshooting into a second attempt");
+    assert.deepEqual(waitDelays, [7], "Atomics.wait backoff is clamped to remaining 7ms after 18ms SQLite wait");
+  });
+
+  it("Issue #8 recheck6 [2]: withPlansLock charges PRAGMA busy_timeout pause against budget even when monotonicNow stalls", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-pragma-pause");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    let perfMs = 1000, beginCount = 0;
+    const pragmas = [], waits = [];
+    const fakeModule = { exports: {} };
+    class PragmaPauseDatabase {
+      exec(sql) {
+        const m = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (m) {
+          pragmas.push(Number(m[1]));
+          perfMs += 30;
+          return;
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          beginCount++;
+          const error = new Error("database is locked");
+          error.errcode = 5;
+          throw error;
+        }
+      }
+      close() {}
+    }
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      Atomics: {
+        wait(_array, _index, _value, delay) {
+          waits.push(delay);
+          perfMs += delay;
+        },
+      },
+      require: (name) => {
+        if (name === "node:sqlite") return { DatabaseSync: PragmaPauseDatabase };
+        if (name === "node:perf_hooks") return { performance: { now: () => perfMs } };
+        return localRequire(name);
+      },
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(path.join(dir, "pragma.sqlite"), { threadId: "fixture" }, () => {}, {
+        timeoutMs: 25,
+        monotonicNow: () => 0,
+      });
+    }, /PLAN_LOCK_BUSY/);
+    assert.deepEqual(pragmas, [25], "exhausted 25ms budget during first 30ms PRAGMA must stop without configuring a second PRAGMA");
+    assert.equal(beginCount, 0, "must abort immediately once PRAGMA pause exhausts budget");
+    assert.deepEqual(waits, [], "must not enter Atomics.wait after budget is exhausted");
+    assert.equal(perfMs - 1000, 30);
+  });
+
+  it("Issue #8 recheck6 [4]: withPlansLock configures exact PRAGMA busy_timeout=5000 on initial entry under real performance.now()", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-exact-5000");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const firstPragmas = [];
+    const fakeModule = { exports: {} };
+    class ProbeDatabase {
+      exec(sql) {
+        const m = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (m) firstPragmas.push(Number(m[1]));
+      }
+      close() {}
+    }
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      require: (name) => name === "node:sqlite" ? { DatabaseSync: ProbeDatabase } : localRequire(name),
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+    for (let i = 0; i < 10; i++) {
+      assert.equal(fakeModule.exports.reviewLock(path.join(dir, "probe.sqlite"), { threadId: `t-${i}` }, () => "ok"), "ok");
+    }
+    assert.deepEqual(firstPragmas, Array(10).fill(5000), "all 10 default calls must configure exact PRAGMA busy_timeout=5000");
+  });
+
+  it("Issue #8 recheck7 [1]: withPlansLock tightens busy_timeout after partial PRAGMA pause under real SQLite contention", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-pragma-partial-real");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const scope = { threadId: "real-lock-scope" };
+    const hash = require("node:crypto").createHash("sha256").update(planFileKey(scope)).digest("hex");
+    const lockFile = path.join(dir, `.plan-write-lock.${hash}.sqlite`);
+    const holder = new DatabaseSync(lockFile);
+    holder.exec("BEGIN IMMEDIATE");
+    t.after(() => { try { holder.exec("ROLLBACK"); } catch {} try { holder.close(); } catch {} });
+
+    const pragmas = [];
+    let pausedOnce = false, actualPauseMs = 0, beginCount = 0;
+    class WrappedDatabase extends DatabaseSync {
+      exec(sql) {
+        const m = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (m) {
+          pragmas.push(Number(m[1]));
+          if (!pausedOnce) {
+            pausedOnce = true;
+            const p0 = performance.now();
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+            actualPauseMs = performance.now() - p0;
+          }
+        } else if (sql === "BEGIN IMMEDIATE") {
+          beginCount++;
+        }
+        return super.exec(sql);
+      }
+    }
+    const fakeModule = { exports: {} };
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer, Atomics,
+      require: (name) => name === "node:sqlite" ? { DatabaseSync: WrappedDatabase } : localRequire(name),
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+
+    let mono = 0;
+    const t0 = performance.now();
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(dir, scope, () => {}, {
+        timeoutMs: 200,
+        monotonicNow: () => (mono += 0.1),
+      });
+    }, /PLAN_LOCK_BUSY/);
+    const totalMs = performance.now() - t0;
+    assert.ok(pragmas[0] === 199 || pragmas[0] === 200, `expected initial 199..200ms PRAGMA, saw ${pragmas[0]}`);
+    if (actualPauseMs < 198) {
+      assert.ok(pragmas.length >= 2, `expected PRAGMA tightening after ${actualPauseMs.toFixed(1)}ms pause, saw ${JSON.stringify(pragmas)}`);
+      assert.ok(pragmas[pragmas.length - 1] <= Math.ceil(200 - actualPauseMs) && pragmas[pragmas.length - 1] <= 125, `expected tightened busy_timeout <= ${Math.ceil(200 - actualPauseMs)}ms, saw ${JSON.stringify(pragmas)}`);
+      assert.equal(beginCount, 1, "must execute BEGIN IMMEDIATE at most once after tightened PRAGMA consumes remaining budget");
+    } else {
+      assert.equal(beginCount, 0, "must skip BEGIN IMMEDIATE if OS timer slack during PRAGMA already exhausted 200ms budget");
+    }
+    assert.ok(totalMs < 600, `expected bounded single-pass contention wait (< 600ms including macOS QoS usleep slack), took ${totalMs}ms`);
+  });
+
+  it("Issue #8 recheck7 [2]: withPlansLock does not double-count fractional monotonicNow ticks on top of performance.now()", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-no-double-count");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    let perfMs = 1000, mono = 0;
+    const waits = [];
+    class BusyDatabase {
+      exec(sql) {
+        if (sql === "BEGIN IMMEDIATE") {
+          const error = new Error("database is locked");
+          error.errcode = 5;
+          throw error;
+        }
+      }
+      close() {}
+    }
+    const fakeModule = { exports: {} };
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      Atomics: {
+        wait(_array, _index, _value, delay) {
+          waits.push(delay);
+          perfMs += delay;
+        },
+      },
+      require: (name) => {
+        if (name === "node:sqlite") return { DatabaseSync: BusyDatabase };
+        if (name === "node:perf_hooks") return { performance: { now: () => perfMs } };
+        return localRequire(name);
+      },
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(dir, { threadId: "frac" }, () => {}, {
+        timeoutMs: 100,
+        monotonicNow: () => (mono += 0.9),
+      });
+    }, /PLAN_LOCK_BUSY/);
+    const waitedTotal = waits.reduce((a, b) => a + b, 0);
+    assert.equal(waitedTotal, 100, `expected full 100ms budget wait without premature double-counted timeout, waited ${waitedTotal}ms (${JSON.stringify(waits)})`);
+  });
+
+  it("Issue #8 recheck8 [3]: withPlansLock keeps tightening PRAGMA busy_timeout beyond 3 pauses so BEGIN IMMEDIATE never runs with a stale large timeout", (t) => {
+    const vm = require("node:vm");
+    const { createRequire } = require("node:module");
+    const modulePath = path.resolve(__dirname, "../src/hub-task-board.cjs");
+    const localRequire = createRequire(modulePath);
+    const dir = makeTmp("lock-pragma-multi-pause");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    let clockMs = 0, pragmaCalls = 0, activeBusyTimeout = 0, beginImmediateBusyTimeout = null, beginImmediateAtMs = null;
+    class MultiPauseDb {
+      exec(sql) {
+        const m = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (m) {
+          activeBusyTimeout = Number(m[1]);
+          pragmaCalls++;
+          if (pragmaCalls <= 3) clockMs += 200;
+          return;
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          beginImmediateBusyTimeout = activeBusyTimeout;
+          beginImmediateAtMs = clockMs;
+          const err = new Error("database is locked");
+          err.errcode = 5;
+          clockMs += activeBusyTimeout;
+          throw err;
+        }
+      }
+      close() {}
+    }
+    const fakeModule = { exports: {} };
+    const sandbox = {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      Atomics: { wait(_a, _i, _v, ms) { clockMs += ms; } },
+      require: (name) => {
+        if (name === "node:sqlite") return { DatabaseSync: MultiPauseDb };
+        if (name === "node:perf_hooks") return { performance: { now: () => clockMs } };
+        return localRequire(name);
+      },
+    };
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", sandbox, { filename: modulePath });
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(dir, { threadId: "multi-pause" }, () => {}, {
+        timeoutMs: 700,
+        monotonicNow: () => clockMs,
+      });
+    }, /PLAN_LOCK_BUSY/);
+    assert.ok(pragmaCalls >= 4, `expected >= 4 PRAGMA tightening iterations after 3x200ms pauses, saw ${pragmaCalls}`);
+    assert.ok(beginImmediateBusyTimeout <= 700 - beginImmediateAtMs, `BEGIN IMMEDIATE ran with stale busy_timeout=${beginImmediateBusyTimeout} > remaining=${700 - beginImmediateAtMs}`);
+    assert.ok(clockMs <= 705, `total elapsed ${clockMs}ms exceeded 700ms budget`);
+  });
+
+  for (const pause of [18, 30]) it(`Issue #8 final [2] frozen clocks charge ${pause}ms PRAGMA pause to the total budget`, (t) => {
+    const dir = makeTmp("lock-frozen-pragma");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const modulePath = require.resolve("../src/hub-task-board.cjs");
+    const localRequire = require("node:module").createRequire(modulePath);
+    let elapsed = 0, timeout = 0, begins = 0;
+    const pragmas = [], waits = [], fakeModule = { exports: {} };
+    const fakeProcess = Object.create(process);
+    fakeProcess.hrtime = { bigint: () => BigInt(elapsed) * 1000000n };
+    class FrozenClockDb {
+      exec(sql) {
+        const match = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (match) {
+          timeout = Number(match[1]); pragmas.push(timeout);
+          if (pragmas.length === 1) elapsed += pause;
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          begins++;
+          assert.ok(elapsed + timeout <= 25, "SQLite timeout must fit after PRAGMA returns");
+          elapsed += timeout;
+          const error = new Error("database is locked"); error.errcode = 5; throw error;
+        }
+      }
+      close() {}
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule, exports: fakeModule.exports, process: fakeProcess, Buffer,
+      Atomics: { wait(_a, _i, _v, delay) { waits.push(delay); elapsed += delay; } },
+      require: name => name === "node:sqlite" ? { DatabaseSync: FrozenClockDb } : name === "node:perf_hooks" ? { performance: { now: () => 0 } } : localRequire(name),
+    });
+    assert.throws(() => fakeModule.exports.reviewLock(dir, { threadId: "frozen" }, () => assert.fail("held lock"), {
+      timeoutMs: 25, monotonicNow: () => 0,
+    }), /PLAN_LOCK_BUSY/);
+    assert.deepEqual(pragmas, pause < 25 ? [25, 7] : [25]);
+    assert.equal(begins, pause < 25 ? 1 : 0);
+    assert.equal(elapsed, Math.max(25, pause));
+    assert.deepEqual(waits, [], "no extra backoff after the budget is exhausted");
+  });
+
+  it("Issue #8 final [2] frozen clocks under real SQLite lock contention still honor 25ms budget via hrtime", (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3-stalled-clock-real-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const { DatabaseSync } = require("node:sqlite");
+    const modulePath = path.join(__dirname, "../src/hub-task-board.cjs");
+    const vm = require("node:vm"), localRequire = require("node:module").createRequire(modulePath);
+    const fakeModule = { exports: {} }, pragmas = [], waits = [];
+    let begins = 0;
+    class TrackedDatabase extends DatabaseSync {
+      exec(sql) {
+        const m = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (m) pragmas.push(Number(m[1]));
+        if (sql === "BEGIN IMMEDIATE") begins++;
+        return super.exec(sql);
+      }
+    }
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer, Atomics,
+      require: name => name === "node:perf_hooks" ? { performance: { now: () => 0 } }
+        : name === "node:sqlite" ? { DatabaseSync: TrackedDatabase } : localRequire(name),
+    }, { filename: modulePath });
+    const scope = { threadId: "stalled" };
+    const hash = require("node:crypto").createHash("sha256").update(planFileKey(scope)).digest("hex");
+    const holder = new DatabaseSync(path.join(dir, `.plan-write-lock.${hash}.sqlite`));
+    t.after(() => { try { holder.exec("ROLLBACK"); } catch {} try { holder.close(); } catch {} });
+    holder.exec("BEGIN IMMEDIATE");
+    const wallStart = Number(process.hrtime.bigint()) / 1e6;
+    assert.throws(() => {
+      fakeModule.exports.reviewLock(dir, scope, () => assert.fail("must not acquire held lock"), {
+        timeoutMs: 25,
+        monotonicNow: () => 1000, // completely stalled clock!
+      });
+    }, /PLAN_LOCK_BUSY/);
+    const wallElapsed = Number(process.hrtime.bigint()) / 1e6 - wallStart;
+    assert.equal(pragmas[0], 25, "stalled clocks must start at exact 25ms PRAGMA");
+    assert.ok(pragmas.every((v, i) => i === 0 || v < pragmas[i - 1] && v >= 1), `PRAGMA tightening must strictly decrease, saw ${JSON.stringify(pragmas)}`);
+    assert.equal(begins, 1, "stalled clocks must terminate after a single SQLite BEGIN IMMEDIATE pass");
+    assert.ok(wallElapsed < 250, `stalled monotonicNow must terminate on first SQLite pass (< 250ms including macOS QoS usleep slack), took ${wallElapsed.toFixed(1)}ms`);
+  });
+
+  for (const mode of ["real-backoff", "real-sqlite", "mock-wait-pragma", "mock-wait-begin"]) it(`Issue #8 closure [2] frozen performance and slow +0.1ms clock bound physical waits (${mode})`, (t) => {
+    const dir = makeTmp("lock-slow-clock");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const modulePath = require.resolve("../src/hub-task-board.cjs");
+    const localRequire = require("node:module").createRequire(modulePath);
+    const fakeModule = { exports: {} }, scope = { threadId: "slow-clock" };
+    const mockWait = mode.startsWith("mock-wait");
+    let mono = 0, paused = false, begins = 0, lockStarted, pauseElapsed = 0;
+    const waits = [], pragmas = [];
+    const sleep = ms => {
+      const started = process.hrtime.bigint();
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      pauseElapsed += Number(process.hrtime.bigint() - started) / 1e6;
+    };
+    class BusyDatabase {
+      exec(sql) {
+        lockStarted ??= process.hrtime.bigint();
+        const match = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (match) {
+          pragmas.push(Number(match[1]));
+          if (mode === "mock-wait-pragma" && !paused) { paused = true; sleep(18); }
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          begins++;
+          if (mode === "mock-wait-begin" && !paused) { paused = true; sleep(30); }
+          if (begins > 10) throw new Error("unbounded real wait guard");
+          const error = new Error("database is locked"); error.errcode = 5; throw error;
+        }
+      }
+      close() {}
+    }
+    class TimedDatabase extends DatabaseSync {
+      exec(sql) {
+        lockStarted ??= process.hrtime.bigint();
+        const match = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (match) pragmas.push(Number(match[1]));
+        if (sql === "BEGIN IMMEDIATE") begins++;
+        return super.exec(sql);
+      }
+    }
+    if (mode === "real-sqlite") {
+      const hash = require("node:crypto").createHash("sha256").update(planFileKey(scope)).digest("hex");
+      const holder = new DatabaseSync(path.join(dir, `.plan-write-lock.${hash}.sqlite`));
+      holder.exec("BEGIN IMMEDIATE");
+      t.after(() => { holder.exec("ROLLBACK"); holder.close(); });
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule, exports: fakeModule.exports, process, Buffer,
+      Atomics: mockWait ? { wait(_a, _i, _v, ms) { waits.push(ms); } } : Atomics,
+      require: name => name === "node:perf_hooks" ? { performance: { now: () => 0 } }
+        : name === "node:sqlite" ? { DatabaseSync: mode === "real-sqlite" ? TimedDatabase : BusyDatabase } : localRequire(name),
+    });
+    assert.throws(() => fakeModule.exports.reviewLock(dir, scope, () => assert.fail("held lock"), {
+      timeoutMs: 25, monotonicNow: () => (mono += 0.1),
+    }), /PLAN_LOCK_BUSY/);
+    const elapsed = Number(process.hrtime.bigint() - lockStarted) / 1e6;
+    if (mode === "real-sqlite") {
+      assert.ok(pragmas[0] === 24 || pragmas[0] === 25, `expected 24..25ms initial PRAGMA after +0.1ms tick, saw ${JSON.stringify(pragmas)}`);
+      assert.ok(pragmas.every((v, i) => i === 0 || v < pragmas[i - 1] && v >= 1), `PRAGMA tightening must strictly decrease, saw ${JSON.stringify(pragmas)}`);
+      assert.equal(begins, 1, "real-sqlite must not repeat BEGIN IMMEDIATE after 25ms physical wait");
+      assert.ok(elapsed < 250, `single SQLite 25ms pass exceeded macOS QoS allowance: ${elapsed.toFixed(1)}ms`);
+    } else if (mode === "real-backoff") {
+      assert.ok(begins >= 1 && begins <= 3, `real-backoff must stop within <= 3 attempts, saw ${begins}`);
+      assert.ok(elapsed < 180, `physical backoff exceeded 25ms budget plus macOS QoS allowance: ${elapsed.toFixed(1)}ms`);
+    }
+    // An injected exec cannot be interrupted if the OS oversleeps its 18/30ms
+    // pause; it must abort on return or charge that pause before any retry.
+    if (mode === "mock-wait-pragma") {
+      if (pragmas.length > 1) assert.ok(pragmas[1] <= 7, `18ms PRAGMA pause must tighten next timeout, got ${pragmas}`);
+      else { assert.ok(pauseElapsed >= 24); assert.equal(begins, 0); }
+      assert.ok(waits.reduce((sum, ms) => sum + ms, 0) <= Math.max(0, 25 - pauseElapsed), "mock retries must fit after the entire physical pause");
+    }
+    if (mode === "mock-wait-begin") { assert.equal(begins, 1); assert.deepEqual(waits, [], "no retry after 30ms real BEGIN pause"); }
+  });
+
+  for (const mockedWait of [false, true]) for (const phase of ["pragma", "begin"]) it(`Issue #8 closure [2] physical clock is an exact 25ms ceiling (${phase}, mocked wait=${mockedWait})`, (t) => {
+    const dir = makeTmp("lock-physical-ceiling");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const modulePath = require.resolve("../src/hub-task-board.cjs"), localRequire = require("node:module").createRequire(modulePath);
+    const fakeModule = { exports: {} }, fakeProcess = Object.create(process), waits = [];
+    let elapsed = 0, mono = 0, timeout = 0, pragmas = 0, begins = 0;
+    fakeProcess.hrtime = { bigint: () => BigInt(elapsed) * 1000000n };
+    class PhysicalDatabase {
+      exec(sql) {
+        const match = /^PRAGMA busy_timeout=(\d+)$/.exec(sql);
+        if (match) {
+          timeout = Number(match[1]); pragmas++;
+          if (phase === "pragma" && pragmas === 1) elapsed += 18;
+        }
+        if (sql === "BEGIN IMMEDIATE") {
+          begins++;
+          assert.ok(elapsed + timeout <= 25, `physical ${elapsed}ms + SQLite ${timeout}ms must fit 25ms`);
+          elapsed += timeout;
+          const error = new Error("database is locked"); error.errcode = 5; throw error;
+        }
+      }
+      close() {}
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule, exports: fakeModule.exports, process: fakeProcess, Buffer,
+      Atomics: mockedWait ? { wait(_a, _i, _v, delay) { waits.push(delay); elapsed += delay; } } : Atomics,
+      require: name => name === "node:perf_hooks" ? { performance: { now: () => 0 } }
+        : name === "node:sqlite" ? { DatabaseSync: PhysicalDatabase } : localRequire(name),
+    });
+    assert.throws(() => fakeModule.exports.reviewLock(dir, { threadId: "ceiling" }, () => assert.fail("held lock"), {
+      timeoutMs: 25, monotonicNow: () => (mono += 0.1),
+    }), /PLAN_LOCK_BUSY/);
+    assert.equal(begins, 1); assert.ok(elapsed <= 25);
+    assert.deepEqual(waits, mockedWait && phase === "begin" ? [1] : [], "backoff can only spend the unconsumed whole-millisecond remainder");
+  });
+
+  it("Issue #8 closure [2] virtual 100ms clock ignores sub-5ms CPU jitter during PRAGMA", (t) => {
+    const dir = makeTmp("lock-virtual-cpu-jitter");
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const modulePath = require.resolve("../src/hub-task-board.cjs"), localRequire = require("node:module").createRequire(modulePath);
+    const fakeModule = { exports: {} }, fakeProcess = Object.create(process), waits = [];
+    let perfMs = 0, hrMs = 0, mono = 0;
+    fakeProcess.hrtime = { bigint: () => BigInt(Math.round(hrMs * 1e6)) };
+    class VirtualDatabase {
+      exec(sql) {
+        if (sql.startsWith("PRAGMA")) hrMs += 1.1;
+        if (sql === "BEGIN IMMEDIATE") { const error = new Error("database is locked"); error.errcode = 5; throw error; }
+      }
+      close() {}
+    }
+    require("node:vm").runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule, exports: fakeModule.exports, process: fakeProcess, Buffer,
+      Atomics: { wait(_a, _i, _v, delay) { waits.push(delay); perfMs += delay; } },
+      require: name => name === "node:perf_hooks" ? { performance: { now: () => perfMs } }
+        : name === "node:sqlite" ? { DatabaseSync: VirtualDatabase } : localRequire(name),
+    });
+    assert.throws(() => fakeModule.exports.reviewLock(dir, { threadId: "jitter" }, () => {}, {
+      timeoutMs: 100, monotonicNow: () => (mono += 0.9),
+    }), /PLAN_LOCK_BUSY/);
+    assert.deepEqual(waits, [10, 20, 40, 30], "CPU jitter must not charge virtual waiting twice");
+  });
+
+  it("Issue #8 final [3] paused clock that later catches up does not double-count wait and acquires lock released at 18ms within 25ms budget", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3-paused-resume-clock-"));
+    const modulePath = path.join(__dirname, "../src/hub-task-board.cjs");
+    const vm = require("node:vm"), localRequire = require("node:module").createRequire(modulePath);
+    let clockMs = 0, realMs = 0, hrNs = 0n;
+    class CatchupDb {
+      exec(sql) {
+        const up = String(sql).trim().toUpperCase();
+        if (up.startsWith("PRAGMA BUSY_TIMEOUT")) return;
+        if (up === "BEGIN IMMEDIATE") {
+          if (realMs < 18) {
+            realMs += 10;
+            hrNs = BigInt(realMs) * 1000000n;
+            // First 10ms wait occurs while clockMs is stalled at 0; on second attempt clockMs catches up to realMs!
+            if (realMs >= 18) clockMs = realMs;
+            const err = new Error("database is locked");
+            err.errcode = 5;
+            throw err;
+          }
+        }
+      }
+      close() {}
+    }
+    const fakeModule = { exports: {} };
+    const fakeProcess = Object.create(process);
+    fakeProcess.hrtime = Object.assign(() => [0, 0], { bigint: () => hrNs });
+    vm.runInNewContext(fs.readFileSync(modulePath, "utf8") + "\nmodule.exports.reviewLock = withPlansLock;", {
+      module: fakeModule,
+      exports: fakeModule.exports,
+      process: fakeProcess,
+      Buffer,
+      Atomics: { wait(_a, _i, _v, ms) { realMs += ms; hrNs = BigInt(realMs) * 1000000n; clockMs = realMs; } },
+      require: (name) => {
+        if (name === "node:sqlite") return { DatabaseSync: CatchupDb };
+        if (name === "node:perf_hooks") return { performance: { now: () => clockMs } };
+        return localRequire(name);
+      },
+    }, { filename: modulePath });
+    try {
+      let acquired = false;
+      fakeModule.exports.reviewLock(dir, { threadId: "catchup" }, () => { acquired = true; }, {
+        timeoutMs: 25,
+        monotonicNow: () => clockMs,
+      });
+      assert.equal(acquired, true, "lock released at 18ms must be acquired within 25ms budget without double-counting stalled 10ms wait");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

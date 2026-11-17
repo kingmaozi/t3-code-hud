@@ -10,7 +10,23 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn, spawnSync } = require("node:child_process");
+const { StringDecoder } = require("node:string_decoder");
 const { DatabaseSync } = require("node:sqlite");
+const RAW_FS = Object.freeze({
+  mkdirSync: fs.mkdirSync.bind(fs),
+  openSync: fs.openSync.bind(fs),
+  statSync: fs.statSync.bind(fs),
+  fstatSync: fs.fstatSync.bind(fs),
+  fchmodSync: fs.fchmodSync.bind(fs),
+  lstatSync: fs.lstatSync.bind(fs),
+  readlinkSync: fs.readlinkSync.bind(fs),
+  symlinkSync: typeof fs.symlinkSync === "function" ? fs.symlinkSync.bind(fs) : null,
+  readdirSync: fs.readdirSync.bind(fs),
+  renameSync: fs.renameSync.bind(fs),
+  unlinkSync: fs.unlinkSync.bind(fs),
+  rmdirSync: fs.rmdirSync.bind(fs),
+  closeSync: fs.closeSync.bind(fs),
+});
 
 const MODULES = ["constraints", "architecture", "pitfalls", "topics"];
 const MODULE_FILES = {
@@ -442,7 +458,9 @@ function createMemoryVault(opts = {}) {
   const healthFn = opts._healthFn || opts.healthFn || null;
   const embedHealthUrl = opts.embeddingHealthUrl || embedUrl.replace(/\/v1\/embeddings\/?$/, "/health");
   const vaultAutoConsolidateThreshold = opts.autoConsolidateThreshold != null ? Number(opts.autoConsolidateThreshold) : 60;
-  const dreamPromptTempRoot = opts._dreamPromptTempRoot || os.tmpdir();
+  const dreamPromptTempRoot = opts._dreamPromptTempRoot || (hubDir ? path.join(hubDir, "dream-tmp") : os.tmpdir());
+  const dreamAtomicUnlinkHook = typeof opts._dreamAtomicUnlinkHook === "function" ? opts._dreamAtomicUnlinkHook : null;
+  const dreamAfterDirCreateHook = typeof opts._dreamAfterDirCreateHook === "function" ? opts._dreamAfterDirCreateHook : null;
   let _healthCache = { modelId: null, dim: null, at: 0 };
   let _reindexing = false;
 
@@ -3299,6 +3317,442 @@ function createMemoryVault(opts = {}) {
   function buildDreamPrompt(clusters) {
     return DREAM_PROMPT_HEAD + JSON.stringify(clusters) + DREAM_PROMPT_TAIL;
   }
+  // Safe dream diagnostics: streaming whitelist classification, O(1) memory.
+  // Raw stdout/stderr, URLs, paths, credentials, prompt or memory text never
+  // leave memory: reports carry only { category, httpStatus? }.
+  const DREAM_DIAG_HEAD_BYTES = 4096;
+  const DREAM_DIAG_TAIL_BYTES = 8192;
+  const DREAM_DIAG_MAX_SCAN_BYTES = 4 * 1024 * 1024;
+  const DREAM_DIAG_OVERFLOW_GRACE_MS = 150;
+  const DREAM_DIAG_WINDOW_CHARS = 8192;
+  const DREAM_DIAG_CONTEXT_CHARS = 1024;
+  const DREAM_DIAG_CATEGORIES = new Set(["http", "arguments", "authentication", "model", "dns", "tls", "network", "unknown"]);
+  function dreamDiagSample(text) {
+    const s = String(text ?? "");
+    if (s.length <= DREAM_DIAG_HEAD_BYTES + DREAM_DIAG_TAIL_BYTES) return s;
+    return s.slice(0, DREAM_DIAG_HEAD_BYTES) + "\n" + s.slice(-DREAM_DIAG_TAIL_BYTES);
+  }
+  function sanitizeDreamDiagnostic(raw) {
+    const cat = raw && typeof raw.category === "string" && DREAM_DIAG_CATEGORIES.has(raw.category) ? raw.category : "unknown";
+    const out = { category: cat };
+    if (cat === "http" && raw != null && Number.isInteger(raw.httpStatus) && raw.httpStatus >= 100 && raw.httpStatus <= 599) out.httpStatus = raw.httpStatus;
+    return out;
+  }
+  function isDreamEscapedChar(s, idx) {
+    let bs = 0;
+    while (idx - 1 - bs >= 0 && s[idx - 1 - bs] === "\\") bs++;
+    return (bs % 2) === 1;
+  }
+  function scanDreamUrlTokenEnd(s, start, outerQuote = "", openBracket = "", initialDepth = 0) {
+    const closeBracket = openBracket === "(" ? ")" : openBracket === "[" ? "]" : "";
+    let bracketDepth = initialDepth > 0 ? initialDepth : 0;
+    let end = start;
+    while (end < s.length) {
+      const ch = s[end];
+      if (/\s/.test(ch) || ch === "<" || ch === ">") break;
+      if (outerQuote) {
+        if (ch === outerQuote && !isDreamEscapedChar(s, end)) break;
+      } else if (closeBracket) {
+        if (ch === openBracket) bracketDepth++;
+        else if (ch === closeBracket) {
+          if (bracketDepth === 0) break;
+          bracketDepth--;
+        }
+      }
+      end++;
+    }
+    return { end, depth: bracketDepth };
+  }
+  // Linear O(N) URL / relative-query / standalone-query span collector with no
+  // artificial path or key length truncation, so embedded status codes or error
+  // tokens inside URLs never masquerade as top-level CLI diagnostics.
+  function collectDreamUrlSpansWithState(s, carryPrefixLen = 0, carryInnerDepth = 0) {
+    const spans = [];
+    const len = s.length;
+    if (!len) return { spans, outerQuote: "", pendingRel: null, pendingQuery: null };
+    const isUrlBoundary = (idx) => idx === 0 || /[\s"'`([<]/.test(s[idx - 1]);
+    const isRelPathBoundary = (idx) => isUrlBoundary(idx) || s[idx - 1] === "=";
+    const isQuoteOpenBoundary = (idx) => idx === 0 || /[\s:=[({,;<>]/.test(s[idx - 1]);
+    let outerQuote = "";
+    let quoteEnd = -1;
+    let pendingRel = null;
+    let pendingQuery = null;
+    let nextQ = s.indexOf("?", 0);
+    let unspacedEnd = 0;
+    let bracketChunkStart = -1;
+    let bracketChunkEnd = -1;
+    let bracketMatchClose = null;
+    let bracketUnclosedDepth = null;
+    const ensureUnspacedEnd = (pos) => {
+      if (unspacedEnd <= pos) {
+        unspacedEnd = pos + 1;
+        while (unspacedEnd < len && !/[\s<>]/.test(s[unspacedEnd])) unspacedEnd++;
+      }
+      return unspacedEnd;
+    };
+    const lookupBracketEnd = (openPos, chunkEnd, openBracket, seedDepth) => {
+      if (seedDepth > 0) {
+        const closeB = openBracket === "(" ? ")" : "]";
+        let depth = seedDepth;
+        for (let p = openPos + 1; p < chunkEnd; p++) {
+          const c = s[p];
+          if (c === openBracket) depth++;
+          else if (c === closeB) {
+            if (depth === 0) return { end: p, depth: 0 };
+            depth--;
+          }
+        }
+        return { end: chunkEnd, depth };
+      }
+      if (bracketChunkEnd !== chunkEnd || openPos < bracketChunkStart) {
+        bracketChunkStart = openPos;
+        bracketChunkEnd = chunkEnd;
+        const size = chunkEnd - openPos;
+        bracketMatchClose = new Int32Array(size);
+        bracketMatchClose.fill(-1);
+        bracketUnclosedDepth = new Int32Array(size);
+        const pStack = [];
+        const bStack = [];
+        for (let p = openPos; p < chunkEnd; p++) {
+          const c = s[p];
+          if (c === "(") pStack.push(p);
+          else if (c === ")" && pStack.length) bracketMatchClose[pStack.pop() - openPos] = p;
+          else if (c === "[") bStack.push(p);
+          else if (c === "]" && bStack.length) bracketMatchClose[bStack.pop() - openPos] = p;
+        }
+        for (let k = 0; k < pStack.length; k++) bracketUnclosedDepth[pStack[k] - openPos] = pStack.length - 1 - k;
+        for (let k = 0; k < bStack.length; k++) bracketUnclosedDepth[bStack[k] - openPos] = bStack.length - 1 - k;
+      }
+      const mc = bracketMatchClose[openPos - bracketChunkStart];
+      if (mc !== -1) return { end: mc, depth: 0 };
+      return { end: chunkEnd, depth: bracketUnclosedDepth[openPos - bracketChunkStart] || 0 };
+    };
+    let i = 0;
+    while (i < len) {
+      const ch = s[i];
+      if (outerQuote) {
+        if (ch === "\r" || ch === "\n") {
+          outerQuote = "";
+          quoteEnd = -1;
+          i++;
+          continue;
+        }
+        if (i === quoteEnd || (ch === outerQuote && !isDreamEscapedChar(s, i))) {
+          outerQuote = "";
+          quoteEnd = -1;
+          i++;
+          continue;
+        }
+      } else if ((ch === '"' || ch === "'" || ch === "`") && !isDreamEscapedChar(s, i) && isQuoteOpenBoundary(i)) {
+        outerQuote = ch;
+        let q = i + 1;
+        while (q < len && s[q] !== "\r" && s[q] !== "\n" && !(s[q] === ch && !isDreamEscapedChar(s, q))) q++;
+        quoteEnd = q;
+        i++;
+        continue;
+      }
+      if (nextQ !== -1 && nextQ < i) nextQ = s.indexOf("?", i);
+      if ((ch === "/" || (ch === "." && (s[i + 1] === "/" || (s[i + 1] === "." && s[i + 2] === "/")))) && isRelPathBoundary(i)) {
+        const chunkEnd = ensureUnspacedEnd(i);
+        const maxEnd = outerQuote ? Math.min(chunkEnd, quoteEnd) : chunkEnd;
+        const openBracket = !outerQuote && i > 0 && (s[i - 1] === "(" || s[i - 1] === "[") ? s[i - 1] : "";
+        const seedDepth = openBracket && i - 1 < carryPrefixLen ? carryInnerDepth : 0;
+        const br = openBracket ? lookupBracketEnd(i - 1, chunkEnd, openBracket, seedDepth) : { end: maxEnd, depth: 0 };
+        const end = br.end;
+        if (nextQ !== -1 && nextQ < maxEnd && nextQ < end) {
+          spans.push([i, end, outerQuote, openBracket, br.depth]);
+          if (pendingRel && pendingRel[0] >= i) pendingRel = null;
+          i = Math.max(end, i + 1);
+          continue;
+        }
+        if (nextQ === -1 && maxEnd >= len && end >= len && (!pendingRel || pendingRel[1] < i)) {
+          pendingRel = [i, len, outerQuote, openBracket, br.depth];
+        }
+      }
+      if (ch === "?" && isUrlBoundary(i)) {
+        const openBracket = !outerQuote && i > 0 && (s[i - 1] === "(" || s[i - 1] === "[") ? s[i - 1] : "";
+        const seedDepth = openBracket && i - 1 < carryPrefixLen ? carryInnerDepth : 0;
+        let p = i + 1;
+        while (p < len && (s[p] === "&" || s[p] === ";")) p++;
+        let k = p;
+        while (k < len && (/[A-Za-z0-9_~.%+-]/.test(s[k]) || (!outerQuote && (s[k] === '"' || s[k] === "'")))) k++;
+        if (k > p && k < len && /[=&;(]/.test(s[k])) {
+          const extraDepth = !outerQuote && openBracket && s[k] === openBracket ? 1 : 0;
+          const scanned = scanDreamUrlTokenEnd(s, k + 1, outerQuote, openBracket, seedDepth + extraDepth);
+          spans.push([i, scanned.end, outerQuote, openBracket, scanned.depth]);
+          i = Math.max(scanned.end, i + 1);
+          continue;
+        }
+        if (k > p && k >= len) {
+          pendingQuery = [i, len, outerQuote, openBracket, "key", seedDepth];
+        } else if (p > i + 1 && p >= len) {
+          pendingQuery = [i, len, outerQuote, openBracket, "sep", seedDepth];
+        } else if (i + 1 === len) {
+          pendingQuery = [i, len, outerQuote, openBracket, "qmark", seedDepth];
+        }
+      }
+      if (ch === ":" && i >= 2 && s[i + 1] === "/" && s[i + 2] === "/") {
+        let sc = i - 1;
+        while (sc > 0 && i - sc < 16 && /[A-Za-z0-9+.-]/.test(s[sc - 1])) sc--;
+        if (i - sc >= 2 && i - sc <= 16 && /[A-Za-z]/.test(s[sc]) && (sc === 0 || !/[A-Za-z0-9+.-]/.test(s[sc - 1]))) {
+          const openBracket = !outerQuote && sc > 0 && (s[sc - 1] === "(" || s[sc - 1] === "[") ? s[sc - 1] : "";
+          const seedDepth = openBracket && sc - 1 < carryPrefixLen ? carryInnerDepth : 0;
+          const scanned = scanDreamUrlTokenEnd(s, i + 3, outerQuote, openBracket, seedDepth);
+          while (spans.length && spans[spans.length - 1][1] > sc) {
+            const prev = spans.pop();
+            sc = Math.min(sc, prev[0]);
+          }
+          if (pendingRel && pendingRel[0] >= sc) pendingRel = null;
+          spans.push([sc, scanned.end, outerQuote, openBracket, scanned.depth]);
+          i = Math.max(scanned.end, i + 3);
+          continue;
+        }
+      }
+      i++;
+    }
+    return { spans, outerQuote, pendingRel, pendingQuery };
+  }
+  function collectDreamUrlSpans(s) {
+    return collectDreamUrlSpansWithState(s).spans;
+  }
+  function maskDreamUrlSpans(s, spans = collectDreamUrlSpans(s)) {
+    if (!spans.length) return s;
+    const parts = [];
+    let pos = 0;
+    for (let i = 0; i < spans.length; i++) {
+      const [uStart, uEnd] = spans[i];
+      if (uStart > pos) parts.push(s.slice(pos, uStart));
+      parts.push("\0");
+      pos = uEnd;
+    }
+    if (pos < s.length) parts.push(s.slice(pos));
+    return parts.join("");
+  }
+  // Only called on a bounded window with its real left boundary. All spacing
+  // is bounded; no pattern may search arbitrary text between diagnostic words.
+  function scanDreamHttpStatuses(rawText, preMasked = false) {
+    const s = preMasked ? rawText : maskDreamUrlSpans(rawText);
+    const found = new Set();
+    const patterns = [
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])HTTP\/(?:1\.0|1\.1|2\.0|2|3)[ \t]{1,8}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])HTTP[ \t]{1,8}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])HTTP[ \t]{1,8}status(?:[ \t]{1,4}code)?[ \t]{0,4}[:=]?[ \t]{0,4}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])HTTP[ \t]{1,8}error[ \t]{0,4}[:=]?[ \t]{0,4}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])"(?:httpStatus|http_status|statusCode|status_code)"[ \t]{0,4}[:=][ \t]{0,4}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])'(?:httpStatus|http_status|statusCode|status_code)'[ \t]{0,4}[:=][ \t]{0,4}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+      /(?<![\p{L}\p{M}\p{N}_?&=.;$'"\/-])(?:httpStatus|http_status|statusCode|status_code)[ \t]{0,4}[:=][ \t]{0,4}([1-5][0-9]{2})(?![\p{L}\p{M}\p{N}_]|\.[\p{L}\p{M}\p{N}_])/giu,
+    ];
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        // Also reject parens/brackets glued directly to query/assignment punctuation, e.g. `x=(statusCode=429)`.
+        const prevSlice = s.slice(Math.max(0, m.index - 8), m.index);
+        if (!/[?&=;/][(\[]+$/.test(prevSlice)) {
+          const n = Number(m[1]);
+          if (Number.isInteger(n) && n >= 100 && n <= 599) found.add(n);
+        }
+        if (re.lastIndex === m.index) re.lastIndex += 1;
+      }
+    }
+    return [...found];
+  }
+  function scanDreamDiagFeatures(rawWindow, hits, preMasked = false) {
+    const window = preMasked ? rawWindow : maskDreamUrlSpans(rawWindow);
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:unexpected|unknown|invalid|unrecognized)[ \t]{1,16}(?:argument|option|flag)(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("arguments");
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:missing[ \t]{1,16}credentials|please[ \t]{1,16}sign[ \t]{1,16}in|sign[ \t]{1,16}in[ \t]{1,16}(?:required|failed)|not[ \t]{1,16}authenticated|authentication[ \t]{1,16}failed|unauthorized|invalid[ \t]{1,16}credentials)(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("authentication");
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:model[ \t]{1,16}not[ \t]{1,16}found|unknown[ \t]{1,16}model|model[ \t]{1,16}does[ \t]{1,16}not[ \t]{1,16}exist)(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("model");
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:ENOTFOUND|EAI_AGAIN|EAI_FAIL|EAI_NONAME|SERVFAIL|NXDOMAIN|getaddrinfo[ \t]{1,16}(?:ENOTFOUND|EAI_[A-Z_]{1,32}|failed)|dns[ \t]{1,16}(?:lookup|resolution)[ \t]{1,16}(?:failed|error|timed[ \t]{0,16}out))(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("dns");
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:ERR_TLS_[A-Z0-9_]{1,96}|ERR_CERT_[A-Z0-9_]{1,96}|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|certificate[ \t]{1,16}(?:verify|verification)[ \t]{1,16}failed|(?:tls|ssl)[ \t]{1,16}handshake[ \t]{1,16}(?:failed|error|timed[ \t]{0,16}out|aborted))(?![\p{L}\p{M}\p{N}_])/iu.test(window)
+      || /(?<![\p{L}\p{M}\p{N}_])x509:[ \t]{1,16}certificate[ \t]{1,16}(?:signed[ \t]{1,8}by[ \t]{1,8}unknown[ \t]{1,8}authority|(?:has[ \t]{1,8})?expired|is[ \t]{1,8}not[ \t]{1,8}valid|is[ \t]{1,8}valid[ \t]{1,8}for[ \t]{1,8}[^\r\n]{1,256}?,[ \t]{1,8}not[ \t]{1,8}[A-Za-z0-9*._:\[\]-]{1,253}|verify[ \t]{1,8}failed|invalid|revoked|untrusted|(?:rely|relies)[ \t]{1,8}on[ \t]{1,8}legacy)(?![\p{L}\p{M}\p{N}_])/iu.test(window)
+      || /(?<![\p{L}\p{M}\p{N}_])(?:Hostname\/IP[ \t]{1,8}does[ \t]{1,8}not[ \t]{1,8}match[ \t]{1,8}certificate's[ \t]{1,8}altnames|certificate[ \t]{1,8}subject[ \t]{1,8}name[ \t]{1,8}[^\r\n]{1,128}?[ \t]{1,8}does[ \t]{1,8}not[ \t]{1,8}match[ \t]{1,8}target[ \t]{1,8}host[ \t]{1,8}name)(?![\p{L}\p{M}\p{N}_])/iu.test(window)
+      || /(?<![\p{L}\p{M}\p{N}_])SSL[ \t]{1,16}routines:[A-Za-z0-9_]{0,96}:[ \t]{0,8}(?:certificate[ \t]{1,8}verify[ \t]{1,8}failed|wrong[ \t]{1,8}version[ \t]{1,8}number|(?:tlsv1|sslv3)[ \t]{1,8}alert|handshake[ \t]{1,8}failure|unexpected[ \t]{1,8}eof|decryption[ \t]{1,8}failed|bad[ \t]{1,8}record[ \t]{1,8}mac)(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("tls");
+    if (/(?<![\p{L}\p{M}\p{N}_])(?:connection[ \t]{1,16}failed|transport[ \t]{1,16}error|ECONNREFUSED|ECONNRESET|ETIMEDOUT)(?![\p{L}\p{M}\p{N}_])/iu.test(window)) hits.add("network");
+  }
+  function createDreamDiagAccumulator() {
+    const decoder = new StringDecoder("utf8");
+    let pendingLine = "", leftContext = "", leftCarryDepth = 0;
+    let scanned = 0;
+    let truncated = false, finished = false;
+    const codes = new Set();
+    const hits = new Set();
+    const scan = (text, prefixLen = 0, carryDepth = 0, isFinalLine = true) => {
+      // The caller bounds this before any regular expression sees it.
+      const urlState = collectDreamUrlSpansWithState(text, prefixLen, carryDepth);
+      const spans = urlState.spans.slice();
+      if (!isFinalLine) {
+        for (const pending of [urlState.pendingRel, urlState.pendingQuery]) {
+          if (pending && pending[0] < text.length) spans.push([pending[0], text.length]);
+        }
+        if (spans.length > 1) spans.sort((a, b) => a[0] - b[0]);
+      }
+      const masked = maskDreamUrlSpans(text, spans);
+      for (const c of scanDreamHttpStatuses(masked, true)) codes.add(c);
+      scanDreamDiagFeatures(masked, hits, true);
+    };
+    // Walk whole code points: UTF-16 surrogate halves and Unicode combining
+    // marks (\p{M}) must never manufacture a delimiter inside compound names.
+    const previousChar = (text, end) => {
+      const width = end > 1 && /[\uDC00-\uDFFF]/.test(text[end - 1]) && /[\uD800-\uDBFF]/.test(text[end - 2]) ? 2 : 1;
+      return text.slice(end - width, end);
+    };
+    const nextChar = (text, start) => {
+      const width = start + 1 < text.length && /[\uD800-\uDBFF]/.test(text[start]) && /[\uDC00-\uDFFF]/.test(text[start + 1]) ? 2 : 1;
+      return text.slice(start, start + width);
+    };
+    function safeTokenEnd(text, end) {
+      if (end < text.length && /[\uDC00-\uDFFF]/.test(text[end]) && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+      while (end > 0) {
+        const char = previousChar(text, end);
+        if (!/[\p{L}\p{M}\p{N}_.+-]/u.test(char)) break;
+        end -= char.length;
+      }
+      return end;
+    }
+    function trailingUrlContext(combined, prevPrefixLen, prevCarryDepth, lastChar) {
+      const { spans, outerQuote, pendingRel, pendingQuery } = collectDreamUrlSpansWithState(combined, prevPrefixLen, prevCarryDepth);
+      const trailingEsc = outerQuote && isDreamEscapedChar(combined, combined.length) ? "\\" : "";
+      const safeTail = (fallback) => {
+        if (trailingEsc) return "\\";
+        if (!lastChar || /[\s<>()[\]"'`?\\]/.test(lastChar)) return fallback;
+        return lastChar;
+      };
+      const activeUrl = spans.length && spans[spans.length - 1][1] >= combined.length ? spans[spans.length - 1] : null;
+      if (activeUrl) {
+        const q = activeUrl[2] || "";
+        const b = q ? "" : (activeUrl[3] || "");
+        return { text: " " + (q || b) + "https://u/?" + safeTail("u"), depth: b ? (activeUrl[4] || 0) : 0 };
+      }
+      if (pendingRel && pendingRel[1] >= combined.length) {
+        const q = pendingRel[2] || "";
+        const b = q ? "" : (pendingRel[3] || "");
+        return { text: " " + (q || b) + "/u" + safeTail("u"), depth: b ? (pendingRel[4] || 0) : 0 };
+      }
+      if (pendingQuery && pendingQuery[1] >= combined.length) {
+        const q = pendingQuery[2] || "";
+        const b = q ? "" : (pendingQuery[3] || "");
+        const mode = pendingQuery[4];
+        const nextText = mode === "sep" ? " " + (q || b) + "?&"
+          : mode === "qmark" ? " " + (q || b) + "?"
+          : " " + (q || b) + "?k" + (/^[A-Za-z0-9_~.%+-]$/.test(lastChar) ? lastChar : "k");
+        return { text: nextText, depth: b ? (pendingQuery[5] || 0) : 0 };
+      }
+      let tStart = combined.length;
+      while (tStart > 0) {
+        const c = combined[tStart - 1];
+        if (/\s/.test(c) || c === "<" || c === ">") break;
+        if (outerQuote && c === outerQuote && !isDreamEscapedChar(combined, tStart - 1)) break;
+        tStart--;
+      }
+      if (tStart < combined.length && (tStart === 0 || /[\s"'`([<]/.test(combined[tStart - 1]))) {
+        const q = outerQuote || "";
+        const tail = combined.slice(tStart);
+        if (tail.includes("=/")) return { text: " " + q + "u=/" + safeTail("u"), depth: 0 };
+      }
+      return { text: outerQuote ? " " + outerQuote + (trailingEsc || lastChar) : lastChar, depth: 0 };
+    }
+    function boundPendingLine() {
+      while (pendingLine.length > DREAM_DIAG_WINDOW_CHARS) {
+        // Commit only at an actual non-token delimiter, with 1024 characters
+        // of overlap covering every bounded pattern. Never invent a right boundary.
+        const prevPrefixLen = leftContext.length;
+        const prevCarryDepth = leftCarryDepth;
+        const cut = safeTokenEnd(pendingLine, DREAM_DIAG_WINDOW_CHARS - DREAM_DIAG_CONTEXT_CHARS);
+        if (cut > 0) scan(leftContext + pendingLine.slice(0, cut), prevPrefixLen, prevCarryDepth, false);
+        let drop = cut > DREAM_DIAG_CONTEXT_CHARS ? cut - DREAM_DIAG_CONTEXT_CHARS
+          : DREAM_DIAG_WINDOW_CHARS - DREAM_DIAG_CONTEXT_CHARS;
+        if (drop < pendingLine.length && /[\uDC00-\uDFFF]/.test(pendingLine[drop]) && /[\uD800-\uDBFF]/.test(pendingLine[drop - 1])) drop++;
+        let guard = 0;
+        while (drop < pendingLine.length && guard < 32) {
+          const ch = nextChar(pendingLine, drop);
+          if (!/^\p{M}$/u.test(ch)) break;
+          drop += ch.length;
+          guard++;
+        }
+        const combined = leftContext + pendingLine.slice(0, drop);
+        const nextCtx = trailingUrlContext(combined, prevPrefixLen, prevCarryDepth, previousChar(pendingLine, drop));
+        leftContext = nextCtx.text;
+        leftCarryDepth = nextCtx.depth;
+        pendingLine = pendingLine.slice(drop);
+      }
+    }
+    function consume(text) {
+      let start = 0, newline;
+      while ((newline = text.indexOf("\n", start)) !== -1) {
+        pendingLine += text.slice(start, newline);
+        boundPendingLine();
+        scan(leftContext + pendingLine + "\n", leftContext.length, leftCarryDepth);
+        pendingLine = ""; leftContext = ""; leftCarryDepth = 0;
+        start = newline + 1;
+      }
+      pendingLine += text.slice(start);
+      boundPendingLine();
+    }
+    return {
+      feed(chunk) {
+        if (finished) return;
+        const isBuffer = Buffer.isBuffer(chunk);
+        const text = isBuffer ? chunk : String(chunk ?? "");
+        const bytes = isBuffer ? text.length : Buffer.byteLength(text, "utf8");
+        if (!bytes) return;
+        const remaining = DREAM_DIAG_MAX_SCAN_BYTES - scanned;
+        if (bytes > remaining) truncated = true;
+        if (!remaining) return;
+        // Limit allocation as well as scanning. A UTF-8 code point split by
+        // either a stream chunk or this byte cap stays inside StringDecoder.
+        const buf = isBuffer ? text : Buffer.from(text.slice(0, remaining), "utf8");
+        const length = Math.min(bytes, remaining);
+        scanned += length;
+        for (let i = 0; i < length; i += 4096) consume(decoder.write(buf.subarray(i, Math.min(i + 4096, length))));
+      },
+      finish() {
+        if (!finished) {
+          finished = true;
+          // A budget cutoff is not EOF. Retain complete diagnostics before
+          // the last real delimiter, but never finish a cutoff token.
+          if (!truncated) {
+            consume(decoder.end());
+            scan(leftContext + pendingLine, leftContext.length, leftCarryDepth);
+          } else {
+            const safeEnd = safeTokenEnd(pendingLine, pendingLine.length);
+            if (safeEnd > 0) scan(leftContext + pendingLine.slice(0, safeEnd), leftContext.length, leftCarryDepth, false);
+          }
+          pendingLine = ""; leftContext = ""; leftCarryDepth = 0;
+        }
+        return { codes: new Set(codes), hits: new Set(hits) };
+      },
+    };
+  }
+  function dreamDiagFromAccumulators(accOut, accErr) {
+    const a = accOut ? accOut.finish() : { codes: new Set(), hits: new Set() };
+    const b = accErr ? accErr.finish() : { codes: new Set(), hits: new Set() };
+    const codes = new Set([...a.codes, ...b.codes]);
+    const hits = new Set([...a.hits, ...b.hits]);
+    if (codes.size === 1) return { category: "http", httpStatus: [...codes][0] };
+    if (codes.size > 1) return { category: "http" };
+    for (const cat of ["arguments", "authentication", "model", "dns", "tls", "network"]) if (hits.has(cat)) return { category: cat };
+    return { category: "unknown" };
+  }
+  function feedDreamDiagText(acc, text) {
+    acc.feed(text);
+  }
+  function extractDreamHttpStatuses(text) {
+    const acc = createDreamDiagAccumulator();
+    acc.feed(text);
+    return [...acc.finish().codes];
+  }
+  function classifyDreamDiagnostic(stdoutText, stderrText) {
+    const accOut = createDreamDiagAccumulator();
+    const accErr = createDreamDiagAccumulator();
+    feedDreamDiagText(accOut, stdoutText);
+    feedDreamDiagText(accErr, stderrText);
+    return dreamDiagFromAccumulators(accOut, accErr);
+  }
+  function dreamCliError(message, stdoutText, stderrText) {
+    const err = new Error(message);
+    err.diagnostic = sanitizeDreamDiagnostic(classifyDreamDiagnostic(stdoutText, stderrText));
+    return err;
+  }
   function safeDreamError(error) {
     const text = String(error && error.message || error || "");
     const exit = /^cli-exit-(\d+)/.exec(text);
@@ -3313,41 +3767,500 @@ function createMemoryVault(opts = {}) {
   async function runDreamAgentWithPromptFile(options) {
     const args = Array.isArray(options.args) ? [...options.args] : [];
     const flag = args.indexOf("--prompt-file");
-    if (flag < 0 || flag + 1 >= args.length || args.lastIndexOf("--prompt-file") !== flag) throw new Error("cli-spawn-failed:invalid-prompt-file-option");
-    let dir, file, dirIdentity, fileIdentity, fd;
-    const sameFile = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+    if (flag < 0 || flag + 1 >= args.length || args.lastIndexOf("--prompt-file") !== flag) throw dreamCliError("cli-spawn-failed", "", "");
+    let dir, file, dirIdentity, fileIdentity, fd, dirFd, rootFd;
+    let dirCreated = false;
+    let dirOwned = false;
+    let fileCreated = false;
+    let hubSameDev = false;
+    const isDarwin = process.platform === "darwin";
+    const dirOpenFlags = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0);
+    const sameFile = (a, b) => Boolean(a && b && a.dev === b.dev && a.ino === b.ino);
+    const volDirPath = (id) => `/.vol/${String(id.dev)}/${String(id.ino)}`;
+    let lastCliError = null;
+    const isSanitizedCli = (e) => e && typeof e.message === "string" && /^cli-(?:timeout|output-overflow|unavailable|spawn-failed|temp-cleanup-failed)$/.test(e.message) && e.diagnostic;
+    const isSanitizedExit = (e) => e && typeof e.message === "string" && /^cli-exit-\d+$/.test(e.message) && e.diagnostic;
+    const pythonCandidates = () => {
+      const seen = new Set();
+      const out = [];
+      for (const cand of [
+        "/usr/bin/python3", "/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+        ...String(process.env.PATH || "").split(path.delimiter).filter(Boolean).map((d) => path.join(d, "python3")),
+      ]) {
+        if (!cand || seen.has(cand)) continue;
+        seen.add(cand);
+        try {
+          const st = RAW_FS.statSync(cand);
+          if (st.isFile() && (st.mode & 0o111) !== 0) out.push(cand);
+        } catch {}
+      }
+      return out;
+    };
+    const createPrivateStageDir = () => {
+      const baseDir = hubSameDev && hubDir ? hubDir : dreamPromptTempRoot;
+      const sRoot = path.join(baseDir, `.t3-dream-stage-${crypto.randomBytes(16).toString("hex")}`);
+      let sfd;
+      RAW_FS.mkdirSync(sRoot, { mode: 0o700 });
+      try {
+        sfd = RAW_FS.openSync(sRoot, dirOpenFlags);
+        const ss = RAW_FS.fstatSync(sfd, { bigint: true });
+        const sls = RAW_FS.lstatSync(sRoot, { bigint: true });
+        const sUidOk = typeof process.geteuid === "function" ? ss.uid === BigInt(process.geteuid()) : true;
+        if (!ss.isDirectory() || sls.isSymbolicLink() || !sameFile(ss, sls) || !sUidOk
+          || (ss.mode & 0o7777n) !== 0o700n || ss.dev !== dirIdentity.dev
+          || RAW_FS.readdirSync(sRoot).length !== 0) {
+          throw new Error("stage-dir-invalid");
+        }
+        return sRoot;
+      } finally {
+        // Only a validated stage is returned to the caller for later cleanup.
+        // Before that, even an empty directory at sRoot may belong to someone
+        // else. Leave it untouched on failure and let the caller report cleanupError.
+        if (sfd !== undefined) { try { RAW_FS.closeSync(sfd); } catch {} }
+      }
+    };
+    const atomicRenameNoReplace = (srcPath, dstPath) => {
+      if (typeof spawnSync !== "function") return false;
+      const pyRestore = [
+        "import ctypes, os, sys",
+        "src, dst = os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2])",
+        "if sys.platform == 'darwin':",
+        "  libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)",
+        "  libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]",
+        "  libc.renamex_np.restype = ctypes.c_int",
+        "  sys.exit(0 if libc.renamex_np(src, dst, 4) == 0 else 2)",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)",
+        "if hasattr(libc, 'renameat2'):",
+        "  libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]",
+        "  libc.renameat2.restype = ctypes.c_int",
+        "  sys.exit(0 if libc.renameat2(-100, src, -100, dst, 1) == 0 else 2)",
+        "nr = {'x86_64':316,'amd64':316,'aarch64':276,'arm64':276,'riscv64':276,'i386':353,'i686':353,'armv7l':382,'ppc64le':357,'s390x':345}.get(os.uname().machine)",
+        "if nr is None: sys.exit(2)",
+        "libc.syscall.restype = ctypes.c_long",
+        "rc = libc.syscall(ctypes.c_long(nr), ctypes.c_int(-100), ctypes.c_char_p(src), ctypes.c_int(-100), ctypes.c_char_p(dst), ctypes.c_uint(1))",
+        "sys.exit(0 if rc == 0 else 2)",
+      ].join("\n");
+      for (const cand of pythonCandidates()) {
+        const r = spawnSync(cand, ["-I", "-c", pyRestore, srcPath, dstPath], {
+          encoding: "utf8",
+          timeout: 2000,
+          env: { PYTHONDONTWRITEBYTECODE: "1" },
+        });
+        if (!r?.error && r?.status === 0) return true;
+        if (!r?.error && r?.status === 2) return false;
+      }
+      return false;
+    };
+    const restoreStagedNoOverwrite = (stagedPath, targetPath, stagedStat) => {
+      try {
+        if (stagedStat.isSymbolicLink()) {
+          const linkTarget = RAW_FS.readlinkSync(stagedPath, "buffer");
+          RAW_FS.symlinkSync(linkTarget, targetPath);
+          RAW_FS.unlinkSync(stagedPath);
+          return true;
+        }
+        if (stagedStat.isFile()) {
+          try {
+            RAW_FS.linkSync(stagedPath, targetPath);
+            RAW_FS.unlinkSync(stagedPath);
+            return true;
+          } catch (le) {
+            if (le && le.code === "EEXIST") return false;
+          }
+        }
+        return atomicRenameNoReplace(stagedPath, targetPath);
+      } catch {
+        return false;
+      }
+    };
     try {
-      dir = fs.mkdtempSync(path.join(dreamPromptTempRoot, "t3-dream-prompt-"));
-      dirIdentity = fs.lstatSync(dir, { bigint: true });
-      if (!dirIdentity.isDirectory() || dirIdentity.isSymbolicLink()) throw new Error("cli-spawn-failed:unsafe-temp-directory");
-      fs.chmodSync(dir, 0o700);
-      file = path.join(dir, "prompt.txt");
-      fd = fs.openSync(file, "wx", 0o600);
-      fileIdentity = fs.fstatSync(fd, { bigint: true });
-      fs.fchmodSync(fd, 0o600);
-      fs.writeFileSync(fd, String(options.prompt || ""), "utf8");
-      fs.closeSync(fd); fd = undefined;
+      try {
+        const sentinelFlags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+        let sentinelStat = null;
+        let sentinelDir = dreamPromptTempRoot;
+        let hubDev = null;
+        if (hubDir) {
+          let hfd;
+          try {
+            RAW_FS.mkdirSync(hubDir, { recursive: true, mode: 0o700 });
+            hfd = RAW_FS.openSync(hubDir, dirOpenFlags);
+            const hs = RAW_FS.fstatSync(hfd, { bigint: true });
+            const hls = RAW_FS.lstatSync(hubDir, { bigint: true });
+            const hUidOk = typeof process.geteuid === "function" ? hs.uid === BigInt(process.geteuid()) : true;
+            if (hs.isDirectory() && !hls.isSymbolicLink() && sameFile(hs, hls) && hUidOk) {
+              if ((hs.mode & 0o077n) !== 0n) {
+                try { RAW_FS.fchmodSync(hfd, 0o700); } catch {}
+              }
+              const hsAfter = RAW_FS.fstatSync(hfd, { bigint: true });
+              if ((hsAfter.mode & 0o077n) === 0n) hubDev = hsAfter.dev;
+            }
+          } catch {} finally {
+            if (hfd !== undefined) { try { RAW_FS.closeSync(hfd); } catch {} }
+          }
+          if (!opts._dreamPromptTempRoot) {
+            if (hubDev === null) throw dreamCliError("cli-spawn-failed", "", "");
+            RAW_FS.mkdirSync(dreamPromptTempRoot, { recursive: true, mode: 0o700 });
+          }
+        }
+        rootFd = RAW_FS.openSync(dreamPromptTempRoot, dirOpenFlags);
+        const rootStat = RAW_FS.fstatSync(rootFd, { bigint: true });
+        const rootPathStat = RAW_FS.lstatSync(dreamPromptTempRoot, { bigint: true });
+        const rootUidOk = typeof process.geteuid === "function" ? rootStat.uid === BigInt(process.geteuid()) : true;
+        const rootModeOk = opts._dreamPromptTempRoot ? (rootStat.mode & 0o022n) === 0n : (rootStat.mode & 0o7777n) === 0o700n;
+        if (!rootStat.isDirectory() || rootPathStat.isSymbolicLink() || !sameFile(rootStat, rootPathStat)
+          || !rootUidOk || !rootModeOk) throw dreamCliError("cli-spawn-failed", "", "");
+        if (hubDev !== null && hubDev === rootStat.dev) {
+          hubSameDev = true;
+          sentinelDir = hubDir;
+        }
+        {
+          const sentinelPath = path.join(sentinelDir, `.t3-dream-sentinel-${crypto.randomBytes(16).toString("hex")}`);
+          let sfd;
+          try {
+            sfd = RAW_FS.openSync(sentinelPath, sentinelFlags, 0o600);
+            sentinelStat = RAW_FS.fstatSync(sfd, { bigint: true });
+            if (isDarwin) RAW_FS.unlinkSync(volDirPath(sentinelStat));
+            else RAW_FS.unlinkSync(sentinelPath);
+          } finally {
+            if (sfd !== undefined) { try { RAW_FS.closeSync(sfd); } catch {} }
+          }
+        }
+        let createdViaAtomicExcl = false;
+        if (hubSameDev && typeof spawnSync === "function") {
+          const pyScript = [
+            "import errno, json, os, stat, sys",
+            "hub_dir, temp_root, s_dev, s_ino, r_dev, r_ino, strict_root = sys.argv[1:8]",
+            "s_dev, s_ino = int(s_dev), int(s_ino)",
+            "r_dev, r_ino = int(r_dev), int(r_ino)",
+            "os.umask(0)",
+            "is_darwin_lib = (sys.platform == 'darwin')",
+            "O_DIR = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)",
+            "hfd = os.open(hub_dir, O_DIR)",
+            "root_fd = None",
+            "try:",
+            "  hs = os.fstat(hfd); hls = os.lstat(hub_dir)",
+            "  if (not stat.S_ISDIR(hs.st_mode) or stat.S_ISLNK(hls.st_mode) or (hs.st_mode & 0o077) != 0",
+            "      or hs.st_dev != s_dev or hs.st_dev != hls.st_dev or hs.st_ino != hls.st_ino",
+            "      or (hasattr(os, 'geteuid') and hs.st_uid != os.geteuid())):",
+            "    sys.exit(2)",
+            "  root_fd = os.open(temp_root, O_DIR)",
+            "  rs = os.fstat(root_fd)",
+            "  if (not stat.S_ISDIR(rs.st_mode) or (rs.st_dev, rs.st_ino) != (r_dev, r_ino)",
+            "      or (hasattr(os, 'geteuid') and rs.st_uid != os.geteuid())",
+            "      or ((rs.st_mode & 0o7777) != 0o700 if strict_root == '1' else (rs.st_mode & 0o022) != 0)):",
+            "    sys.exit(2)",
+            "  for attempt in range(4):",
+            "    cand_name = 't3-dream-prompt-' + os.urandom(16).hex()",
+            "    dst = os.path.join(temp_root, cand_name)",
+            "    try:",
+            "      os.mkdir(cand_name, 0o700, dir_fd=root_fd)",
+            "    except OSError as e:",
+            "      err = e.errno",
+            "      if err == errno.EEXIST and attempt < 3: continue",
+            "      sys.exit(2)",
+            "    dfd = None",
+            "    try:",
+            "      dfd = os.open(cand_name, O_DIR, dir_fd=root_fd)",
+            "      ds = os.fstat(dfd); ls = os.stat(cand_name, dir_fd=root_fd, follow_symlinks=False)",
+            "      if (not stat.S_ISDIR(ds.st_mode) or stat.S_ISLNK(ls.st_mode)",
+            "          or (ds.st_mode & 0o7777) != 0o700 or ds.st_dev != s_dev",
+            "          or ds.st_dev != ls.st_dev or ds.st_ino != ls.st_ino",
+            "          or (hasattr(os, 'geteuid') and ds.st_uid != os.geteuid())",
+            "          or (is_darwin_lib and ds.st_ino <= s_ino) or os.listdir(dfd)):",
+            "        sys.exit(2)",
+            "      sys.stdout.write(json.dumps({'dir': dst, 'dev': str(ds.st_dev), 'ino': str(ds.st_ino)}))",
+            "      sys.exit(0)",
+            "    finally:",
+            "      if dfd is not None: os.close(dfd)",
+            "finally:",
+            "  if root_fd is not None: os.close(root_fd)",
+            "  os.close(hfd)",
+            "sys.exit(2)",
+          ].join("\n");
+          for (const cand of pythonCandidates()) {
+            const r = spawnSync(cand, ["-I", "-c", pyScript, hubDir, dreamPromptTempRoot, String(sentinelStat.dev), String(sentinelStat.ino), String(rootStat.dev), String(rootStat.ino), opts._dreamPromptTempRoot ? "0" : "1"], {
+              encoding: "utf8",
+              timeout: 2000,
+              env: { PYTHONDONTWRITEBYTECODE: "1" },
+            });
+            if (!r?.error && r?.status === 0 && typeof r.stdout === "string" && r.stdout.trim()) {
+              const parsed = JSON.parse(r.stdout.trim());
+              const pinned = { dev: BigInt(parsed.dev), ino: BigInt(parsed.ino) };
+              dir = parsed.dir;
+              dirIdentity = pinned;
+              dirCreated = true;
+              if (typeof opts._dreamBeforeInitialDirOpenHook === "function") {
+                await opts._dreamBeforeInitialDirOpenHook({ dir, dev: pinned.dev, ino: pinned.ino });
+              }
+              dirFd = RAW_FS.openSync(isDarwin ? volDirPath(pinned) : dir, dirOpenFlags);
+              const initialDirStat = RAW_FS.fstatSync(dirFd, { bigint: true });
+              const initialPathStat = RAW_FS.lstatSync(dir, { bigint: true });
+              let procFdOk = true;
+              if (!isDarwin) {
+                try {
+                  const fdLink = RAW_FS.readlinkSync(`/proc/self/fd/${dirFd}`);
+                  if (fdLink && fdLink !== dir) procFdOk = false;
+                } catch {}
+              }
+              if (!procFdOk || !initialDirStat.isDirectory() || initialDirStat.isSymbolicLink()
+                || !sameFile(initialDirStat, pinned) || !sameFile(initialPathStat, pinned) || initialPathStat.isSymbolicLink()
+                || (isDarwin && initialDirStat.ino <= sentinelStat.ino)
+                || (initialDirStat.mode & 0o7777n) !== 0o700n) {
+                throw dreamCliError("cli-spawn-failed", "", "");
+              }
+              dirIdentity = initialDirStat;
+              dirOwned = true;
+              createdViaAtomicExcl = true;
+              break;
+            }
+          }
+        }
+        // Fail closed rather than ever falling back to unpinned mkdir+open in dreamPromptTempRoot.
+        if (!createdViaAtomicExcl) {
+          throw dreamCliError("cli-spawn-failed", "", "");
+        }
+        if (dreamAfterDirCreateHook) {
+          await dreamAfterDirCreateHook({ dir });
+        }
+        const readyPathStat = RAW_FS.lstatSync(dir, { bigint: true });
+        const initialEntries = isDarwin ? RAW_FS.readdirSync(volDirPath(dirIdentity)) : RAW_FS.readdirSync(dir);
+        if ((dirIdentity.mode & 0o7777n) !== 0o700n
+          || !sameFile(readyPathStat, dirIdentity) || readyPathStat.isSymbolicLink() || initialEntries.length !== 0) {
+          throw dreamCliError("cli-spawn-failed", "", "");
+        }
+        file = path.join(dir, "prompt.txt");
+        fd = fs.openSync(isDarwin ? `${volDirPath(dirIdentity)}/prompt.txt` : file, "wx", 0o600);
+        fileCreated = true;
+        fileIdentity = fs.fstatSync(fd, { bigint: true });
+        fs.fchmodSync(fd, 0o600);
+        if (!fileIdentity.isFile() || fileIdentity.nlink !== 1n) throw dreamCliError("cli-spawn-failed", "", "");
+        const createdPathStat = RAW_FS.lstatSync(file, { bigint: true });
+        if (!sameFile(createdPathStat, fileIdentity) || !createdPathStat.isFile() || createdPathStat.isSymbolicLink()) {
+          throw dreamCliError("cli-spawn-failed", "", "");
+        }
+        if (isDarwin) {
+          const volCreated = RAW_FS.lstatSync(`${volDirPath(dirIdentity)}/prompt.txt`, { bigint: true });
+          if (!sameFile(volCreated, fileIdentity) || !volCreated.isFile() || volCreated.isSymbolicLink()) {
+            throw dreamCliError("cli-spawn-failed", "", "");
+          }
+        }
+        fs.writeFileSync(fd, String(options.prompt || ""), "utf8");
+      } catch (e) {
+        if (isSanitizedCli(e) || isSanitizedExit(e)) throw e;
+        throw dreamCliError("cli-spawn-failed", "", "");
+      }
       args[flag + 1] = file;
       return await runDreamAgentCli({ ...options, args, prompt: "", promptFile: false });
+    } catch (e) {
+      lastCliError = e;
+      throw e;
     } finally {
-      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
-      if (dir) {
-        try {
-          let currentDir;
-          try { currentDir = fs.lstatSync(dir, { bigint: true }); } catch (e) { if (e.code !== "ENOENT") throw e; }
-          if (currentDir) {
-            if (!sameFile(currentDir, dirIdentity) || !currentDir.isDirectory() || currentDir.isSymbolicLink()) throw new Error("directory-replaced");
-            if (file && fileIdentity) {
-              let currentFile;
-              try { currentFile = fs.lstatSync(file, { bigint: true }); } catch (e) { if (e.code !== "ENOENT") throw e; }
-              if (currentFile) {
-                if (!sameFile(currentFile, fileIdentity) || !currentFile.isFile() || currentFile.isSymbolicLink()) throw new Error("file-replaced");
-                fs.unlinkSync(file);
+      let cleanupFailed = false;
+      let ownedFd = false;
+      try {
+        if (fd !== undefined && fileCreated && fileIdentity) {
+          try {
+            const current = fs.fstatSync(fd, { bigint: true });
+            if (!sameFile(current, fileIdentity) || !current.isFile()) cleanupFailed = true;
+            else {
+              ownedFd = true;
+              fs.ftruncateSync(fd, 0);
+            }
+          } catch { cleanupFailed = true; }
+        }
+        if (dirCreated && !dirOwned) {
+          cleanupFailed = true;
+          if (isDarwin && dirIdentity && dir) {
+            try {
+              const cur = RAW_FS.lstatSync(dir, { bigint: true });
+              if (sameFile(cur, dirIdentity) && cur.isDirectory() && !cur.isSymbolicLink()
+                && RAW_FS.readdirSync(volDirPath(dirIdentity)).length === 0) {
+                RAW_FS.rmdirSync(volDirPath(dirIdentity));
+              }
+            } catch {}
+          }
+        } else if (dirOwned && dir && dirIdentity && dirFd !== undefined) {
+          const heldDirStat = RAW_FS.fstatSync(dirFd, { bigint: true });
+          let currentDir = null;
+          try { currentDir = RAW_FS.lstatSync(dir, { bigint: true }); } catch { currentDir = null; }
+          const ownedDir = sameFile(heldDirStat, dirIdentity) && heldDirStat.isDirectory()
+            && currentDir && sameFile(currentDir, dirIdentity) && currentDir.isDirectory() && !currentDir.isSymbolicLink();
+          let canRemoveDir = ownedDir && !fileCreated && !cleanupFailed;
+          if (!ownedDir) cleanupFailed = true;
+          else if (fileCreated && fileIdentity && file) {
+            const hookActive = typeof dreamAtomicUnlinkHook === "function";
+            let currentFile = null, missingFile = false;
+            try { currentFile = fs.lstatSync(file, { bigint: true }); }
+            catch (e) { cleanupFailed = true; missingFile = Boolean(e && e.code === "ENOENT"); }
+            if (currentFile && !cleanupFailed) {
+              if (hookActive) {
+                try { await dreamAtomicUnlinkHook({ phase: "before-rename", dir, filePath: file, stagePath: "" }); } catch {}
+              }
+              const fdBeforeUnlink = ownedFd ? fs.fstatSync(fd, { bigint: true }) : null;
+              if (!ownedFd || !fdBeforeUnlink || !sameFile(fdBeforeUnlink, fileIdentity) || !fdBeforeUnlink.isFile() || fdBeforeUnlink.nlink !== 1n
+                || !sameFile(currentFile, fileIdentity) || !currentFile.isFile() || currentFile.isSymbolicLink() || currentFile.nlink !== 1n) {
+                cleanupFailed = true;
+              } else if (isDarwin) {
+                // Verify via XNU volfs on the pinned directory inode, then unlink
+                // strictly by (st_dev, st_ino) vnode with zero staging subdirs inside
+                // `dir`, so a pre-opened `parentFd` on `dir` has nothing to enumerate
+                // or chmod and foreign replacements at `dir/prompt.txt` are untouchable.
+                let volEntry = null;
+                try { volEntry = RAW_FS.lstatSync(`${volDirPath(dirIdentity)}/prompt.txt`, { bigint: true }); }
+                catch { volEntry = null; }
+                const fdRightBefore = fs.fstatSync(fd, { bigint: true });
+                if (!volEntry || !sameFile(volEntry, fileIdentity) || !volEntry.isFile() || volEntry.isSymbolicLink() || volEntry.nlink !== 1n
+                  || !sameFile(fdRightBefore, fileIdentity) || fdRightBefore.nlink !== 1n) {
+                  cleanupFailed = true;
+                } else {
+                  let unlinkedOk = false;
+                  try {
+                    RAW_FS.unlinkSync(volDirPath(fileIdentity));
+                    unlinkedOk = true;
+                  } catch { cleanupFailed = true; }
+                  if (unlinkedOk) {
+                    const unlinked = fs.fstatSync(fd, { bigint: true });
+                    const remainingEntries = RAW_FS.readdirSync(volDirPath(dirIdentity));
+                    if (!sameFile(unlinked, fileIdentity) || !unlinked.isFile() || unlinked.nlink !== 0n || remainingEntries.length !== 0) {
+                      cleanupFailed = true;
+                    } else {
+                      canRemoveDir = true;
+                    }
+                  }
+                }
+              } else {
+                // Non-darwin fallback: move into an owned 0700 stage directory on the
+                // same filesystem and verify inode identity inside private storage
+                // before unlinking, restoring foreign replacements without overwrite.
+                let stageRoot = "";
+                try {
+                  const dirNow = RAW_FS.lstatSync(dir, { bigint: true });
+                  if (!sameFile(dirNow, dirIdentity) || !dirNow.isDirectory() || dirNow.isSymbolicLink()) {
+                    cleanupFailed = true;
+                  } else {
+                    stageRoot = createPrivateStageDir();
+                    const stagedFile = path.join(stageRoot, "p");
+                    if (hookActive) {
+                      try { await dreamAtomicUnlinkHook({ phase: "before-stage-move", dir, filePath: file, stagePath: stagedFile }); } catch {}
+                    }
+                    RAW_FS.renameSync(file, stagedFile);
+                    const stagedStat = RAW_FS.lstatSync(stagedFile, { bigint: true });
+                    const fdRightBefore = fs.fstatSync(fd, { bigint: true });
+                    if (!sameFile(stagedStat, fileIdentity) || !stagedStat.isFile() || stagedStat.isSymbolicLink() || stagedStat.nlink !== 1n
+                      || !sameFile(fdRightBefore, fileIdentity) || fdRightBefore.nlink !== 1n) {
+                      if (hookActive) {
+                        try { await dreamAtomicUnlinkHook({ phase: "before-stage-restore", dir, filePath: file, stagePath: stagedFile }); } catch {}
+                      }
+                      restoreStagedNoOverwrite(stagedFile, file, stagedStat);
+                      cleanupFailed = true;
+                    } else {
+                      RAW_FS.unlinkSync(stagedFile);
+                      const unlinked = fs.fstatSync(fd, { bigint: true });
+                      if (!sameFile(unlinked, fileIdentity) || !unlinked.isFile() || unlinked.nlink !== 0n || RAW_FS.readdirSync(dir).length !== 0) {
+                        cleanupFailed = true;
+                      } else {
+                        canRemoveDir = true;
+                      }
+                    }
+                  }
+                } catch {
+                  cleanupFailed = true;
+                } finally {
+                  if (stageRoot) {
+                    try {
+                      if (RAW_FS.readdirSync(stageRoot).length === 0) RAW_FS.rmdirSync(stageRoot);
+                      else cleanupFailed = true;
+                    } catch { cleanupFailed = true; }
+                  }
+                }
+              }
+            } else if (missingFile) {
+              canRemoveDir = true;
+            }
+          } else if (fileCreated) cleanupFailed = true;
+          if (canRemoveDir) {
+            if (typeof dreamAtomicUnlinkHook === "function") {
+              try { await dreamAtomicUnlinkHook({ phase: "before-dir-rename", dir, filePath: file, stagePath: "" }); } catch {}
+            }
+            let beforeRemove = null;
+            try { beforeRemove = RAW_FS.lstatSync(dir, { bigint: true }); } catch { beforeRemove = null; }
+            const dirEntries = isDarwin ? RAW_FS.readdirSync(volDirPath(dirIdentity)) : (beforeRemove ? RAW_FS.readdirSync(dir) : ["x"]);
+            if (!beforeRemove || !sameFile(beforeRemove, dirIdentity) || !beforeRemove.isDirectory() || beforeRemove.isSymbolicLink() || dirEntries.length !== 0) {
+              cleanupFailed = true;
+            } else if (isDarwin) {
+              let rmdirOk = false;
+              try {
+                RAW_FS.rmdirSync(volDirPath(dirIdentity));
+                rmdirOk = true;
+              } catch {
+                cleanupFailed = true;
+              }
+              if (rmdirOk) {
+                let stillAtPath = false;
+                try { RAW_FS.lstatSync(dir, { bigint: true }); stillAtPath = true; }
+                catch (postErr) { if (!postErr || postErr.code !== "ENOENT") stillAtPath = true; }
+                if (stillAtPath) cleanupFailed = true;
+              }
+            } else {
+              let stageRoot = "";
+              try {
+                stageRoot = createPrivateStageDir();
+                const stagedDir = path.join(stageRoot, "d");
+                RAW_FS.renameSync(dir, stagedDir);
+                const stagedStat = RAW_FS.lstatSync(stagedDir, { bigint: true });
+                const heldNow = RAW_FS.fstatSync(dirFd, { bigint: true });
+                if (!sameFile(stagedStat, dirIdentity) || !sameFile(heldNow, dirIdentity)
+                  || !stagedStat.isDirectory() || stagedStat.isSymbolicLink()
+                  || RAW_FS.readdirSync(stagedDir).length !== 0) {
+                  if (typeof dreamAtomicUnlinkHook === "function") {
+                    try { await dreamAtomicUnlinkHook({ phase: "before-dir-restore", dir, filePath: file, stagePath: stagedDir }); } catch {}
+                  }
+                  restoreStagedNoOverwrite(stagedDir, dir, stagedStat);
+                  cleanupFailed = true;
+                } else {
+                  RAW_FS.rmdirSync(stagedDir);
+                  let stillAtPath = false;
+                  try { RAW_FS.lstatSync(dir, { bigint: true }); stillAtPath = true; }
+                  catch (postErr) { if (!postErr || postErr.code !== "ENOENT") stillAtPath = true; }
+                  if (stillAtPath) cleanupFailed = true;
+                }
+              } catch {
+                cleanupFailed = true;
+              } finally {
+                if (stageRoot) {
+                  try {
+                    if (RAW_FS.readdirSync(stageRoot).length === 0) RAW_FS.rmdirSync(stageRoot);
+                    else cleanupFailed = true;
+                  } catch { cleanupFailed = true; }
+                }
               }
             }
-            fs.rmdirSync(dir);
           }
-        } catch { throw new Error("cli-temp-cleanup-failed"); }
+        }
+      } catch { cleanupFailed = true; }
+      finally {
+        if (rootFd !== undefined) {
+          try { RAW_FS.closeSync(rootFd); } catch { cleanupFailed = true; }
+          rootFd = undefined;
+        }
+        if (dirFd !== undefined) {
+          try { RAW_FS.closeSync(dirFd); } catch { cleanupFailed = true; }
+          dirFd = undefined;
+        }
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch { cleanupFailed = true; }
+          fd = undefined;
+        }
+      }
+      if (cleanupFailed) {
+        if (lastCliError) {
+          lastCliError.cleanupError = "cli-temp-cleanup-failed";
+        } else {
+          const err = new Error("cli-temp-cleanup-failed");
+          err.cleanupError = "cli-temp-cleanup-failed";
+          err.diagnostic = { category: "unknown" };
+          throw err;
+        }
       }
     }
   }
@@ -3365,67 +4278,102 @@ function createMemoryVault(opts = {}) {
       try {
         child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, T3_SUBAGENT_ROLE: "dream-worker", MUSE_NO_AUTO_UPDATE: "1", MUSE_LOGIN: "0", PI_OFFLINE: "1" } });
       } catch (e) {
-        reject(new Error("cli-spawn-failed:" + String((e && e.message) || e)));
+        reject(dreamCliError("cli-spawn-failed", "", ""));
         return;
       }
       let settled = false;
-      let timedOut = false;
+      let stopReason = null;
+      let hasExited = false;
       let killTimer = null;
+      let drainTimer = null;
+      let stopDeadline = null;
       let stdoutLen = 0, stderrLen = 0;
       let stdoutBuf = [], stderrBuf = [];
-      const timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        try { child.kill("SIGTERM"); } catch {}
-        killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 100);
-        if (killTimer && typeof killTimer.unref === "function") killTimer.unref();
-        finish(new Error("cli-timeout:exceeded-" + timeoutMs + "ms"));
-      }, timeoutMs);
+      const stdoutAcc = createDreamDiagAccumulator();
+      const stderrAcc = createDreamDiagAccumulator();
+      const diagError = (message) => {
+        const err = new Error(message);
+        err.diagnostic = sanitizeDreamDiagnostic(dreamDiagFromAccumulators(stdoutAcc, stderrAcc));
+        return err;
+      };
+      const timeoutTimer = setTimeout(() => requestStop("cli-timeout"), timeoutMs);
       if (timeoutTimer && typeof timeoutTimer.unref === "function") timeoutTimer.unref();
       function finish(err, val) {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
+        // A termination request is not proof of exit. In particular never
+        // cancel a pending SIGKILL while the child can still read its prompt.
+        if (hasExited && killTimer) clearTimeout(killTimer);
+        if (drainTimer) clearTimeout(drainTimer);
+        if (stopDeadline) clearTimeout(stopDeadline);
         if (err) reject(err);
         else resolve(val);
       }
-      child.on("error", (e) => {
-        finish(new Error("cli-unavailable:" + String((e && e.message) || e)));
+      function destroyPipes() {
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          try { stream.destroy(); } catch {}
+        }
+      }
+      function requestStop(reason) {
+        if (stopReason || settled) return;
+        stopReason = reason;
+        clearTimeout(timeoutTimer);
+        // Install escalation before SIGTERM, even if a fake/fast child exits
+        // synchronously. Only exit/close is allowed to cancel this timer.
+        killTimer = setTimeout(() => {
+          if (!hasExited) { try { child.kill("SIGKILL"); } catch {} }
+        }, 100);
+        stopDeadline = setTimeout(() => {
+          if (!hasExited) { try { child.kill("SIGKILL"); } catch {} }
+          destroyPipes();
+          // Keep awaiting exit if termination is not confirmed. Deleting the
+          // prompt under a live process would be an unsafe false completion.
+          if (hasExited) finish(diagError(stopReason));
+        }, 1100);
+        if (!hasExited) { try { child.kill("SIGTERM"); } catch {} }
+      }
+      child.on("error", () => {
+        if (stopReason || settled) return;
+        if (child.pid) requestStop("cli-unavailable");
+        else { hasExited = true; finish(diagError("cli-unavailable")); }
       });
-      child.stdout.on("data", (chunk) => {
+      function collect(chunk, acc, isStdout) {
+        if (settled) return;
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         if (!buf.length) return;
-        const nextBytes = stdoutLen + buf.length;
-        if (nextBytes > maxOutputBytes) {
-          try { child.kill("SIGKILL"); } catch {}
-          finish(new Error("cli-output-overflow:stdout>" + maxOutputBytes + "B"));
-          return;
+        const nextBytes = (isStdout ? stdoutLen : stderrLen) + buf.length;
+        if (nextBytes > maxOutputBytes) requestStop("cli-output-overflow");
+        // Budget and bounded windows are enforced inside feed before regex
+        // scanning; keep queued diagnostics while the dying child is reaped.
+        acc.feed(buf);
+        if (!stopReason) {
+          if (isStdout) { stdoutBuf.push(buf); stdoutLen = nextBytes; }
+          else { stderrBuf.push(buf); stderrLen = nextBytes; }
         }
-        stdoutBuf.push(buf);
-        stdoutLen = nextBytes;
-      });
-      child.stderr.on("data", (chunk) => {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (!buf.length) return;
-        const nextBytes = stderrLen + buf.length;
-        if (nextBytes > maxOutputBytes) {
-          try { child.kill("SIGKILL"); } catch {}
-          finish(new Error("cli-output-overflow:stderr>" + maxOutputBytes + "B"));
-          return;
+      }
+      child.stdout.on("data", chunk => collect(chunk, stdoutAcc, true));
+      child.stderr.on("data", chunk => collect(chunk, stderrAcc, false));
+      child.on("exit", () => {
+        hasExited = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (stopReason && !settled) {
+          // Descendants may retain inherited pipes after the owned CLI exits.
+          drainTimer = setTimeout(() => { destroyPipes(); finish(diagError(stopReason)); }, DREAM_DIAG_OVERFLOW_GRACE_MS);
         }
-        stderrBuf.push(buf);
-        stderrLen = nextBytes;
       });
       child.on("close", (code) => {
+        hasExited = true;
         if (killTimer) clearTimeout(killTimer);
         if (settled) return;
-        const stdout = Buffer.concat(stdoutBuf).toString("utf8");
-        const stderr = Buffer.concat(stderrBuf).toString("utf8");
-        if (timedOut) {
-          finish(new Error("cli-timeout:exceeded-" + timeoutMs + "ms"));
+        if (stopReason) {
+          finish(diagError(stopReason));
           return;
         }
+        const stdout = Buffer.concat(stdoutBuf).toString("utf8");
+        const stderr = Buffer.concat(stderrBuf).toString("utf8");
         if (code !== 0) {
-          finish(new Error("cli-exit-" + code + ":" + String(stderr || "").slice(0, 500)));
+          finish(diagError("cli-exit-" + code));
           return;
         }
         finish(null, { stdout, stderr, status: code });
@@ -3434,7 +4382,7 @@ function createMemoryVault(opts = {}) {
       try {
         child.stdin.end(prompt);
       } catch (e) {
-        finish(new Error("cli-spawn-failed:" + String((e && e.message) || e)));
+        requestStop("cli-spawn-failed");
       }
     });
   }
@@ -3565,7 +4513,10 @@ function createMemoryVault(opts = {}) {
     return [];
   }
   function writeDreamJournal(entries) {
-    const trimmed = Array.isArray(entries) ? entries.slice(-30) : [];
+    const trimmed = (Array.isArray(entries) ? entries.slice(-30) : []).map((e) => {
+      if (e && typeof e === "object" && e.agent && typeof e.agent === "object" && e.agent.diagnostic) return { ...e, agent: { ...e.agent, diagnostic: sanitizeDreamDiagnostic(e.agent.diagnostic) } };
+      return e;
+    });
     const obj = { entries: trimmed };
     try { writeJsonFileAtomic(dreamJournalPath(), obj); } catch {}
     const mirror = dreamJournalMirrorPath();
@@ -3866,6 +4817,8 @@ function createMemoryVault(opts = {}) {
       let estimatedOutputTokens = 0;
       let estimatedCostUsd = 0;
       let agentFallbackReason = null;
+      let agentDiagnostic = null;
+      let agentCleanupError = null;
       let deltaSince = null;
       const earlyConfig = readDreamConfig();
       dreamMode = earlyConfig.dreamMode || "agent";
@@ -4058,6 +5011,8 @@ function createMemoryVault(opts = {}) {
                 }
               } catch(e) {
                 runnerError = String((e && e.message) || e);
+                if (e && e.diagnostic) agentDiagnostic = sanitizeDreamDiagnostic(e.diagnostic);
+                if (e && e.cleanupError === "cli-temp-cleanup-failed") agentCleanupError = "cli-temp-cleanup-failed";
               }
             } else {
               // 默认生产实现：子进程调用宿主 CLI，非交互，timeout 60000，环境 T3_SUBAGENT_ROLE=dream-worker
@@ -4080,9 +5035,13 @@ function createMemoryVault(opts = {}) {
                   }
                 } catch(e) {
                   runnerError = String(e && e.message || e);
+                  if (e && e.diagnostic) agentDiagnostic = sanitizeDreamDiagnostic(e.diagnostic);
+                  if (e && e.cleanupError === "cli-temp-cleanup-failed") agentCleanupError = "cli-temp-cleanup-failed";
                 }
               } catch(e) {
                 runnerError = String(e && e.message || e);
+                if (e && e.diagnostic) agentDiagnostic = sanitizeDreamDiagnostic(e.diagnostic);
+                if (e && e.cleanupError === "cli-temp-cleanup-failed") agentCleanupError = "cli-temp-cleanup-failed";
               }
             }
             if (runnerError) {
@@ -4341,6 +5300,8 @@ function createMemoryVault(opts = {}) {
         } catch (e) {
           if (e.dreamTxFatal) throw e;
           agentFallbackReason = String((e&&e.message)||e||"unknown");
+          if (e && e.diagnostic) agentDiagnostic = sanitizeDreamDiagnostic(e.diagnostic);
+          if (e && e.cleanupError === "cli-temp-cleanup-failed") agentCleanupError = "cli-temp-cleanup-failed";
           estimatedInputTokens = 0;
           estimatedOutputTokens = 0;
           estimatedCostUsd = 0;
@@ -4383,11 +5344,12 @@ function createMemoryVault(opts = {}) {
       if (dreamMode !== "agent") agent = { status: "skipped", reason: "local-mode" };
       else if (safeFallback === "gate-skip-delta") agent = { status: "skipped", reason: safeFallback };
       else if (safeFallback === "prompt-over-budget") agent = { status: "skipped", reason: safeFallback };
-      else if (safeFallback) agent = { status: "failed", error: safeFallback };
+      else if (safeFallback) agent = { status: "failed", error: safeFallback, ...(agentDiagnostic ? { diagnostic: sanitizeDreamDiagnostic(agentDiagnostic) } : {}) };
       else if (!agentUsed && scannedClusterCount === 0) agent = { status: "skipped", reason: "no-ambiguous-clusters" };
       else if (mergeErrors || invalidSuggestions || conflictSkippedCount) agent = { status: "partial", error: "merge-review-incomplete" };
       else if (deferredClusterCount > 0) agent = { status: "partial", reason: "deferred" };
       else agent = { status: "success" };
+      if (agentCleanupError === "cli-temp-cleanup-failed" || safeFallback === "cli-temp-cleanup-failed") agent.cleanupError = "cli-temp-cleanup-failed";
       if (dreamMode === "agent") Object.assign(agent, { providerInstanceId, model, reasoningEffort });
       const agentFailed = agent.status === "failed" || (agent.status === "partial" && Boolean(agent.error));
       const overallOk = !localErrors.size && !agentFailed;
@@ -4802,6 +5764,13 @@ function createMemoryVault(opts = {}) {
     estimateTokensForText,
     buildDreamPrompt,
     runDreamAgentCli,
+    classifyDreamDiagnostic,
+    extractDreamHttpStatuses,
+    sanitizeDreamDiagnostic,
+    createDreamDiagAccumulator,
+    dreamDiagSample,
+    DREAM_DIAG_HEAD_BYTES,
+    DREAM_DIAG_TAIL_BYTES,
     DREAM_MAX_INPUT_TOKENS,
     _ensureProjectVault: ensureProjectVault,
   };
@@ -4874,6 +5843,12 @@ function buildDreamPrompt(a) {
 function runDreamAgentCli(a) {
   return getDefaultMemoryVault().runDreamAgentCli(a || {});
 }
+function classifyDreamDiagnostic(a, b) {
+  return getDefaultMemoryVault().classifyDreamDiagnostic(a, b);
+}
+function extractDreamHttpStatuses(a) {
+  return getDefaultMemoryVault().extractDreamHttpStatuses(a);
+}
 function invalidateEmbedHealthCache() {
   return getDefaultMemoryVault().invalidateEmbedHealthCache();
 }
@@ -4925,6 +5900,8 @@ module.exports = {
   estimateTokensForText,
   buildDreamPrompt,
   runDreamAgentCli,
+  classifyDreamDiagnostic,
+  extractDreamHttpStatuses,
   DREAM_MAX_INPUT_TOKENS: 7900,
   invalidateEmbedHealthCache,
   DREAM_AGENT_PRESETS: DREAM_AGENT_PRESETS_SHARED,

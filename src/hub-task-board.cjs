@@ -14,7 +14,13 @@ const os = require("node:os");
 const path = require("node:path");
 const { createHash } = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
+const { performance } = require("node:perf_hooks");
+const NATIVE_ATOMICS_WAIT = Atomics.wait;
+// VM fixtures may replace Atomics before module evaluation, so identity alone
+// cannot distinguish virtual waits from physical blocking.
+const HAS_NATIVE_ATOMICS_WAIT = /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(NATIVE_ATOMICS_WAIT));
 const { assertSafeFsPath } = require("./hub-skills.cjs");
+const { captureArtifactIdentity } = require("./hub-artifact-access.cjs");
 
 const STATUS_COMPLETED = "completed";
 const STATUS_IN_PROGRESS = "in_progress";
@@ -67,6 +73,141 @@ function writeJsonAtomic(file, obj) {
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
   fs.renameSync(tmp, file);
 }
+function planRecordRevision(record) {
+  const canonical = (value) => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+  return createHash("sha256").update(JSON.stringify(canonical(record))).digest("hex");
+}
+function planRevision(plans) {
+  if (!plans.length) return ""; // An absent manual scope is itself a CAS baseline.
+  const files = plans.map(({ file, data }) => [path.basename(file), planRecordRevision(data)]);
+  files.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return createHash("sha256").update(JSON.stringify(files)).digest("hex");
+}
+function planConflict() {
+  const error = new Error("PLAN_CONFLICT: 计划已被其他窗口更新，请刷新后重试");
+  error.code = "PLAN_CONFLICT";
+  return error;
+}
+// SQLite's OS-backed lock serializes the CAS and mutation across processes,
+// and releases even after a crash. No manual plan content goes into this DB.
+function withPlansLock(hubPlansDir, scope, work, options = {}) {
+  const { timeoutMs = 5000 } = options;
+  const hasCustomMono = typeof options.monotonicNow === "function";
+  const monotonicNow = hasCustomMono ? options.monotonicNow : () => performance.now();
+  assertPlansStore(hubPlansDir);
+  safeMkdir(hubPlansDir);
+  // Canonical project aliases must share a lock, including drafts and old files.
+  const key = planFileKey({ threadId: scope.threadId || undefined, projectRoot: scope.projectRoot ? canonicalProjectPath(scope.projectRoot) : undefined });
+  const hash = createHash("sha256").update(key).digest("hex");
+  const file = assertSafeFsPath(hubPlansDir, path.join(hubPlansDir, `.plan-write-lock.${hash}.sqlite`));
+  for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+    const entry = assertSafeFsPath(hubPlansDir, file + suffix);
+    try { if (!fs.lstatSync(entry).isFile()) throw new Error("unsafe plan lock path"); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  const lock = new DatabaseSync(file);
+  let acquired = false;
+  try {
+    const lockBusy = () => {
+      const error = new Error("PLAN_LOCK_BUSY: 计划正在保存，等待超时，请稍后重试");
+      error.code = "PLAN_LOCK_BUSY";
+      return error;
+    };
+    if (Number.isFinite(timeoutMs) && timeoutMs <= 0) {
+      lock.exec("PRAGMA busy_timeout=0");
+      try { lock.exec("BEGIN IMMEDIATE"); acquired = true; }
+      catch (error) {
+        if ((error.errcode & 255) !== 5 && error.code !== "SQLITE_BUSY" && !/database.*locked/i.test(error.message)) throw error;
+        throw lockBusy();
+      }
+      return work();
+    }
+    const maxWaitMs = Math.max(1, Math.min(5000, Number.isFinite(timeoutMs) ? timeoutMs : 5000));
+    const hasHrtime = typeof process?.hrtime?.bigint === "function";
+    const physicalWait = HAS_NATIVE_ATOMICS_WAIT && Atomics.wait === NATIVE_ATOMICS_WAIT;
+    let monoBase = monotonicNow(), perfBase = performance.now(), hrBase = hasHrtime ? process.hrtime.bigint() : null;
+    let lastMono = monoBase, lastPerf = perfBase, lastHr = hrBase, physicalLockStep = false;
+    let monoMax = 0, perfMax = 0, hrMax = 0, elapsedFloor = 0;
+    const currentElapsed = () => Math.max(monoMax, perfMax, hrMax, elapsedFloor);
+    const sampleElapsed = (usePerf = true, lockStep = false) => {
+      const now = monotonicNow();
+      if (Number.isFinite(now)) {
+        if (!Number.isFinite(monoBase)) monoBase = now;
+        else if (now - monoBase > monoMax) monoMax = now - monoBase;
+      }
+      const perfNow = performance.now();
+      const monoStepMs = now - lastMono, perfStepMs = perfNow - lastPerf;
+      lastMono = now; lastPerf = perfNow;
+      if (Number.isFinite(perfNow)) {
+        if (!Number.isFinite(perfBase)) perfBase = perfNow;
+        else if (usePerf && perfNow - perfBase > perfMax) perfMax = perfNow - perfBase;
+      }
+      if (hasHrtime) {
+        const hrNow = process.hrtime.bigint();
+        if (hrBase === null) hrBase = hrNow;
+        // A real SQLite call can block even in a VM with virtual Atomics.wait.
+        // Ignore small CPU jitter in healthy virtual clocks (e.g. +0.9ms ticks).
+        if (lockStep && lastHr !== null && Number(hrNow - lastHr) / 1e6 >= 5 && perfStepMs === 0 && monoStepMs < 1) physicalLockStep = true;
+        if (usePerf && (physicalWait || physicalLockStep || perfMax === 0 && monoMax === 0)) {
+          const hrMs = Number(hrNow - hrBase) / 1e6;
+          if (hrMs > hrMax) hrMax = hrMs;
+        }
+        lastHr = hrNow;
+      }
+      return currentElapsed();
+    };
+    for (let attempt = 0; !acquired; attempt++) {
+      let remainingWholeMs;
+      if (attempt === 0) {
+        perfBase = performance.now();
+        perfMax = 0;
+        if (hasHrtime) { hrBase = process.hrtime.bigint(); lastHr = hrBase; hrMax = 0; }
+        remainingWholeMs = hasCustomMono ? Math.floor(maxWaitMs - sampleElapsed(false)) : Math.floor(maxWaitMs);
+      } else {
+        remainingWholeMs = Math.floor(maxWaitMs - sampleElapsed(true));
+      }
+      if (remainingWholeMs < 1) throw lockBusy();
+      let busyTimeout = Math.min(maxWaitMs, remainingWholeMs);
+      for (let tighten = 0; ; tighten++) {
+        const beforePragma = currentElapsed();
+        if (Math.floor(maxWaitMs - beforePragma) < 1) throw lockBusy();
+        lock.exec(`PRAGMA busy_timeout=${busyTimeout}`);
+        const afterPragma = sampleElapsed(true, true);
+        const afterPragmaRem = Math.floor(maxWaitMs - afterPragma);
+        if (afterPragmaRem < 1) throw lockBusy();
+        if (tighten === 0 && !hasCustomMono && attempt === 0 && afterPragma < 1) break;
+        if (afterPragmaRem >= busyTimeout) break;
+        busyTimeout = afterPragmaRem;
+      }
+      try { lock.exec("BEGIN IMMEDIATE"); acquired = true; }
+      catch (error) {
+        if ((error.errcode & 255) !== 5 && error.code !== "SQLITE_BUSY" && !/database.*locked/i.test(error.message)) throw error;
+        const beforeWait = sampleElapsed(true, true);
+        const remainingRetryMs = Math.floor(maxWaitMs - beforeWait);
+        if (remainingRetryMs < 1) throw lockBusy();
+        // Retry VFS-level immediate BUSY with bounded backoff, clamped to remaining budget.
+        const delay = Math.min(10 * 2 ** Math.min(attempt, 4), 100, remainingRetryMs);
+        const floorBeforeWait = currentElapsed();
+        const monoBeforeWait = monoMax, perfBeforeWait = perfMax;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        sampleElapsed();
+        // A clock that measured the full wait already covers it. Adding that
+        // wait to another clock's fractional read ticks would count it twice.
+        if (monoMax - monoBeforeWait < delay && perfMax - perfBeforeWait < delay) {
+          elapsedFloor = Math.max(elapsedFloor, floorBeforeWait + delay);
+        }
+      }
+    }
+    return work();
+  } finally {
+    try { if (acquired) lock.exec("ROLLBACK"); }
+    finally { lock.close(); }
+  }
+}
+function assertPlanVersion(input, current) {
+  if (Object.hasOwn(input, "expectedRevision") && (typeof input.expectedRevision !== "string" || input.expectedRevision !== (current?.planRevision || ""))) throw planConflict();
+  if (Object.hasOwn(input, "expectedUpdatedAt") && (typeof input.expectedUpdatedAt !== "string" || input.expectedUpdatedAt !== (current?.updatedAt || ""))) throw planConflict();
+}
 
 function slugify(raw) {
   let s = String(raw ?? "").trim();
@@ -110,7 +251,7 @@ function sameProject(a, b) {
 function planFileKey(input) {
   validatePlanInput(input);
   const threadId = input && input.threadId ? String(input.threadId) : "";
-  const projectRoot = input && input.projectRoot ? String(input.projectRoot) : "";
+  const projectRoot = input && input.projectRoot ? canonicalProjectPath(input.projectRoot) : "";
   const hash = (value) => createHash("sha256").update(value).digest("hex");
   if (threadId === "__NEW__") {
     const scope = projectRoot ? threadId + "::" + path.resolve(projectRoot) : threadId;
@@ -578,28 +719,37 @@ function hasBrainPlanEntry(dir) {
     catch (error) { return error && error.code !== "ENOENT" && error.code !== "ENOTDIR"; }
   });
 }
-function captureBrainSession(dir) {
+function resolveBrainHomeAnchor(dir, homeDir) {
+  if (!homeDir) return null;
+  const anchor = path.resolve(homeDir), target = path.resolve(dir);
+  const rel = path.relative(anchor, target);
+  return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel) ? anchor : null;
+}
+function captureBrainSession(dir, homeDir = null) {
   try {
+    const anchorDir = resolveBrainHomeAnchor(dir, homeDir);
+    const anchorIdentity = anchorDir ? captureArtifactIdentity(anchorDir, dir) : null;
     const stat = fs.lstatSync(dir);
-    if (!stat.isDirectory()) return null;
-    return { dir, realPath: fs.realpathSync(dir), dev: stat.dev, ino: stat.ino };
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    return { dir, realPath: fs.realpathSync(dir), dev: stat.dev, ino: stat.ino, anchorDir, anchorIdentity };
   } catch { return null; }
 }
 function sameBrainSession(session) {
   if (!session) return false;
   try {
+    if (session.anchorDir && JSON.stringify(captureArtifactIdentity(session.anchorDir, session.dir)) !== JSON.stringify(session.anchorIdentity)) return false;
     const stat = fs.lstatSync(session.dir);
-    return stat.isDirectory() && stat.dev === session.dev && stat.ino === session.ino && fs.realpathSync(session.dir) === session.realPath;
+    return !stat.isSymbolicLink() && stat.isDirectory() && stat.dev === session.dev && stat.ino === session.ino && fs.realpathSync(session.dir) === session.realPath;
   } catch { return false; }
 }
-function findScopedBrainSessions(brainRoots, candidateIds) {
+function findScopedBrainSessions(brainRoots, candidateIds, homeDir = null) {
   const sessions = new Map();
   for (const root of brainRoots) {
     if (!dirExists(root)) continue;
     for (const id of candidateIds) {
       if (!id || id === "." || id === ".." || path.basename(id) !== id || id.includes("\\")) continue;
       if (path.basename(root) === id && hasBrainPlanEntry(root)) {
-        const session = captureBrainSession(root);
+        const session = captureBrainSession(root, homeDir);
         if (session) sessions.set(session.realPath, session);
       }
       const dir = path.join(root, id);
@@ -608,7 +758,7 @@ function findScopedBrainSessions(brainRoots, candidateIds) {
         const relative = path.relative(fs.realpathSync(root), fs.realpathSync(dir));
         if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) continue;
         if (hasBrainPlanEntry(dir)) {
-          const session = captureBrainSession(dir);
+          const session = captureBrainSession(dir, homeDir);
           if (session) sessions.set(session.realPath, session);
         }
       } catch {}
@@ -693,11 +843,21 @@ function collectArtifacts(session) {
     artifacts.push({ name: doc, path: full, summary: "", updatedAt: fileMtimeIso(full) });
   }
   artifacts.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
-  return sameBrainSession(session) ? artifacts : [];
+  const resolvedSessionDir = path.resolve(sessionDir);
+  const bound = artifacts.flatMap(artifact => {
+    try {
+      const accessIdentity = captureArtifactIdentity(session.dir, artifact.path, session.anchorDir || null);
+      const rootEntry = accessIdentity.entries.find((e) => e.path === resolvedSessionDir);
+      if (accessIdentity.realRoot !== session.realPath || !rootEntry || rootEntry.dev !== session.dev || rootEntry.ino !== session.ino) return [];
+      return [{ ...artifact, accessIdentity }];
+    } catch { return []; }
+  });
+  return sameBrainSession(session) ? bound : [];
 }
 
 function readAgyBrain(brainRoots, threadOrIds, opts = {}) {
   if (!brainRoots || !brainRoots.length) return null;
+  const homeDir = opts && opts.homeDir ? opts.homeDir : null;
   // 归一化候选集合：支持字符串 / 字符串数组 / Set
   let candidateSet = new Set();
   if (Array.isArray(threadOrIds)) {
@@ -709,9 +869,9 @@ function readAgyBrain(brainRoots, threadOrIds, opts = {}) {
   }
   let sessions;
   if (opts && opts.strictThreadMatch === true) {
-    sessions = findScopedBrainSessions(brainRoots, candidateSet);
+    sessions = findScopedBrainSessions(brainRoots, candidateSet, homeDir);
   } else {
-    sessions = listSessionDirs(brainRoots).map(captureBrainSession).filter(Boolean);
+    sessions = listSessionDirs(brainRoots).map((d) => captureBrainSession(d, homeDir)).filter(Boolean);
     const matching = sessions.filter((session) => candidateSet.has(path.basename(session.dir)));
     if (matching.length) sessions = matching;
   }
@@ -759,6 +919,13 @@ function gcTaskPlans(hubPlansDir, nowMs, anchorDir) {
   try {
     assertPlansStore(hubPlansDir, anchorDir);
     if (!dirExists(hubPlansDir)) return { deleted: 0 };
+    return gcTaskPlansCandidates(hubPlansDir, nowMs, anchorDir);
+  } catch { return { deleted: 0 }; }
+}
+function gcTaskPlansCandidates(hubPlansDir, nowMs, anchorDir) {
+  try {
+    assertPlansStore(hubPlansDir, anchorDir);
+    if (!dirExists(hubPlansDir)) return { deleted: 0 };
     const now = nowMs != null ? nowMs : Date.now();
     let entries = [];
     try { entries = fs.readdirSync(hubPlansDir, { withFileTypes: true }); } catch { return { deleted: 0 }; }
@@ -767,10 +934,25 @@ function gcTaskPlans(hubPlansDir, nowMs, anchorDir) {
       if (!ent.isFile() || !ent.name.endsWith(".json")) continue;
       try {
         const full = planPath(hubPlansDir, ent.name);
-        const st = fs.statSync(full);
-        files.push({ file: full, mtimeMs: st.mtimeMs });
+        const st = fs.statSync(full, { bigint: true });
+        files.push({ file: full, mtimeMs: Number(st.mtimeMs), signature: [st.dev, st.ino, st.ctimeNs, st.mtimeNs, st.size].join(":") });
       } catch {}
     }
+    const remove = (candidate) => {
+      try {
+        const data = safeReadJson(candidate.file) || {};
+        // Opportunistic GC must neither wait on unrelated scopes nor bypass
+        // the CAS lock of a live writer (including the caller's own scope).
+        return withPlansLock(hubPlansDir, data, () => {
+          assertPlansStore(hubPlansDir, anchorDir);
+          assertSafeFsPath(hubPlansDir, candidate.file);
+          const st = fs.lstatSync(candidate.file, { bigint: true });
+          if (!st.isFile() || [st.dev, st.ino, st.ctimeNs, st.mtimeNs, st.size].join(":") !== candidate.signature) return 0;
+          fs.unlinkSync(candidate.file);
+          return 1;
+        }, { timeoutMs: 0 });
+      } catch { return 0; }
+    };
     let deleted = 0;
     for (const f of files) {
       if (now - f.mtimeMs > PLAN_STALE_MS) {
@@ -783,7 +965,7 @@ function gcTaskPlans(hubPlansDir, nowMs, anchorDir) {
         const updatedAtMs = data && data.updatedAt ? Date.parse(data.updatedAt) : NaN;
         const noActiveUpdate = Number.isNaN(updatedAtMs) || now - updatedAtMs > PLAN_STALE_MS;
         if (allDone || noActiveUpdate || now - f.mtimeMs > PLAN_STALE_MS) {
-          try { assertPlansStore(hubPlansDir, anchorDir); assertSafeFsPath(hubPlansDir, f.file); fs.unlinkSync(f.file); deleted += 1; } catch {}
+          deleted += remove(f);
         }
       }
     }
@@ -797,7 +979,7 @@ function gcTaskPlans(hubPlansDir, nowMs, anchorDir) {
       if (remaining.length > PLAN_MAX_FILES) {
         remaining.sort((a, b) => a.mtimeMs - b.mtimeMs);
         for (const f of remaining.slice(0, remaining.length - PLAN_MAX_FILES)) {
-          try { assertPlansStore(hubPlansDir, anchorDir); assertSafeFsPath(hubPlansDir, f.file); fs.unlinkSync(f.file); deleted += 1; } catch {}
+          deleted += remove(f);
         }
       }
     } catch {}
@@ -822,12 +1004,9 @@ function listHubPlans(hubPlansDir, nowMs, anchorDir) {
   return out;
 }
 
-function findHubPlan(hubPlansDir, opts) {
-  const plans = listHubPlans(hubPlansDir);
-  if (!plans.length) return null;
+function matchingHubPlans(plans, opts) {
   const hasThread = opts && opts.threadId;
   const hasRoot = opts && opts.projectRoot;
-  const byUpdated = (a, b) => String(b.data.updatedAt || "").localeCompare(String(a.data.updatedAt || ""));
   let matched = plans;
   if (hasThread) {
     const tid = String(opts.threadId);
@@ -844,10 +1023,19 @@ function findHubPlan(hubPlansDir, opts) {
     // never surface another thread's plan just because the projectRoot fits.
     matched = plans.filter((p) => sameProject(p.data.projectRoot, opts.projectRoot) && !p.data.threadId);
   }
+  return matched;
+}
+
+function findHubPlan(hubPlansDir, opts, plans = listHubPlans(hubPlansDir)) {
+  const matched = matchingHubPlans(plans, opts);
   if (!matched.length) return null;
-  matched.sort(byUpdated);
+  matched.sort((a, b) => String(b.data.updatedAt || "").localeCompare(String(a.data.updatedAt || "")) || (path.basename(a.file) < path.basename(b.file) ? -1 : 1));
   const best = matched[0].data;
+  // Global fallback still displays one plan; its revision belongs to that
+  // selected (threadId, projectRoot) scope, never every unrelated plan.
+  const scoped = opts?.threadId || opts?.projectRoot ? matched : matchingHubPlans(matched, best);
   return {
+    planRevision: planRevision(scoped),
     steps: best.steps.map((s, i) => ({
       id: String((s && s.id) || `step-${i + 1}`),
       text: String((s && s.text) || ""),
@@ -905,6 +1093,7 @@ function createTaskBoard(opts = {}) {
   const hubPlansDir = expandTilde(opts.hubPlansDir || path.join(homeDir, ".t3", "hub", "task-plans"));
   const brainRoots = normalizeBrainRoots(opts.agyBrainDirs ?? opts.agyBrainDir ?? null, homeDir);
   const nowFn = typeof opts.now === "function" ? opts.now : () => Date.now();
+  const lockOptions = { monotonicNow: opts.monotonicNow };
   function checkPlansStore() {
     const resolved = path.resolve(hubPlansDir);
     const homeRes = path.resolve(homeDir);
@@ -962,6 +1151,7 @@ function createTaskBoard(opts = {}) {
         subagents: [],
         artifacts: [],
         source: hub ? winner.source || "hub-mcp" : "t3-native",
+        planRevision: hub?.planRevision || "",
         progress: computeProgress(steps),
         updatedAt: String(winner.updatedAt || new Date(nowFn()).toISOString()),
       };
@@ -991,24 +1181,7 @@ function createTaskBoard(opts = {}) {
                 return (rp === hp || rp.startsWith(hp + path.sep)) ? homeDir : undefined;
               } catch { return undefined; }
             })());
-            const reqTid = String(q.threadId);
-            const reqRoot = String(q.projectRoot);
-            const matched = all.filter((p) => String(p.data.threadId || "") === reqTid && p.data.projectRoot && sameProject(p.data.projectRoot, reqRoot));
-            if (matched.length) {
-              matched.sort((a, b) => String(b.data.updatedAt || "").localeCompare(String(a.data.updatedAt || "")));
-              const best = matched[0].data;
-              scopedHub = {
-                steps: best.steps.map((s, i) => ({
-                  id: String((s && s.id) || `step-${i + 1}`),
-                  text: String((s && s.text) || ""),
-                  status: normalizeStepStatus(s && s.status),
-                  ...(s && typeof s.note === "string" && s.note.trim() ? { note: s.note } : {}),
-                })),
-                background: String(best.background || best.title || ""),
-                updatedAt: String(best.updatedAt || ""),
-                source: "hub-mcp",
-              };
-            }
+            scopedHub = findHubPlan(hubPlansDir, { threadId: String(q.threadId), projectRoot: String(q.projectRoot) }, all);
           } catch {}
           const scopedSteps = scopedHub && Array.isArray(scopedHub.steps) ? scopedHub.steps : [];
           const winner = scopedHub || { steps: [], background: "", updatedAt: "", source: "t3-native" };
@@ -1027,6 +1200,7 @@ function createTaskBoard(opts = {}) {
             artifacts: [],
             artifactScopeError: bound ? "mismatch" : "unknown",
             source: winner.source || "t3-native",
+            planRevision: scopedHub?.planRevision || "",
             progress: computeProgress(scopedSteps),
             updatedAt: String(winner.updatedAt || new Date(nowFn()).toISOString()),
           };
@@ -1059,7 +1233,7 @@ function createTaskBoard(opts = {}) {
     // before reading any of it: task.md contains private plan text just as
     // artifacts do. Hub-authored plans retain their own explicit scope.
     const artifactScope = verifyArtifactScope({ projectRoot: q.projectRoot, threadId: requestedThreadId || resolved.threadId });
-    const agy = artifactScope.ok ? readAgyBrain(brainRoots, candidateIds, { strictThreadMatch: true }) : null;
+    const agy = artifactScope.ok ? readAgyBrain(brainRoots, candidateIds, { strictThreadMatch: true, homeDir }) : null;
     const hub = findHubPlan(hubPlansDir, { threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
 
     const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) =>
@@ -1086,6 +1260,7 @@ function createTaskBoard(opts = {}) {
       artifacts,
       ...(!artifactScope.ok && candidateIds?.length ? { artifactScopeError: artifactScope.reason } : {}),
       source: winner.source || "t3-native",
+      planRevision: hub?.planRevision || "",
       progress: computeProgress(steps),
       updatedAt: String(winner.updatedAt || new Date(nowFn()).toISOString()),
     };
@@ -1117,15 +1292,19 @@ function createTaskBoard(opts = {}) {
       updatedAt: new Date(nowFn()).toISOString(),
     };
     checkPlansStore();
-    const file = planPath(hubPlansDir, planFileKey({ threadId: threadId || undefined, projectRoot: projectRoot || undefined }) + ".json");
-    try {
-      const rp = path.resolve(hubPlansDir);
-      const hp = path.resolve(homeDir);
-      const anchor = (rp === hp || rp.startsWith(hp + path.sep)) ? homeDir : undefined;
-      gcTaskPlans(hubPlansDir, nowFn(), anchor);
-    } catch {}
-    writeJsonAtomic(file, record);
-    return record;
+    return withPlansLock(hubPlansDir, { threadId, projectRoot }, () => {
+      checkPlansStore();
+      const file = planPath(hubPlansDir, planFileKey({ threadId: threadId || undefined, projectRoot: projectRoot || undefined }) + ".json");
+      const matched = matchingHubPlans(listHubPlans(hubPlansDir), { threadId, projectRoot });
+      assertPlanVersion(o, findHubPlan(hubPlansDir, { threadId, projectRoot }, matched));
+      writeJsonAtomic(file, record);
+      // Consolidate legacy names under the same lock as the scope-wide CAS.
+      for (const plan of matched) {
+        if (plan.file === file) continue;
+        checkPlansStore(); assertSafeFsPath(hubPlansDir, plan.file); fs.unlinkSync(plan.file);
+      }
+      return { ...record, planRevision: planRevision([{ file, data: record }]) };
+    }, lockOptions);
   }
 
   function clearPlan(input) {
@@ -1133,41 +1312,22 @@ function createTaskBoard(opts = {}) {
     validatePlanInput(o);
     if (!o.threadId && !o.projectRoot) throw new Error("clearPlan requires threadId or projectRoot");
     checkPlansStore();
-    let deleted = 0;
-    let plansAnchor;
-    try {
-      const rp = path.resolve(hubPlansDir);
-      const hp = path.resolve(homeDir);
-      plansAnchor = (rp === hp || rp.startsWith(hp + path.sep)) ? homeDir : undefined;
-    } catch { plansAnchor = undefined; }
-    const hasThread = o.threadId != null && String(o.threadId) !== "";
-    const hasRoot = o.projectRoot != null && String(o.projectRoot) !== "";
-    for (const p of listHubPlans(hubPlansDir, undefined, plansAnchor)) {
-      const d = p.data;
-      const dThread = String(d.threadId || "");
-      const dRoot = String(d.projectRoot || "");
-      let shouldDelete = false;
-      if (o.threadId === "__NEW__") {
-        // The sentinel is shared across projects; unlike real thread IDs it
-        // only identifies a draft together with its (possibly empty) scope.
-        shouldDelete = d.threadId === "__NEW__" && (hasRoot ? sameProject(d.projectRoot, o.projectRoot) : !d.projectRoot);
-      } else if (hasThread) {
-        // Strict thread isolation: when a threadId is supplied, only that
-        // thread's plans are removed. Never cross-delete other threads that
-        // merely share the same projectRoot.
-        // Missing scope is only compatible with old unscoped records; it is
-        // never permission to clear another project's scoped plan.
-        shouldDelete = dThread === String(o.threadId) && (hasRoot ? dRoot && sameProject(dRoot, o.projectRoot) : !dRoot);
-      } else if (hasRoot) {
-        // Project-level clear only removes plans without an explicit
-        // threadId (project-scoped drafts), never other sessions' plans.
-        shouldDelete = sameProject(dRoot, o.projectRoot) && dThread === "";
+    return withPlansLock(hubPlansDir, o, () => {
+      checkPlansStore();
+      let deleted = 0;
+      let plansAnchor;
+      try {
+        const rp = path.resolve(hubPlansDir);
+        const hp = path.resolve(homeDir);
+        plansAnchor = (rp === hp || rp.startsWith(hp + path.sep)) ? homeDir : undefined;
+      } catch { plansAnchor = undefined; }
+      const matched = matchingHubPlans(listHubPlans(hubPlansDir, undefined, plansAnchor), o);
+      assertPlanVersion(o, findHubPlan(hubPlansDir, o, matched));
+      for (const p of matched) {
+        checkPlansStore(); assertSafeFsPath(hubPlansDir, p.file); fs.unlinkSync(p.file); deleted += 1;
       }
-      if (shouldDelete) {
-        try { checkPlansStore(); assertSafeFsPath(hubPlansDir, p.file); fs.unlinkSync(p.file); deleted += 1; } catch {}
-      }
-    }
-    return { deleted };
+      return { deleted };
+    }, lockOptions);
   }
 
   return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope };

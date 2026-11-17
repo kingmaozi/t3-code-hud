@@ -6,7 +6,7 @@
 - GitHub：<https://github.com/kingmaozi/t3-code-hud>
 - `origin`：`https://github.com/kingmaozi/t3-code-hud.git`
 - 接手分支：`codex/t3-hub-handoff-20261116`，基于 `4a28ce4`
-- 当前版本：`package.json` 中的 `1.0.1`
+- 当前版本：`package.json` 中的 `1.0.2`（已对齐官方 `T3 Code v0.1.10`）
 
 本地新工程已经有 Git 历史和远程地址，不要再 `git init`、不要更换 remote。推送前先检查 remote、暂存清单和完整差异，因为 GitHub 仓库是公开的。私人会话、用户记忆库、日志、报告、密钥和账号资料不能提交。
 

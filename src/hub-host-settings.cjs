@@ -11,6 +11,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const CODEX_TOP_KEYS = ["model", "model_reasoning_effort", "approval_policy", "sandbox_mode", "max_concurrent_threads"];
 const CODEX_EDITABLE_KEYS = ["model", "model_reasoning_effort", "approval_policy", "sandbox_mode"];
@@ -620,12 +621,191 @@ function createHostSettingsManager(opts = {}) {
   const museSettingsPath = expandTilde(opts.museSettingsPath || path.join(homeDir, ".config", "muse", "settings.json"));
   const piSettingsPath = expandTilde(opts.piSettingsPath || path.join(homeDir, ".pi", "agent", "settings.json"));
   const agyConfigDir = expandTilde(opts.agyConfigDir || path.join(homeDir, ".gemini", "antigravity"));
-  const agyProvidersDir = path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
-  const agyProviderRules = () => {
-    try { return fs.readdirSync(agyProvidersDir, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => path.join(agyProvidersDir, e.name, "config", "rules", "AGENTS.md")).filter(p => !probeTextSnapshot(p).missing).sort(); }
-    catch { return []; }
+  const resolveAgyProvidersDir = () => {
+    if (typeof opts.t3UserdataDir === "string" && opts.t3UserdataDir.trim()) {
+      return path.join(path.resolve(expandTilde(opts.t3UserdataDir)), "providers", "antigravity");
+    }
+    const envHome = process.env.HOME || os.homedir();
+    const sameHome = !opts.homeDir || path.resolve(homeDir) === path.resolve(envHome);
+    if (sameHome && typeof process.env.T3CODE_HOME === "string" && process.env.T3CODE_HOME.trim()) {
+      return path.join(path.resolve(process.env.T3CODE_HOME), "providers", "antigravity");
+    }
+    return path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
   };
-  const existingOr = (primary, legacy) => !probeTextSnapshot(primary).missing ? primary : !probeTextSnapshot(legacy).missing ? legacy : primary;
+  const isMacAliasPath = (linkPath, realPath) => {
+    const link = path.resolve(String(linkPath)), real = path.resolve(String(realPath));
+    return (link === "/tmp" && real === "/private/tmp") || (link === "/var" && real === "/private/var");
+  };
+  const assertNoSymlinkChain = (targetPath) => {
+    let cur = path.resolve(targetPath);
+    while (true) {
+      const parent = path.dirname(cur);
+      if (parent === cur) return;
+      cur = parent;
+      const st = lstatIfPresent(cur);
+      if (!st) continue;
+      if (st.isSymbolicLink()) {
+        let real = null, dangling = false;
+        try { real = fs.realpathSync(cur); } catch (e) { dangling = Boolean(e && e.code === "ENOENT"); real = null; }
+        if (dangling) { const err = new Error("Refusing dangling symlink: " + cur); err.danglingSymlink = true; throw err; }
+        if (!real || !isMacAliasPath(cur, real)) throw new Error("unsafe non-directory or symlink: " + cur);
+      } else if (!st.isDirectory()) {
+        throw new Error("unsafe non-directory or symlink: " + cur);
+      }
+    }
+  };
+  const isSafeRealDirectory = (dir) => {
+    try {
+      assertNoSymlinkChain(dir);
+      const st = fs.lstatSync(dir);
+      return !st.isSymbolicLink() && st.isDirectory();
+    } catch { return false; }
+  };
+  const probeNoSymlinkText = (filePath) => {
+    if (!filePath) return { missing: true, content: "", error: null, corrupted: false };
+    try {
+      assertNoSymlinkChain(filePath);
+      const st = lstatIfPresent(filePath);
+      if (!st) return { missing: true, content: "", error: null, corrupted: false };
+      if (st.isSymbolicLink()) {
+        let dangling = false;
+        try { fs.realpathSync(filePath); } catch (e) { dangling = Boolean(e && e.code === "ENOENT"); }
+        return { missing: false, content: "", error: (dangling ? "Refusing dangling symlink: " : "unsafe symlink path: ") + filePath, corrupted: true };
+      }
+      if (!st.isFile()) return { missing: false, content: "", error: "unsafe non-regular file: " + filePath, corrupted: true };
+      if (!(st.mode & 0o444)) return { missing: false, content: "", error: "unreadable rule file: " + filePath, corrupted: true };
+      return probeTextSnapshot(filePath);
+    } catch (e) {
+      const missing = e?.code === "ENOENT" && !e?.danglingSymlink;
+      return { missing, content: "", error: String(e?.message || e), corrupted: !missing };
+    }
+  };
+  const safeReadJsonNoSymlink = (filePath, fallback) => {
+    try {
+      assertNoSymlinkChain(filePath);
+      const st = lstatIfPresent(filePath);
+      if (!st || st.isSymbolicLink() || !st.isFile()) return fallback;
+      return safeReadJson(filePath, fallback);
+    } catch { return fallback; }
+  };
+  const agyProviderRules = () => {
+    const agyProvidersDir = resolveAgyProvidersDir();
+    if (!isSafeRealDirectory(agyProvidersDir)) return [];
+    try {
+      const found = [];
+      for (const e of fs.readdirSync(agyProvidersDir, { withFileTypes: true })) {
+        if (e.name === ".DS_Store" || e.name === ".localized" || e.name.startsWith("skills-archived")) continue;
+        const inst = path.join(agyProvidersDir, e.name);
+        if (!isSafeRealDirectory(inst)) continue;
+        const cfg = path.join(inst, "config");
+        if (!isSafeRealDirectory(cfg)) continue;
+        const rules = path.join(cfg, "rules");
+        if (!isSafeRealDirectory(rules)) continue;
+        const rf = path.join(rules, "AGENTS.md");
+        const rfProbe = probeNoSymlinkText(rf);
+        if (!rfProbe.missing) found.push(rf);
+      }
+      return found.sort();
+    } catch { return []; }
+  };
+  const existingOr = (primary, legacy) => !probeNoSymlinkText(primary).missing ? primary : !probeNoSymlinkText(legacy).missing ? legacy : primary;
+  const hubDirForSkills = opts.hubDir || path.join(homeDir, ".t3", "hub");
+  function sha256Hex(text) { return crypto.createHash("sha256").update(text, "utf8").digest("hex"); }
+  const { isHubManagedSkillContent: isManagedSkillText } = require("./hub-subagents.cjs");
+  function routingSkillPaths() {
+    const staticTargets = [
+      path.join(hubDirForSkills, "skills", "t3-subagent-routing", "SKILL.md"),
+      path.join(homeDir, ".agents", "skills", "t3-subagent-routing", "SKILL.md"),
+    ];
+    const targets = [];
+    const errors = [];
+    const record = (dir, e) => errors.push({ path: dir, exists: null, sha256: null, managed: false, error: "enumeration_failed", detail: String(e?.message || e) });
+    const assertAncestors = assertNoSymlinkChain;
+    const directoryState = (dir, checkAncestors = false) => {
+      try {
+        if (checkAncestors) assertAncestors(dir);
+        const st = fs.lstatSync(dir);
+        if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("unsafe non-directory or symlink: " + dir);
+        // Check every layer, including config, so an intermediate symlink or
+        // unreadable directory cannot hide an older routing Skill.
+        fs.readdirSync(dir);
+        return "ok";
+      } catch (e) {
+        if (e?.code === "ENOENT") return "missing";
+        record(dir, e);
+        return "error";
+      }
+    };
+    for (const staticSkill of staticTargets) {
+      const pkgDir = path.dirname(staticSkill);
+      const skillsRoot = path.dirname(pkgDir);
+      const rootState = directoryState(skillsRoot, true);
+      if (rootState === "error") continue;
+      if (rootState === "ok") {
+        const pkgState = directoryState(pkgDir, false);
+        if (pkgState === "error") continue;
+      }
+      targets.push(staticSkill);
+    }
+    if (directoryState(agyConfigDir, true) === "ok") {
+      const globalRulesDir = path.join(agyConfigDir, "rules");
+      if (directoryState(globalRulesDir, false) === "ok") {
+        const gf = path.join(globalRulesDir, "AGENTS.md");
+        const gfProbe = probeNoSymlinkText(gf);
+        if (!gfProbe.missing && gfProbe.error) record(gf, new Error(gfProbe.error));
+      }
+    }
+    const agyRoot = resolveAgyProvidersDir();
+    if (directoryState(agyRoot, true) === "ok") {
+      let entries = [];
+      try { entries = fs.readdirSync(agyRoot, { withFileTypes: true }); }
+      catch (e) { if (e?.code !== "ENOENT") record(agyRoot, e); }
+      for (const ent of entries) {
+        const instance = path.join(agyRoot, ent.name);
+        let entrySt = null;
+        try { entrySt = lstatIfPresent(instance); }
+        catch (e) { record(instance, e); continue; }
+        if (!entrySt) continue;
+        if (ent.name === ".DS_Store" || ent.name === ".localized") {
+          if (entrySt.isSymbolicLink() || !entrySt.isFile()) record(instance, new Error("unsafe metadata entry: " + instance));
+          continue;
+        }
+        if (ent.name.startsWith("skills-archived")) {
+          if (entrySt.isSymbolicLink() || !entrySt.isDirectory()) record(instance, new Error("unsafe archive entry: " + instance));
+          continue;
+        }
+        if (directoryState(instance) !== "ok") continue;
+        const config = path.join(instance, "config"), skillsDir = path.join(config, "skills"), instRulesDir = path.join(config, "rules");
+        if (directoryState(config) === "ok") {
+          if (directoryState(instRulesDir) === "ok") {
+            const rf = path.join(instRulesDir, "AGENTS.md");
+            const rfProbe = probeNoSymlinkText(rf);
+            if (!rfProbe.missing && rfProbe.error) record(rf, new Error(rfProbe.error));
+          }
+          if (directoryState(skillsDir) === "ok") {
+            const pkgState = directoryState(path.join(skillsDir, "t3-subagent-routing"));
+            if (pkgState !== "error") targets.push(path.join(skillsDir, "t3-subagent-routing", "SKILL.md"));
+          }
+        }
+      }
+    }
+    return { paths: [...new Set(targets)].sort(), errors, assertNoSymlinkAncestors: assertAncestors };
+  }
+  function detectUnmanagedConflictForPath(targetPath) {
+    if (!targetPath) return null;
+    const probe = probeNoSymlinkText(targetPath);
+    if (probe.missing || probe.error) return null;
+    const text = probe.content;
+    const START = "<!-- T3_HUB_ORCHESTRATOR_START -->", END = "<!-- T3_HUB_ORCHESTRATOR_END -->";
+    const s = text.indexOf(START), e = text.indexOf(END);
+    let outside = text;
+    if (s >= 0 && e >= s) outside = text.slice(0, s) + "\n" + text.slice(e + END.length);
+    const matches = [];
+    if (outside.includes("code-review") && /\bhigh\b/.test(outside)) matches.push("code-review+high");
+    if (outside.includes("4 专项分身") || outside.includes("4专项")) matches.push("4专项分身");
+    if (!matches.length) return null;
+    return { path: targetPath, matches, excerpt: outside.slice(0, 400) };
+  }
   const agyRulePath = () => {
     if (opts.agyAgentsPath) return expandTilde(opts.agyAgentsPath);
     if (opts.agyConfigDir) return path.join(agyConfigDir, "rules", "AGENTS.md");
@@ -655,7 +835,7 @@ function createHostSettingsManager(opts = {}) {
   function getMuseSnapshot() {
     const probe = probeJsonSnapshot(museSettingsPath);
     const data = probe.data || {};
-    const mcpCount = data && typeof data === "object" && data.mcpServers && typeof data.mcpServers === "object"
+    const mcpCount = data && typeof data === "object" && data.mcpServers && typeof data.mcpServers === "object" && !Array.isArray(data.mcpServers)
       ? Object.keys(data.mcpServers).length
       : 0;
     return {
@@ -687,29 +867,83 @@ function createHostSettingsManager(opts = {}) {
   }
 
   function getAntigravitySnapshot() {
+    const routing = routingSkillPaths();
     const rulesDir = path.join(agyConfigDir, "rules");
     const agentsPath = rulesPaths.antigravity;
     const geminiPath = path.join(agyConfigDir, "GEMINI.md");
-    let rulePath = agentsPath, probe = agentsPath ? probeTextSnapshot(agentsPath) : { missing: true, content: "", error: null, corrupted: false };
+    let rulePath = agentsPath, probe = agentsPath ? probeNoSymlinkText(agentsPath) : { missing: true, content: "", error: null, corrupted: false };
     if (probe.missing) {
-      const fallback = probeTextSnapshot(geminiPath);
+      const fallback = probeNoSymlinkText(geminiPath);
       if (!fallback.missing) { rulePath = geminiPath; probe = fallback; }
     }
     const content = probe.content;
     const mcpJsonPaths = [path.join(agyConfigDir, "mcp.json"), path.join(homeDir, ".gemini", "mcp.json")];
     let mcpCount = 0;
     for (const mp of mcpJsonPaths) {
-      const d = safeReadJson(mp, null);
+      const d = safeReadJsonNoSymlink(mp, null);
       if (d && typeof d === "object") {
         const servers = d.mcpServers || d.servers || null;
         if (servers && typeof servers === "object") { mcpCount = Object.keys(servers).length; break; }
         if (Array.isArray(d)) { mcpCount = d.length; break; }
       }
     }
-    const skillsCount = countSkillsDirs([
+    const safeSkillCountDirs = [
       path.join(agyConfigDir, "skills"),
       path.join(homeDir, ".agents", "skills"),
-    ]);
+    ].filter(isSafeRealDirectory);
+    const skillsCount = countSkillsDirs(safeSkillCountDirs);
+    const probeRoutingSkillStrict = (file) => {
+      try {
+        routing.assertNoSymlinkAncestors(file);
+        const st = lstatIfPresent(file);
+        if (!st) return { path: file, exists: false, sha256: null, managed: false };
+        if (st.isSymbolicLink()) return { path: file, exists: true, sha256: null, managed: false, error: "symlink" };
+        if (!st.isFile()) return { path: file, exists: true, sha256: null, managed: false, error: "non_regular_file" };
+        if (!(st.mode & 0o444)) return { path: file, exists: true, sha256: null, managed: false, error: "unreadable" };
+        const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        let raw;
+        try {
+          const fst = fs.fstatSync(fd);
+          if (!fst.isFile() || fst.ino !== st.ino || fst.dev !== st.dev) {
+            return { path: file, exists: true, sha256: null, managed: false, error: "non_regular_file" };
+          }
+          raw = fs.readFileSync(fd);
+        } finally {
+          try { fs.closeSync(fd); } catch {}
+        }
+        const skillContent = raw.toString("utf8");
+        return { path: file, exists: true, sha256: crypto.createHash("sha256").update(raw).digest("hex"), managed: isManagedSkillText(skillContent) };
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        let code = "unreadable";
+        if (/symlink|ELOOP/i.test(msg) || (e && e.code === "ELOOP")) code = "symlink";
+        else if (/non-directory|non-regular|not a regular/i.test(msg)) code = "non_regular_file";
+        return { path: file, exists: true, sha256: null, managed: false, error: code };
+      }
+    };
+    const routingSkills = routing.paths.map(probeRoutingSkillStrict).concat(routing.errors);
+    const skillErrors = routingSkills.filter((s) => Boolean(s.error) && s.error !== "enumeration_failed");
+    const routingSkillsEnumerationError = routing.errors.length ? routing.errors.map(e => e.path + ": " + e.detail).join("; ") : null;
+    const routingSkillsErrorSummary = routingSkillsEnumerationError || (skillErrors.length ? skillErrors.map((s) => s.path + ": " + s.error).join("; ") : null);
+    let unmanagedConflictWarning = null;
+    const conflictCandidates = [...new Set([rulePath, path.join(agyConfigDir, "rules", "AGENTS.md")])].filter(Boolean);
+    for (const cp of conflictCandidates) {
+      const w = detectUnmanagedConflictForPath(cp);
+      if (w) { unmanagedConflictWarning = w; break; }
+    }
+    if (!unmanagedConflictWarning) {
+      for (const cp of agyProviderRules()) {
+        const w = detectUnmanagedConflictForPath(cp);
+        if (w) { unmanagedConflictWarning = w; break; }
+      }
+    }
+    const ruleCandidates = [...new Set([...agyProviderRules(), path.join(homeDir, ".gemini", "GEMINI.md"), path.join(agyConfigDir, "rules", "AGENTS.md")])].map((p) => {
+      const candidate = probeNoSymlinkText(p);
+      return { path: p, exists: !candidate.missing, error: candidate.error, corrupted: candidate.corrupted };
+    });
+    const ruleErrors = ruleCandidates.filter((candidate) => candidate.error);
+    const effectiveError = probe.error || ruleErrors.map((candidate) => candidate.path + ": " + candidate.error).join("; ") || routingSkillsErrorSummary;
+    const isCorrupted = Boolean(probe.corrupted || ruleCandidates.some((candidate) => candidate.corrupted) || routing.errors.length > 0 || skillErrors.length > 0);
     return {
       rulesDir,
       rulePath,
@@ -718,11 +952,15 @@ function createHostSettingsManager(opts = {}) {
       preview: content.slice(0, 600),
       mcpCount,
       skillsCount,
-      ruleCandidates: [...new Set([...agyProviderRules(), path.join(homeDir, ".gemini", "GEMINI.md"), path.join(agyConfigDir, "rules", "AGENTS.md")])].map(p => ({ path: p, exists: !probeTextSnapshot(p).missing })),
+      ruleCandidates,
       ruleSelectionAmbiguous: !agentsPath,
       loadedByAcp: null,
-      error: probe.error,
-      corrupted: probe.corrupted,
+      routingSkills,
+      routingSkillsComplete: routing.errors.length === 0 && skillErrors.length === 0,
+      routingSkillsEnumerationError,
+      unmanagedConflictWarning,
+      error: effectiveError,
+      corrupted: isCorrupted,
     };
   }
 
@@ -734,15 +972,32 @@ function createHostSettingsManager(opts = {}) {
     const globalRules = {};
     for (const host of Object.keys(rulesPaths)) {
       const p = rulesPaths[host];
-      const probe = p ? probeTextSnapshot(p) : { missing: true, content: "", error: "存在多个 AGY 规则文件，请先确认当前实例。", corrupted: false };
-      globalRules[host] = { path: p, exists: !probe.missing, chars: probe.content.length, error: probe.error, corrupted: probe.corrupted };
+      const probe = p
+        ? (host === "antigravity" ? probeNoSymlinkText(p) : probeTextSnapshot(p))
+        : { missing: true, content: "", error: "存在多个 AGY 规则文件，请先确认当前实例。", corrupted: false };
+      const hostErr = host === "antigravity" ? (probe.error || antigravity.error) : probe.error;
+      const hostCorrupted = host === "antigravity" ? Boolean(probe.corrupted || antigravity.corrupted) : Boolean(probe.corrupted);
+      globalRules[host] = { path: p, exists: !probe.missing, chars: probe.content.length, error: hostErr, corrupted: hostCorrupted };
     }
     return { codex, antigravity, muse, pi, globalRules };
+  }
+
+  function assertNoSymlinkForAgyRule(filePath) {
+    assertNoSymlinkChain(filePath);
+    const st = lstatIfPresent(filePath);
+    if (!st) return;
+    if (st.isSymbolicLink()) {
+      let dangling = false;
+      try { fs.realpathSync(filePath); } catch (e) { dangling = Boolean(e && e.code === "ENOENT"); }
+      throw new Error((dangling ? "Refusing dangling symlink: " : "unsafe symlink path: ") + filePath);
+    }
+    if (!st.isFile()) throw new Error("Refusing non-regular file: " + filePath);
   }
 
   function getRuleContent(host) {
     const p = rulesPaths[host];
     if (!p) throw new Error(host === "antigravity" ? "存在多个 AGY 规则文件，无法确定当前实例" : `unknown host: ${host}`);
+    if (host === "antigravity") assertNoSymlinkForAgyRule(p);
     const { content, missing } = readTextFileStrict(p);
     return { path: p, targetPath: canonicalRuleTarget(p), exists: !missing, content };
   }
@@ -764,11 +1019,13 @@ function createHostSettingsManager(opts = {}) {
     const p = rulesPaths[host];
     if (!p) throw new Error(host === "antigravity" ? "存在多个 AGY 规则文件，无法确定当前实例" : `unknown host: ${host}`);
     if (typeof content !== "string") throw new Error("content must be string");
+    if (host === "antigravity") assertNoSymlinkForAgyRule(p);
     const target = canonicalRuleTarget(p);
     if (typeof expectedContent !== "string" || typeof expectedTarget !== "string" || target !== expectedTarget) throw new Error("规则文件或目标已变更，请重新读取后保存");
     backupOnce(p);
     const writer = require("./hub-subagents.cjs").createSubagentsManager({ homeDir, hubDir: opts.hubDir || path.join(homeDir, ".t3", "hub") });
     writer.replaceRuleDocument(target, content, expectedContent);
+    if (host === "antigravity") assertNoSymlinkForAgyRule(p);
     if (canonicalRuleTarget(p) !== target || readTextFileStrict(p).content !== content) throw new Error("保存后规则目标已变更，请重新读取");
     return { path: p, chars: content.length };
   }
@@ -800,7 +1057,7 @@ function createHostSettingsManager(opts = {}) {
     throw new Error(`unknown host: ${host}`);
   }
 
-  return { getSettingsSnapshot, getRuleContent, saveRuleContent, updateHostSetting };
+  return { getSettingsSnapshot, getAntigravitySnapshot, getRuleContent, saveRuleContent, updateHostSetting };
 }
 
 module.exports = {

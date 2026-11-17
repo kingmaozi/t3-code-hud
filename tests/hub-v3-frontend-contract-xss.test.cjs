@@ -52,11 +52,12 @@ function harness(rpc = async () => ({}), environment = {}) {
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings,
       onInput, onChange, onClick, onEditorKeydown, renderMemoryList, renderHooks, renderSkillList, renderMcpList, renderDream, saveDream, saveDreamEngine, runDream,
       renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
-      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab,
+      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
       composerToken, composerSurface, positionSlash, closeSlash, selectSlash, onComposerInput, onComposerKeydown,
       findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory, renderDream,
-      ready: () => { contextLoading = false; },
-      setCurrentRoute: () => { lastRoute = routeKey(); },
+      refreshContext, ready: () => { contextLoading = false; },
+      setCurrentRoute: () => { lastRoute = routeKey(); lastBoardRoute = boardScopeRoute(); },
+      routeScope: () => ({ cached: lastBoardRoute, current: boardScopeRoute() }),
       setSlash: (session) => { slashSession = session; }, getSlash: () => slashSession,
       setStyle: (fn) => { getComputedStyle = fn; }};
   }`;
@@ -1301,6 +1302,537 @@ test("Hub steps containing CRLF and CR can be toggled without losing identity", 
   }
 });
 
+function issue8BoardFixture(t) {
+  const { DatabaseSync } = require("node:sqlite");
+  const { createTaskBoard } = require("../src/hub-task-board.cjs");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "t3-issue8-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const root = path.join(home, ".gemini/antigravity/brain"), session = path.join(root, "thread-a"), sibling = path.join(root, "thread-b");
+  for (const dir of [session, sibling]) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "task.md"), `# ${path.basename(dir)}\n- [ ] task\n`);
+    fs.utimesSync(path.join(dir, "task.md"), new Date("2020-01-01"), new Date("2020-01-01"));
+  }
+  const projectRoot = path.join(home, "project"), dbPath = path.join(home, "state.sqlite"), db = new DatabaseSync(dbPath);
+  db.exec("CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT PRIMARY KEY, title TEXT, project_id TEXT); CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, workspace_root TEXT, deleted_at TEXT)");
+  db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?)").run("thread-a", "fixture", "p");
+  db.prepare("INSERT INTO projection_projects VALUES (?,?,NULL)").run("p", projectRoot); db.close();
+  const board = createTaskBoard({ homeDir: home, t3DbPath: dbPath, hubPlansDir: path.join(home, "plans"), agyBrainDirs: [root], now: () => Date.parse("2026-11-16T12:00:00Z") });
+  return { home, root, session, sibling, board, query: { threadId: "thread-a", projectRoot, strictThreadMatch: true } };
+}
+
+for (const operation of ["preview", "reveal"]) for (const replacement of ["symlink", "directory"]) {
+  test(`Issue #8 [1] ${operation} rejects a session ${replacement} replacement after listing`, async (t) => {
+    const f = issue8BoardFixture(t), calls = [];
+    const { createArtifactAccess } = require("../src/hub-artifact-access.cjs");
+    const board = { verifyArtifactScope: f.board.verifyArtifactScope, getBoardSnapshot(q) {
+      const snapshot = f.board.getBoardSnapshot(q);
+      assert.ok(snapshot.artifacts.some(a => a.name === "task.md"));
+      fs.renameSync(f.session, f.session + "-old");
+      if (replacement === "symlink") fs.symlinkSync(f.sibling, f.session);
+      else { fs.mkdirSync(f.session); fs.copyFileSync(path.join(f.sibling, "task.md"), path.join(f.session, "task.md")); }
+      return snapshot;
+    } };
+    const access = createArtifactAccess({ homeDir: f.home, board, open: async (...args) => calls.push(args) });
+    await assert.rejects(access({ ...f.query, path: path.join(f.session, "task.md"), operation }), /会话|路径|变化|实体/);
+    assert.equal(calls.length, 0, "a replaced session must never reach Finder");
+  });
+}
+
+test("Issue #8 [1] preview binds the opened fd to the listed file inode", async (t) => {
+  const f = issue8BoardFixture(t), target = path.join(f.session, "task.md");
+  const source = fs.readFileSync(path.join(repo, "src/hub-artifact-access.cjs"), "utf8"), module = { exports: {} };
+  let swapped = false;
+  const guardedFs = Object.create(fs);
+  guardedFs.openSync = (file, ...args) => {
+    if (file === target && !swapped) {
+      swapped = true; fs.renameSync(target, target + ".old"); fs.writeFileSync(target, "SIBLING CONTENT MUST NOT LEAK");
+    }
+    return fs.openSync(file, ...args);
+  };
+  vm.runInNewContext(source, { module, exports: module.exports, require: name => name === "node:fs" ? guardedFs : require(name), Buffer, process });
+  const access = module.exports.createArtifactAccess({ homeDir: f.home, board: f.board, open: async () => assert.fail("preview must not reach Finder") });
+  await assert.rejects(access({ ...f.query, path: target, operation: "preview" }), /会话|路径|变化|实体/);
+  assert.equal(swapped, true, "the race must occur between path validation and open");
+});
+
+function issue8Ui(rpc, environment = {}) {
+  const ui = harness(rpc, environment);
+  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
+  return ui;
+}
+test("Issue #8 [1] preview rechecks the directory chain even when the fd still points to the original inode", async (t) => {
+  const f = issue8BoardFixture(t), target = path.join(f.session, "task.md"), module = { exports: {} }, guardedFs = Object.create(fs);
+  let swapped = false;
+  guardedFs.openSync = (file, ...args) => {
+    const fd = fs.openSync(file, ...args);
+    if (file === target && !swapped) {
+      swapped = true; fs.renameSync(f.session, f.session + "-old"); fs.symlinkSync(f.sibling, f.session);
+    }
+    return fd;
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(repo, "src/hub-artifact-access.cjs"), "utf8"), { module, exports: module.exports, require: name => name === "node:fs" ? guardedFs : require(name), Buffer, process });
+  const access = module.exports.createArtifactAccess({ homeDir: f.home, board: f.board, open: async () => assert.fail("must not reveal a replaced directory") });
+  await assert.rejects(access({ ...f.query, path: target, operation: "preview" }), /会话|路径|变化|实体/);
+  assert.equal(swapped, true);
+});
+
+for (const kind of ["file", "directory"]) for (const ancestor of ["session", "trusted-parent", "provider-parent", "home", "leaf"]) {
+  test(`Issue #8 tail [2] reveal rejects an ABA ${ancestor} replacement for a ${kind}`, async (t) => {
+    const f = issue8BoardFixture(t), { createArtifactAccess } = require("../src/hub-artifact-access.cjs");
+    const target = path.join(f.session, kind === "file" ? "task.md" : "output");
+    if (kind === "directory") {
+      fs.mkdirSync(target);
+      fs.writeFileSync(target + ".metadata.json", JSON.stringify({ userFacing: true }));
+    }
+    const replaced = ancestor === "session" ? f.session : ancestor === "trusted-parent" ? path.dirname(f.root) : ancestor === "provider-parent" ? path.dirname(path.dirname(f.root)) : ancestor === "home" ? f.home : target;
+    const before = fs.lstatSync(replaced, { bigint: true });
+    let revealed = false;
+    const access = createArtifactAccess({ homeDir: f.home, board: f.board, open: async () => {
+      revealed = true;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+      fs.renameSync(replaced, replaced + ".aba-original");
+      fs.symlinkSync(kind === "file" && ancestor === "leaf" ? path.join(f.sibling, "task.md") : f.sibling, replaced);
+      assert.equal(fs.lstatSync(replaced).isSymbolicLink(), true);
+      await new Promise(setImmediate);
+      fs.unlinkSync(replaced);
+      fs.renameSync(replaced + ".aba-original", replaced);
+      const after = fs.lstatSync(replaced, { bigint: true });
+      assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino);
+      assert.notEqual(after.ctimeNs, before.ctimeNs, "the restored entity retains inode identity but records the rename");
+    } });
+    await assert.rejects(access({ ...f.query, path: target, operation: "reveal" }), /会话|路径|变化|实体/);
+    assert.equal(revealed, true, "the ABA must occur during the external reveal");
+  });
+}
+
+for (const kind of ["file", "directory"]) for (const outcome of ["success", "failure"]) {
+  test(`Issue #8 tail [2] reveal retains nofollow ${kind} and ancestor handles until ${outcome}`, async (t) => {
+    const f = issue8BoardFixture(t), module = { exports: {} }, guardedFs = Object.create(fs), handles = new Map();
+    const target = path.join(f.session, kind === "file" ? "task.md" : "output");
+    if (kind === "directory") {
+      fs.mkdirSync(target);
+      fs.writeFileSync(target + ".metadata.json", JSON.stringify({ userFacing: true }));
+    }
+    guardedFs.openSync = (file, flags, ...args) => {
+      const fd = fs.openSync(file, flags, ...args); handles.set(fd, { file, flags }); return fd;
+    };
+    guardedFs.closeSync = (fd) => { handles.delete(fd); return fs.closeSync(fd); };
+    vm.runInNewContext(fs.readFileSync(path.join(repo, "src/hub-artifact-access.cjs"), "utf8"), { module, exports: module.exports, require: name => name === "node:fs" ? guardedFs : require(name), Buffer, process });
+    const access = module.exports.createArtifactAccess({ homeDir: f.home, board: f.board, open: async () => {
+      for (const file of [path.dirname(f.root), f.root, f.session, target]) {
+        const held = [...handles].find(([, item]) => item.file === file);
+        assert.ok(held, `reveal must retain the verified handle for ${path.basename(file)}`);
+        assert.ok(held[1].flags & fs.constants.O_NOFOLLOW);
+        const stat = fs.fstatSync(held[0], { bigint: true });
+        assert.equal(typeof stat.ctimeNs, "bigint");
+      }
+      await new Promise(setImmediate);
+      assert.ok(handles.size >= 4, "handles must remain open across the asynchronous boundary");
+      if (outcome === "failure") throw new Error("simulated Finder failure");
+    } });
+    try {
+      if (outcome === "failure") await assert.rejects(access({ ...f.query, path: target, operation: "reveal" }), /simulated Finder failure/);
+      else assert.equal((await access({ ...f.query, path: target, operation: "reveal" })).kind, "revealed");
+      assert.equal(handles.size, 0, "all handles are released on either outcome");
+    } finally { for (const fd of handles.keys()) fs.closeSync(fd); }
+  });
+}
+test("Issue #8 [2] clearing an absent manual slot preserves the external plan and rejects a newly created manual plan", (t) => {
+  const { board, query, session } = issue8BoardFixture(t), file = path.join(session, "task.md"), original = fs.readFileSync(file, "utf8");
+  const external = board.getBoardSnapshot(query);
+  assert.equal(external.source, "agy-brain"); assert.equal(external.planRevision, "");
+  assert.deepEqual(board.clearPlan({ ...query, expectedRevision: "" }), { deleted: 0 });
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  board.updatePlan({ ...query, steps: [{ text: "new manual plan" }] });
+  assert.throws(() => board.clearPlan({ ...query, expectedRevision: "" }), { code: "PLAN_CONFLICT" });
+  assert.equal(board.getBoardSnapshot(query).steps[0].text, "new manual plan");
+});
+test("Issue #8 [2] clearPlan CAS refuses a newer on-disk manual plan", (t) => {
+  const f = issue8BoardFixture(t), { board, query } = f;
+  board.updatePlan({ ...query, steps: [{ text: "old" }] });
+  const old = board.getBoardSnapshot(query);
+  board.updatePlan({ ...query, steps: [{ text: "unseen new plan" }] });
+  assert.throws(() => board.clearPlan({ ...query, expectedRevision: old.planRevision }), { code: "PLAN_CONFLICT" });
+  assert.equal(board.getBoardSnapshot(query).steps[0].text, "unseen new plan");
+});
+
+test("Issue #8 [3] content revision rejects a stale full-plan overwrite even at the same timestamp", (t) => {
+  const { board, query } = issue8BoardFixture(t);
+  board.updatePlan({ ...query, steps: [{ id: "a", text: "A" }] });
+  const old = board.getBoardSnapshot(query);
+  board.updatePlan({ ...query, steps: [{ id: "a", text: "A" }, { id: "c", text: "concurrent C" }] });
+  const latest = board.getBoardSnapshot(query);
+  assert.equal(old.updatedAt, latest.updatedAt, "timestamp equality cannot establish content identity");
+  assert.throws(() => board.updatePlan({ ...query, expectedRevision: old.planRevision, steps: [{ id: "a", text: "A", status: "completed" }] }), { code: "PLAN_CONFLICT" });
+  assert.ok(board.getBoardSnapshot(query).steps.some(s => s.text === "concurrent C"));
+});
+function issue8Plan(revision, text = revision) {
+  return { threadId: "thread-a", source: "hub-mcp", planRevision: revision, updatedAt: "2026-11-16T12:00:00Z", steps: [{ id: "hub-a", text, status: "pending" }], artifacts: [] };
+}
+function issue8Button(ui, action, dataset = {}) {
+  const target = node(); Object.assign(target, { dataset: { action, ...dataset }, tagName: "BUTTON", isConnected: true }); target.closest = () => target;
+  ui.root.contains = item => item === target; ui.content.contains = item => item === target || item === ui.sandbox.document.activeElement && item !== null;
+  return target;
+}
+
+// Model the relevant DOM lifecycle: innerHTML disconnects the old editor and
+// drops its focus/selection. Restoring only the old object cannot pass this.
+function issue8DraftDom(ui) {
+  let html = ui.content.innerHTML, editor, add, bodySlot, footSlot, prevSlot, countSlot, renders = 0;
+  const spliceBetween = (openTag, closeSuffix, nextInner) => {
+    const start = html.indexOf(openTag);
+    if (start < 0) return;
+    const contentStart = start + openTag.length;
+    const end = closeSuffix ? html.indexOf(closeSuffix, contentStart) : html.lastIndexOf("</div>");
+    if (end < 0) return;
+    html = html.slice(0, contentStart) + nextInner + html.slice(end);
+  };
+  Object.defineProperty(ui.content, "innerHTML", {
+    get: () => html,
+    set(value) {
+      html = value; renders++;
+      if (editor) { editor.isConnected = false; add.isConnected = false; }
+      if (bodySlot) bodySlot.isConnected = false;
+      if (footSlot) footSlot.isConnected = false;
+      if (prevSlot) prevSlot.isConnected = false;
+      if (countSlot) countSlot.isConnected = false;
+      if (ui.content.contains(ui.sandbox.document.activeElement)) ui.sandbox.document.activeElement = null;
+      bodySlot = html.includes("<div data-board-body>") ? Object.defineProperty({ ...node(), isConnected: true }, "innerHTML", {
+        get: () => "",
+        set(v) {
+          const suffix = html.includes('</div><div class="hub-board-add">') ? '</div><div class="hub-board-add">' : "</div><div data-board-foot>";
+          spliceBetween("<div data-board-body>", suffix, String(v));
+        },
+      }) : null;
+      footSlot = html.includes("<div data-board-foot>") ? Object.defineProperty({ ...node(), isConnected: true }, "innerHTML", {
+        get: () => "",
+        set(v) { spliceBetween("<div data-board-foot>", "</div></section><div data-board-preview>", String(v)); },
+      }) : null;
+      prevSlot = html.includes("<div data-board-preview>") ? Object.defineProperty({ ...node(), isConnected: true }, "innerHTML", {
+        get: () => "",
+        set(v) { spliceBetween("<div data-board-preview>", null, String(v)); },
+      }) : null;
+      countSlot = html.includes('<span class="hub-count">') ? Object.defineProperty({ ...node(), isConnected: true }, "textContent", {
+        get: () => "",
+        set(v) { html = html.replace(/<span class="hub-count">[^<]*<\/span>/, `<span class="hub-count">${ui.esc(v)}</span>`); },
+      }) : null;
+      const raw = html.match(/name="board-step-draft" value="([^"]*)"/)?.[1];
+      if (raw === undefined) { editor = add = null; return; }
+      const entities = { amp: "&", quot: '"', lt: "<", gt: ">", "#39": "'" };
+      const valueText = raw.replace(/&(amp|quot|lt|gt|#39);/g, (_, key) => entities[key]);
+      editor = node(); add = node();
+      const origAddSet = add.setAttribute, origAddRem = add.removeAttribute;
+      Object.assign(add, { tagName: "BUTTON", dataset: { action: "board-add" }, isConnected: true, disabled: /data-action="board-add"[^>]*\bdisabled\b/.test(html),
+        setAttribute(k, v) { origAddSet(k, v); if (k === "disabled") html = html.replace(/(data-action="board-add")(?! disabled)/, "$1 disabled"); },
+        removeAttribute(k) { origAddRem(k); if (k === "disabled") html = html.replace(/(data-action="board-add")\s+disabled\b/, "$1"); },
+      });
+      const origEdSet = editor.setAttribute, origEdRem = editor.removeAttribute;
+      Object.assign(editor, { name: "board-step-draft", tagName: "INPUT", value: valueText, isConnected: true, disabled: false, readOnly: /name="board-step-draft"[^>]*\breadonly\b/.test(html),
+        selectionStart: valueText.length, selectionEnd: valueText.length, selectionDirection: "none",
+        setAttribute(k, v) {
+          origEdSet(k, v);
+          if (k === "value") html = html.replace(/(name="board-step-draft" value=")[^"]*"/, (_, prefix) => `${prefix}${ui.esc(v)}"`);
+          if (k === "readonly") html = html.replace(/(name="board-step-draft" value="[^"]*")(?![^>]*\breadonly\b)/, "$1 readonly");
+        },
+        removeAttribute(k) { origEdRem(k); if (k === "readonly") html = html.replace(/(name="board-step-draft" value="[^"]*")\s+readonly\b/, "$1"); },
+        focus() { assert.equal(this.isConnected, true); ui.sandbox.document.activeElement = this; },
+        setSelectionRange(start, end, direction) { this.selectionStart = start; this.selectionEnd = end; this.selectionDirection = direction; },
+        closest: selector => selector === ".hub-board-add" ? { querySelector: () => add } : null,
+      });
+    },
+  });
+  ui.content.querySelector = selector => {
+    if (selector === "[data-board-body]") return bodySlot;
+    if (selector === "[data-board-foot]") return footSlot;
+    if (selector === "[data-board-preview]") return prevSlot;
+    if (selector === ".hub-section-heading .hub-count") return countSlot;
+    return selector.includes("board-add") ? add : selector.includes("board-step-draft") ? editor : null;
+  };
+  ui.content.contains = item => !!item && (item === editor || item === add || item === bodySlot || item === footSlot || item === prevSlot || item === countSlot);
+  ui.root.contains = item => ui.content.contains(item);
+  return { get editor() { return editor; }, get add() { return add; }, get renders() { return renders; },
+    type(text, start = text.length, end = start, direction = "none") {
+      editor.value = text; editor.setSelectionRange(start, end, direction); ui.onInput({ target: editor });
+    },
+    enter() { ui.onEditorKeydown({ target: editor, key: "Enter", preventDefault() {} }); },
+  };
+}
+
+for (const focused of [true, false]) test(`Issue #8 recheck3 [1] failed post-save read preserves ${focused ? "focused" : "unfocused"} draft DOM and recovery advances the Enter baseline`, async () => {
+  let save, failRead = true, plan = issue8Plan("r1", "original");
+  const writes = [], ui = issue8Ui(async (action, payload) => {
+    if (action === "board:update") {
+      writes.push(payload);
+      const finish = () => { plan = { ...plan, steps: payload.steps, planRevision: `r${writes.length + 1}` }; return {}; };
+      if (writes.length === 1) return new Promise(resolve => { save = () => resolve(finish()); });
+      return finish();
+    }
+    if (failRead) throw new Error("post-save read failed");
+    return plan;
+  });
+  const dom = issue8DraftDom(ui); ui.cache.board = plan; ui.renderBoardTab();
+  dom.type("第一条"); const pending = ui.updateBoard(dom.add, "add");
+  dom.type("  第二条 <draft>  ", 2, 6, "backward");
+  if (focused) dom.editor.focus();
+  const oldEditor = dom.editor, oldHtml = ui.content.innerHTML, renders = dom.renders;
+  save(); await pending;
+  assert.equal(dom.editor, oldEditor, "read failure must not replace the editor");
+  assert.equal(ui.content.innerHTML, oldHtml, "the visible list stays intact until a successful read");
+  ui.renderBoardTab({ preserveDraftEditor: true });
+  assert.equal(dom.renders, renders, "explicit preserved rendering must also protect an unfocused draft");
+  assert.equal(dom.editor.value, "  第二条 <draft>  ");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "backward"]);
+  assert.equal(ui.sandbox.document.activeElement, focused ? dom.editor : null);
+  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /读取失败|Read failed/);
+  failRead = false; await ui.pollBoard();
+  assert.match(ui.content.innerHTML, />第一条</, "recovery renders even while the editor remains focused");
+  assert.equal(dom.editor.value, "  第二条 <draft>  ");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "backward"]);
+  assert.equal(ui.sandbox.document.activeElement, focused ? dom.editor : null);
+  dom.editor.focus(); dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 2, "no blur or extra Enter is required after recovery");
+  assert.equal(writes[1].expectedRevision, "r2");
+  assert.deepEqual(Array.from(plan.steps, step => step.text), ["original", "第一条", "第二条 <draft>"]);
+});
+
+test("Issue #8 recheck3 [1] a planReadError readback recovers its focused editor without an explicit render", async () => {
+  let failRead = true;
+  const ui = issue8Ui(async action => action === "board:update" ? {} : failRead ? { ...issue8Plan("r2", "saved step"), planReadError: "unsafe_path" } : issue8Plan("r2", "saved step"));
+  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("first"); const pending = ui.updateBoard(dom.editor, "add");
+  dom.type("next draft", 2, 5, "forward"); const editor = dom.editor; await pending;
+  assert.equal(dom.editor, editor, "an unusable snapshot must preserve the draft DOM");
+  failRead = false; await ui.pollBoard();
+  assert.match(ui.content.innerHTML, /saved step/, "recovery must synchronize even when board:get did not throw");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor); assert.equal(dom.editor.value, "next draft");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "forward"]);
+});
+
+test("Issue #8 recheck3 [1] recovery to a native read-only plan releases editor sync state", async () => {
+  let failRead = true;
+  const native = { ...issue8Plan("native", "native step"), source: "t3-native" };
+  const ui = issue8Ui(async action => {
+    if (action === "board:update") return {};
+    if (failRead) throw new Error("post-save read failed");
+    return native;
+  });
+  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("first"); const pending = ui.updateBoard(dom.add, "add");
+  dom.type("keep draft", 1, 4, "forward"); await pending;
+  assert.ok(dom.editor?.isConnected, "the failed read preserves the active input");
+  failRead = false; await ui.pollBoard();
+  assert.match(ui.content.innerHTML, /native step/);
+  assert.ok(dom.editor?.isConnected, "unsaved draft remains visible on read-only native plan");
+  assert.equal(dom.editor.value, "keep draft");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 4, "forward"]);
+  const renders = dom.renders; await ui.pollBoard();
+  assert.equal(dom.renders, renders, "read-only recovery clears pending editor synchronization");
+});
+
+for (const failRead of [false, true]) test(`Issue #8 recheck3 [2] focused conflict refresh ${failRead ? "recovers after a read failure" : "renders immediately"} without losing draft or selection`, async () => {
+  let readingFails = failRead, plan = { ...issue8Plan("r2", "original"), steps: [...issue8Plan("r1", "original").steps, { id: "hub-external", text: "external step", status: "pending" }] };
+  const writes = [], ui = issue8Ui(async (action, payload) => {
+    if (action === "board:update") {
+      writes.push(payload);
+      if (writes.length === 1) return { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT" } };
+      plan = { ...plan, steps: payload.steps, planRevision: "r3" }; return {};
+    }
+    if (readingFails) throw new Error("conflict refresh failed");
+    return plan;
+  });
+  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1", "original"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("  keep conflict draft  ", 3, 9, "forward");
+  const oldEditor = dom.editor; await ui.updateBoard(dom.editor, "add");
+  if (failRead) {
+    assert.equal(dom.editor, oldEditor); ui.renderBoardTab({ preserveDraftEditor: true });
+    assert.equal(dom.editor, oldEditor, "conflict read failure protects the same DOM");
+    readingFails = false; await ui.pollBoard();
+  }
+  assert.match(ui.content.innerHTML, /external step/, "the external addition must be visible without blur");
+  assert.equal(ui.state.boardDraft, "  keep conflict draft  "); assert.equal(dom.editor.value, ui.state.boardDraft);
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [3, 9, "forward"]);
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 2); assert.equal(writes[1].expectedRevision, "r2");
+  assert.ok(plan.steps.some(step => step.text === "external step"));
+});
+
+test("Issue #8 recheck3 [2] stale Enter refresh advances the focused editor baseline before retry", async () => {
+  const writes = [], latest = issue8Plan("r2", "external step");
+  const ui = issue8Ui(async (action, payload) => { if (action === "board:update") writes.push(payload); return latest; });
+  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("next draft", 1, 5, "backward");
+  await ui.pollBoard(); assert.doesNotMatch(ui.content.innerHTML, /external step/, "ordinary polling defers replacing an active editor");
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 0, "the stale click itself must not write");
+  assert.match(ui.content.innerHTML, /external step/, "stale-click recovery must show the refreshed plan while focused");
+  assert.equal(dom.editor.value, "next draft"); assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 5, "backward"]);
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 1); assert.equal(writes[0].expectedRevision, "r2");
+});
+
+test("Issue #8 final [1] two Enter additions render each saved plan and advance its CAS baseline while restoring the draft selection", async () => {
+  const calls = []; let save, revision = 0, plan = issue8Plan("r0", "original");
+  const ui = issue8Ui(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "board:update") return new Promise(resolve => { save = () => {
+      assert.equal(payload.expectedRevision, plan.planRevision, "each save uses the visible plan version");
+      plan = { ...plan, steps: payload.steps, planRevision: `r${++revision}` }; resolve(plan);
+    }; });
+    return plan;
+  });
+  const dom = issue8DraftDom(ui); ui.cache.board = plan; ui.renderBoardTab();
+  dom.editor.focus(); dom.type("第一条"); dom.enter();
+  assert.ok(save); assert.equal(dom.add.disabled, true); assert.equal(dom.editor.disabled, false);
+  dom.type("  第二条 <draft>  ", 2, 5, "backward");
+  dom.enter(); await ui.updateBoard(dom.add, "add");
+  assert.equal(calls.filter(c => c.action === "board:update").length, 1, "Enter and button share one in-flight lock");
+  const oldEditor = dom.editor, before = dom.renders;
+  save(); await new Promise(setImmediate);
+  assert.ok(dom.renders > before, "saving must actually refresh the list, not only change its revision");
+  assert.match(ui.content.innerHTML, />第一条</);
+  assert.notEqual(dom.editor, oldEditor);
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.equal(dom.editor.value, "  第二条 <draft>  ");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "backward"]);
+  assert.equal(dom.add.disabled, false);
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "board:update").length, 2, "the second Enter must submit immediately after the first save finishes");
+  assert.equal(calls.filter(c => c.action === "board:update")[1].payload.expectedRevision, "r1");
+  save(); await new Promise(setImmediate);
+  assert.deepEqual(Array.from(plan.steps, step => step.text), ["original", "第一条", "第二条 <draft>"]);
+  assert.match(ui.content.innerHTML, />第二条 &lt;draft&gt;</);
+  assert.equal(dom.editor.value, ""); assert.equal(ui.state.boardDraft, "");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+});
+
+test("Issue #8 final [2] editing away and back to identical text during save preserves the new draft and selection", async () => {
+  let save;
+  const ui = issue8Ui(action => action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved")));
+  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("old"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("repeat"); const pending = ui.updateBoard(dom.add, "add");
+  dom.type("different"); dom.type("repeat", 1, 4, "forward");
+  save({}); await pending;
+  assert.equal(ui.state.boardDraft, "repeat", "a new edit is not the old submission even when its text is equal");
+  assert.equal(dom.editor.value, "repeat"); assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 4, "forward"]);
+  assert.match(ui.content.innerHTML, />saved</);
+});
+
+for (const change of ["revision", "route", "project", "thread"]) test(`Issue #8 [2] old clear rejects a changed ${change}`, async () => {
+  const calls = [], ui = issue8Ui(async (action, payload) => { calls.push({ action, payload }); return issue8Plan("new"); });
+  ui.cache.board = issue8Plan("old"); ui.renderBoardTab();
+  const button = issue8Button(ui, "board-clear");
+  if (change === "revision") ui.cache.board = issue8Plan("new");
+  if (change === "route") { ui.sandbox.location.pathname = "/threads/thread-b"; ui.sandbox.location.href = "https://fixture.test/threads/thread-b"; }
+  if (change === "project") ui.state.projectRoot = "/other-project";
+  if (change === "thread") { ui.state.threadId = "thread-b"; ui.state.context.threadId = "thread-b"; }
+  ui.onClick({ target: button }); await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "board:clear").length, 0, "an unseen plan or another scope cannot be cleared");
+  assert.equal(ui.root.querySelector(".hub-toast").hidden, false);
+});
+
+test("Issue #8 [2] clear carries the rendered plan revision", async () => {
+  const calls = [], ui = issue8Ui(async (action, payload) => { calls.push({ action, payload }); return issue8Plan("r1"); });
+  ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
+  await ui.updateBoard(issue8Button(ui, "board-clear"), "clear");
+  assert.equal(calls.find(c => c.action === "board:clear")?.payload.expectedRevision, "r1");
+});
+
+for (const action of ["toggle", "add"]) test(`Issue #8 [3] ${action} carries CAS revision and refreshes a conflict without losing concurrent steps`, async () => {
+  const f = [], old = issue8Plan("r1", "A"), latest = { ...issue8Plan("r2", "A"), steps: [...old.steps, { id: "hub-c", text: "concurrent C", status: "pending" }] };
+  const ui = issue8Ui(async (method, payload) => {
+    f.push({ method, payload });
+    if (method === "board:update") return { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT: 计划已被其他窗口更新" } };
+    return latest;
+  });
+  ui.cache.board = old; ui.state.boardDraft = "new draft"; ui.renderBoardTab();
+  const button = issue8Button(ui, action === "toggle" ? "board-step" : "board-add", { index: "0", stepId: "hub-a", stepText: "A" });
+  await ui.updateBoard(button, action, 0);
+  assert.equal(f.find(c => c.method === "board:update")?.payload.expectedRevision, "r1");
+  assert.ok(f.some(c => c.method === "board:get"), "conflicts must reload the current plan");
+  assert.ok(ui.cache.board.steps.some(s => s.text === "concurrent C"));
+  assert.equal(ui.state.boardDraft, "new draft", "a rejected save must keep the input draft");
+});
+
+for (const outcome of ["success", "failure"]) test(`Issue #8 [4] late loadTab ${outcome} preserves a newly focused editor`, async () => {
+  let finish;
+  const ui = issue8Ui(() => new Promise((resolve, reject) => { finish = () => outcome === "success" ? resolve(issue8Plan("new")) : reject(new Error("late read failure")); }));
+  ui.cache.board = issue8Plan("old"); ui.renderBoardTab();
+  const displayed = ui.content.innerHTML, pending = ui.loadTab(true), editor = node();
+  ui.content.contains = item => item === editor; ui.sandbox.document.activeElement = editor;
+  ui.state.boardDraft = "typing while the request is pending";
+  finish(); await pending;
+  assert.equal(ui.content.innerHTML, displayed, "loadTab must not replace the active input after pollBoard preserved it");
+  ui.sandbox.document.activeElement = null; ui.flushBoardRender();
+  assert.match(ui.content.innerHTML, outcome === "success" ? /new/ : /读取失败/);
+});
+
+test("Issue #8 [5] saving one step preserves a newer draft and focused editor", async () => {
+  let save;
+  const ui = issue8Ui((action, payload) => action === "board:update" ? new Promise(resolve => { save = () => resolve({}); }) : Promise.resolve(issue8Plan("saved")));
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "first step"; ui.renderBoardTab();
+  const pending = ui.updateBoard(dom.add, "add");
+  assert.ok(save, "the first step is in flight");
+  dom.editor.focus(); dom.type("next draft  \nkeep whitespace", 3, 8, "backward");
+  save(); await pending;
+  assert.equal(ui.state.boardDraft, "next draft  \nkeep whitespace");
+  assert.match(ui.content.innerHTML, />saved</);
+  assert.equal(dom.editor.value, ui.state.boardDraft);
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [3, 8, "backward"]);
+});
+
+test("Issue #8 tail [3] Enter keeps the input editable and focused while saving the previous draft", async () => {
+  let save;
+  const calls = [], ui = issue8Ui((action, payload) => {
+    calls.push({ action, payload });
+    return action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved"));
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "first step"; ui.renderBoardTab();
+  const button = dom.add, editor = dom.editor; editor.focus();
+  let prevented = false;
+  ui.onEditorKeydown({ target: editor, currentTarget: editor, key: "Enter", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true); assert.ok(save, "keyboard submission must reach the save RPC");
+  assert.equal(editor.disabled, false, "the active draft input must never be disabled");
+  assert.equal(ui.sandbox.document.activeElement, editor, "Enter must preserve focus during the request");
+  assert.equal(button.disabled, true, "only the sibling Add button becomes busy");
+  dom.type("next draft  keep whitespace ");
+  ui.onEditorKeydown({ target: editor, key: "Enter", preventDefault() {} });
+  assert.equal(calls.filter(call => call.action === "board:update").length, 1, "a second Enter is serialized without disabling typing");
+  save({}); await new Promise(setImmediate);
+  assert.equal(ui.state.boardDraft, "next draft  keep whitespace "); assert.equal(dom.editor.value, ui.state.boardDraft);
+  assert.equal(dom.editor.disabled, false); assert.equal(dom.add.disabled, false);
+  assert.equal(ui.sandbox.document.activeElement, dom.editor); assert.match(ui.content.innerHTML, />saved</);
+});
+test("Issue #8 [5] an unchanged submitted draft clears and restores focus after rendering the saved list", async () => {
+  let save;
+  const ui = issue8Ui(action => action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved")));
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "only draft"; ui.renderBoardTab();
+  dom.editor.focus(); const pending = ui.updateBoard(dom.add, "add");
+  save({}); await pending;
+  assert.equal(ui.state.boardDraft, ""); assert.equal(dom.editor.value, "");
+  assert.match(ui.content.innerHTML, />saved</); assert.equal(ui.sandbox.document.activeElement, dom.editor);
+});
+
+test("Issue #8 [6] every real render updates the signature through A to B to A", async () => {
+  const a = issue8Plan("A"), b = issue8Plan("B"); let data = a;
+  const ui = issue8Ui(async () => data);
+  await ui.pollBoard(); assert.match(ui.content.innerHTML, /value=""/);
+  const editor = node(); ui.content.contains = item => item === editor; ui.sandbox.document.activeElement = editor;
+  data = b; await ui.pollBoard(); assert.doesNotMatch(ui.content.innerHTML, />B</);
+  ui.sandbox.document.activeElement = null;
+  ui.state.boardBackground = true; ui.renderBoardTab(); assert.match(ui.content.innerHTML, />B</);
+  data = a; await ui.pollBoard(); assert.match(ui.content.innerHTML, />A</);
+  assert.doesNotMatch(ui.content.innerHTML, />B</);
+});
+
 test("the full task panel applies the latest snapshot after the user leaves its focused editor", async () => {
   const ui = harness(async () => ({ threadId: "thread-a", source: "t3-native", steps: [{ text: "最新主计划", status: "pending" }], subagents: [{ title: "最新子任务", rawStatus: "running" }] }));
   ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
@@ -1449,6 +1981,7 @@ test("inline add, check and clear send the captured current thread on every muta
     return action === "board:get" ? data : {};
   });
   Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-b", boardDraft: "追加步骤" });
+  Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
   await ui.updateBoard(null, "add");
   assert.equal(ui.cache.board.steps[0].text, "追加步骤");
   await ui.updateBoard(null, "toggle", 0);
@@ -1919,4 +2452,484 @@ test('stale host rule editor refuses to overwrite a newly injected role block', 
   ui.state.settingsRule='# stale editor text\n';ui.state.settingsRuleDirty=true;await ui.saveNativeSettings(undefined,true);
   assert.equal(fs.readFileSync(file,'utf8'),before+block);assert.equal(ui.state.settingsRuleDirty,true);
   assert.match(ui.nodes.get('.hub-toast').innerHTML,/变更|重新读取/);
+});
+
+test("Issue #8 recheck4 [1] conflict to native read-only plan keeps unsaved draft, focus, and selection visible", async () => {
+  const native = { ...issue8Plan("r2", "native step"), source: "t3-native" };
+  const ui = issue8Ui(async action => action === "board:update"
+    ? { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT" } }
+    : native);
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("r1", "old step"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("unsaved draft", 2, 7, "backward");
+  await ui.updateBoard(dom.editor, "add");
+  assert.match(ui.content.innerHTML, /native step/);
+  assert.ok(dom.editor?.isConnected, "unsaved draft input remains in DOM");
+  assert.equal(dom.editor.value, "unsaved draft");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+  assert.match(ui.content.innerHTML, /unsaved draft/);
+});
+
+test("Issue #8 recheck4 [3] failed manual refresh preserves protected draft editor and reconnects cleanly", async () => {
+  let finish, online = false, plan = issue8Plan("r2", "synced step");
+  const ui = issue8Ui(async action => {
+    if (action === "board:update") return new Promise(resolve => { finish = () => resolve({}); });
+    if (!online && (action === "board:get" || action === "hub:getContext")) throw new Error("fixture connection failed");
+    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
+    if (action === "board:get") return plan;
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("r1", "old step"); ui.renderBoardTab();
+  dom.editor.focus(); dom.type("submitted");
+  const pending = ui.updateBoard(dom.editor, "add");
+  dom.type("unsaved draft", 2, 7, "backward");
+  const protectedEditor = dom.editor;
+  finish(); await pending;
+  assert.equal(dom.editor, protectedEditor);
+  const refreshBtn = node();
+  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
+  refreshBtn.closest = () => refreshBtn;
+  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
+  ui.onClick({ target: refreshBtn });
+  await new Promise(setImmediate);
+  assert.equal(dom.editor, protectedEditor, "failed manual refresh keeps protected draft editor intact");
+  assert.equal(ui.sandbox.document.activeElement, protectedEditor);
+  assert.equal(dom.editor.value, "unsaved draft");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+  online = true;
+  ui.onClick({ target: refreshBtn });
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.match(ui.content.innerHTML, /synced step/);
+  assert.equal(dom.editor.value, "unsaved draft");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+});
+
+test("Issue #8 recheck4 [4] saving while hidden syncs focused board list and CAS baseline upon return", async () => {
+  const writes = [];
+  let finish, reads = 0, plan = issue8Plan("r1", "old step");
+  const ui = issue8Ui(async (action, payload) => {
+    if (action === "board:update") {
+      writes.push(payload);
+      if (writes.length === 1) return new Promise(resolve => { finish = () => {
+        plan = { ...plan, steps: payload.steps, planRevision: "r2" };
+        resolve({});
+      }; });
+      plan = { ...plan, steps: payload.steps, planRevision: "r3" };
+      return {};
+    }
+    if (action === "board:get") { reads++; return plan; }
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = plan; ui.renderBoardTab();
+  dom.editor.focus(); dom.type("first step");
+  const pending = ui.updateBoard(dom.editor, "add");
+  dom.type("next draft", 2, 5, "backward");
+  ui.sandbox.document.hidden = true;
+  finish(); await pending;
+  assert.equal(reads, 0, "hidden window skips background poll");
+  ui.sandbox.document.hidden = false;
+  await ui.pollBoard();
+  assert.equal(reads, 1);
+  assert.match(ui.content.innerHTML, />first step</, "first visible poll updates focused board list");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.equal(dom.editor.value, "next draft");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "backward"]);
+  await ui.updateBoard(dom.editor, "add");
+  assert.equal(writes.length, 2, "next Enter submits immediately with synced r2 baseline");
+  assert.equal(writes[1].expectedRevision, "r2");
+});
+
+test("Issue #8 recheck5 [1] same-scope manual refresh while task save is in flight clears submitted draft and syncs without duplicate submit", async () => {
+  const writes = [];
+  let finishSave, plan = issue8Plan("r1", "old step");
+  const ui = issue8Ui(async (action, payload) => {
+    if (action === "board:update") {
+      writes.push(payload);
+      return new Promise(resolve => {
+        finishSave = () => {
+          plan = { ...plan, steps: payload.steps, planRevision: "r2" };
+          resolve({});
+        };
+      });
+    }
+    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
+    if (action === "board:get") return plan;
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = plan; ui.renderBoardTab();
+  dom.editor.focus(); dom.type("task one");
+  const pendingSave = ui.updateBoard(dom.editor, "add");
+  const refreshBtn = node();
+  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
+  refreshBtn.closest = () => refreshBtn;
+  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
+  ui.onClick({ target: refreshBtn });
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  finishSave();
+  await pendingSave;
+  assert.equal(dom.editor.value, "", "submitted draft must clear even after same-scope manual refresh");
+  assert.equal(ui.state.boardDraft, "");
+  assert.match(ui.content.innerHTML, />task one</);
+  await ui.updateBoard(dom.editor, "add");
+  assert.equal(writes.length, 1, "subsequent Enter on cleared input must not submit a duplicate task");
+});
+
+test("Issue #8 recheck5 [2] typing a board draft while refreshContext is already in flight preserves editor and selection on disconnect", async () => {
+  let rejectContext;
+  const ui = issue8Ui(async action => {
+    if (action === "hub:getContext") {
+      return new Promise((_resolve, reject) => {
+        rejectContext = () => reject(new Error("fixture mid-flight disconnect"));
+      });
+    }
+    if (action === "board:get") throw new Error("fixture board offline");
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = issue8Plan("r1", "existing step");
+  ui.renderBoardTab();
+  // Start refresh while draft input is blurred and empty!
+  const refreshBtn = node();
+  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
+  refreshBtn.closest = () => refreshBtn;
+  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
+  ui.onClick({ target: refreshBtn });
+  await new Promise(setImmediate);
+  // User focuses and types a draft while hub:getContext is still pending:
+  const activeEditor = dom.editor;
+  activeEditor.focus();
+  dom.type("mid-flight draft", 4, 10, "backward");
+  rejectContext();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(dom.editor, activeEditor, "mid-flight draft editor DOM node must remain intact on disconnect");
+  assert.equal(ui.sandbox.document.activeElement, activeEditor);
+  assert.equal(dom.editor.value, "mid-flight draft");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [4, 10, "backward"]);
+});
+
+test("Issue #8 recheck6 [1] same-session query parameter change preserves unsaved board draft, DOM editor, focus, and selection", async () => {
+  let plan = issue8Plan("r1", "existing step");
+  const ui = issue8Ui(async action => {
+    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
+    if (action === "board:get") return plan;
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = plan;
+  ui.renderBoardTab();
+  const originalEditor = dom.editor;
+  originalEditor.focus();
+  dom.type("important draft", 2, 7, "backward");
+
+  ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
+  ui.sandbox.location.search = "?view=chat";
+  ui.checkRoute();
+
+  assert.equal(ui.state.threadId, "thread-a");
+  assert.equal(ui.state.projectRoot, "/fixture");
+  assert.equal(dom.editor, originalEditor, "same-thread query param change must not replace editor DOM node");
+  assert.equal(dom.editor.value, "important draft");
+  assert.equal(ui.state.boardDraft, "important draft");
+  assert.equal(ui.sandbox.document.activeElement, originalEditor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(dom.editor, originalEditor, "async refreshContext for same thread+project must keep editor DOM node");
+  assert.equal(dom.editor.value, "important draft");
+  assert.equal(ui.sandbox.document.activeElement, originalEditor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+
+  ui.sandbox.location.href = "https://fixture.test/threads/thread-b";
+  ui.sandbox.location.pathname = "/threads/thread-b";
+  ui.sandbox.location.search = "";
+  ui.checkRoute();
+  assert.equal(ui.state.threadId, "thread-b");
+  assert.equal(ui.state.boardDraft, "");
+});
+
+test("Issue #8 recheck7 [3] same-session query param change coinciding with read recovery keeps original draft input DOM node connected", async () => {
+  for (const planChangedDuringOutage of [false, true]) {
+    let failBoardRead = false;
+    let plan = issue8Plan("r1", "existing step");
+    const ui = issue8Ui(async action => {
+      if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
+      if (action === "board:get") {
+        if (failBoardRead) throw new Error("transient board read failure");
+        return plan;
+      }
+      return {};
+    });
+    const dom = issue8DraftDom(ui);
+    ui.cache.board = plan;
+    ui.renderBoardTab();
+    const originalEditor = dom.editor;
+    originalEditor.focus();
+    dom.type("important draft", 2, 7, "backward");
+
+    failBoardRead = true;
+    await ui.pollBoard();
+    assert.equal(originalEditor.isConnected, true);
+    assert.equal(dom.editor, originalEditor);
+
+    failBoardRead = false;
+    if (planChangedDuringOutage) plan = issue8Plan("r2", "updated background step");
+    ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
+    ui.sandbox.location.search = "?view=chat";
+    ui.checkRoute();
+    await new Promise(setImmediate);
+    await new Promise(setImmediate);
+
+    assert.equal(originalEditor.isConnected, true, `planChanged=${planChangedDuringOutage}: original input DOM node must stay connected`);
+    assert.equal(dom.editor, originalEditor, `planChanged=${planChangedDuringOutage}: editor DOM node must not be replaced`);
+    assert.equal(ui.sandbox.document.activeElement, originalEditor);
+    assert.equal(dom.editor.value, "important draft");
+    assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
+  }
+});
+
+test("Issue #8 recheck8 [1] post-save read failure + query param recovery + Enter keeps original input DOM node connected continuously", async () => {
+  let save, failRead = true, plan = issue8Plan("r1", "original");
+  const writes = [];
+  const ui = issue8Ui(async (action, payload) => {
+    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
+    if (action === "board:update") {
+      writes.push(payload);
+      const finish = () => {
+        plan = { ...plan, steps: payload.steps, planRevision: `r${writes.length + 1}` };
+        return {};
+      };
+      if (writes.length === 1) return new Promise(resolve => { save = () => resolve(finish()); });
+      return finish();
+    }
+    if (action === "board:get") {
+      if (failRead) throw new Error("post-save read failed");
+      return plan;
+    }
+    return {};
+  });
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = plan;
+  ui.renderBoardTab();
+  dom.type("first");
+  const pending = ui.updateBoard(dom.add, "add");
+  dom.type("  second draft  ", 2, 8, "backward");
+  dom.editor.focus();
+  const oldEditor = dom.editor;
+
+  save();
+  await pending;
+  assert.equal(oldEditor.isConnected, true);
+
+  ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
+  ui.sandbox.location.search = "?view=chat";
+  ui.checkRoute();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(oldEditor.isConnected, true);
+
+  failRead = false;
+  await ui.pollBoard();
+  assert.equal(oldEditor.isConnected, true, "recovery render must update board container in-place without disconnecting oldEditor");
+  assert.equal(dom.editor, oldEditor);
+  assert.match(ui.content.innerHTML, />first</, "saved step must appear after recovery");
+  assert.equal(ui.sandbox.document.activeElement, oldEditor);
+  assert.equal(dom.editor.value, "  second draft  ");
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 8, "backward"]);
+
+  dom.enter();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(writes.length, 2);
+  assert.equal(writes[1].expectedRevision, "r2");
+  assert.equal(dom.editor.isConnected, true);
+  assert.match(ui.content.innerHTML, />second draft</);
+});
+
+test("Issue #8 recheck8 [2] cross-environment route change sharing same threadId immediately hides previous environment plan and draft even on context disconnect", async () => {
+  const envA = "11111111-1111-1111-1111-111111111111";
+  const envB = "22222222-2222-2222-2222-222222222222";
+  let failContext = false;
+  const planA = issue8Plan("r1", "secret step from env A");
+  const ui = issue8Ui(async action => {
+    if (action === "hub:getContext") {
+      if (failContext) throw new Error("env B offline");
+      return { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
+    }
+    if (action === "board:get") return planA;
+    return {};
+  }, {
+    location: { pathname: `/${envA}/thread-a`, href: `https://fixture.test/${envA}/thread-a`, hash: "", search: "" },
+  });
+  ui.state.projectRoot = "/fixture-a";
+  ui.state.context = { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = planA;
+  ui.renderBoardTab();
+  dom.editor.focus();
+  dom.type("secret draft from env A", 1, 7, "forward");
+  assert.match(ui.content.innerHTML, /secret step from env A/);
+
+  failContext = true;
+  ui.sandbox.location.pathname = `/${envB}/thread-a`;
+  ui.sandbox.location.href = `https://fixture.test/${envB}/thread-a`;
+  ui.checkRoute();
+
+  assert.equal(ui.cache.board, null, "cross-environment route change must clear cached board immediately");
+  assert.equal(ui.state.boardDraft, "", "cross-environment route change must clear draft immediately");
+  assert.doesNotMatch(ui.content.innerHTML, /secret step from env A/, "must not show env A plan synchronously after switching to env B");
+  assert.doesNotMatch(ui.root.querySelector("#t3-hub-live-board").innerHTML, /secret step from env A/);
+
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(ui.state.projectRoot, null, "failed context for env B must not retain env A projectRoot");
+  assert.equal(ui.state.boardDraft, "");
+  assert.doesNotMatch(ui.content.innerHTML, /secret step from env A/, "must not leak env A plan after env B context failure");
+  assert.doesNotMatch(ui.content.innerHTML, /secret draft from env A/, "must not leak env A draft after env B context failure");
+});
+
+for (const booting of [false, true]) for (const queryMode of ["url", "url+pathname", "pathname-only"]) for (const replacement of ["environmentId", "remove", "projectRoot"]) test(`Issue #8 closure [1] initial scope query canonicalizes (${booting ? "pending context" : "known context"}, ${queryMode}, ${replacement})`, async () => {
+  const envA = "abcdef11-1111-4111-8111-111111111111";
+  const pathname = queryMode === "pathname-only" ? "/thread-a" : `/${envA}/thread-a`, base = `https://fixture.test${pathname}`;
+  const locationFor = query => ({ pathname: pathname + (queryMode === "url" ? "" : query), href: base + (queryMode === "pathname-only" ? "" : query), search: queryMode === "pathname-only" ? "" : query });
+  const initial = replacement === "projectRoot" ? `?environmentId=${envA.toUpperCase()}` : "?projectRoot=%2Ffixture";
+  const context = { projectRoot: "/fixture", threadId: "thread-a", environmentId: envA };
+  const plan = issue8Plan("r1", "private plan");
+  let confirmContext, offline = false;
+  const ui = issue8Ui(async action => {
+    if (action === "hub:getContext") {
+      if (offline) throw new Error("other scope offline");
+      if (booting && !confirmContext) return new Promise(resolve => { confirmContext = () => resolve(context); });
+      return context;
+    }
+    if (action === "board:get") return plan;
+    return {};
+  }, { location: locationFor(initial) });
+  if (booting) { ui.state.projectRoot = null; ui.state.context = null; ui.state.open = false; }
+  else ui.state.context = context;
+  ui.setCurrentRoute(); // This is set before the initial getContext resolves in the real mount.
+  if (booting) {
+    const loading = ui.refreshContext(); confirmContext(); await loading; ui.state.open = true;
+    assert.equal(ui.routeScope().cached, ui.routeScope().current, "getContext must align the cached scope before any board render");
+    assert.doesNotMatch(ui.routeScope().cached, /\|r=|\|e=/, "confirmed redundant queries are absent from the cached key");
+  }
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = plan; ui.renderBoardTab();
+  const original = dom.editor;
+  original.focus(); dom.type("private draft", 2, 7, "backward");
+  const renders = dom.renders;
+  const query = replacement === "environmentId" ? `?environmentId=${envA}` : replacement === "projectRoot" ? "?projectRoot=%2Ffixture%2F" : "";
+  Object.assign(ui.sandbox.location, locationFor(query));
+  ui.checkRoute();
+  const preserved = () => {
+    assert.equal(ui.state.boardDraft, "private draft", "equivalent replacement must keep draft synchronously and after RPC");
+    assert.equal(dom.editor, original); assert.equal(original.isConnected, true);
+    assert.equal(dom.renders, renders, "no content replacement may disconnect the input");
+    assert.equal(ui.sandbox.document.activeElement, original);
+    assert.deepEqual([original.selectionStart, original.selectionEnd, original.selectionDirection], [2, 7, "backward"]);
+  };
+  preserved(); await new Promise(setImmediate); preserved();
+  // Explicit foreign values must still isolate immediately, including during a disconnect.
+  offline = true;
+  const foreign = replacement === "environmentId" ? "?projectRoot=%2Fother" : "?environmentId=22222222-2222-4222-8222-222222222222";
+  Object.assign(ui.sandbox.location, locationFor(foreign));
+  ui.checkRoute();
+  assert.equal(ui.state.boardDraft, ""); assert.equal(ui.cache.board, null);
+  assert.doesNotMatch(ui.content.innerHTML, /private plan|private draft/);
+  assert.doesNotMatch(ui.root.querySelector("#t3-hub-live-board").innerHTML, /private plan|private draft/);
+  await new Promise(setImmediate);
+  assert.equal(ui.state.projectRoot, null); assert.equal(ui.cache.board, null);
+});
+
+for (const queryKind of ["environmentId", "projectRoot"]) test(`Issue #8 final [1, 4, 5] equivalent ${queryKind} query preserves focused draft, stale Enter refresh, and post-save recovery`, async () => {
+  const envA = "abcdef11-1111-4111-8111-111111111111";
+  const base = `https://fixture.test/${envA}/thread-a`;
+  const context = { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
+  let currentPlan = issue8Plan("r1", "step one"), failRead = false, finishSave;
+  const writes = [];
+  const ui = issue8Ui(async (action, payload) => {
+    if (action === "hub:getContext") return context;
+    if (action === "board:get") {
+      if (failRead) throw new Error("post-save read failed");
+      return currentPlan;
+    }
+    if (action === "board:update") {
+      writes.push(payload);
+      const save = () => {
+        currentPlan = { ...currentPlan, planRevision: `r${writes.length + 2}`, steps: payload.steps };
+        return {};
+      };
+      if (writes.length === 1) return new Promise(resolve => { finishSave = () => resolve(save()); });
+      return save();
+    }
+    return {};
+  }, { location: { pathname: `/${envA}/thread-a`, href: base, hash: "", search: "" } });
+  assert.equal(typeof ui.sandbox.URLSearchParams, "undefined");
+  ui.state.projectRoot = context.projectRoot; ui.state.context = context;
+  const dom = issue8DraftDom(ui);
+  ui.cache.board = currentPlan;
+  ui.renderBoardTab(); ui.setCurrentRoute();
+  const originalEditor = dom.editor;
+  originalEditor.focus(); dom.type("keep my draft", 2, 6, "forward");
+
+  const query = queryKind === "environmentId" ? `?environmentId=${envA.toUpperCase()}` : `?projectRoot=${encodeURIComponent(context.projectRoot + "/")}`;
+  ui.sandbox.location.search = query; ui.sandbox.location.href = base + query;
+  ui.checkRoute(); await new Promise(setImmediate);
+  assert.equal(dom.editor, originalEditor, "equivalent query preserves the original input");
+  assert.equal(originalEditor.isConnected, true);
+  assert.equal(ui.state.boardDraft, "keep my draft");
+  assert.equal(ui.sandbox.document.activeElement, originalEditor);
+  assert.deepEqual([originalEditor.selectionStart, originalEditor.selectionEnd, originalEditor.selectionDirection], [2, 6, "forward"]);
+
+  // The authoritative recheck3 contract defers ordinary focused polls. A stale
+  // first Enter refreshes the visible plan; the second uses that visible CAS.
+  currentPlan = issue8Plan("r2", "external step r2");
+  await ui.pollBoard();
+  assert.equal(dom.editor, originalEditor);
+  assert.equal(originalEditor.isConnected, true);
+  assert.doesNotMatch(ui.content.innerHTML, /external step r2/);
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 0, "stale Enter must refresh before it writes");
+  assert.match(ui.content.innerHTML, /external step r2/);
+  assert.equal(dom.editor.value, "keep my draft");
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "forward"]);
+  dom.enter();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].expectedRevision, "r2");
+
+  // Preserve this newer draft through failed readback and same-session query
+  // recovery. Updating sibling slots must keep the protected input connected.
+  dom.type("next <draft>", 1, 5, "backward");
+  const protectedEditor = dom.editor, rendersBeforeRecovery = dom.renders;
+  failRead = true; finishSave(); await new Promise(setImmediate);
+  ui.sandbox.location.search = query + "&view=chat";
+  ui.sandbox.location.href = base + ui.sandbox.location.search;
+  ui.checkRoute(); await new Promise(setImmediate);
+  assert.equal(protectedEditor.isConnected, true);
+  failRead = false; await ui.pollBoard();
+  assert.equal(dom.editor, protectedEditor);
+  assert.equal(protectedEditor.isConnected, true);
+  assert.equal(dom.renders, rendersBeforeRecovery, "recovery updates siblings, not content.innerHTML");
+  assert.match(ui.content.innerHTML, />external step r2</);
+  assert.match(ui.content.innerHTML, />keep my draft</);
+  assert.match(ui.content.innerHTML, /value="next &lt;draft&gt;"/);
+  assert.equal(dom.editor.value, "next <draft>");
+  assert.equal(ui.sandbox.document.activeElement, protectedEditor);
+  assert.deepEqual([protectedEditor.selectionStart, protectedEditor.selectionEnd, protectedEditor.selectionDirection], [1, 5, "backward"]);
+  dom.enter(); await new Promise(setImmediate);
+  assert.equal(writes.length, 2, "first Enter after recovery submits with the refreshed baseline");
+  assert.equal(writes[1].expectedRevision, "r3");
+  assert.match(ui.content.innerHTML, />next &lt;draft&gt;</);
+  assert.equal(dom.editor.isConnected, true);
+  assert.equal(ui.sandbox.document.activeElement, dom.editor);
+  assert.equal(dom.editor.value, "");
 });

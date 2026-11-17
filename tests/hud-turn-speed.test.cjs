@@ -670,6 +670,14 @@ test("latest statev2 turn evidence outranks reset ordinals, missing cache fields
       },
     ],
   });
+  // These fixtures represent a completed provider switch. Persist that current
+  // selection too: a selected Muse/Codex session now correctly outranks an old different-driver turn.
+  for (const threadId of ["thread:latest-unknown-speed", "thread:provider-context-does-not-leak", "thread:claude-does-not-inherit-codex-native-context"]) {
+    nativeDb.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?")
+      .run(JSON.stringify({ modelSelection: { provider: "claudeAgent", model: "claude-opus-4-test" } }), threadId);
+    nativeDb.prepare("UPDATE orchestration_v2_projection_provider_sessions SET driver=?, provider=?, model=? WHERE thread_id=?")
+      .run("claudeAgent", "claudeAgent", "claude-opus-4-test", threadId);
+  }
   nativeDb.close();
 
   const latestUnknownSpeed = backend.getThreadStats("thread:latest-unknown-speed");
@@ -687,4 +695,1129 @@ test("latest statev2 turn evidence outranks reset ordinals, missing cache fields
   assert.equal(interruptedLatest.cache.turnRate, null, "an interrupted ordinal 13 with no usage supersedes old ordinal 264");
   fs.accessSync(oldNativeFile);
   fs.accessSync(oldCodexFile);
+});
+
+
+// R7–R12 exercise the production functions with deterministic DOM/clock/transport fakes.
+function telemetryDomNode(attrs, text = "", children = []) {
+  const node = {
+    nodeType: 1, tagName: "DIV", style: {}, innerText: text, textContent: text,
+    childNodes: { ...children, length: children.length, [Symbol.iterator]: children[Symbol.iterator].bind(children) },
+    getAttribute(name) { return attrs[name] ?? null; },
+    querySelectorAll() { return children; },
+  };
+  for (const child of children) child.parentElement = node;
+  return node;
+}
+function telemetryColumn(nodes) {
+  return { querySelectorAll(selector) { return nodes.filter(n => n.getAttribute("data-message-role") || (selector.includes("thinking") && n.getAttribute("data-timeline-row-kind") === "thinking")); } };
+}
+function telemetryRendererHarness(nodes, stats = { ok: true, provider: "codex", isRunning: false }) {
+  const context = vm.createContext({
+    document: { hidden: false, querySelector: () => telemetryColumn(nodes) },
+    performance: { now: () => 2000 }, setTimeout: () => 1, clearTimeout() {},
+  });
+  const funcs = ["createHudTurnSpeedState", "resolveHudTurnSpeed", "getAssistantStreamSnapshot", "createHudStreamSampler", "resetLiveStreamSampler"]
+    .map(name => rendererSource.match(new RegExp(`  function ${name}\\([\\s\\S]*?\\n  \\}`))[0]).join("\n");
+  const clearSamples = rendererSource.match(/  function clearActiveStreamSamples\([\s\S]*?\n  \}/)?.[0] || "";
+  const topbar = rendererSource.slice(rendererSource.indexOf("  function renderTopbarStats("), rendererSource.indexOf("    const qInfo = computeQuotaAndContext(stats);")) + "return speedView;\n}";
+  vm.runInContext(`let currentPathHint='r7', streamRouteSnap='r7', latestStats=null, liveStreamTps=null;
+    let lastIdleMessageId='',lastIdleTextLen=0,lastFastRefreshAt=0;
+    ${funcs}\n${clearSamples}\nlet streamSampler=createHudStreamSampler(),turnSpeedState=createHudTurnSpeedState('r7');\n${topbar}`, context);
+  context.stats = stats;
+  return { context, run: code => vm.runInContext(code, context) };
+}
+
+test("R7: empty baseline never authorizes bare/unconfirmed first-frame speed", () => {
+  const running = { ok: true, provider: "codex", isRunning: true, speed: {} };
+  for (const sample of [undefined, true, { messageId: "", liveSampleConfirmedNewTurn: true }, { messageId: "arbitrary-old", liveSampleConfirmedNewTurn: false }]) {
+    assert.equal(resolveSpeed(createState("r7"), running, 70, "r7", sample).kind, "waiting");
+  }
+  const unobserved = createState("r7");
+  assert.equal(unobserved.baselineCaptured, false);
+  assert.equal(resolveSpeed(unobserved, running, 70, "r7", { messageId: "old", liveSampleConfirmedNewTurn: true }).kind, "waiting");
+  const captured = createState("r7");
+  captured.baselineCaptured = true;
+  assert.equal(resolveSpeed(captured, running, 70, "r7", { messageId: "new", liveSampleConfirmedNewTurn: true }).value, 70);
+  const conflict = createState("r7");
+  Object.assign(conflict, { baselineCaptured: true, baselineProvider: "codex" });
+  assert.equal(resolveSpeed(conflict, { ...running, provider: "muse" }, 70, "r7", { messageId: "new", liveSampleConfirmedNewTurn: true }).kind, "waiting");
+});
+
+test("R7: render synchronously captures empty/final idle baseline and clears the completed sampler", () => {
+  const nodes = [telemetryDomNode({ "data-message-role": "user", "data-message-id": "u" })];
+  const h = telemetryRendererHarness(nodes);
+  h.run("renderTopbarStats(stats)");
+  assert.equal(h.run("turnSpeedState.baselineCaptured"), true);
+  assert.equal(h.run("turnSpeedState.baselineMessageId"), "");
+  nodes.push(telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "final" }, "done"));
+  h.run("turnSpeedState.active=true; liveStreamTps=70; streamSampler.messageId='final'; streamSampler.liveTps=70; renderTopbarStats(stats)");
+  assert.equal(h.run("liveStreamTps"), null);
+  assert.equal(h.run("streamSampler.messageId"), "");
+  assert.equal(h.run("turnSpeedState.baselineMessageId"), "final");
+  h.run("stats.isRunning=true");
+  assert.equal(h.run("renderTopbarStats(stats).kind"), "waiting", "next turn before 260ms tick cannot reuse 70");
+});
+
+test("R7: topbar proof requires sampler growth rather than an arbitrary new ID", () => {
+  const h = telemetryRendererHarness([]);
+  h.run("renderTopbarStats(stats); stats.isRunning=true; liveStreamTps=70; streamSampler.messageId='arbitrary'");
+  assert.equal(h.run("renderTopbarStats(stats).kind"), "waiting");
+});
+
+test("R10: independent thinking rows join assistant text under a stable current-turn anchor", () => {
+  const old = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "old" }, "OLD");
+  const user = telemetryDomNode({ "data-message-role": "user", "data-message-id": "user" });
+  const thinking = telemetryDomNode({ "data-timeline-row-kind": "thinking", "data-timeline-row-id": "thought" }, "thinking grows");
+  const nodes = [old, user, thinking];
+  const first = getAssistantStreamSnapshot(telemetryColumn(nodes));
+  assert.ok(first, "a thinking-only current turn is streamable");
+  assert.equal(first.text, "thinking grows");
+  assert.ok(first.messageId.includes("thought"));
+  nodes.push(telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "answer" }, "answer grows"));
+  const second = getAssistantStreamSnapshot(telemetryColumn(nodes));
+  assert.equal(second.messageId, first.messageId);
+  assert.ok(second.text.includes("thinking grows"));
+  assert.ok(second.text.includes("answer grows"));
+  assert.ok(!second.text.includes("OLD"));
+  nodes.push(telemetryDomNode({ "data-message-role": "user", "data-message-id": "next" }));
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn(nodes)), null);
+  assert.ok(getAssistantStreamSnapshot(telemetryColumn([thinking])), "history without user rows still samples thinking");
+});
+
+test("R11: real NodeList recursion filters aria/CSS/closed details, including extras", () => {
+  const aria = telemetryDomNode({ "aria-hidden": "true" }, "ARIA");
+  const css = telemetryDomNode({}, "CSS");
+  css.ownerDocument = { defaultView: { getComputedStyle: () => ({ display: "none" }) } };
+  const collapse = telemetryDomNode({}, "COLLAPSE");
+  collapse.ownerDocument = { defaultView: { getComputedStyle: () => ({ visibility: "collapse" }) } };
+  const details = telemetryDomNode({}, "CLOSED"); details.tagName = "DETAILS";
+  const visible = telemetryDomNode({}, "visible");
+  const root = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "r11" }, "visibleARIACSSCOLLAPSECLOSED", [visible, aria, css, collapse, details]);
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([root])).text, "visible");
+  const allHidden = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "r11b" }, "ARIA", [aria]);
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([allHidden])).text, "", "empty filtered children must never fall back to container text");
+  const hiddenRow = telemetryDomNode({ "data-message-role": "assistant", "aria-hidden": "true" }, "HIDDEN-ROW");
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([hiddenRow])), null);
+});
+
+test("R12: trailing refresh does not schedule timers while in flight and resumes from finally", async () => {
+  const timers = [];
+  const ctx = vm.createContext({ document: { hidden: false }, performance: { now: () => 2000 }, setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {} });
+  const scheduler = rendererSource.match(/  function scheduleTrailingFastRefresh\([\s\S]*?\n  \}/)[0];
+  vm.runInContext(`let trailingFastRefreshTimer=null,lastFastRefreshAt=0,statsInFlight=true,pendingFastRefresh=true,disposed=false,calls=0;
+    function refreshStats(){calls++}\n${scheduler}\nscheduleTrailingFastRefresh();`, ctx);
+  assert.equal(timers.length, 0, "in-flight work must have no timer polling");
+  vm.runInContext("statsInFlight=false;scheduleTrailingFastRefresh();statsInFlight=true", ctx);
+  assert.equal(timers.length, 1);
+  timers.shift()();
+  assert.equal(timers.length, 0, "timer firing during an RPC must not recursively reschedule");
+  assert.equal(vm.runInContext("pendingFastRefresh", ctx), true);
+  vm.runInContext("statsInFlight=false;scheduleTrailingFastRefresh()", ctx);
+  timers.shift()();
+  assert.equal(vm.runInContext("calls", ctx), 1);
+  let finish;
+  ctx.callBackend = () => new Promise(resolve => { finish = resolve; });
+  Object.assign(ctx, { getRouteHint: () => "r", isCurrentStatsSnapshot: () => false });
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  vm.runInContext(`let statsRequestSeq=0;${refresh}; pendingFastRefresh=true; trailingFastRefreshTimer=null;`, ctx);
+  const pending = vm.runInContext("refreshStats(false)", ctx);
+  finish({ ok: true });
+  await pending;
+  assert.equal(timers.length, 1, "RPC completion must schedule the pending trailing refresh");
+});
+
+test("R12: hung bridge and both fetch transports time out, abort, and clear timers", async () => {
+  const source = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  for (const transport of ["bridge", "http", "override"]) {
+    const timers = new Map(); let serial = 0; let signal;
+    const window = transport === "bridge" ? { __t3HudBridge: { hung: () => new Promise(() => {}) } }
+      : transport === "http" ? { __t3HudHttpConfig: { url: "http://test", token: "fixture" } } : { __t3HudOverrideRpc: { url: "http://test", token: "fixture" } };
+    const ctx = vm.createContext({ window, AbortController,
+      fetch: (_url, options) => { signal = options.signal; return new Promise(() => {}); },
+      setTimeout: (fn, ms) => { assert.ok(ms > 0 && ms <= 8000); timers.set(++serial, fn); return serial; },
+      clearTimeout: id => timers.delete(id),
+    });
+    const call = vm.runInContext(`(${source.trim()})`, ctx);
+    let settled = false;
+    const pending = call("hung").then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    assert.equal(timers.size, 1, `${transport}: must arm a bounded RPC timeout`);
+    for (const fn of [...timers.values()]) fn();
+    for (let i=0; i<12; i++) await Promise.resolve();
+    assert.equal(settled, true, `${transport}: must settle even if transport ignores abort`);
+    await pending;
+    assert.equal(timers.size, 0, `${transport}: timeout must be cleared`);
+    if (transport !== "bridge") assert.equal(signal.aborted, true);
+  }
+});
+
+
+test("R7: route changes retain the newly captured idle baseline and provider changes drop old live rates", () => {
+  const nodes = [telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "idle" }, "idle")];
+  const h = telemetryRendererHarness(nodes);
+  h.run("currentPathHint='new-route';renderTopbarStats(stats)");
+  assert.equal(h.run("turnSpeedState.baselineCaptured"), true);
+  assert.equal(h.run("turnSpeedState.baselineMessageId"), "idle");
+  h.run("stats.isRunning=true; renderTopbarStats(stats); liveStreamTps=70; streamSampler.messageId='codex-live'; streamSampler.liveTps=70");
+  assert.equal(h.run("renderTopbarStats(stats).value"), 70);
+  h.run("stats.provider='muse'");
+  assert.equal(h.run("renderTopbarStats(stats).kind"), "waiting");
+  assert.equal(h.run("liveStreamTps"), null);
+});
+
+test("R7: idle watcher captures an empty snapshot even before any stats response", () => {
+  const h = telemetryRendererHarness([]);
+  const watcher = rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0];
+  Object.assign(h.context, { setInterval: fn => { h.context.tick = fn; }, getRouteHint: () => "r7", disposed: false,
+    advanceHudStreamSampler, canSampleHudStream, estimateRenderedTokens });
+  h.run(watcher);
+  h.context.tick();
+  assert.equal(h.run("turnSpeedState.baselineCaptured"), true);
+  assert.equal(h.run("turnSpeedState.baselineMessageId"), "");
+});
+
+test("R12: successful/rejected RPCs clear their deadline and override failure falls back within the same deadline", async () => {
+  const source = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  for (const fail of [false, true]) {
+    const timers = new Map();
+    const ctx = vm.createContext({ window: { __t3HudOverrideRpc: { url: "http://fixture", token: "test" }, __t3HudBridge: { run: () => fail ? Promise.reject(new Error("fixture rejection")) : Promise.resolve(42) } },
+      fetch: () => Promise.reject(new Error("override offline")), AbortController,
+      setTimeout: fn => { timers.set(1, fn); return 1; }, clearTimeout: id => timers.delete(id) });
+    const call = vm.runInContext(`(${source.trim()})`, ctx);
+    if (fail) await assert.rejects(call("run"), /fixture rejection/);
+    else assert.equal(await call("run"), 42);
+    assert.equal(timers.size, 0);
+  }
+});
+
+
+test("R8: switched provider cannot inherit native Codex cache, model, speed or context", () => {
+  const dbPath = path.join(process.env.T3CODE_HOME, "statev2.sqlite");
+  for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(dbPath + suffix, { force: true });
+  const db = createAgyStateDb();
+  const stamp = Date.parse("2026-11-16T00:00:00Z").toString(16).padStart(12, "0");
+  const sessionId = `${stamp.slice(0, 8)}-${stamp.slice(8)}-7000-8000-000000000008`;
+  writeIndexedCodexSession(sessionId, { contextMax: 20000 });
+  insertProjectionThread(db, {
+    threadId: "thread:r8-native", provider: "muse", model: "current-muse",
+    providerThreads: [{ driver: "codex", payload: { nativeThreadRef: { nativeId: sessionId }, contextUsage: { usedTokens: 900, maxTokens: 20000 } } }],
+    turnRows: [{ driver: "codex", status: "running", startedAt: "2026-11-16T00:00:00Z", usage: { inputTokens: 1000, cachedInputTokens: 900, outputTokens: 270 } }],
+  });
+  db.close();
+  const result = backend.getThreadStats("thread:r8-native");
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.telemetrySource, "native");
+  assert.equal(result.provider, "muse");
+  assert.equal(result.model, "current-muse");
+  assert.equal(result.isRunning, false);
+  assert.equal(result.cache.turnRate, null);
+  assert.equal(result.cache.lastCallRate, null);
+  assert.equal(result.speed.lastDecodeTps, null);
+  assert.equal(result.speed.currentTurnEstimateTps, null);
+  assert.equal(result.speed.durationSec, null);
+  assert.equal(result.tokens.contextUsed, null);
+  assert.equal(result.tokens.contextMax, 1007997);
+  assert.ok(result.tokens.output > 0);
+});
+
+test("R15: repeated idle render/tick round trips never trigger fast refresh for unchanged text", () => {
+  const h = telemetryRendererHarness([telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "idle" }, "unchanged")]);
+  const timers = []; let refreshes = 0; let now = 2000;
+  Object.assign(h.context, { setInterval: fn => { h.context.tick = fn; }, getRouteHint: () => "r7", disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler, canSampleHudStream, estimateRenderedTokens,
+    setTimeout: fn => { timers.push(fn); return timers.length; }, refreshStats: () => { refreshes++; } });
+  h.run(`let pendingFastRefresh=false,trailingFastRefreshTimer=null,statsInFlight=false;
+    ${rendererSource.match(/  function scheduleTrailingFastRefresh\([\s\S]*?\n  \}/)[0]}
+    ${rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]}
+    lastFastRefreshAt=1234;`);
+  for (let i=0; i<12; i++) {
+    now += 260;
+    h.run("renderTopbarStats(stats)"); h.context.tick();
+    while (timers.length) timers.shift()();
+  }
+  assert.equal(refreshes, 0);
+  assert.equal(h.run("lastFastRefreshAt"), 1234);
+  assert.equal(h.run("lastIdleMessageId"), "idle");
+  assert.equal(h.run("lastIdleTextLen"), 9);
+});
+
+test("R18: no-user DOM must prove a turn boundary or return null; a lone unbounded row cannot reuse baseline growth", () => {
+  const row = (id, text, turn) => telemetryDomNode({ "data-message-role": "assistant", "data-message-id": id, ...(turn ? { "data-turn-id": turn } : {}) }, text);
+  const old = row("old", "OLD OUTPUT");
+  const thinking = telemetryDomNode({ "data-timeline-row-kind": "thinking", "data-timeline-row-id": "new" }, "NEW THINKING");
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([old, thinking])), null);
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([old, row("a", "A")])), null);
+  const hiddenOld = row("hidden-old", "hidden"); hiddenOld.style.display = "none";
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([hiddenOld, thinking])), null, "hidden history also leaves the boundary unproven");
+  const identified = [row("old", "OLD", "t0"), row("first", "FIRST", "t1"), row("last", "LAST", "t1")];
+  const snap = getAssistantStreamSnapshot(telemetryColumn(identified));
+  assert.equal(snap.text, "FIRST\nLAST"); assert.equal(snap.messageId, "first");
+  const lone = getAssistantStreamSnapshot(telemetryColumn([thinking]));
+  assert.equal(lone.unboundedNoUser, true);
+  const nodes = [thinking]; const h = telemetryRendererHarness(nodes);
+  Object.assign(h.context, { setInterval: fn => { h.context.tick = fn; }, getRouteHint: () => "r7", disposed: false,
+    advanceHudStreamSampler, canSampleHudStream, estimateRenderedTokens });
+  h.run("renderTopbarStats(stats);stats.isRunning=true;renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  h.context.tick();
+  thinking.innerText += " growing old text".repeat(20); h.context.tick();
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+});
+
+test("R19: rejected/timed-out stats degrade through pricing to local projection and reject stale routes", async () => {
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  for (const changeAt of [null, "stats", "price"]) {
+    for (const priceFails of [false, true]) {
+      const calls = []; const renders = []; let reads = 0; let route = "r19";
+      const ctx = vm.createContext({ getRouteHint: () => route, isCurrentStatsSnapshot,
+        callBackend: async method => { calls.push(method); if (method === "getThreadStats") { if (changeAt === "stats") route = "other"; throw new Error("rpc_timeout:getThreadStats"); }
+          if (changeAt === "price") route = "other";
+          if (priceFails) throw new Error("rpc_timeout:priceRemoteProjection"); return { ok: true, source: "priced" }; },
+        readFiberThreadProjection: () => { reads++; return { threadId: "r19", isRunning: true, turns: [] }; },
+        buildLocalProjectionFallback: () => ({ ok: true, source: "local" }), renderTopbarStats: stats => renders.push(stats),
+        document: { hidden: false } });
+      vm.runInContext(`let statsInFlight=false,statsRequestSeq=0,pendingFastRefresh=false,disposed=false,drawerOpen=false,lastLoadedGraphThreadId=null,lastRemotePayload=null;${refresh}`, ctx);
+      await vm.runInContext("refreshStats(false)", ctx);
+      assert.equal(reads, changeAt === "stats" ? 0 : 1);
+      assert.equal(renders.length, changeAt ? 0 : 1);
+      if (!changeAt) assert.equal(renders[0].source, priceFails ? "local" : "priced");
+      assert.equal(vm.runInContext("statsInFlight", ctx), false);
+    }
+  }
+});
+
+test("R13: native-only history without any provider turn cannot override a newly selected provider", () => {
+  const dbPath = path.join(process.env.T3CODE_HOME, "statev2.sqlite");
+  for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(dbPath + suffix, { force: true });
+  const db = createAgyStateDb();
+  const stamp = Date.parse("2026-11-16T00:00:00Z").toString(16).padStart(12, "0");
+  const sessionId = `${stamp.slice(0, 8)}-${stamp.slice(8)}-7000-8000-000000000013`;
+  writeIndexedCodexSession(sessionId, { contextMax: 20000 });
+  const id = "thread:r13-native-only";
+  insertProjectionThread(db, { threadId: id, provider: "muse", model: "current-muse",
+    providerThreads: [{ driver: "codex", payload: { nativeThreadRef: { nativeId: sessionId }, contextUsage: { usedTokens: 9999, maxTokens: 20000 } } }] });
+  // No provider_turns at all: only stale native history and an old session remain.
+  db.prepare("UPDATE orchestration_v2_projection_provider_sessions SET driver='codex',provider='codex',model='old-codex',status='running',updated_at='2026-11-16T00:00:00Z'").run();
+  db.close();
+  const stats = backend.getThreadStats(id);
+  assert.equal(stats.ok, true, stats.error); assert.equal(stats.provider, "muse"); assert.equal(stats.model, "current-muse");
+  assert.equal(stats.telemetrySource, "native"); assert.ok(stats.tokens.output > 0);
+  assert.equal(stats.isRunning, false); assert.equal(stats.cache.turnRate, null); assert.equal(stats.cache.lastCallRate, null);
+  for (const k of ["lastDecodeTps", "currentTurnEstimateTps", "durationSec"]) assert.equal(stats.speed[k], null, k);
+  assert.equal(stats.tokens.contextUsed, null); assert.notEqual(stats.tokens.contextMax, 20000);
+});
+
+test("R24: HUD mounted mid-stream without idle baseline never samples a lone unbounded row", () => {
+  const orphan = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "unbounded" }, "old");
+  const h = telemetryRendererHarness([orphan], { ok: true, provider: "codex", isRunning: true, speed: {} });
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  h.run("renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  h.context.tick();
+  now += 260;
+  orphan.innerText += " x".repeat(30);
+  h.context.tick();
+  assert.equal(h.run("turnSpeedState.baselineCaptured"), false);
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+  assert.equal(h.run("renderTopbarStats(stats)").kind, "waiting");
+});
+
+test("R25: newly selected provider never inherits unattributed stale live contextWindow usedTokens", () => {
+  const fn = rendererSource.match(/  function computeQuotaAndContext\([\s\S]*?\n  \}/)[0];
+  const ctx = vm.createContext({
+    readLiveT3State: () => ({
+      usage: null,
+      contextWindow: { usedTokens: 9999, maxTokens: 20000 },
+      selectedProvider: "muse",
+      selectedModel: "new-muse",
+    }),
+  });
+  vm.runInContext(fn, ctx);
+  const s = { ok: true, provider: "muse", tokens: { contextUsed: null, contextMax: 1007997, contextMaxSource: "estimated" }, cache: {} };
+  const got = ctx.computeQuotaAndContext(s);
+  assert.equal(got.ctxUsed, null);
+  assert.equal(got.ctxMax, 1007997);
+});
+
+test("R26: same-thread provider switch while refreshStats is in flight discards stale response and queues re-fetch", async () => {
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  let selectedProvider = "codex", finish, trailingScheduled = 0;
+  const rendered = [];
+  const previous = { ok: true, provider: "codex", model: "old-model", isRunning: false, cache: { turnRate: 0.9 }, tokens: { contextUsed: 9999 } };
+  const ctx = vm.createContext({
+    getRouteHint: () => "same-thread",
+    isCurrentStatsSnapshot,
+    callBackend: () => new Promise(resolve => { finish = resolve; }),
+    readLiveT3State: () => ({ selectedProvider }),
+    scheduleTrailingFastRefresh: () => { trailingScheduled++; },
+    renderTopbarStats: s => rendered.push(s),
+    document: { hidden: false },
+  });
+  vm.runInContext(`let statsInFlight=false,statsRequestSeq=0,pendingFastRefresh=false,disposed=false,drawerOpen=false,lastLoadedGraphThreadId=null,lastRemotePayload=null;${refresh}`, ctx);
+  const request = vm.runInContext("refreshStats(false)", ctx);
+  selectedProvider = "muse";
+  finish(previous);
+  await request;
+  assert.equal(rendered.length, 0);
+  assert.equal(vm.runInContext("pendingFastRefresh", ctx), true);
+  assert.equal(trailingScheduled, 1);
+});
+
+test("R27: mutating Hub RPC writes are not aborted by the 8s HUD read deadline while read-only Hub RPCs stay bounded", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  const timers = new Map();
+  let serial = 0, releaseWrite, writeCompleted = false;
+  const window = {
+    __t3HudBridge: {
+      getGitGraph: async (_tag, action) => {
+        if (action === "skills:importGitHub") {
+          await new Promise(resolve => { releaseWrite = resolve; });
+          writeCompleted = true;
+          return { ok: true, imported: true };
+        }
+        return new Promise(() => {});
+      },
+    },
+  };
+  const ctx = vm.createContext({
+    window,
+    AbortController,
+    setTimeout: fn => { timers.set(++serial, fn); return serial; },
+    clearTimeout: id => timers.delete(id),
+  });
+  vm.runInContext(`${call}\n${wrapper}`, ctx);
+  const writeReq = window.__t3HubRpc("skills:importGitHub", { url: "https://example.invalid/fixture" });
+  assert.equal(timers.size, 0, "mutating Hub write must not arm 8s read timeout");
+  releaseWrite();
+  const writeRes = await writeReq;
+  assert.equal(writeCompleted, true);
+  assert.deepEqual(writeRes, { ok: true, imported: true });
+
+  const readReq = window.__t3HubRpc("hub:getDrawerScript", {});
+  await Promise.resolve();
+  assert.equal(timers.size, 1, "read-only Hub query keeps bounded timeout");
+  for (const fn of [...timers.values()]) fn();
+  await assert.rejects(readReq, /HUD RPC timed out/);
+});
+
+test("R28: an identified old turn growing while a new turn is running never produces live stream speed", () => {
+  const old = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "old-message", "data-turn-id": "old-turn" }, "old");
+  const h = telemetryRendererHarness([old]);
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  h.run("renderTopbarStats(stats); stats.isRunning=true; renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  h.context.tick();
+  now += 260;
+  old.innerText += " more old output".repeat(4);
+  h.context.tick();
+  assert.equal(h.run("turnSpeedState.baselineMessageId"), "old-message");
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+  assert.equal(h.run("renderTopbarStats(stats)").kind, "waiting");
+});
+
+test("R34: an identified old-turn DOM row mounting and growing after an empty idle baseline never produces live stream speed", () => {
+  const nodes = [];
+  const h = telemetryRendererHarness(nodes, { ok: true, provider: "codex", isRunning: false, activeTurnIds: [], speed: {} });
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  h.run("renderTopbarStats(stats); stats.isRunning=true; stats.activeTurnIds=['new-turn']; renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  const user = telemetryDomNode({ "data-message-role": "user", "data-message-id": "u-1" }, "prompt");
+  const old = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "old-message", "data-turn-id": "old-turn" }, "old");
+  nodes.push(user, old);
+  h.context.tick();
+  now += 260;
+  old.innerText += " late hydrated old turn text".repeat(8);
+  h.context.tick();
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+  assert.equal(h.run("renderTopbarStats(stats)").kind, "waiting");
+
+  // Also when activeTurnIds is omitted in harness, an identified turnId without activeTurnIds match is rejected
+  h.run("delete stats.activeTurnIds");
+  now += 260;
+  old.innerText += " more text".repeat(8);
+  h.context.tick();
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+});
+
+test("R35: mid-flight provider selection when requestedProvider started empty discards pre-switch response and schedules trailing refresh", async () => {
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  let selectedProvider = "", finish, trailingScheduled = 0;
+  const rendered = [];
+  const staleCodex = {
+    ok: true,
+    provider: "codex",
+    model: "old-codex",
+    isRunning: true,
+    speed: { lastDecodeTps: 42, currentTurnEstimateTps: 38, durationSec: 2 },
+    cache: { turnRate: 0.9, sessionRate: 0.8 },
+    tokens: { contextUsed: 9999, contextMax: 20000, contextMaxSource: "reported" },
+  };
+  const ctx = vm.createContext({
+    getRouteHint: () => "same-thread",
+    isCurrentStatsSnapshot,
+    callBackend: () => new Promise(resolve => { finish = resolve; }),
+    readLiveT3State: () => ({ selectedProvider, selectedModel: selectedProvider ? "new-muse" : null }),
+    scheduleTrailingFastRefresh: () => { trailingScheduled++; },
+    renderTopbarStats: s => rendered.push(s),
+    document: { hidden: false },
+  });
+  vm.runInContext(`let statsInFlight=false,statsRequestSeq=0,pendingFastRefresh=false,disposed=false,drawerOpen=false,lastLoadedGraphThreadId=null,lastRemotePayload=null;${refresh}`, ctx);
+  const request = vm.runInContext("refreshStats(false)", ctx);
+  selectedProvider = "muse";
+  finish(staleCodex);
+  await request;
+  assert.equal(rendered.length, 0, "pre-switch codex response must not render when picker resolved to muse mid-flight");
+  assert.equal(vm.runInContext("pendingFastRefresh", ctx), true);
+  assert.equal(trailingScheduled, 1);
+});
+
+test("R36: multi-segment and stat/catalog read-only Hub RPCs arm 8s read deadline while mutating actions do not", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  for (const readAction of [
+    "subagents:orchestration:get",
+    "memory:dream:get",
+    "memory:health",
+    "memory:stats",
+    "memory:vectorStats",
+    "memory:worktreeInfo",
+    "plugins:catalog",
+    "mcp:matrix",
+    "board:readArtifact",
+    "subagents:slashPrompt",
+  ]) {
+    const timers = new Map();
+    let serial = 0;
+    const window = {
+      __t3HudBridge: { getGitGraph: () => new Promise(() => {}) },
+      __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+    };
+    const ctx = vm.createContext({
+      window,
+      AbortController,
+      fetch: () => new Promise(() => {}),
+      setTimeout: fn => { timers.set(++serial, fn); return serial; },
+      clearTimeout: id => timers.delete(id),
+    });
+    vm.runInContext(`${call}\n${wrapper}`, ctx);
+    const req = window.__t3HubRpc(readAction, {});
+    await Promise.resolve();
+    assert.equal(timers.size, 1, `${readAction} must arm bounded read timeout`);
+    for (const fn of [...timers.values()]) fn();
+    if (readAction === "memory:dream:get") {
+      const dreamRes = await req;
+      assert.equal(dreamRes.ok, false);
+      assert.equal(dreamRes.status, "unavailable");
+      // Also verify direct callBackend Hub tunnel for memory:dream:get
+      const directReq = vm.runInContext(`callBackend('getGitGraph', '__HUB_RPC__', 'memory:dream:get', {})`, ctx);
+      await Promise.resolve();
+      assert.equal(timers.size, 1, "direct callBackend memory:dream:get must arm bounded read timeout");
+      for (const fn of [...timers.values()]) fn();
+      await assert.rejects(directReq, /HUD RPC timed out/);
+    } else {
+      await assert.rejects(req, /HUD RPC timed out/);
+    }
+  }
+  for (const writeAction of [
+    "subagents:orchestration:update",
+    "memory:dream:run",
+    "memory:dream:update",
+    "board:openArtifact",
+    "embed:switch",
+  ]) {
+    const timers = new Map();
+    let release;
+    const window = {
+      __t3HudBridge: { getGitGraph: () => new Promise(r => { release = () => r({ ok: true }); }) },
+      __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+    };
+    const ctx = vm.createContext({
+      window,
+      AbortController,
+      fetch: () => new Promise(r => { release = () => r({ ok: true, status: 200, json: async () => ({ ok: true }) }); }),
+      setTimeout: fn => { timers.set(1, fn); return 1; },
+      clearTimeout: id => timers.delete(id),
+    });
+    vm.runInContext(`${call}\n${wrapper}`, ctx);
+    const req = window.__t3HubRpc(writeAction, {});
+    assert.equal(timers.size, 0, `${writeAction} must NOT arm 8s read deadline`);
+    release();
+    assert.deepEqual(await req, { ok: true });
+  }
+});
+
+test("R42: unattributed DOM growth without turnId cannot fabricate live speed when activeTurnIds is non-empty or explicit empty", () => {
+  const nodes = [];
+  const h = telemetryRendererHarness(nodes, { ok: true, provider: "codex", isRunning: false, activeTurnIds: [], speed: {} });
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  h.run("renderTopbarStats(stats); stats.isRunning=true; stats.activeTurnIds=['new-turn']; renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  const user = telemetryDomNode({ "data-message-role": "user", "data-message-id": "u-old" }, "old prompt");
+  const unattributedOld = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "old-no-turn" }, "old text");
+  nodes.push(user, unattributedOld);
+  h.context.tick();
+  now += 260;
+  unattributedOld.innerText += " late hydrated unattributed text".repeat(10);
+  h.context.tick();
+  assert.equal(h.run("streamSampler.samples.length"), 0, "unattributed DOM row must not sample when activeTurnIds=['new-turn']");
+  assert.equal(h.run("liveStreamTps"), null);
+  assert.equal(h.run("renderTopbarStats(stats)").kind, "waiting");
+
+  // Explicit empty activeTurnIds=[] (runningWithoutActiveTurn) must also reject unattributed DOM growth
+  h.run("stats.activeTurnIds=[]");
+  now += 260;
+  unattributedOld.innerText += " more unattributed text".repeat(10);
+  h.context.tick();
+  assert.equal(h.run("streamSampler.samples.length"), 0);
+  assert.equal(h.run("liveStreamTps"), null);
+});
+
+test("R43: empty initial baselineProvider still drops previous provider live speed immediately on provider switch", () => {
+  const nodes = [
+    telemetryDomNode({ "data-message-role": "user", "data-message-id": "u-1" }, "prompt"),
+    telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "a-codex", "data-turn-id": "codex-turn" }, "init"),
+  ];
+  const h = telemetryRendererHarness(nodes, { ok: true, provider: "", isRunning: false, activeTurnIds: [], speed: {} });
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  // Capture initial idle baseline with empty provider ("")
+  h.run("nodes = undefined; renderTopbarStats({ ok: true, provider: '', isRunning: false, activeTurnIds: [], speed: {} })");
+  nodes.length = 0;
+  h.run("renderTopbarStats({ ok: true, provider: '', isRunning: false, activeTurnIds: [], speed: {} })");
+  assert.equal(h.run("turnSpeedState.baselineProvider"), "");
+
+  // Codex starts running and streams live speed (~100+ tok/s)
+  const u1 = telemetryDomNode({ "data-message-role": "user", "data-message-id": "u-1" }, "prompt");
+  const aCodex = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "a-codex", "data-turn-id": "codex-turn" }, "hello ");
+  nodes.push(u1, aCodex);
+  h.run("stats = { ok: true, provider: 'codex', isRunning: true, activeTurnIds: ['codex-turn'], speed: {} }; renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  h.context.tick();
+  now += 300;
+  aCodex.innerText += "codex streaming tokens ".repeat(15);
+  h.context.tick();
+  assert.ok(h.run("liveStreamTps") > 0, "Codex live stream speed established");
+
+  // Switch directly to running Muse before any idle frame intervened
+  const museView = h.run("stats = { ok: true, provider: 'muse', isRunning: true, activeTurnIds: ['muse-turn'], speed: {} }; renderTopbarStats(stats)");
+  assert.equal(museView.kind, "waiting", "first Muse render must NOT inherit Codex liveStreamTps");
+  assert.equal(h.run("liveStreamTps"), null);
+});
+
+test("R44: memory:dream:get bounds response.json() body read inside 8s deadline", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  const timers = new Map();
+  let serial = 0;
+  let aborted = false;
+  const window = {
+    __t3HudBridge: {},
+    __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+  };
+  const ctx = vm.createContext({
+    window,
+    AbortController,
+    fetch: (_url, opts) => {
+      opts?.signal?.addEventListener("abort", () => { aborted = true; });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}), // headers arrived, body hangs forever!
+      });
+    },
+    setTimeout: fn => { timers.set(++serial, fn); return serial; },
+    clearTimeout: id => timers.delete(id),
+  });
+  vm.runInContext(`${call}\n${wrapper}`, ctx);
+  const req = window.__t3HubRpc("memory:dream:get", {});
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.equal(timers.size, 1, "deadline timer must remain armed while response.json() is pending");
+  for (const fn of [...timers.values()]) fn();
+  const res = await req;
+  assert.equal(res.ok, false);
+  assert.equal(res.status, "unavailable");
+  assert.equal(aborted, true);
+  assert.equal(timers.size, 0);
+});
+
+test("R45: fallback sidecar /hub-rpc fetch for read-only Hub RPC is bounded by 8s deadline", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  const timers = new Map();
+  let serial = 0;
+  let fallbackAborted = false;
+  const window = {
+    __t3HudBridge: { getGitGraph: async () => ({ ok: false, error: "Unknown method" }) },
+    __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+  };
+  const ctx = vm.createContext({
+    window,
+    AbortController,
+    fetch: (_url, opts) => {
+      opts?.signal?.addEventListener("abort", () => { fallbackAborted = true; });
+      return new Promise(() => {});
+    },
+    setTimeout: fn => { timers.set(++serial, fn); return serial; },
+    clearTimeout: id => timers.delete(id),
+  });
+  vm.runInContext(`${call}\n${wrapper}`, ctx);
+  let settled = false;
+  const req = window.__t3HubRpc("memory:health", {}).then(() => { settled = true; }, () => { settled = true; });
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal(timers.size, 1, "fallback /hub-rpc fetch must arm bounded read timeout");
+  for (const fn of [...timers.values()]) fn();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal(settled, true, "hung fallback /hub-rpc fetch must settle when deadline fires");
+  assert.equal(fallbackAborted, true);
+  await req;
+  assert.equal(timers.size, 0);
+});
+
+test("R46: non-Hub mutating backend RPC (setConfig) does NOT arm 8s read deadline", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const timers = new Map();
+  let release;
+  const window = {
+    __t3HudBridge: { setConfig: () => new Promise(r => { release = () => r({ ok: true }); }) },
+  };
+  const ctx = vm.createContext({
+    window,
+    AbortController,
+    fetch: () => new Promise(() => {}),
+    setTimeout: fn => { timers.set(1, fn); return 1; },
+    clearTimeout: id => timers.delete(id),
+  });
+  const fn = vm.runInContext(`(${call.trim()})`, ctx);
+  const pending = fn("setConfig", { userLang: "zh" });
+  await Promise.resolve();
+  assert.equal(timers.size, 0, "setConfig write RPC must NOT arm 8s read timeout");
+  release();
+  assert.deepEqual(await pending, { ok: true });
+});
+
+test("R47 (#9-1): growing un-ID'd prior DOM row while an identified current turn row stays unchanged never produces live stream speed", () => {
+  const oldRow = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "legacy-no-turn" }, "legacy prefix");
+  const curUser = telemetryDomNode({ "data-message-role": "user", "data-message-id": "u-cur", "data-turn-id": "turn-cur" }, "question");
+  const curAsst = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "a-cur", "data-turn-id": "turn-cur" }, "thinking...");
+  // A legacy row may hydrate after the current user anchor; only tailTurnId may join the snapshot.
+  const h = telemetryRendererHarness([curUser, oldRow, curAsst], {
+    ok: true,
+    provider: "codex",
+    isRunning: false,
+    activeTurnIds: ["turn-cur"],
+    speed: {},
+  });
+  let now = 1000;
+  Object.assign(h.context, {
+    setInterval: fn => { h.context.tick = fn; },
+    getRouteHint: () => "r7",
+    disposed: false,
+    performance: { now: () => now },
+    advanceHudStreamSampler,
+    canSampleHudStream,
+    estimateRenderedTokens,
+  });
+  const readSnapshot = () => h.run("getAssistantStreamSnapshot(document.querySelector('[data-chat-column]'))");
+  assert.equal(readSnapshot().messageId, "a-cur");
+  assert.equal(readSnapshot().turnId, "turn-cur");
+  assert.equal(readSnapshot().text, "thinking...");
+  h.run("renderTopbarStats(stats); stats.isRunning=true; renderTopbarStats(stats)");
+  h.run(rendererSource.match(/  const streamWatchTimer = setInterval\(\(\) => \{[\s\S]*?\n  \}, 260\);/)[0]);
+  h.context.tick();
+  now += 260;
+  oldRow.innerText += " hydrated old markdown block ".repeat(20);
+  h.context.tick();
+  now += 260;
+  oldRow.innerText += " more old markdown block ".repeat(20);
+  h.context.tick();
+  assert.equal(readSnapshot().text, "thinking...", "unattributed legacy DOM growth must not enter the current-turn snapshot");
+  assert.equal(h.run("liveStreamTps"), null, "un-ID'd prior row growth must not contaminate current turn live speed");
+});
+
+test("R48 (#9-2): late completion of a pre-switch Codex turn after selecting Muse keeps Muse selected without reverting to Codex stats", () => {
+  const dbPath = path.join(process.env.T3CODE_HOME, "statev2.sqlite");
+  for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${dbPath}${suffix}`, { force: true });
+  const db = createAgyStateDb();
+  const threadId = "thread:r48-late-pre-switch-completion";
+  db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?,?,?,?,?,?)").run(
+    threadId, "p1", threadId, "muse", "2026-11-16T10:00:01.000Z",
+    JSON.stringify({ modelSelection: { provider: "muse", model: "muse-ember-1.0" } }), null, null
+  );
+  db.prepare("INSERT INTO orchestration_v2_projection_provider_sessions VALUES (?,?,?,?,?,?,?,?)").run(
+    `${threadId}-ps`, threadId, "codex", "completed", "old-codex", "2026-11-16T10:00:02.000Z", "{}", "codex"
+  );
+  db.prepare("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?)").run(
+    `${threadId}-pt`, threadId, "codex", "2026-11-16T10:00:02.000Z",
+    JSON.stringify({ contextUsage: { usedTokens: 9999, maxTokens: 200000 } })
+  );
+  db.prepare("INSERT INTO orchestration_v2_projection_provider_turns VALUES (?,?,?,?,?,?,?)").run(
+    `${threadId}-t1`, threadId, 1, "completed", "2026-11-16T10:00:00.000Z", "2026-11-16T10:00:02.000Z",
+    JSON.stringify({
+      nativeTurnRef: { driver: "codex" },
+      turnTokenUsage: { inputTokens: 1000, cachedInputTokens: 900, outputTokens: 100, models: ["old-codex"] },
+    })
+  );
+  db.close();
+  const res = backend.getThreadStats(threadId);
+  assert.equal(res.ok, true);
+  assert.equal(res.provider, "muse", "turn started at 10:00:00 before 10:00:01 selection must not revert provider to codex");
+  assert.equal(res.model, "muse-ember-1.0");
+  assert.equal(res.cache.turnRate, null);
+  assert.equal(res.speed.lastDecodeTps, null);
+  assert.equal(res.tokens.contextUsed, null);
+});
+
+test("R49 (#9-3): second Muse turn completing after a prior 50 tok/s native log reports its own 20 tok/s instead of stale 50 tok/s", () => {
+  const dbPath = path.join(process.env.T3CODE_HOME, "statev2.sqlite");
+  for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${dbPath}${suffix}`, { force: true });
+  const db = createAgyStateDb();
+  const museSid = "muse-r49-stale-native";
+  writeIndexedMuseSession(museSid, { mtime: Date.parse("2026-11-16T10:00:02.000Z"), output: 100 }); // 100 tok / 2s = 50 tok/s
+  insertProjectionThread(db, {
+    threadId: "thread:r49-same-provider-new-turn",
+    provider: "muse",
+    model: "muse-fixture-model",
+    providerThreads: [{ driver: "muse", updatedAt: "2026-11-16T10:01:10.000Z", payload: { nativeThreadRef: { nativeId: museSid } } }],
+    turnRows: [
+      { ordinal: 1, status: "completed", driver: "muse", startedAt: "2026-11-16T10:00:00.000Z", completedAt: "2026-11-16T10:00:02.000Z", usage: { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 100 } },
+      { ordinal: 2, status: "completed", driver: "muse", startedAt: "2026-11-16T10:01:00.000Z", completedAt: "2026-11-16T10:01:10.000Z", usage: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200 } },
+    ],
+  });
+  db.close();
+  const res = backend.getThreadStats("thread:r49-same-provider-new-turn");
+  assert.equal(res.ok, true);
+  assert.equal(res.speed.lastDecodeTps, 20, "new 200 tok / 10s turn must report 20 tok/s rather than prior native log's 50 tok/s");
+  assert.equal(res.cache.lastCallRate, null, "stale native log must not claim latest per-call cache rate");
+});
+
+test("R50 (#9-4): A->B->A provider/model bounce while refreshStats is in flight discards stale response and queues trailing refresh", async () => {
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  let selectedProvider = "codex", selectedModel = "old-codex", finish, trailingScheduled = 0;
+  const rendered = [];
+  const stalePreSwitch = {
+    ok: true,
+    provider: "codex",
+    model: "old-codex",
+    isRunning: true,
+    cache: { turnRate: 0.9, sessionRate: 0.9 },
+    speed: { lastDecodeTps: 50 },
+    tokens: { contextUsed: 9999 },
+  };
+  const ctx = vm.createContext({
+    getRouteHint: () => "same-thread",
+    isCurrentStatsSnapshot,
+    callBackend: () => new Promise(resolve => { finish = resolve; }),
+    readLiveT3State: () => ({ selectedProvider, selectedModel }),
+    scheduleTrailingFastRefresh: () => { trailingScheduled++; },
+    renderTopbarStats: s => rendered.push(s),
+    document: { hidden: false },
+  });
+  vm.runInContext(`let statsInFlight=false,statsRequestSeq=0,pendingFastRefresh=false,disposed=false,drawerOpen=false,lastLoadedGraphThreadId=null,lastRemotePayload=null;${refresh}`, ctx);
+  const req = vm.runInContext("refreshStats(false)", ctx);
+  // Switch to Muse, then back to Codex (even same or new model!) while req is in flight
+  selectedProvider = "muse"; selectedModel = "muse-ember-1.0";
+  await vm.runInContext("refreshStats(false)", ctx);
+  selectedProvider = "codex"; selectedModel = "new-codex";
+  await vm.runInContext("refreshStats(false)", ctx);
+  finish(stalePreSwitch);
+  await req;
+  assert.equal(rendered.length, 0, "stale pre-bounce Codex response must be discarded");
+  assert.equal(vm.runInContext("pendingFastRefresh", ctx), true, "must queue pendingFastRefresh");
+  assert.equal(trailingScheduled, 1);
+});
+
+test("R51 (#9-5): standalone Hub dispatcher shares one 8s deadline with real or stubbed callBackend", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+
+  for (const realBackend of [true, false]) {
+    for (const error of ["Unknown method", "unknown action: hub:getDrawerScript", "当前会话未绑定本地 Git 仓库目录"]) {
+      for (const elapsedMs of [7990, 8000]) {
+        let nowMs = 1000;
+        const scheduledDelays = [];
+        const timers = new Map();
+        let serial = 0, resolvePrimary, fallbackCalls = 0, fallbackAborted = false;
+        const primary = () => new Promise(resolve => { resolvePrimary = resolve; });
+        const window = {
+          __t3HudBridge: { getGitGraph: primary },
+          __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+        };
+        const ctx = vm.createContext({
+          window,
+          callBackend: primary,
+          Date: { now: () => nowMs },
+          AbortController,
+          fetch: (_url, opts) => {
+            fallbackCalls++;
+            opts.signal.addEventListener("abort", () => { fallbackAborted = true; });
+            return new Promise(() => {});
+          },
+          setTimeout: (fn, ms) => { scheduledDelays.push(ms); timers.set(++serial, fn); return serial; },
+          clearTimeout: id => timers.delete(id),
+        });
+        vm.runInContext(`${realBackend ? call : ""}\n${wrapper}`, ctx);
+        const pending = window.__t3HubRpc("hub:getDrawerScript", {});
+        const rejected = assert.rejects(pending, /HUD RPC timed out/);
+        assert.deepEqual(scheduledDelays, realBackend ? [8000] : []);
+        nowMs += elapsedMs;
+        resolvePrimary({ ok: false, error });
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+        assert.equal(fallbackCalls, elapsedMs < 8000 ? 1 : 0, "an exhausted read budget must prevent fallback");
+        assert.deepEqual(scheduledDelays, [
+          ...(realBackend ? [8000] : []),
+          ...(elapsedMs < 8000 ? [10] : []),
+        ], "fallback must use exactly the remaining budget");
+        for (const fn of [...timers.values()]) fn();
+        await rejected;
+        assert.equal(fallbackAborted, elapsedMs < 8000);
+        assert.equal(timers.size, 0);
+      }
+    }
+  }
+});
+
+test("R52 (#9-6): standalone Hub dispatcher works without timers or AbortController", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  for (const realBackend of [true, false]) {
+    for (const withAbortController of [true, false]) {
+      for (const route of ["primary", "fallback", "dream"]) {
+        let primaryCalls = 0, fetchCalls = 0;
+        const primaryResult = { ok: true, via: "primary" };
+        const sidecarResult = { ok: true, via: "sidecar" };
+        const primary = async () => {
+          primaryCalls++;
+          return route === "fallback" ? { ok: false, error: "Unknown method" } : primaryResult;
+        };
+        const window = {
+          __t3HudBridge: { getGitGraph: primary },
+          __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+        };
+        const ctx = vm.createContext({
+          window,
+          callBackend: primary,
+          ...(withAbortController ? { AbortController } : {}),
+          fetch: async () => {
+            fetchCalls++;
+            return { ok: true, json: async () => sidecarResult };
+          },
+        });
+        vm.runInContext(`${realBackend ? call : ""}\n${wrapper}`, ctx);
+        const action = route === "dream" ? "memory:dream:get" : "hub:getContext";
+        assert.deepEqual(await window.__t3HubRpc(action, {}), route === "primary" ? primaryResult : sidecarResult);
+        assert.equal(primaryCalls, route === "dream" ? 0 : 1);
+        assert.equal(fetchCalls, route === "primary" ? 0 : 1);
+      }
+    }
+  }
+});
+
+test("R51 additional: mutating Hub fallback never acquires a read timeout even after 8s primary", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  for (const realBackend of [true, false]) {
+    let nowMs = 1000, timerCalls = 0, release;
+    const primary = async () => {
+      nowMs += 9000;
+      return { ok: false, error: "Unknown method" };
+    };
+    const window = {
+      __t3HudBridge: { getGitGraph: primary },
+      __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" },
+    };
+    const ctx = vm.createContext({
+      window,
+      callBackend: primary,
+      Date: { now: () => nowMs },
+      AbortController,
+      setTimeout: () => { timerCalls++; return 1; },
+      clearTimeout: () => {},
+      fetch: (_url, opts) => {
+        assert.equal(opts.signal, undefined, "fallback writes must not receive a read abort signal");
+        return new Promise(resolve => { release = () => resolve({ ok: true, json: async () => ({ ok: true }) }); });
+      },
+    });
+    vm.runInContext(`${realBackend ? call : ""}\n${wrapper}`, ctx);
+    const pending = window.__t3HubRpc("skills:importGitHub", {});
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.equal(timerCalls, 0);
+    assert.equal(typeof release, "function", "write fallback must still execute after 8s primary");
+    release();
+    assert.equal((await pending).ok, true);
+    assert.equal(timerCalls, 0);
+  }
+});
+
+test("R53: an unidentified tail cannot join growing historical rows above the first identified current row", () => {
+  const user = telemetryDomNode({ "data-message-role": "user" }, "question");
+  const old = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "old" }, "history");
+  const current = telemetryDomNode({ "data-message-role": "assistant", "data-message-id": "current", "data-turn-id": "live" }, "answer");
+  const tail = telemetryDomNode({ "data-timeline-row-kind": "thinking" }, "thinking");
+  const read = () => getAssistantStreamSnapshot(telemetryColumn([user, old, current, tail]));
+  const first = read();
+  assert.equal(first.text, "answer\nthinking");
+  assert.equal(first.turnId, "live");
+  assert.equal(first.messageId, "current");
+  old.innerText += " expanding old markdown".repeat(100);
+  const second = read();
+  assert.equal(second.text, first.text, "old text cannot contribute a token delta");
+  const sampler = createHudStreamSampler();
+  advanceHudStreamSampler(sampler, { threadId: "r53", messageId: second.messageId, textLen: estimateRenderedTokens(first.text), nowMs: 1000 });
+  const sample = advanceHudStreamSampler(sampler, { threadId: "r53", messageId: second.messageId, textLen: estimateRenderedTokens(second.text), nowMs: 1260 });
+  assert.equal(sample.liveTps, null);
+  const unknown = getAssistantStreamSnapshot(telemetryColumn([user, old, tail]));
+  assert.equal(unknown.turnId, null);
+  assert.equal(canSampleHudStream({ ok: true, isRunning: true, activeTurnIds: ["live"] }, unknown), false);
+  assert.equal(getAssistantStreamSnapshot(telemetryColumn([old, current, tail])).text, first.text, "virtualized user anchor still locks the first nonempty turn ID");
+});
+
+test("R55: exact A->B->A between route ticks invalidates an in-flight refresh through calls, reads and capture events", async () => {
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const install = rendererSource.match(/  function installHudSelectionObservers\([\s\S]*?\n  \}/)?.[0];
+  assert.ok(install, "selection changes need an immediate event hook");
+  const read = rendererSource.match(/  function readLiveT3State\([\s\S]*?\n  \}/)[0];
+  for (const via of ["refresh", "read", "click", "keydown", "input", "change", "mutation"]) {
+    const props = { selectedProvider: "codex", selectedModel: "same-model" };
+    const listeners = new Map();
+    const rendered = [];
+    let finish, trailing = 0;
+    const ctx = vm.createContext({
+      document: {
+        hidden: false, getElementById: () => ({ "__reactFiber$fixture": { memoizedProps: props } }),
+        addEventListener: (type, fn, capture) => { assert.equal(capture, true); listeners.set(type, fn); },
+        removeEventListener: type => listeners.delete(type),
+      },
+      queueMicrotask, getRouteHint: () => "same-thread", isCurrentStatsSnapshot,
+      callBackend: () => new Promise(resolve => { finish = resolve; }),
+      renderTopbarStats: s => rendered.push(s), scheduleTrailingFastRefresh: () => { trailing++; },
+    });
+    vm.runInContext(`let statsInFlight=false, statsRequestSeq=0, pendingFastRefresh=false, disposed=false;
+      let lastRemotePayload=null, latestStats=null, lastTopbarSig='', lastLoadedGraphThreadId=null;
+      ${read}\n${refresh}\n${install}\nconst stopSelectionWatch=installHudSelectionObservers();`, ctx);
+    const pending = vm.runInContext("refreshStats(false)", ctx);
+    for (const provider of ["muse", "codex"]) {
+      props.selectedProvider = provider;
+      if (via === "refresh") await vm.runInContext("refreshStats(false)", ctx);
+      else if (via === "read") vm.runInContext("readLiveT3State()", ctx);
+      else if (via === "mutation") {
+        const observer = rendererSource.match(/  const domObserver = new MutationObserver\(\(records\) => \{[\s\S]*?\n  \}\);/)[0];
+        Object.assign(ctx, { MutationObserver: class { constructor(fn) { ctx.mutate = fn; } }, isHudOwnNode: () => true });
+        vm.runInContext(`{ ${observer} }`, ctx);
+        ctx.mutate([{ target: {} }]);
+      } else listeners.get(via)();
+      await Promise.resolve();
+    }
+    finish({ ok: true, provider: "codex", model: "same-model", speed: { lastDecodeTps: 50 } });
+    await pending;
+    assert.equal(rendered.length, 0, `${via}: old response must be discarded even though selection returned to the same value`);
+    assert.equal(vm.runInContext("pendingFastRefresh", ctx), true);
+    assert.equal(trailing, 1);
+    vm.runInContext("stopSelectionWatch()", ctx);
+    assert.equal(listeners.size, 0, "event handlers must be removable on cleanup");
+  }
+});
+
+test("R56: trailing refresh without timers preserves pending work without throwing", async () => {
+  const scheduler = rendererSource.match(/  function scheduleTrailingFastRefresh\([\s\S]*?\n  \}/)[0];
+  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const ctx = vm.createContext({
+    performance: { now: () => 2000 }, document: { hidden: false },
+    getRouteHint: () => "r56", isCurrentStatsSnapshot,
+    readLiveT3State: () => ({ selectedProvider: "codex" }),
+    callBackend: async () => ({ ok: true, provider: "codex" }), renderTopbarStats() {},
+  });
+  vm.runInContext(`let statsInFlight=false, statsRequestSeq=0, pendingFastRefresh=true, disposed=false;
+    let trailingFastRefreshTimer=null, lastFastRefreshAt=0, lastLoadedGraphThreadId=null;
+    let lastRemotePayload=null; ${scheduler}\n${refresh}`, ctx);
+  assert.doesNotThrow(() => vm.runInContext("scheduleTrailingFastRefresh()", ctx));
+  await assert.doesNotReject(vm.runInContext("refreshStats(false)", ctx));
+  assert.equal(vm.runInContext("pendingFastRefresh", ctx), true);
+  assert.equal(vm.runInContext("trailingFastRefreshTimer", ctx), null);
+});
+
+test("R57: Hub fallback shares the 8s budget across wall-clock rollback and virtual-clock advances", async () => {
+  const call = rendererSource.match(/  async function callBackend\([\s\S]*?\n  \}/)[0];
+  const wrapper = rendererSource.slice(rendererSource.indexOf("  const callRpc = "), rendererSource.indexOf("  function formatCompactTokens("));
+  for (const realBackend of [false, true]) {
+    for (const clock of ["rollback", "date-only-advance", "invalid-performance", "no-performance"]) {
+      let wallMs = 20000, monoMs = 100, release, aborted = false;
+      const delays = [], timers = new Map();
+      let serial = 0;
+      const primary = () => new Promise(resolve => { release = resolve; });
+      const window = { __t3HudBridge: { getGitGraph: primary }, __t3HubSidecarBridge: { url: "http://127.0.0.1:59999", token: "fixture" } };
+      const ctx = vm.createContext({
+        window, callBackend: primary, Date: { now: () => wallMs }, AbortController,
+        ...(clock === "no-performance" ? {} : { performance: { now: () => clock === "invalid-performance" ? NaN : monoMs } }),
+        setTimeout: (fn, ms) => { delays.push(ms); timers.set(++serial, fn); return serial; },
+        clearTimeout: id => timers.delete(id),
+        fetch: (_url, opts) => { opts.signal.addEventListener("abort", () => { aborted = true; }); return new Promise(() => {}); },
+      });
+      vm.runInContext(`${realBackend ? call : ""}\n${wrapper}`, ctx);
+      const pending = window.__t3HubRpc("hub:getDrawerScript", {});
+      const rejected = assert.rejects(pending, /HUD RPC timed out/);
+      wallMs += clock === "rollback" ? -3000 : 7000;
+      monoMs += clock === "date-only-advance" ? 0 : 7000;
+      release({ ok: false, error: "Unknown method" });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      const fallbackDelay = delays.at(-1);
+      // Fire before asserting so a failed assertion cannot leave a pending rejection.
+      for (const fn of [...timers.values()]) fn();
+      await rejected;
+      assert.equal(fallbackDelay, 1000, `${clock}: primary used 7s, fallback has only 1s left`);
+      assert.equal(aborted, true);
+      assert.equal(timers.size, 0);
+    }
+  }
 });

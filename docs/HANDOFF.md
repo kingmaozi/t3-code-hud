@@ -1,6 +1,6 @@
 # T3 Hub engineering handoff
 
-Last updated: 2026-11-16 (Asia/Singapore)
+Last updated: 2026-11-17 (Asia/Singapore)
 
 ## Project location and GitHub
 
@@ -10,7 +10,7 @@ Last updated: 2026-11-16 (Asia/Singapore)
 - Current handoff branch: `codex/t3-hub-handoff-20261116`
 - Base at handoff creation: `4a28ce4` (`feat(hub): ship floating plans, tiered agents and scheduled memory care`)
 - WIP source checkpoint: `6f0953f` (includes the intentionally red diagnostic test specification)
-- Package version: `1.0.1` from `package.json`
+- Package version: `1.0.2` from `package.json` (aligned with official `T3 Code v0.1.10`; closes `#6`, `#7`, `#8`, `#9`, `#10` with `94` suites / `1994` tests passing)
 
 This is an existing Git repository in a separate worktree. Do not run `git init`, replace `origin`, or treat the original `~/Documents/t3-code-hud` checkout as disposable. Keep unrelated WIP files. The GitHub target is public; never include private prompts, memory, local reports, account settings, or raw chat records.
 
