@@ -302,14 +302,17 @@
   }
 
   function getRouteHint() {
+    // The app may keep its hash on /draft/<id> after promoting a draft. In
+    // that case the router's resolved pathname is the current conversation;
+    // use it before falling back to the unchanged hash.
+    try {
+      const rp = getRouterPathname(findTanStackRouter());
+      if (typeof rp === "string" && rp) return rp === "/" ? "__NEW__" : resolvePromotedDraftRoute(rp);
+    } catch {}
     const hash = window.location.hash || "";
     if (hash.startsWith("#/") || hash.length > 1) {
       return resolvePromotedDraftRoute(hash.slice(1));
     }
-    try {
-      const rp = getRouterPathname(findTanStackRouter());
-      if (rp && rp !== "/") return resolvePromotedDraftRoute(rp);
-    } catch {}
     return resolvePromotedDraftRoute(window.location.pathname || "/");
   }
 

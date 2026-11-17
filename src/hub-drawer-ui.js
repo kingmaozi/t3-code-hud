@@ -2508,7 +2508,8 @@
  return null;
     }
     function rawRouteHint() {
- return location.hash?.slice(1) || findRouter()?.state?.location?.pathname || location.pathname || "/";
+ const path = findRouter()?.state?.location?.pathname;
+ return path === "/" ? "__NEW__" : path || location.hash?.slice(1) || location.pathname || "/";
     }
     function routeHint() {
  const raw = rawRouteHint();
@@ -2561,6 +2562,7 @@
     }
     function currentThreadId() {
  const paths = [rawRouteHint(), location.pathname].filter(Boolean);
+ if (paths.includes("__NEW__")) return "__NEW__";
  for (const path of paths) {
  const promoted = resolvePromotedDraftRoute(path);
  if (promoted) { try { return decodeURIComponent(promoted.slice(promoted.lastIndexOf("/") + 1)); } catch { return "__ROUTE_invalid__"; } }

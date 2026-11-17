@@ -2164,6 +2164,41 @@ test("promoted draft detection refreshes context when storage changes without a 
   assert.match(drawerSource, /routeTimer = setInterval\([^]*?checkRoute\(\)/);
 });
 
+test("resolved router route overrides a stale draft hash and route polling follows chat switches", async () => {
+  const environmentId = "11111111-1111-4111-8111-111111111111", calls = [];
+  const router = { state: { location: { pathname: `/${environmentId}/thread-a`, searchStr: "" } } };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return { environmentId, threadId: payload.routeHint.split("/").at(-1), projectRoot: "/fixture" };
+    return { threadId: payload.threadId, steps: [] };
+  }, {
+    window: { __TSR_ROUTER__: router },
+    location: { pathname: "/", hash: "#/draft/old-draft", href: "t3code://app/#/draft/old-draft" },
+  });
+  const firstRoute = `/${environmentId}/thread-a`, nextRoute = `/${environmentId}/thread-b`;
+  assert.equal(ui.routeHint(), firstRoute);
+  assert.equal(ui.currentThreadId(), "thread-a");
+  await ui.refreshContext();
+  assert.equal(ui.state.connected, true);
+  assert.equal(ui.state.threadId, "thread-a");
+
+  // T3 v0.1.10 updates the resolved route while retaining its initial draft hash.
+  router.state.location = { pathname: nextRoute, searchStr: "" };
+  ui.checkRoute();
+  await new Promise(setImmediate);
+  assert.equal(ui.routeHint(), nextRoute);
+  assert.equal(ui.state.threadId, "thread-b");
+  assert.ok(calls.some(({ action, payload }) => action === "hub:getContext" && payload.routeHint === nextRoute));
+  assert.equal(ui.sandbox.location.hash, "#/draft/old-draft");
+
+  router.state.location = { pathname: "/", searchStr: "" };
+  ui.checkRoute();
+  assert.equal(ui.routeHint(), "__NEW__");
+  assert.equal(ui.currentThreadId(), "__NEW__");
+  assert.equal(ui.state.threadId, "__NEW__");
+  assert.equal(ui.state.connected, false);
+});
+
 for (const source of ["storage", "fiber"]) for (const candidate of ["hash", "router", "pathname"]) test(`Round-2 P2 #5 environment-prefixed draft stays isolated until in-place promotion (${source}, ${candidate})`, async () => {
   const environmentId = "remote:west", draftId = "draft:active/7", threadId = "thread:promoted/7", calls = [];
   const route = `${candidate === "router" ? "" : "/"}_t3_env_/${encodeURIComponent(environmentId)}/draft/${encodeURIComponent(draftId)}`;
