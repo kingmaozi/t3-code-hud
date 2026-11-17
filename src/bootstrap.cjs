@@ -52,10 +52,12 @@ const MARKER_FILE = path.join(RUN_DIR, "active.pid");
 const childEnv = { ...process.env };
 delete childEnv.ELECTRON_RUN_AS_NODE;
 delete childEnv.NODE_OPTIONS;
-const basePath = childEnv.PATH || "/usr/bin:/bin:/usr/sbin:/sbin";
-if (!basePath.includes("/opt/homebrew/bin")) {
-  childEnv.PATH = `/opt/homebrew/bin:/usr/local/bin:${basePath}`;
-}
+const basePath = childEnv.PATH || "";
+childEnv.PATH = [...new Set([
+  path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
+  "/opt/homebrew/bin", "/usr/local/bin", ...basePath.split(path.delimiter),
+  "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+].filter(Boolean))].join(path.delimiter);
 
 const extraArgs = process.argv.slice(2);
 const child = spawn(resolved.binPath, ["--inspect=127.0.0.1:0", ...extraArgs], {

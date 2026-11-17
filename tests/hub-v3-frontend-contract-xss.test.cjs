@@ -40,7 +40,7 @@ function harness(rpc = async () => ({}), environment = {}) {
     window: { dispatchEvent() {}, ...environment.window },
     document: { body: null, hidden: false, activeElement: null, querySelectorAll: () => [], querySelector: () => null, getElementById: () => null, documentElement: { lang: "zh" }, ...environment.document },
     location: { pathname: "/threads/thread-a", href: "https://fixture.test/threads/thread-a", hash: "", ...environment.location },
-    innerWidth: 1280, innerHeight: 800, getComputedStyle: () => ({ visibility: "visible" }),
+    innerWidth: environment.innerWidth ?? 1280, innerHeight: environment.innerHeight ?? 800, getComputedStyle: () => ({ visibility: "visible" }),
     CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     localStorage: environment.localStorage || { getItem: () => null, setItem() {} },
     setTimeout: () => 1, clearTimeout() {}, console,
@@ -55,7 +55,12 @@ function harness(rpc = async () => ({}), environment = {}) {
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
       composerToken, composerSurface, positionSlash, closeSlash, selectSlash, onComposerInput, onComposerKeydown,
       findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory, renderDream,
-      refreshContext, ready: () => { contextLoading = false; },
+      refreshContext, routeHint, routeKey, boardMismatch, projectContextReady, syncOcclusion,
+      runImport, setSkillScope, saveMcpMode, primeCatalogs, parseScopeParts,
+      saveMemory, deleteMemory, promoteMemory, consolidateMemory, rollbackMemory,
+      isContextLoading: () => contextLoading,
+      onDreamToggle: typeof onDreamToggle === "function" ? onDreamToggle : undefined,
+      snapshot: ${drawerSource.match(/snapshot: (.*),\n destroy:/)[1]}, ready: () => { contextLoading = false; },
       setCurrentRoute: () => { lastRoute = routeKey(); lastBoardRoute = boardScopeRoute(); },
       routeScope: () => ({ cached: lastBoardRoute, current: boardScopeRoute() }),
       setSlash: (session) => { slashSession = session; }, getSlash: () => slashSession,
@@ -589,7 +594,8 @@ test("hooks, skills, MCP, agents, models and task-board templates keep hostile v
 
 test("AutoDream run consumes the backend journal while preserving presets and its wrapped config", async () => {
   const source = drawerSource.match(/    async function runDream\([^]*?\n    \}/)[0];
-  const cache = { dream: { config: { enabled: true }, presets: [{ id: "keep" }], journal: [{ id: "old" }] }, overview: {} };
+  const runtime = { scheduler: { started: true } };
+  const cache = { dream: { config: { enabled: true }, presets: [{ id: "keep" }], journal: [{ id: "old" }], runtime }, overview: {} };
   const context = {
     cache, state: { projectRoot: "/fixture", tab: "board" }, errors: {}, disposed: false, contextVersion: 1,
     dreamConfig: () => cache.dream.config, hubRpc: async () => ({ config: { enabled: true }, journal: [{ id: "new" }], report: { merged: 1 } }),
@@ -599,6 +605,98 @@ test("AutoDream run consumes the backend journal while preserving presets and it
   assert.equal(cache.dream.journal[0].id, "new");
   assert.equal(cache.dream.presets[0].id, "keep");
   assert.equal(cache.dream.config.lastReport.merged, 1);
+  assert.equal(cache.dream.runtime, runtime);
+});
+
+test("AutoDream opens by default and exposes all six curated presets with its Chinese and English title", () => {
+  const ui = harness();
+  ui.cache.dream = { config: { dreamTime: "03:30" } };
+  assert.equal(ui.state.dreamOpen, true);
+  ui.renderDream();
+  let html = ui.nodes.get("#t3-hub-dream").innerHTML;
+  assert.match(html, /<details class="hub-dream-card" open>/);
+  assert.match(html, /<summary[^>]*><span class="hub-dream-summary-title">梦境系统 · AutoDream/);
+  assert.match(html, /<section aria-label="梦境系统 · AutoDream"/);
+  const presets = html.match(/<select\b[^>]*name="dream-preset"[^>]*>([^]*?)<\/select>/)?.[1];
+  assert.ok(presets, "presets must be a visible select, not only a datalist");
+  assert.deepEqual([...presets.matchAll(/<option value="([^"]+)"/g)].map((match) => match[1]), ["local-zero", "muse-ember", "codex-terra", "codex-sol", "claude-sonnet", "pi-magpie"]);
+  assert.match(html, /执行引擎/); assert.match(html, /思考强度/); assert.match(html, /保存引擎/);
+  ui.state.lang = "en"; ui.renderDream(); html = ui.nodes.get("#t3-hub-dream").innerHTML;
+  assert.match(html, /<summary[^>]*><span class="hub-dream-summary-title">Memory Dream · AutoDream/);
+  assert.match(html, /<section aria-label="Memory Dream · AutoDream"/);
+});
+
+test("AutoDream native details toggle persists collapse and survives snapshots without a double toggle", () => {
+  const values = new Map(), storage = { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
+  const ui = harness(undefined, { localStorage: storage });
+  const card = node(), summary = node();
+  card.isConnected = true; card.open = true;
+  summary.dataset = { action: "dream-fold" }; summary.closest = () => card;
+  ui.root.contains = (target) => target === summary || target === card;
+  ui.onClick({ target: { closest: () => summary } });
+  assert.equal(ui.state.dreamOpen, true, "the browser owns summary activation until its toggle event");
+  card.open = false;
+  assert.equal(typeof ui.onDreamToggle, "function"); ui.onDreamToggle({ currentTarget: card });
+  assert.equal(ui.state.dreamOpen, false); assert.equal(values.get("t3-hub:dream-open"), "false");
+  assert.equal(ui.snapshot().dreamOpen, false);
+  assert.equal(harness(undefined, { localStorage: storage }).state.dreamOpen, false);
+  const restored = harness(undefined, { localStorage: storage, window: { __t3SidecarHub: { snapshot: () => ({ dreamOpen: true }) } } });
+  assert.equal(restored.state.dreamOpen, true, "a live snapshot wins over persisted preference");
+  card.open = true; ui.onDreamToggle({ currentTarget: card });
+  assert.equal(values.get("t3-hub:dream-open"), "true");
+  card.isConnected = false; card.open = false; ui.onDreamToggle({ currentTarget: card });
+  assert.equal(ui.state.dreamOpen, true, "a detached old render must not change the current preference");
+  values.set("t3-hub:dream-open", "invalid"); assert.equal(harness(undefined, { localStorage: storage }).state.dreamOpen, true);
+  assert.match(drawerSource, /addEventListener\("toggle", onDreamToggle\)/);
+});
+
+test("AutoDream preset selection stays a draft, can be customized or cancelled, and saves the wrapped response", async () => {
+  const calls = [], journal = [{ id: "keep-journal" }];
+  let config = { enabled: false, dreamTime: "03:30", dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium" };
+  const runtime = { providers: [{ id: "local", status: "available", efforts: [] }, { id: "muse", status: "available", efforts: ["medium", "max"] }, { id: "codex", status: "available", efforts: ["medium", "high"] }], scheduler: { started: true } };
+  const presets = [{ id: "muse-ember", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium", label: "Muse" }, { id: "codex-sol", providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high", label: "Codex Sol" }];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") { config = { ...config, ...payload }; return { config }; } return { config }; });
+  ui.cache.dream = { config, runtime, presets, journal };
+  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.state.dreamEngineDraft)), { providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high" });
+  assert.equal(calls.length, 0); assert.equal(ui.cache.dream.config.model, "muse-ember-1.0");
+  ui.onChange({ target: { name: "dream-effort", value: "medium" } });
+  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /<option value="custom" selected/);
+  ui.onChange({ target: { name: "dream-preset", value: "muse-ember" } });
+  ui.onInput({ target: { name: "dream-model", value: "custom-model" } });
+  assert.match(ui.nodes.get('[name="dream-preset"]').innerHTML, /<option value="custom" selected/);
+  const cancel = node(); cancel.dataset = { action: "cancel-dream-engine" }; ui.root.contains = (target) => target === cancel;
+  ui.onClick({ target: { closest: () => cancel } });
+  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
+  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
+  await ui.saveDreamEngine();
+  assert.equal(calls.length, 2); assert.equal(calls[0].action, "memory:dream:save");
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamMode: "agent", providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high" });
+  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(ui.cache.dream.config.model, "gpt-6.1-sol");
+  assert.equal(ui.cache.dream.presets, presets); assert.equal(ui.cache.dream.journal, journal); assert.equal(ui.cache.dream.runtime, runtime);
+});
+
+test("AutoDream differentiates missing CLI and unsupported providers on both selectors and rejects unavailable presets", () => {
+  const calls = [], ui = harness(async (action) => { calls.push(action); return {}; });
+  ui.cache.dream = { config: { dreamTime: "03:30" }, runtime: { providers: [{ id: "local", status: "available" }, { id: "muse", status: "available", efforts: ["medium"] }, { id: "codex", status: "missing" }, { id: "claude", status: "unsupported" }, { id: "pi", status: "available" }] } };
+  ui.renderDream(); const html = ui.nodes.get("#t3-hub-dream").innerHTML;
+  for (const name of ["dream-preset", "dream-provider"]) {
+    const select = html.match(new RegExp(`<select\\b[^>]*name="${name}"[^>]*>([^]*?)<\\/select>`))[1];
+    assert.match(select, new RegExp(`<option value="${name === "dream-preset" ? "codex-sol" : "codex"}"[^>]*disabled[^>]*>[^<]*· 未安装 CLI`));
+    assert.match(select, new RegExp(`<option value="${name === "dream-preset" ? "claude-sonnet" : "claude"}"[^>]*disabled[^>]*>[^<]*· 暂不支持`));
+  }
+  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
+  ui.onChange({ target: { name: "dream-preset", value: "claude-sonnet" } });
+  ui.onChange({ target: { name: "dream-preset", value: "unknown" } });
+  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
+});
+
+test("AutoDream escapes preset IDs, labels, model, provider and effort fields", () => {
+  const ui = harness(), attack = attacks.join(" ");
+  ui.cache.dream = { config: { dreamTime: "03:30", providerInstanceId: attack, model: attack, reasoningEffort: attack }, presets: [{ id: attack, providerInstanceId: attack, model: attack, reasoningEffort: attack, label: attack }], runtime: { providers: [{ id: attack, status: "unsupported", efforts: [attack] }] } };
+  ui.renderDream(); const html = ui.nodes.get("#t3-hub-dream").innerHTML;
+  assert.match(html, /name="dream-preset"/); assert.ok(html.includes(ui.esc(attack)));
+  assert.doesNotMatch(html, /<img src=x|<svg onload=|" autofocus onfocus="/);
 });
 
 test("AutoDream edits Agent, custom model and effort as a single read-back-confirmed setting", async () => {
@@ -1112,6 +1210,45 @@ test("unknown environment routes cannot reuse the previous local thread context"
   assert.equal(calls[0].payload.threadId, thread);
 });
 
+for (const prefix of ["/", "", "/_t3_env_/", "_t3_env_/"]) test(`Round-2 P2 #7 board scope decodes both environment and thread (${prefix || "no leading slash"})`, async () => {
+  const environmentId = "remote:west", threadId = "thread:task/7%3A", calls = [];
+  const route = `${prefix}${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { threadId, steps: [] }; }, {
+    location: { pathname: "/", hash: `#${route}`, href: `t3code://app/#${route}` },
+  });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId, projectRoot: "/remote-project", context: { environmentId: environmentId.toUpperCase(), threadId, projectRoot: "/remote-project" }, boardDraft: "do not cross scopes" });
+  ui.setCurrentRoute();
+  assert.equal(ui.boardMismatch(), false);
+  assert.equal(ui.projectContextReady(), true);
+  assert.equal(await ui.pollBoard(), true);
+  assert.equal(calls[0].payload.threadId, threadId, "decode the thread once without changing its literal percent escape");
+  calls.length = 0;
+  ui.state.context.environmentId = "remote:east";
+  assert.equal(ui.boardMismatch(), true);
+  await ui.pollBoard(); await ui.updateBoard(null, "add");
+  assert.equal(calls.length, 0, "a different decoded environment still blocks plan reads and writes");
+  ui.state.context.environmentId = environmentId;
+  for (const badRoute of [`${prefix}%E0%A4%A/${encodeURIComponent(threadId)}`, `${prefix}${encodeURIComponent(environmentId)}/%E0%A4%A`, `${prefix}${encodeURIComponent(environmentId)}/another-thread`]) {
+    ui.sandbox.location.hash = `#${badRoute}`;
+    assert.equal(ui.boardMismatch(), true, "malformed escapes and another thread must fail closed");
+  }
+});
+
+test("Round-2 P2 #7 thread wrappers are environments only with an explicit prefix; project wrappers stay project routes", () => {
+  const ui = harness();
+  Object.assign(ui.state, { threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a", projectRoot: "/fixture" } });
+  for (const segment of ["threads", "_chat", "projects", "project", "workspaces", "workspace"]) {
+    Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${segment}/thread-a` });
+    assert.equal(ui.boardMismatch(), false, `${segment} must not become an implicit environment`);
+    ui.sandbox.location.hash = `#/_t3_env_/${segment}/thread-a`;
+    assert.equal(ui.boardMismatch(), ["threads", "_chat"].includes(segment), "only explicit thread wrappers require an environment match");
+    ui.state.context.environmentId = segment;
+    assert.equal(ui.boardMismatch(), false);
+    delete ui.state.context.environmentId;
+  }
+});
+
 test("floating dashboard clamps to viewport and hides for dialogs and settings", () => {
   const { ui } = relationFixture();
   const board = ui.nodes.get("#t3-hub-live-board");
@@ -1126,6 +1263,44 @@ test("floating dashboard clamps to viewport and hides for dialogs and settings",
   ui.root.classList.remove("is-occluded");
   Object.assign(ui.sandbox.location, { pathname: "/settings", hash: "", href: "https://fixture.test/settings" });
   ui.positionConversationTools(); assert.equal(board.hidden, true);
+});
+
+test("dialog occlusion ignores hidden, closed and transparent elements including hidden ancestors", () => {
+  const dialog = node(), parent = node(); dialog.parentElement = parent; dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
+  const ui = harness(undefined, { document: { querySelectorAll: (selector) => selector.includes('[role="dialog"]') ? [dialog] : [] } });
+  ui.setStyle((element) => ({ display: "block", visibility: "visible", opacity: "1", ...element.css }));
+  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
+  for (const hidden of [() => { dialog.hidden = true; }, () => dialog.setAttribute("aria-hidden", "true"), () => dialog.setAttribute("data-closed", ""), () => { dialog.css = { display: "none" }; }, () => { dialog.css = { visibility: "hidden" }; }, () => { dialog.css = { opacity: "0" }; }, () => { parent.css = { opacity: "0" }; }, () => { parent.hidden = true; }, () => { dialog.tagName = "DIALOG"; dialog.open = false; }]) {
+    dialog.hidden = false; dialog.tagName = "DIV"; dialog.open = true; dialog.css = {}; parent.css = {}; parent.hidden = false; dialog.removeAttribute("aria-hidden"); dialog.removeAttribute("data-closed");
+    hidden(); ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false);
+  }
+});
+
+test("non-modal inline dialogs occlude only overlapping composer or visible Hub surfaces", () => {
+  const dialog = node(); dialog.setAttribute("role", "dialog");
+  const ui = harness(undefined, { document: { querySelectorAll: (selector) => selector.includes('[role="dialog"]') ? [dialog] : [] } });
+  dialog.getBoundingClientRect = () => ({ left: 0, top: 0, right: 70, bottom: 50, width: 70, height: 50 });
+  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false);
+  dialog.getBoundingClientRect = () => ({ left: 110, top: 610, right: 180, bottom: 660, width: 70, height: 50 });
+  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
+  dialog.getBoundingClientRect = () => ({ left: 0, top: 0, right: 70, bottom: 50, width: 70, height: 50 });
+  dialog.setAttribute("aria-modal", "true"); ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true, "a real modal remains a blocker even outside Hub geometry");
+  dialog.removeAttribute("aria-modal");
+  const editor = node(); editor.isConnected = true; editor.tagName = "TEXTAREA"; editor.closest = () => null; editor.parentElement = null;
+  editor.getBoundingClientRect = dialog.getBoundingClientRect;
+  ui.sandbox.document.querySelectorAll = (selector) => selector.includes('[role="dialog"]') ? [dialog] : selector.includes("textarea") ? [editor] : [];
+  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true, "composer overlap also hides Hub controls");
+});
+
+test("non-modal popover over only the dashboard does not make occlusion oscillate after positioning hides it", () => {
+  const dialog = node(), ui = harness(undefined, { document: { querySelectorAll: (selector) => selector.includes('[role="dialog"]') ? [dialog] : [] } });
+  const board = ui.nodes.get("#t3-hub-live-board");
+  dialog.getBoundingClientRect = board.getBoundingClientRect = () => ({ left: 900, top: 100, right: 1200, bottom: 300, width: 300, height: 200 });
+  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
+  board.hidden = true; board.getClientRects = () => [];
+  ui.syncOcclusion(); ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
+  dialog.hidden = true; ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false);
+  dialog.hidden = false; ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false, "dismissal drops the previously occluded board's cached geometry");
 });
 
 test("dragging persists a clamped position, supports cancel and preserves viewport bounds", () => {
@@ -1944,6 +2119,379 @@ test("native two-UUID routes use the thread UUID; drafts and project-only routes
   }
 });
 
+for (const source of ["promotedTo", "promotedDraftRedirects"]) for (const wrapped of [false, true]) {
+  test(`promoted draft ${source} (${wrapped ? "persisted state" : "flat store"}) resolves context and loads only its server plan`, async () => {
+    const environmentId = "6ee0c274-d218-41d6-b277-cbfc803dfbc0", draftId = "draft-active", threadId = "3972c780-3288-4f8b-9990-c6cd999f70ba";
+    const route = `/_t3_env_/${environmentId}/${threadId}`, ref = { environmentId, threadId }, calls = [];
+    const store = source === "promotedTo" ? { draftThreadsByThreadKey: { [draftId]: { environmentId, threadId: "not-the-promoted-thread", promotedTo: ref } } } : { promotedDraftRedirects: { [draftId]: ref }, draftThreadsByThreadKey: { [draftId]: { promotedTo: null } } };
+    const ui = harness(async (action, payload) => {
+      calls.push({ action, payload });
+      if (action === "hub:getContext") {
+        assert.equal(payload.threadHint, `t3code://app/#${route}`); assert.equal(payload.routeHint, route);
+        assert.doesNotMatch(payload.threadHint + payload.routeHint, /\/draft\//);
+        return { environmentId, threadId, projectRoot: "/fixture", projectId: "fixture-project" };
+      }
+      return { threadId, source: "t3-native", steps: [{ text: "晋升后的当前会话计划", status: "in_progress" }] };
+    }, { location: { pathname: "/", hash: `#/draft/${draftId}`, href: `t3code://app/#/draft/${draftId}` }, localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify(wrapped ? { state: store } : store) : null, setItem() {} } });
+    assert.equal(ui.currentThreadId(), threadId); assert.equal(ui.routeHint(), route);
+    await ui.refreshContext();
+    await new Promise(setImmediate); // refreshContext starts the initial board poll without blocking the closed drawer.
+    assert.equal(ui.state.connected, true); assert.equal(ui.state.projectRoot, "/fixture"); assert.equal(ui.state.threadId, threadId);
+    assert.equal(ui.boardMismatch(), false); assert.equal(ui.projectContextReady(), true);
+    assert.equal(await ui.pollBoard(), true);
+    assert.ok(calls.some((entry) => entry.action === "board:get" && entry.payload.threadId === threadId && entry.payload.strictThreadMatch === true));
+    assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /晋升后的当前会话计划/);
+    assert.doesNotMatch(ui.nodes.get("#t3-hub-live-board").innerHTML, /会话未匹配/);
+  });
+}
+
+test("promoted draft detection refreshes context when storage changes without a hash change", async () => {
+  const environmentId = "6ee0c274-d218-41d6-b277-cbfc803dfbc0", threadId = "thread:promoted", draftId = "draft-active", calls = [];
+  let promotedTo = null;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    return action === "hub:getContext" ? { environmentId, threadId, projectRoot: "/fixture" } : { threadId, steps: [{ text: "原地址内晋升的计划", status: "pending" }] };
+  }, { location: { pathname: "/", hash: `#/draft/${draftId}`, href: `t3code://app/#/draft/${draftId}` }, localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify({ state: { draftThreadsByThreadKey: { [draftId]: { promotedTo } } } }) : null, setItem() {} } });
+  ui.state.threadId = "__NEW__"; ui.setCurrentRoute(); const previousKey = ui.routeKey(), href = ui.sandbox.location.href;
+  assert.equal(ui.currentThreadId(), "__NEW__");
+  promotedTo = { environmentId, threadId }; assert.notEqual(ui.routeKey(), previousKey);
+  ui.checkRoute(); assert.equal(ui.state.threadId, threadId);
+  await new Promise(setImmediate);
+  assert.equal(ui.sandbox.location.href, href); assert.equal(ui.boardMismatch(), false);
+  assert.ok(calls.some((entry) => entry.action === "hub:getContext" && entry.payload.routeHint === `/_t3_env_/${environmentId}/thread%3Apromoted`));
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /原地址内晋升的计划/);
+  assert.match(drawerSource, /listen\(window, "storage", checkRoute\)/);
+  assert.match(drawerSource, /routeTimer = setInterval\([^]*?checkRoute\(\)/);
+});
+
+for (const source of ["storage", "fiber"]) for (const candidate of ["hash", "router", "pathname"]) test(`Round-2 P2 #5 environment-prefixed draft stays isolated until in-place promotion (${source}, ${candidate})`, async () => {
+  const environmentId = "remote:west", draftId = "draft:active/7", threadId = "thread:promoted/7", calls = [];
+  const route = `${candidate === "router" ? "" : "/"}_t3_env_/${encodeURIComponent(environmentId)}/draft/${encodeURIComponent(draftId)}`;
+  const store = { promotedDraftRedirects: {} }, props = { draftId, isServerThread: false, threadId };
+  const host = { __reactFiber$fixture: { memoizedProps: props } };
+  const href = `t3code://app/${candidate === "hash" ? `#${route}` : candidate === "pathname" ? route : ""}`;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    return action === "hub:getContext" ? { environmentId, threadId, projectRoot: "/promoted-project" } : { threadId, steps: [{ text: "promoted environment plan" }] };
+  }, {
+    location: { pathname: candidate === "pathname" ? route : "/", hash: candidate === "hash" ? `#${route}` : "", href },
+    window: candidate === "router" ? { __TSR_ROUTER__: { state: { location: { pathname: route } } } } : {},
+    localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify({ state: store }) : null, setItem() {} },
+    document: { getElementById: (id) => source === "fiber" && id === "root" ? host : null },
+  });
+  Object.assign(ui.state, { connected: true, threadId: "old-thread", projectRoot: "/old-project", context: { environmentId: "old-environment", threadId: "old-thread", projectRoot: "/old-project" } });
+  ui.setCurrentRoute();
+  assert.equal(ui.routeHint(), route); assert.equal(ui.currentThreadId(), "__NEW__");
+  await ui.refreshContext(); await ui.pollBoard(); await ui.updateBoard(null, "add");
+  assert.equal(calls.length, 0, "an unpromoted prefixed draft never requests context or a plan for the previous project");
+  assert.equal(ui.state.connected, false); assert.equal(ui.state.context, null); assert.equal(ui.state.projectRoot, null);
+  assert.equal(ui.state.threadId, "__NEW__"); assert.equal(ui.cache.board, null);
+  const before = ui.routeKey();
+  if (source === "storage") store.promotedDraftRedirects[draftId] = { environmentId: "   ", threadId };
+  else props.isServerThread = true;
+  const promoted = `/_t3_env_/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
+  assert.equal(ui.routeHint(), promoted, "promotion without an environment in the ref uses the decoded path environment");
+  assert.notEqual(ui.routeKey(), before);
+  ui.checkRoute(); await new Promise(setImmediate);
+  assert.equal(ui.sandbox.location.href, href, "promotion does not require navigating away from the draft URL");
+  assert.equal(ui.state.connected, true); assert.equal(ui.state.threadId, threadId); assert.equal(ui.state.projectRoot, "/promoted-project");
+  assert.equal(ui.boardMismatch(), false); assert.equal(ui.projectContextReady(), true);
+  const contextCall = calls.find((entry) => entry.action === "hub:getContext");
+  assert.equal(contextCall.payload.routeHint, promoted);
+  assert.equal(contextCall.payload.threadHint, `t3code://app/#${promoted}`);
+  assert.ok(calls.some((entry) => entry.action === "board:get" && entry.payload.projectRoot === "/promoted-project" && entry.payload.threadId === threadId && entry.payload.strictThreadMatch === true));
+  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /promoted environment plan/);
+});
+
+for (const malformed of ["environment", "draft"]) test(`Round-2 P2 #5 malformed prefixed draft ${malformed} cannot promote or fetch old context`, async () => {
+  const calls = [], route = `/_t3_env_/${malformed === "environment" ? "%E0%A4%A" : "remote%3Awest"}/draft/${malformed === "draft" ? "%E0%A4%A" : "draft-a"}`;
+  const ui = harness(async (action) => { calls.push(action); return {}; }, {
+    location: { pathname: "/", hash: `#${route}`, href: `t3code://app/#${route}` },
+    localStorage: { getItem: () => JSON.stringify({ promotedDraftRedirects: { "draft-a": { environmentId: "remote:west", threadId: "server-thread" }, "%E0%A4%A": { threadId: "server-thread" } } }), setItem() {} },
+  });
+  ui.state.context = { environmentId: "old", threadId: "old-thread", projectRoot: "/old-project" };
+  assert.equal(ui.routeHint(), route); assert.equal(ui.currentThreadId(), "__NEW__");
+  await ui.refreshContext();
+  assert.equal(calls.length, 0); assert.equal(ui.state.context, null); assert.equal(ui.state.connected, false);
+});
+
+test("Round-2 P2 #5 an explicit promoted environment takes precedence over the draft path", () => {
+  const ui = harness(undefined, {
+    location: { pathname: "/", hash: "#/_t3_env_/path%3Aenvironment/draft/draft-a" },
+    localStorage: { getItem: () => JSON.stringify({ promotedDraftRedirects: { "draft-a": { environmentId: "ref:environment", threadId: "server-thread" } } }), setItem() {} },
+  });
+  assert.equal(ui.routeHint(), "/_t3_env_/ref%3Aenvironment/server-thread");
+});
+
+for (const kind of ["threadRef", "activeThreadKey", "thread"]) test(`promoted draft Fiber fallback accepts only matching server props (${kind})`, () => {
+  const environmentId = "6ee0c274-d218-41d6-b277-cbfc803dfbc0", threadId = "fiber-thread", draftId = "current-draft";
+  const props = { draftId, isServerThread: true, environmentId, [kind]: kind === "threadRef" ? { environmentId, threadId } : kind === "thread" ? { id: threadId } : `${environmentId}:${threadId}` };
+  const fiber = { memoizedProps: { draftId: "another-draft", isServerThread: true, threadRef: { environmentId, threadId: "other-thread" } }, child: { memoizedProps: props } };
+  const host = { __reactContainer$fixture: { current: fiber } };
+  const ui = harness(undefined, { location: { pathname: "/", hash: `#/draft/${draftId}`, href: `t3code://app/#/draft/${draftId}` }, document: { getElementById: (id) => id === "root" ? host : null } });
+  assert.equal(ui.routeHint(), `/_t3_env_/${environmentId}/${threadId}`); assert.equal(ui.currentThreadId(), threadId);
+  props.isServerThread = false; assert.equal(ui.currentThreadId(), "__NEW__");
+  props.isServerThread = true; props.draftId = "another-draft"; assert.equal(ui.currentThreadId(), "__NEW__");
+});
+
+test("promoted draft Fiber walk is bounded to 400 nodes and tolerates invalid or denied storage", () => {
+  const props = { draftId: "bounded-draft", isServerThread: true, threadRef: { threadId: "fiber-thread" } }, start = {};
+  let leaf = start; for (let index = 1; index < 400; index++) leaf = leaf.child = {};
+  leaf.child = { memoizedProps: props, sibling: start };
+  const ui = harness(undefined, { location: { pathname: "/", hash: "#/draft/bounded-draft" }, document: { getElementById: () => ({ __reactFiber$fixture: start }) }, localStorage: { getItem() { throw new Error("storage denied"); }, setItem() {} } });
+  assert.equal(ui.currentThreadId(), "__NEW__", "node 401 must not be inspected");
+  leaf.memoizedProps = props;
+  assert.equal(ui.currentThreadId(), "fiber-thread"); assert.equal(ui.routeHint(), "/fiber-thread");
+  ui.sandbox.localStorage.getItem = () => "{invalid JSON";
+  assert.equal(ui.currentThreadId(), "fiber-thread", "invalid persisted data must still permit a verified matching Fiber");
+});
+
+for (const source of ["memoizedProps", "pendingProps", "memoizedState", "hookState"]) {
+  test(`promoted draft uses direct T3 v0.1.10 thread fields from the same Fiber (${source})`, () => {
+    const draftId = "real-t3-draft", environmentId = "env:local/1", threadId = "thread:delegated-task:command%3A7";
+    const props = { draftId, isServerThread: true, environmentId, threadId, activeThreadKey: "wrong-env:wrong-thread" };
+    const fiber = source === "hookState" ? { memoizedState: { memoizedState: null, next: { memoizedState: props } } } : { [source]: props };
+    const ui = harness(undefined, { location: { pathname: "/", hash: `#/draft/${draftId}` }, document: { getElementById: () => ({ __reactFiber$fixture: fiber }) } });
+    assert.equal(ui.routeHint(), `/_t3_env_/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`);
+    assert.equal(ui.currentThreadId(), threadId);
+    props.isServerThread = false;
+    assert.equal(ui.currentThreadId(), "__NEW__", "a matching draft ID alone does not prove promotion");
+  });
+}
+
+for (const activeThreadKey of ["env-1:thread:delegated-task:command%3A7", "thread:delegated-task:command%3A7"]) {
+  test(`promoted draft parses the first activeThreadKey separator without truncating thread IDs (${activeThreadKey})`, () => {
+    const draftId = "key-draft", threadId = "thread:delegated-task:command%3A7";
+    const fiber = { memoizedProps: { draftId, isServerThread: true, activeThreadKey, environmentId: "explicit-environment" } };
+    const ui = harness(undefined, { location: { pathname: "/", hash: `#/draft/${draftId}` }, document: { getElementById: () => ({ __reactContainer$fixture: fiber }) } });
+    assert.equal(ui.routeHint(), `/_t3_env_/${activeThreadKey.startsWith("thread:") ? "explicit-environment" : "env-1"}/${encodeURIComponent(threadId)}`);
+    assert.equal(ui.currentThreadId(), threadId);
+  });
+}
+
+for (const kind of ["bare-key", "known-environment-slash-key", "uuid-slash-key"]) {
+  test(`promoted draft keeps existing environment-aware key compatibility (${kind})`, () => {
+    const environmentId = kind === "uuid-slash-key" ? "6ee0c274-d218-41d6-b277-cbfc803dfbc0" : "env-1", threadId = "fiber-thread", draftId = "compatible-key-draft";
+    const props = { draftId, isServerThread: true, activeThreadKey: kind === "bare-key" ? threadId : `${environmentId}/${threadId}` };
+    if (kind !== "uuid-slash-key") props.environmentId = environmentId;
+    const ui = harness(undefined, { location: { pathname: "/", hash: `#/draft/${draftId}` }, document: { getElementById: () => ({ __reactFiber$fixture: { memoizedProps: props } }) } });
+    assert.equal(ui.routeHint(), `/_t3_env_/${environmentId}/${threadId}`);
+    assert.equal(ui.currentThreadId(), threadId);
+  });
+}
+
+for (const wrapped of [false, true]) for (const cleanup of [false, true]) {
+  test(`promoted draft reads native drafts/promotedDraftRedirects (${wrapped ? "persisted state" : "flat store"}, ${cleanup ? "draft deleted" : "draft present"})`, async () => {
+    const draftId = "native-store-draft", environmentId = "env-1", threadId = "thread:delegated-task:command%3A7";
+    const ref = { environmentId, threadId }, route = `/_t3_env_/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`, calls = [];
+    const store = cleanup ? { drafts: {}, promotedDraftRedirects: { [draftId]: ref } } : { drafts: { [draftId]: { promotedTo: ref } } };
+    const ui = harness(async (action, payload) => {
+      calls.push({ action, payload });
+      return action === "hub:getContext" ? { ...ref, projectRoot: "/fixture" } : { steps: [] };
+    }, { location: { pathname: "/", hash: `#/draft/${draftId}`, href: `t3code://app/#/draft/${draftId}` }, localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify(wrapped ? { state: store } : store) : null, setItem() {} } });
+    assert.equal(ui.routeHint(), route);
+    assert.equal(ui.currentThreadId(), threadId);
+    await ui.refreshContext();
+    const contextCall = calls.find((entry) => entry.action === "hub:getContext");
+    assert.equal(contextCall.payload.routeHint, route);
+    assert.equal(contextCall.payload.threadHint, `t3code://app/#${route}`);
+    assert.equal(ui.state.connected, true);
+    assert.equal(ui.state.threadId, threadId);
+  });
+}
+
+for (const key of ["__reactContainer$fixture", "__reactFiber$fixture"]) for (const attachment of ["root", "descendant"]) {
+  test(`promoted draft inspects the committed FiberRoot and ignores an older server tree (${key}, ${attachment})`, () => {
+    const draftId = "double-buffered-draft", environmentId = "env-1", threadId = "old-server-thread";
+    const oldChild = { memoizedProps: { draftId, isServerThread: true, environmentId, threadId, threadRef: { environmentId, threadId } } };
+    const committedChild = { memoizedProps: { draftId, isServerThread: false, environmentId, threadId } };
+    const oldRoot = { child: oldChild }, committedRoot = { child: committedChild }, fiberRoot = { current: committedRoot };
+    oldChild.return = oldRoot; committedChild.return = committedRoot;
+    oldRoot.stateNode = committedRoot.stateNode = fiberRoot;
+    oldRoot.alternate = committedRoot; committedRoot.alternate = oldRoot;
+    const host = { [key]: attachment === "root" ? oldRoot : oldChild };
+    const ui = harness(undefined, { location: { pathname: "/", hash: `#/draft/${draftId}` }, document: { getElementById: () => host } });
+    assert.equal(ui.currentThreadId(), "__NEW__", "the old tree's promotion must not override the committed tree");
+    assert.equal(ui.routeHint(), `/draft/${draftId}`);
+    committedChild.memoizedProps.isServerThread = true;
+    assert.equal(ui.routeHint(), `/_t3_env_/${environmentId}/${threadId}`, "promotion in the current tree is still detected");
+  });
+}
+
+for (const tab of ["skills", "memory"]) {
+  test(`late Project A context after a draft hash change is discarded before checkRoute runs (${tab})`, async () => {
+    const calls = [];
+    let finishContext;
+    const ui = harness(async (action, payload) => {
+      calls.push({ action, payload });
+      if (action === "hub:getContext") return new Promise((resolve) => { finishContext = resolve; });
+      return {};
+    });
+    Object.assign(ui.state, { open: true, tab, connected: true, projectRoot: "/project-a", threadId: "thread-a", context: { projectRoot: "/project-a", threadId: "thread-a", project: { name: "Project A" } } });
+    ui.setCurrentRoute();
+    const pending = ui.refreshContext();
+    Object.assign(ui.sandbox.location, { pathname: "/", hash: "#/draft/draft-b", href: "t3code://app/#/draft/draft-b" });
+    // Deliberately resolve before the hashchange listener / route timer runs.
+    finishContext({ projectRoot: "/project-a", threadId: "thread-a", project: { name: "Project A" } });
+    await pending;
+    await new Promise(setImmediate);
+    assert.equal(ui.state.connected, false);
+    assert.equal(ui.state.context, null);
+    assert.equal(ui.state.projectRoot, null);
+    assert.equal(ui.state.threadId, "__NEW__");
+    assert.equal(ui.isContextLoading(), false);
+    assert.equal(ui.routeScope().cached, ui.routeScope().current);
+    assert.deepEqual(calls.map((entry) => entry.action), ["hub:getContext"], "neither draft lookup nor Project A tab RPCs may start");
+    assert.doesNotMatch(ui.root.querySelector(".hub-header").innerHTML, /Project A/);
+    for (const key of ["skills", "mcp", "memory", "overview"]) assert.equal(ui.cache[key], null);
+  });
+}
+
+for (const outcome of ["resolve", "reject"]) {
+  test(`stale Project A context ${outcome} starts the new route without clearing its loading state`, async () => {
+    const calls = [];
+    let finishA, finishB;
+    const ui = harness(async (action, payload) => {
+      calls.push({ action, payload });
+      if (action !== "hub:getContext") return {};
+      return new Promise((resolve, reject) => {
+        if (payload.routeHint === "/threads/thread-a") finishA = () => outcome === "resolve" ? resolve({ projectRoot: "/project-a", threadId: "thread-a" }) : reject(new Error("Project A failed late"));
+        else finishB = resolve;
+      });
+    });
+    ui.setCurrentRoute();
+    const pending = ui.refreshContext();
+    Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
+    finishA(); await pending;
+    assert.equal(typeof finishB, "function", "a route change missed by the listener must be processed immediately");
+    assert.equal(ui.state.connected, false);
+    assert.equal(ui.state.context, null);
+    assert.equal(ui.state.projectRoot, null);
+    assert.equal(ui.state.threadId, "thread-b");
+    assert.equal(ui.isContextLoading(), true, "the old request must not finish the new request's loading state");
+    finishB({ projectRoot: "/project-b", threadId: "thread-b" });
+    await new Promise(setImmediate);
+    assert.equal(ui.state.projectRoot, "/project-b");
+    assert.equal(ui.state.connected, true);
+    assert.equal(ui.isContextLoading(), false);
+    assert.ok(!calls.some((entry) => entry.action !== "hub:getContext" && entry.payload.projectRoot === "/project-a"));
+  });
+}
+
+for (const source of ["search", "href", "router"]) for (const outcome of ["resolve", "reject"]) test(`Round-2 P2 #1 late context ${outcome} after ${source} environment switch is rejected before route listeners run`, async () => {
+  const envA = "environment-a", envB = "environment-b", calls = [];
+  const query = (env) => `?environmentId=${env}`;
+  let finishA, finishB, contextCalls = 0;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action !== "hub:getContext") return { threadId: "thread-a", steps: [] };
+    return new Promise((resolve, reject) => {
+      if (++contextCalls === 1) finishA = () => outcome === "resolve" ? resolve({ environmentId: envA, projectRoot: "/project-a", threadId: "thread-a" }) : reject(new Error("Environment A failed late"));
+      else finishB = resolve;
+    });
+  }, {
+    location: { search: source === "search" ? query(envA) : "", href: `https://fixture.test/threads/thread-a${source === "href" ? query(envA) : ""}` },
+    window: source === "router" ? { __TSR_ROUTER__: { state: { location: { pathname: "/threads/thread-a", searchStr: query(envA) } } } } : {},
+  });
+  ui.setCurrentRoute();
+  const requestedRoute = ui.routeHint(), previousKey = ui.routeKey(), pending = ui.refreshContext();
+  if (source === "search") ui.sandbox.location.search = query(envB);
+  else if (source === "href") ui.sandbox.location.href = `https://fixture.test/threads/thread-a${query(envB)}`;
+  else ui.sandbox.window.__TSR_ROUTER__.state.location.searchStr = query(envB);
+  assert.equal(ui.routeHint(), requestedRoute, "the pathname and hash deliberately stay unchanged");
+  // No hashchange, router callback, checkRoute or timer has run yet.
+  finishA(); await pending;
+  assert.equal(typeof finishB, "function", "the stale completion must immediately refresh the live URL scope");
+  assert.notEqual(ui.routeKey(), previousKey, "routeKey must also observe search-only and router-only changes");
+  assert.equal(ui.state.connected, false); assert.equal(ui.state.context, null); assert.equal(ui.state.projectRoot, null);
+  assert.equal(ui.state.contextError, "", "the old environment's failure must not replace the new request's status");
+  assert.equal(ui.isContextLoading(), true, "the old completion must not finish the new request");
+  assert.equal(calls.filter((entry) => entry.action === "board:get").length, 0);
+  finishB({ environmentId: envB, projectRoot: "/project-b", threadId: "thread-a" });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.connected, true); assert.equal(ui.state.projectRoot, "/project-b"); assert.equal(ui.state.context.environmentId, envB);
+  assert.equal(ui.isContextLoading(), false, "resolving context on an unchanged URL must not invalidate its own identity");
+  assert.ok(calls.some((entry) => entry.action === "board:get" && entry.payload.projectRoot === "/project-b"));
+  assert.ok(!calls.some((entry) => entry.action !== "hub:getContext" && entry.payload.projectRoot === "/project-a"));
+});
+
+for (const phase of ["board", "skills"]) test(`Round-2 P2 #1 scope identity is rechecked after awaiting ${phase === "board" ? "boardPoll" : "loadTab"}`, async () => {
+  const envA = "environment-a", envB = "environment-b", calls = [];
+  let finishPhase, finishB, contextCalls = 0;
+  const ui = issue8Ui(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return ++contextCalls === 1 ? { environmentId: envA, projectRoot: "/fixture", threadId: "thread-a" } : new Promise((resolve) => { finishB = resolve; });
+    if (contextCalls === 1 && action === (phase === "board" ? "board:get" : "skills:list")) return new Promise((resolve) => { finishPhase = resolve; });
+    return { threadId: "thread-a", steps: [], items: [] };
+  }, { location: { search: `?environmentId=${envA}` } });
+  ui.state.context = { environmentId: envA, projectRoot: "/fixture", threadId: "thread-a" };
+  ui.state.tab = phase;
+  ui.setCurrentRoute();
+  if (phase === "board") {
+    const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1", "old environment plan"); ui.renderBoardTab();
+    dom.editor.focus(); dom.type("unsaved environment A draft", 1, 5, "forward");
+  }
+  const pending = ui.refreshContext();
+  await new Promise(setImmediate);
+  assert.equal(typeof finishPhase, "function");
+  ui.sandbox.location.search = `?environmentId=${envB}`;
+  finishPhase(phase === "board" ? issue8Plan("r2", "late environment A plan") : { items: [{ id: "late-environment-a-skill" }] });
+  await pending;
+  assert.equal(typeof finishB, "function", "the post-await guard must process scope changes");
+  assert.ok(!calls.some((entry) => entry.action === "subagents:list"), "the old refresh must not prime catalogs after its await");
+  finishB({ environmentId: envB, projectRoot: "/project-b", threadId: "thread-a" });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.context.environmentId, envB); assert.equal(ui.state.projectRoot, "/project-b");
+  assert.doesNotMatch(JSON.stringify({ board: ui.cache.board, skills: ui.cache.skills }), /late environment A plan|late-environment-a-skill/);
+});
+
+test("checkRoute synchronously disconnects an unpromoted draft and rejects an in-flight project catalog", async () => {
+  const calls = [];
+  let finishSkills;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "skills:list") return new Promise((resolve) => { finishSkills = resolve; });
+    if (action === "hub:getContext") return new Promise(() => {});
+    return {};
+  });
+  Object.assign(ui.state, { open: true, tab: "skills", connected: true, projectRoot: "/project-a", threadId: "thread-a", context: { projectRoot: "/project-a", threadId: "thread-a" } });
+  ui.ready(); ui.setCurrentRoute();
+  const pending = ui.loadTab();
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: "#/draft/draft-b", href: "t3code://app/#/draft/draft-b" });
+  ui.checkRoute();
+  assert.equal(ui.state.connected, false);
+  assert.equal(ui.state.context, null);
+  assert.equal(ui.state.projectRoot, null);
+  assert.equal(ui.state.threadId, "__NEW__");
+  finishSkills({ items: [{ id: "stale-project-a-skill" }] });
+  await pending;
+  assert.equal(ui.cache.skills, null);
+  assert.ok(!calls.some((entry) => entry.action === "hub:getContext"));
+});
+
+test("unpromoted draft with stale row IDs, other redirects and unrelated server Fibers stays isolated", async () => {
+  const calls = [], environmentId = "6ee0c274-d218-41d6-b277-cbfc803dfbc0", draftId = "unpromoted";
+  const store = { state: { draftThreadsByThreadKey: { [draftId]: { environmentId, threadId: "old-server", projectId: "old-project", promotedTo: null } }, promotedDraftRedirects: { another: { environmentId, threadId: "other-server" } } } };
+  const host = { __reactFiber$fixture: { memoizedProps: { draftId, isServerThread: false, threadRef: { environmentId, threadId: "old-server" } }, child: { memoizedProps: { draftId: "another", isServerThread: true, threadRef: { environmentId, threadId: "other-server" } } } } };
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { ok: false, error: "无法确认新会话所属项目，请先选择项目" }; }, { location: { pathname: "/", hash: `#/draft/${draftId}`, href: `t3code://app/#/draft/${draftId}` }, localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify(store) : null, setItem() {} }, document: { getElementById: (id) => id === "root" ? host : null } });
+  ui.state.context = { environmentId, threadId: "old-server", projectRoot: "/old-project" };
+  assert.equal(ui.currentThreadId(), "__NEW__"); assert.equal(ui.routeHint(), `/draft/${draftId}`);
+  await ui.refreshContext();
+  assert.equal(ui.state.threadId, "__NEW__"); assert.equal(ui.state.connected, false); assert.equal(ui.state.projectRoot, null);
+  await ui.pollBoard(); await ui.updateBoard(null, "add");
+  assert.equal(calls.filter((entry) => entry.action.startsWith("board:")).length, 0);
+  assert.equal(calls.length, 0, "an unpromoted draft never asks the backend for the previous project's context");
+  assert.equal(ui.cache.board, null);
+});
+
+test("promoted draft router and pathname candidates resolve without borrowing stale context", async () => {
+  for (const candidate of ["router", "pathname"]) {
+    const route = "/draft/no-environment", ui = harness(undefined, { location: { pathname: candidate === "pathname" ? route : "/", hash: "" }, window: candidate === "router" ? { __TSR_ROUTER__: { state: { location: { pathname: route } } } } : {}, localStorage: { getItem: (key) => key === "t3code:composer-drafts:v1" ? JSON.stringify({ promotedDraftRedirects: { "no-environment": { threadId: "thread:local" } } }) : null, setItem() {} } });
+    ui.state.context = { threadId: "stale-thread" };
+    assert.equal(ui.routeHint(), "/thread%3Alocal"); assert.equal(ui.currentThreadId(), "thread:local");
+  }
+});
+
 test("route changes clear old plans and artifacts synchronously, request the new thread, and reject late old replies", async () => {
   const calls = [], replies = new Map();
   const ui = harness(async (action, payload) => {
@@ -2012,7 +2560,7 @@ for (const prefix of ["$", "￥"]) test(`${prefix} triggers a left-aligned palet
   assert.equal(token.query, "mem");
   assert.equal(token.start, 4);
   const palette = ui.nodes.get("#t3-hub-slash-palette");
-  const session = { editor, token, manual: false, projectRoot: "/fixture", route: "https://fixture.test/threads/thread-a|/threads/thread-a", rows: [{ type: "skill", trigger: "$memory" }], aria: {} };
+  const session = { editor, token, manual: false, projectRoot: "/fixture", route: ui.routeKey(), rows: [{ type: "skill", trigger: "$memory" }], aria: {} };
   ui.setSlash(session);
   palette.hidden = false;
   ui.positionSlash();
@@ -2932,4 +3480,260 @@ for (const queryKind of ["environmentId", "projectRoot"]) test(`Issue #8 final [
   assert.equal(dom.editor.isConnected, true);
   assert.equal(ui.sandbox.document.activeElement, dom.editor);
   assert.equal(dom.editor.value, "");
+});
+
+for (const change of ["thread", "environment", "project"]) test(`Round-3 #1 scope switch clears the whole project context synchronously (${change})`, async () => {
+  const calls = [];
+  let finishContext;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return new Promise(resolve => { finishContext = resolve; });
+    return { threadId: payload.threadId, steps: [] };
+  });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { environmentId: "env-a", threadId: "thread-a", projectRoot: "/project-a" } });
+  for (const key of ["skills", "mcp", "hooks", "subagents", "agents", "board"]) ui.cache[key] = { private: "project-a" };
+  ui.setCurrentRoute();
+  if (change === "thread") Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
+  else ui.sandbox.location.search = change === "environment" ? "?environmentId=env-b" : "?projectRoot=%2Fproject-b";
+  ui.checkRoute();
+  assert.equal(ui.isContextLoading(), true);
+  assert.equal(ui.state.connected, false);
+  assert.equal(ui.state.context, null);
+  assert.equal(ui.state.projectRoot, null, "the previous root must disappear before getContext settles");
+  assert.equal(ui.state.contextError, "");
+  assert.equal(ui.projectContextReady(), false);
+  for (const key of ["skills", "mcp", "hooks", "subagents", "agents", "board"]) assert.equal(ui.cache[key], null);
+  assert.deepEqual(calls.map(call => call.action), ["hub:getContext"]);
+  finishContext({ environmentId: "env-b", threadId: change === "thread" ? "thread-b" : "thread-a", projectRoot: "/project-b" });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.projectRoot, "/project-b");
+  assert.equal(ui.projectContextReady(), true);
+});
+
+function round3McpModeButton(scope = "project") {
+  const button = node(), controls = node();
+  button.dataset.name = "fixture-server";
+  controls.querySelector = selector => ({ value: selector === '[name="mcp-mode-scope"]' ? scope : "direct" });
+  button.closest = () => controls;
+  return button;
+}
+
+for (const phase of ["loading", "disconnected", "route-before-listener", "context-pending", "context-mismatch", "same-root-refresh"]) test(`Round-3 #1 project skill and MCP writes require a verified live context (${phase})`, async () => {
+  const calls = [], route = "/_t3_env_/remote%3Awest/thread%3Aone";
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return new Promise(() => {});
+    return { items: [{ name: "fixture-server", mode: "project-direct", modeScope: "project" }] };
+  }, { location: { pathname: "/", hash: `#${route}`, href: `t3code://app/#${route}` } });
+  Object.assign(ui.state, { connected: true, threadId: "thread:one", projectRoot: "/project-a", context: { environmentId: "remote:west", threadId: "thread:one", projectRoot: "/project-a" }, importRepo: "owner/fixture", importScope: "project" });
+  ui.setCurrentRoute();
+  if (phase !== "loading") ui.ready();
+  if (phase === "disconnected") ui.state.connected = false;
+  if (phase === "context-mismatch") ui.state.context.environmentId = "remote:east";
+  if (["route-before-listener", "context-pending"].includes(phase)) ui.sandbox.location.hash = "#/_t3_env_/remote%3Aeast/thread%3Aone";
+  if (phase === "context-pending") { ui.checkRoute(); ui.state.importScope = "project"; }
+  if (phase === "same-root-refresh") void ui.refreshContext();
+  assert.equal(ui.projectContextReady(), false);
+  for (const write of [() => ui.runImport(), () => ui.setSkillScope("fixture-skill", "project"), () => ui.saveMcpMode(round3McpModeButton())]) {
+    ui.root.querySelector(".hub-toast").innerHTML = "";
+    await write();
+    assert.match(ui.root.querySelector(".hub-toast").innerHTML, /当前项目/, "blocked writes explain that the current project must be confirmed");
+  }
+  assert.equal(calls.filter(call => ["skills:importGitHub", "skills:setScope", "mcp:setMode"].includes(call.action)).length, 0);
+});
+
+for (const scope of ["project", "global"]) test(`Round-3 #1 verified project writes and independent global writes remain available (${scope})`, async () => {
+  const calls = [], ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "mcp:list") return { items: [{ name: "fixture-server", mode: `${scope}-direct`, modeScope: scope }] };
+    return { item: { id: "fixture-skill", scope } };
+  });
+  ui.ready();
+  Object.assign(ui.state, { connected: scope === "project", threadId: "thread-a", projectRoot: scope === "project" ? "/verified-project" : null, context: scope === "project" ? { threadId: "thread-a", projectRoot: "/verified-project" } : null, importRepo: "owner/fixture", importScope: scope });
+  ui.setCurrentRoute();
+  await ui.runImport();
+  await ui.setSkillScope("fixture-skill", scope);
+  await ui.saveMcpMode(round3McpModeButton(scope));
+  const writes = calls.filter(call => ["skills:importGitHub", "skills:setScope", "mcp:setMode"].includes(call.action));
+  assert.equal(writes.length, 3);
+  if (scope === "project") for (const call of writes) assert.equal(call.payload.projectRoot, "/verified-project");
+});
+
+for (const source of ["hash", "search", "router", "context-version"]) for (const outcome of ["resolve", "reject"]) test(`Round-3 #1 loadTab rejects stale ${outcome} before cache or error writes (${source})`, async () => {
+  let finish;
+  const ui = harness(async action => {
+    if (action === "skills:list") return new Promise((resolve, reject) => { finish = () => outcome === "resolve" ? resolve({ items: [{ id: "stale-skill" }] }) : reject(new Error("stale-catalog-error")); });
+    if (action === "hub:getContext") return new Promise(() => {});
+    return { items: [] };
+  }, source === "router" ? { window: { __TSR_ROUTER__: { state: { location: { pathname: "/threads/thread-a", searchStr: "" } } } } } : {});
+  ui.ready(); Object.assign(ui.state, { open: true, connected: true, tab: "skills", threadId: "thread-a", projectRoot: "/same-root", context: { threadId: "thread-a", projectRoot: "/same-root" } });
+  ui.setCurrentRoute();
+  const pending = ui.loadTab();
+  if (source === "hash") ui.sandbox.location.hash = "#/threads/thread-b";
+  if (source === "search") ui.sandbox.location.search = "?environmentId=remote:east";
+  if (source === "router") ui.sandbox.window.__TSR_ROUTER__.state.location.searchStr = "?projectRoot=%2Fanother-root";
+  if (source === "context-version") void ui.refreshContext();
+  // Deliberately keep the same projectRoot and never run checkRoute.
+  finish(); await pending;
+  assert.equal(ui.cache.skills, null);
+  assert.equal(ui.errors.skills, undefined);
+  assert.doesNotMatch(ui.content.innerHTML, /stale-skill|stale-catalog-error/);
+});
+
+test("Round-3 #1 background catalog reads also reject a route change before listeners run", async () => {
+  let finish;
+  const ui = harness(async action => action === "skills:list" ? new Promise(resolve => { finish = resolve; }) : { items: [] });
+  Object.assign(ui.state, { projectRoot: "/same-root", context: { threadId: "thread-a", projectRoot: "/same-root" } });
+  const pending = ui.primeCatalogs();
+  ui.sandbox.location.search = "?environmentId=another-environment";
+  finish({ items: [{ id: "stale-background-skill" }] });
+  await pending;
+  assert.equal(ui.cache.skills, null);
+});
+
+for (const action of ["import", "set-scope"]) test(`Round-3 #1 late skill ${action} replies cannot change a new route's form or cache`, async () => {
+  let finish;
+  const ui = harness(async () => new Promise(resolve => { finish = resolve; }));
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/same-root", context: { threadId: "thread-a", projectRoot: "/same-root" }, importRepo: "owner/old", importScope: "project" });
+  ui.setCurrentRoute();
+  const pending = action === "import" ? ui.runImport() : ui.setSkillScope("fixture-skill", "project");
+  ui.sandbox.location.search = "?environmentId=another-environment";
+  ui.state.importRepo = "owner/new";
+  ui.cache.skills = { items: [{ id: "fixture-skill", scope: "off" }] };
+  finish({ item: { scope: "project" } }); await pending;
+  assert.equal(ui.state.importRepo, "owner/new");
+  assert.equal(ui.cache.skills.items[0].scope, "off");
+  assert.equal(ui.root.querySelector(".hub-toast").innerHTML, "");
+});
+
+const round3PromotedKeys = [
+  { name: "thread key with explicit environment", props: { environmentId: "remote:west", activeThreadKey: "thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "thread key with nested environment", props: { thread: { environmentId: "remote:west" }, activeThreadKey: "thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "thread key with path environment", pathEnv: "remote:west", props: { activeThreadKey: "thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "colon key with colon environment", props: { environmentId: "remote:west", activeThreadKey: "remote:west:thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "slash key with colon environment", props: { environmentId: "remote:west", activeThreadKey: "remote:west/thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "colon key with path environment", pathEnv: "remote:west", props: { activeThreadKey: "remote:west:thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "slash key without explicit environment", props: { activeThreadKey: "remote:west/thread:one" }, environmentId: "remote:west", threadId: "thread:one" },
+  { name: "legacy colon separator", props: { activeThreadKey: "remote:thread:one" }, environmentId: "remote", threadId: "thread:one" },
+  { name: "bare thread with explicit environment", props: { environmentId: "remote:west", activeThreadKey: "one" }, environmentId: "remote:west", threadId: "one" },
+  { name: "thread without environment", props: { activeThreadKey: "thread:one" }, environmentId: "", threadId: "thread:one" },
+  { name: "threads environment", props: { environmentId: "threads", activeThreadKey: "thread:one" }, environmentId: "threads", threadId: "thread:one" },
+  { name: "chat environment", props: { environmentId: "_chat", activeThreadKey: "_chat:thread:one" }, environmentId: "_chat", threadId: "thread:one" },
+  { name: "literal percent and slash", props: { environmentId: "remote:west/1", activeThreadKey: "remote:west/1:thread:one/7%3A" }, environmentId: "remote:west/1", threadId: "thread:one/7%3A" },
+];
+
+for (const entry of round3PromotedKeys) test(`Round-3 #2 #3 #5 promoted key preserves identity and uses the canonical RPC route (${entry.name})`, async () => {
+  const calls = [], draftId = "round-3-draft", { environmentId, threadId } = entry;
+  const props = { draftId, isServerThread: true, ...entry.props };
+  const raw = `${entry.pathEnv ? `/_t3_env_/${encodeURIComponent(entry.pathEnv)}` : ""}/draft/${draftId}`;
+  const canonical = `${environmentId ? `/_t3_env_/${encodeURIComponent(environmentId)}` : ""}/${encodeURIComponent(threadId)}`;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    return action === "hub:getContext" ? { environmentId, threadId, projectRoot: "/promoted-project" } : { threadId, steps: [] };
+  }, { location: { pathname: "/", hash: `#${raw}`, href: `t3code://app/#${raw}` }, document: { getElementById: () => ({ __reactFiber$fixture: { memoizedProps: props } }) } });
+  ui.state.context = { environmentId: "stale-environment", threadId: "stale-thread", projectRoot: "/stale-project" };
+  assert.equal(ui.routeHint(), canonical);
+  assert.equal(ui.currentThreadId(), threadId);
+  await ui.refreshContext();
+  const contextCall = calls.find(call => call.action === "hub:getContext");
+  assert.equal(contextCall.payload.routeHint, canonical);
+  assert.equal(contextCall.payload.threadHint, `t3code://app/#${canonical}`);
+  assert.equal(ui.state.threadId, threadId);
+  assert.equal(ui.boardMismatch(), false);
+  assert.equal(ui.projectContextReady(), true);
+  if (environmentId) { ui.state.context.environmentId = "another-environment"; assert.equal(ui.boardMismatch(), true); }
+});
+
+for (const prefix of ["/_t3_env_/", "_t3_env_/"]) for (const environmentId of ["remote:west", "threads", "_chat"]) test(`Round-3 #3 #10 currentThreadId decodes explicit environment routes before wrapper matching (${prefix}${environmentId})`, () => {
+  const threadId = "thread:one/7%3A", route = `${prefix}${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
+  const ui = harness(undefined, { location: { pathname: "/", hash: `#${route}` } });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId, projectRoot: "/fixture", context: { environmentId, threadId, projectRoot: "/fixture" } });
+  ui.setCurrentRoute();
+  assert.equal(ui.currentThreadId(), threadId);
+  assert.equal(ui.boardMismatch(), false);
+  assert.equal(ui.projectContextReady(), true);
+});
+
+for (const route of ["/_t3_env_/%E0%A4%A/thread-a", "/_t3_env_/threads/%E0%A4%A", "/_t3_env_/remote%3Awest/%ZZ", "/_t3_env_//thread-a", "/_t3_env_/remote%3Awest//thread-a", "/_t3_env_/remote%3Awest/thread-a//", "/_t3_env_/remote%3Awest/", "/_t3_env_/"]) test(`Round-3 #3 #10 malformed explicit routes fail closed (${route})`, async () => {
+  const calls = [], ui = harness(async action => { calls.push(action); return {}; }, { location: { pathname: "/", hash: `#${route}` } });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture", context: { environmentId: "remote:west", threadId: "thread-a", projectRoot: "/fixture" } });
+  ui.setCurrentRoute();
+  assert.equal(ui.currentThreadId(), "__ROUTE_invalid__");
+  assert.equal(ui.boardMismatch(), true);
+  assert.equal(ui.projectContextReady(), false);
+  await ui.pollBoard(); await ui.setSkillScope("fixture-skill", "project");
+  assert.equal(calls.length, 0);
+});
+
+test("Round-3 #10 explicit wrapper-named environments decode once; query URLs do not create empty path segments", () => {
+  const ui = harness(undefined, { location: { pathname: "/", hash: "#/_t3_env_/%74hreads/thread-a?return=https://fixture.test//next" } });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture", context: { environmentId: "threads", threadId: "thread-a", projectRoot: "/fixture" } });
+  ui.setCurrentRoute();
+  assert.equal(ui.currentThreadId(), "thread-a");
+  assert.equal(ui.boardMismatch(), false);
+  assert.equal(ui.projectContextReady(), true);
+});
+
+for (const prefix of ["", "_t3_env_/"]) for (const wrapper of ["projects", "project", "workspaces", "workspace"]) for (const action of ["draft", "new"]) test(`Round-3 #11 verified project draft remains usable with scoped routing (${prefix}${wrapper}/${action})`, async () => {
+  const projectId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", route = `/${prefix}${wrapper}/${projectId}/${action}/new-a`, calls = [];
+  const ui = harness(async (rpc, payload) => { calls.push({ rpc, payload }); return { threadId: "__NEW__", steps: [] }; }, { location: { pathname: "/", hash: `#${route}`, href: `t3code://app/#${route}` } });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "__NEW__", projectRoot: "/verified-draft", context: { threadId: "__NEW__", projectId, projectRoot: "/verified-draft", draftProjectVerified: true } });
+  ui.setCurrentRoute();
+  assert.equal(ui.currentThreadId(), "__NEW__");
+  assert.equal(ui.boardMismatch(), false);
+  assert.equal(ui.projectContextReady(), true);
+  const workspace = wrapper.startsWith("workspace"), parts = ui.parseScopeParts();
+  assert.equal(workspace ? parts.pWs : parts.pProj, projectId);
+  assert.equal(await ui.pollBoard(), true);
+  assert.equal(calls[0].payload.projectRoot, "/verified-draft");
+  assert.equal(calls[0].payload.threadId, "__NEW__");
+  assert.equal(calls[0].payload.strictThreadMatch, true);
+  const before = ui.routeScope().current;
+  ui.sandbox.location.hash = `#${route}?${workspace ? "workspaceId" : "projectId"}=${projectId}`;
+  assert.equal(ui.routeScope().current, before, "redundant scope queries do not invalidate a verified draft");
+  ui.state.context.draftProjectVerified = false;
+  assert.equal(ui.boardMismatch(), true);
+  ui.state.context.draftProjectVerified = true; ui.state.context.projectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  assert.equal(ui.boardMismatch(), true, "another project's verified draft is never accepted");
+});
+
+for (const operation of ["create", "save", "delete", "promote", "consolidate", "rollback", "pin"]) test(`Round-3 #1 current-project memory ${operation} cannot use a root from an unprocessed route`, async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { item: { id: "memory-a" }, items: [] }; });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", projectRoot: "/project-a" }, memoryProject: "current", tab: "board" });
+  ui.cache.memory = { items: [{ id: "memory-a", title: "Memory", content: "Project A memory", scope: "project" }] };
+  ui.snapshot().drafts.__new = { title: "New memory", content: "New project memory", scope: "project" };
+  ui.setCurrentRoute();
+  ui.sandbox.location.search = "?projectRoot=%2Fproject-b";
+  assert.equal(ui.projectContextReady(), false);
+  if (operation === "create") await ui.saveMemory(null);
+  if (operation === "save") await ui.saveMemory("memory-a");
+  if (operation === "delete") await ui.deleteMemory("memory-a");
+  if (operation === "promote") await ui.promoteMemory("memory-a");
+  if (operation === "consolidate") await ui.consolidateMemory();
+  if (operation === "rollback") await ui.rollbackMemory("memory-a", 1, "revision-a");
+  if (operation === "pin") { clickSettingsAction(ui, { action: "pin-memory", id: "memory-a" }); await new Promise(setImmediate); }
+  assert.equal(calls.length, 0);
+  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /当前项目/);
+});
+
+for (const selection of ["verified-current", "explicit-project", "global-draft"]) test(`Round-3 #1 memory write protection keeps authorized selections usable (${selection})`, async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { item: { id: "memory-a" }, items: [] }; });
+  ui.ready();
+  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", projectRoot: "/project-a" }, memoryProject: selection === "explicit-project" ? "/chosen-project" : "current", tab: "board" });
+  ui.cache.memory = { items: [{ id: "memory-a", title: "Memory", content: "Selected project memory", scope: "project" }] };
+  ui.setCurrentRoute();
+  if (selection !== "verified-current") ui.sandbox.location.search = "?projectRoot=%2Fproject-b";
+  if (selection === "global-draft") ui.snapshot().drafts.__new = { title: "Global memory", content: "Global content", scope: "global" };
+  await ui.saveMemory(selection === "global-draft" ? null : "memory-a");
+  const write = calls.find(call => call.action === "memory:save");
+  assert.ok(write);
+  assert.equal(write.payload.projectRoot, selection === "explicit-project" ? "/chosen-project" : selection === "global-draft" ? null : "/project-a");
+  assert.equal(write.payload.scope, selection === "global-draft" ? "global" : "project");
 });

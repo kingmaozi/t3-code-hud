@@ -210,16 +210,107 @@
     } catch {}
   }
 
+  function resolvePromotedDraftRoute(rawRoute) {
+    if (rawRoute === "__NEW__" || rawRoute === "__ROUTE_invalid__") return rawRoute;
+    const norm = String(rawRoute || "").startsWith("/") ? String(rawRoute) : "/" + String(rawRoute || "");
+    const match = norm.match(/^\/(?:_t3_env_\/([^/?#]+)\/)?draft(?:\/([^/?#]*))?(?:[/?#]|$)/i);
+    if (!match) return rawRoute;
+    let envFromPath = match[1];
+    let draftId = match[2] || "";
+    try {
+      if (envFromPath) envFromPath = decodeURIComponent(envFromPath);
+      draftId = decodeURIComponent(draftId);
+    } catch { return "__ROUTE_invalid__"; }
+    if (!draftId) return "__NEW__";
+    const routeFor = (ref) => {
+      const tid = ref?.threadId;
+      const env = ref?.environmentId == null || ref.environmentId === "" ? envFromPath : ref.environmentId;
+      const validId = (id) => typeof id === "string" && id.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(id) && id !== "." && id !== "..";
+      if (!validId(tid) || (env != null && env !== "" && !validId(env))) return null;
+      return env ? `/_t3_env_/${encodeURIComponent(env)}/${encodeURIComponent(tid)}` : `/${encodeURIComponent(tid)}`;
+    };
+    const routeFromState = (p) => {
+      // All promotion fields must belong to this exact draft on one state
+      // object; unrelated/stale chat state is not evidence of promotion.
+      if (p?.draftId !== draftId || p.isServerThread !== true) return null;
+      let active = p.activeThreadKey;
+      if (typeof active === "string") {
+        const explicitEnv = p.environmentId || p.thread?.environmentId || envFromPath || "";
+        let env = explicitEnv;
+        let tid = active;
+        const colon = active.indexOf(":");
+        const slash = active.indexOf("/");
+        // Match known environments before splitting: environment IDs can
+        // contain ':', and raw thread IDs can contain '/'.
+        if (explicitEnv && (active.startsWith(`${explicitEnv}:`) || active.startsWith(`${explicitEnv}/`))) {
+          tid = active.slice(explicitEnv.length + 1);
+        } else if (active.startsWith("thread:")) {
+          tid = active;
+        } else if (slash >= 0) {
+          env = active.slice(0, slash);
+          tid = active.slice(slash + 1);
+        } else if (colon >= 0) {
+          env = active.slice(0, colon) || env;
+          tid = active.slice(colon + 1);
+        }
+        active = { environmentId: env, threadId: tid };
+      }
+      return routeFor(p) || routeFor(p.threadRef) || routeFor(active) || routeFor({ environmentId: p.environmentId, threadId: p.thread?.id });
+    };
+    try {
+      const parsed = JSON.parse(localStorage.getItem("t3code:composer-drafts:v1") || "null");
+      const state = parsed?.state || parsed;
+      // A draft entry's own threadId is not proof of promotion.
+      const route = routeFor(state?.promotedDraftRedirects?.[draftId]) || routeFor(state?.drafts?.[draftId]?.promotedTo) || routeFor(state?.draftThreadsByThreadKey?.[draftId]?.promotedTo);
+      if (route) return route;
+    } catch {}
+    try {
+      const rootEl = document.getElementById("root");
+      const key = rootEl && Object.keys(rootEl).find((k) => k.startsWith("__reactContainer") || k.startsWith("__reactFiber"));
+      let entry = key ? rootEl[key] : null;
+      const ancestors = new Set();
+      while (entry?.return && !entry.stateNode?.current && ancestors.size < 400 && !ancestors.has(entry)) {
+        ancestors.add(entry);
+        entry = entry.return;
+      }
+      if (entry?.return && !entry.stateNode?.current) return "__NEW__";
+      // HostRoot's expando may point at the alternate; only inspect the
+      // committed tree, never stale/unmounted alternate chat props.
+      const committed = entry?.stateNode?.current || entry?.current || entry;
+      const stack = committed ? [committed] : [];
+      const seen = new Set();
+      while (stack.length && seen.size < 400) {
+        const f = stack.pop();
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
+        const route = routeFromState(f.memoizedProps) || routeFromState(f.pendingProps);
+        if (route) return route;
+        // v0.1.10 can keep the same fields in hook state instead of props.
+        let hook = f.memoizedState;
+        const hooks = new Set();
+        while (hook && typeof hook === "object" && !hooks.has(hook) && hooks.size < 100) {
+          hooks.add(hook);
+          const hookRoute = routeFromState(hook) || routeFromState(hook.memoizedState);
+          if (hookRoute) return hookRoute;
+          hook = hook.next;
+        }
+        if (f.sibling) stack.push(f.sibling);
+        if (f.child) stack.push(f.child);
+      }
+    } catch {}
+    return "__NEW__";
+  }
+
   function getRouteHint() {
     const hash = window.location.hash || "";
     if (hash.startsWith("#/") || hash.length > 1) {
-      return hash.slice(1);
+      return resolvePromotedDraftRoute(hash.slice(1));
     }
     try {
       const rp = getRouterPathname(findTanStackRouter());
-      if (rp && rp !== "/") return rp;
+      if (rp && rp !== "/") return resolvePromotedDraftRoute(rp);
     } catch {}
-    return window.location.pathname || "/";
+    return resolvePromotedDraftRoute(window.location.pathname || "/");
   }
 
   function toEpochMs(v) {
@@ -235,8 +326,14 @@
   }
 
   function extractLastThreadIdFromHint(rawHint) {
-    if (typeof rawHint !== "string" || !rawHint) return null;
-    const parts = rawHint.split(/[/?#]/).filter(Boolean);
+    const clean = String(rawHint || "").split(/[?#]/, 1)[0];
+    if (clean === "__NEW__" || clean === "__ROUTE_invalid__" || /^\/?(?:_t3_env_\/[^/]+\/)?draft(?:\/|$)/i.test(clean)) return "__NEW__";
+    if (!clean) return null;
+    const parts = clean.split("/").filter(Boolean);
+    if ((parts[0] === "_t3_env_" && parts.length === 3) ||
+        (parts.length === 2 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parts[0]))) {
+      try { return decodeURIComponent(parts.at(-1)); } catch { return "__ROUTE_invalid__"; }
+    }
     for (let i = parts.length - 1; i >= 0; i--) {
       let seg = parts[i];
       // Delegated subagent ids are literally `thread:delegated-task:command%3A...`:
@@ -582,6 +679,8 @@
 
   function readFiberThreadProjection(expectedThreadId) {
     const expected = extractLastThreadIdFromHint(expectedThreadId);
+    if (expected === "__NEW__" || expected === "__ROUTE_invalid__") return null;
+    if (expectedThreadId && !expected) return null;
     const fullyDecode = (v) => {
       let cur = String(v || "");
       for (let k = 0; k < 4; k++) {
@@ -689,7 +788,7 @@
     if (matchedSt) {
       return buildProjectionPayload(withFiberItems(matchedSt.projection, matchedItems), matchedSt.environmentId, uhProps);
     }
-    if (!expected && fallbackSt) {
+    if (!expectedThreadId && fallbackSt) {
       return buildProjectionPayload(withFiberItems(fallbackSt.projection, fallbackItems), fallbackSt.environmentId, uhProps);
     }
     if (uhProps && (!expected || sameThreadId(String(uhProps.threadId || ""), expected))) {
@@ -2922,17 +3021,7 @@
       const path = window.location.pathname || "";
       if (check(path)) return null;
     } catch {}
-    // 2) Dialog/Modal check
-    try {
-      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-slot="dialog-popup"], [data-slot="sheet-popup"], [data-slot="drawer-popup"]');
-      for (const d of dialogs) {
-        try {
-          const r = d.getBoundingClientRect();
-          if (r.width > 100 && r.height > 80) return null;
-        } catch {}
-      }
-    } catch {}
-    // 3) Composer check
+    // 2) Composer check: bounds are needed to distinguish inline popovers.
     const shell = document.querySelector('[data-slot="composer-shell"]');
     if (!shell) return null;
     const surface = findComposerSurface(shell);
@@ -2944,6 +3033,31 @@
     if (!(sRect.width >= 180 && sRect.height >= 28 && sRect.top > 40 && sRect.bottom <= window.innerHeight + 4)) {
       return null;
     }
+    // 3) Visible modals always cover the chat; inline popovers only block
+    // the HUD when they overlap its composer surface.
+    try {
+      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-slot="dialog-popup"], [data-slot="sheet-popup"], [data-slot="drawer-popup"]');
+      for (const d of dialogs) {
+        try {
+          if (d.hasAttribute("data-closed")) continue;
+          let invisible = false;
+          for (let el = d; el; el = el.parentElement) {
+            const css = getComputedStyle(el);
+            if (el.hidden || el.inert || el.hasAttribute("inert") || el.getAttribute("aria-hidden") === "true" || css.display === "none" || css.visibility === "hidden" || Number(css.opacity) === 0) {
+              invisible = true;
+              break;
+            }
+            if (el === document.body) break;
+          }
+          if (invisible) continue;
+          const r = d.getBoundingClientRect();
+          if (!(r.width > 100 && r.height > 80)) continue;
+          const modal = d.getAttribute("aria-modal") === "true" || d.getAttribute("role") === "alertdialog" || ["dialog-popup", "sheet-popup"].includes(d.getAttribute("data-slot"));
+          const overlaps = r.left < sRect.right && r.right > sRect.left && r.top < sRect.bottom && r.bottom > sRect.top;
+          if (modal || overlaps) return null;
+        } catch {}
+      }
+    } catch {}
     // 4) Occlusion check
     try {
       const hit = document.elementFromPoint(sRect.left + sRect.width / 2, Math.max(4, sRect.top + 10));
@@ -4143,6 +4257,9 @@
   let statsInFlight = false;
   let statsRequestSeq = 0;
   async function refreshStats(routeChanged = false) {
+    // Promotion can update Zustand/storage while #/draft/<id> stays put.
+    // Re-enter once with routeChanged=true before the in-flight guard.
+    if (onRouteMaybeChanged()) return;
     const readLive = () => (typeof readLiveT3State === "function" ? readLiveT3State() : null);
     const observeSelection = (live) => {
       const p = String(live?.selectedProvider || "");
@@ -4336,8 +4453,11 @@
     if (next !== currentPathHint) {
       currentPathHint = next;
       refreshStats(true);
+      scheduleLayoutSync();
+      return true;
     }
     scheduleLayoutSync();
+    return false;
   }
 
   const origPushState = history.pushState;
@@ -4354,6 +4474,7 @@
   };
   window.addEventListener("hashchange", onRouteMaybeChanged);
   window.addEventListener("popstate", onRouteMaybeChanged);
+  window.addEventListener("storage", onRouteMaybeChanged);
   window.addEventListener("resize", scheduleLayoutSync);
 
   let lastPickerSig = "";
@@ -4588,6 +4709,7 @@
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("hashchange", onRouteMaybeChanged);
     window.removeEventListener("popstate", onRouteMaybeChanged);
+    window.removeEventListener("storage", onRouteMaybeChanged);
     window.removeEventListener("resize", scheduleLayoutSync);
     window.removeEventListener("t3-hub-theme-change", syncHudTheme);
     window.removeEventListener("storage", syncHudTheme);

@@ -1453,15 +1453,52 @@ function computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDri
 function extractThreadId(hint) {
   if (!hint || typeof hint !== "string") return null;
   const trimmed = normalizeT3RouteHint(hint);
-  if (trimmed === "/new" || trimmed.endsWith("/new")) return "__NEW__";
+  if (trimmed.startsWith("__ROUTE_")) return trimmed;
+  // Draft IDs (including UUID-looking ones) are never server thread IDs.
+  // Handle the renderer sentinel too, before the latest-thread fallback.
+  if (trimmed === "__NEW__") return "__NEW__";
   if (trimmed.startsWith("thread:")) return trimmed;
 
-  const segments = trimmed.split("/").filter(Boolean);
+  const rawSegments = trimmed.replace(/^\/|\/$/g, "").split("/");
+  const segments = rawSegments.filter(Boolean);
+  // HUD routes preserve the thread identity even for legacy non-UUID IDs.
+  // Invalid scoped routes must not fall through to the latest-thread query.
+  if (segments[0] === "_t3_env_") {
+    if (rawSegments.some((seg) => !seg) || segments.length < 3) return "__ROUTE_invalid__";
+    try {
+      const env = decodeURIComponent(segments[1]);
+      const tid = decodeURIComponent(segments[2]);
+      if ([env, tid].some((id) => !id || id === "." || id === "..")) return "__ROUTE_invalid__";
+      // Scoped project/workspace drafts are the only project-shaped
+      // exception to /_t3_env_/<environment>/<thread>.
+      if (/^(projects?|workspaces?)$/i.test(env) && ["new", "draft"].includes((segments[3] || "").toLowerCase())) {
+        if (segments.length > 5) return "__ROUTE_invalid__";
+        if (segments[4]) decodeURIComponent(segments[4]);
+        return "__NEW__";
+      }
+      if (["new", "draft"].includes(tid.toLowerCase())) {
+        if (segments.length > 4) return "__ROUTE_invalid__";
+        if (segments[3]) decodeURIComponent(segments[3]);
+        return "__NEW__";
+      }
+      if (segments.length !== 3) return "__ROUTE_invalid__";
+      if (["settings", "usage", "pair"].includes(tid.toLowerCase())) return `__ROUTE_${tid.toLowerCase()}__`;
+      return tid;
+    } catch { return "__ROUTE_invalid__"; }
+  }
+  if (/^\/?(?:_t3_env_\/[^/]+\/)?draft(?:\/|$)/i.test(trimmed)) return "__NEW__";
+  if (trimmed === "/new" || trimmed.endsWith("/new")) return "__NEW__";
   // Native routes carry the exact thread identity in the second segment;
   // older/imported thread IDs are not necessarily UUIDs.
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segments[0] || "") && segments.length === 2) {
-    if (["new", "draft"].includes(segments[1].toLowerCase())) return "__NEW__";
-    try { return decodeURIComponent(segments[1]); } catch { return null; }
+  if (rawSegments.length === 2 && rawSegments.every(Boolean) &&
+      !["threads", "_chat", "projects", "project", "workspaces", "workspace", "draft", "new", "_t3_env_", "settings", "usage", "pair"].includes(segments[0].toLowerCase())) {
+    try {
+      const env = decodeURIComponent(segments[0]);
+      const tid = decodeURIComponent(segments[1]);
+      if ([env, tid].some((id) => !id || id === "." || id === "..")) return "__ROUTE_invalid__";
+      if (["new", "draft"].includes(tid.toLowerCase())) return "__NEW__";
+      return tid;
+    } catch { return "__ROUTE_invalid__"; }
   }
   for (let i = segments.length - 1; i >= 0; i--) {
     let seg = segments[i];
@@ -2991,13 +3028,22 @@ function parseDraftProjectRoute(hint) {
   const route = normalizeT3RouteHint(hint);
   const parts = route.split(/[?#]/, 1)[0].split("/").filter(Boolean);
   const lower = parts.map((part) => part.toLowerCase());
-  const isDraft = lower.includes("draft") || lower.includes("new");
+  const hasExplicitEnvPrefix = lower[0] === "_t3_env_";
+  const effectiveParts = hasExplicitEnvPrefix ? parts.slice(1) : parts;
+  const effectiveLower = effectiveParts.map((part) => part.toLowerCase());
+  const isDraft = effectiveLower.includes("draft") || effectiveLower.includes("new");
   const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value || "");
+  const isProjectDraft = /^(projects?|workspaces?)$/.test(effectiveLower[0] || "") && ["new", "draft"].includes(effectiveLower[2]);
+  let environmentId = effectiveParts[1] && !isProjectDraft && (hasExplicitEnvPrefix || !["threads", "_chat"].includes(effectiveLower[0])) ? effectiveParts[0] : null;
+  try { if (environmentId) environmentId = decodeURIComponent(environmentId); }
+  catch { return { isDraft: false, projectId: null, environmentId: "__INVALID_ENV__", invalidRoute: true }; }
   // T3's actual route is /$environmentId/$threadId, not /project/thread.
-  if (!isDraft) return { isDraft: false, projectId: null, environmentId: parts[1] && !["threads", "_chat"].includes(lower[0]) ? parts[0] : null };
+  if (!isDraft) {
+    return { isDraft: false, projectId: null, environmentId };
+  }
   let projectId = null;
   // /draft/$draftId is client-local draft identity and proves no project.
-  if (/^(projects?|workspaces?)$/.test(lower[0] || "") && isUuid(parts[1]) && ["new", "draft"].includes(lower[2])) projectId = parts[1];
+  if (/^(projects?|workspaces?)$/.test(effectiveLower[0] || "") && isUuid(effectiveParts[1]) && ["new", "draft"].includes(effectiveLower[2])) projectId = effectiveParts[1];
   return { isDraft: true, projectId };
 }
 
@@ -3011,8 +3057,8 @@ function resolveHubContext(args = {}) {
   const hint = routeHint || threadHint;
   const draft = parseDraftProjectRoute(hint);
   let parsed = extractThreadId(hint);
-  if (parsed && parsed.startsWith("__ROUTE_")) parsed = null;
-  if (parsed === "__NEW__") parsed = null;
+  if (draft.invalidRoute || (parsed && parsed.startsWith("__ROUTE_"))) return { ok: false, error: "无效或非会话路由" };
+  if (parsed === "__NEW__") { parsed = null; draft.isDraft = true; }
   try {
     let environmentId = null;
     if (draft.environmentId) {
