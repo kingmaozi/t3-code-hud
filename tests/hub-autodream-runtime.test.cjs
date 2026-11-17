@@ -130,7 +130,8 @@ test("capability and schedule status use static checks without launching a CLI",
   assert.equal(overview.runtime.providers.find(p => p.id === "muse").status, "available");
   assert.ok(overview.runtime.providers.find(p => p.id === "muse").efforts.includes("max"));
   assert.equal(overview.runtime.providers.find(p => p.id === "antigravity").status, "unsupported");
-  assert.equal(overview.runtime.providers.find(p => p.id === "codex").status, "unsupported");
+  assert.equal(overview.runtime.providers.find(p => p.id === "codex").status, "missing");
+  assert.equal(overview.runtime.providers.find(p => p.id === "codex").reason, "executable-not-found");
   assert.equal(overview.runtime.scheduler.requiresHubActive, true);
   assert.equal(typeof overview.runtime.scheduler.timeZone, "string");
   assert.ok(overview.runtime.scheduler.nextDueAt === null || !Number.isNaN(Date.parse(overview.runtime.scheduler.nextDueAt)));
@@ -204,23 +205,43 @@ for (const [provider, model, effort] of [
   ["claude", "claude-sonnet-4-6", "xhigh"],
   ["pi", "magpie/group/code", "max"],
 ]) {
-  test(`${provider} is unsupported without running even an installed stub`, async t => {
-    const f = fixture(t), touched = path.join(f.base, "started");
-    fakeCli(f, provider, `: > ${JSON.stringify(touched)}\nexit 0`);
-    f.vault.getDreamState();
-    assert.equal(f.vault.getDreamOverview().runtime.providers.find(p => p.id === provider).reason, "adapter-unverified");
-    assert.equal(f.vault.updateDreamConfig({ dreamMode: "agent", providerInstanceId: provider, model, reasoningEffort: effort }).ok, false);
-    const file = path.join(f.hubDir, "dream-config.json"), raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    fs.writeFileSync(file, JSON.stringify({ ...raw, dreamMode: "agent", providerInstanceId: provider, model, reasoningEffort: effort }));
-    const saved = f.vault.updateDreamConfig({ dreamTime: "04:30" });
-    assert.equal(saved.ok, true);
-    assert.equal(saved.config.providerInstanceId, provider);
-    let called = false;
-    const result = await f.vault.runDreamCycle({ force: true, agentRunner: () => { called = true; return { merges: [] }; } });
-    assert.equal(result.ok, false);
-    assert.equal(result.report.agent.error, "unsupported-provider");
-    assert.equal(called, false);
-    assert.equal(fs.existsSync(touched), false);
+  for (const fail of [false, true]) test(`${provider} production adapter uses safe flags and stdin (${fail ? "failure" : "success"})`, async t => {
+    const f = fixture(t), probe = path.join(f.base, "probe.json");
+    fs.writeFileSync(path.join(f.bin, provider), `#!${process.execPath}\n` + `
+      const fs = require('node:fs'); let input = '';
+      process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c);
+      process.stdin.on('end', () => {
+        fs.writeFileSync(${JSON.stringify(probe)}, JSON.stringify({args:process.argv.slice(2),input,role:process.env.T3_SUBAGENT_ROLE}));
+        ${fail ? "process.stderr.write('HTTP 429 api_key=EXAMPLE_SECRET_VALUE /synthetic/private');process.exitCode=7;" : "process.stdout.write('{\"merges\":[]}');"}
+      });
+    `, { mode: 0o755 });
+    const capability = f.vault.getDreamOverview().runtime.providers.find(p => p.id === provider);
+    assert.equal(capability.status, "available");
+    assert.equal(capability.reason, "auth-and-model-unverified");
+    assert.ok(capability.efforts.includes(effort));
+    assert.equal(fs.existsSync(probe), false, "capability check must not launch CLI");
+    seedGray(f);
+    assert.equal(f.vault.updateDreamConfig({dreamMode:"agent",providerInstanceId:provider,model,reasoningEffort:effort,minDeltaMemories:1}).ok,true);
+    const result = await f.vault.runDreamCycle({force:true,projectRoot:f.projectRoot});
+    assert.equal(result.ok,!fail,JSON.stringify(result));
+    const seen = JSON.parse(fs.readFileSync(probe,"utf8"));
+    const expected = {
+      codex:["exec","--sandbox","read-only","--skip-git-repo-check","--ephemeral","-m",model,"-c",`model_reasoning_effort=${JSON.stringify(effort)}`,"-c","mcp_servers={}","-"],
+      claude:["-p","--model",model,"--effort",effort,"--output-format","text","--tools","","--no-session-persistence","--permission-mode","plan","--strict-mcp-config","--mcp-config",'{"mcpServers":{}}',"--settings",'{"disableAllHooks":true}'],
+      pi:["-p","--model",model,"--thinking",effort,"--no-tools","--no-session","--no-extensions","--no-mcp","--no-skills","--no-context-files"],
+    }[provider];
+    assert.deepEqual(seen.args,expected);
+    assert.ok(!seen.args.includes("--bare"), "Claude must retain access to OAuth in macOS Keychain");
+    assert.equal(seen.role,"dream-worker");
+    assert.ok(seen.input.includes('"merges"') && seen.input.includes('w1 w2'));
+    assert.ok(!seen.args.some(a=>a.includes('w1 w2') || a.includes('"merges"') || a === seen.input));
+    const state=f.vault.getDreamOverview(), journal=fs.readFileSync(path.join(f.hubDir,"dream-journal.json"),"utf8");
+    assert.doesNotMatch(JSON.stringify({result,state,journal}), /EXAMPLE_SECRET_VALUE|\/synthetic\/private/);
+    if (fail) {
+      assert.equal(result.report.agent.error,"cli-exit-7");
+      assert.deepEqual(result.report.agent.diagnostic,{category:"http",httpStatus:429});
+      assert.equal(result.config.hasDeferredClusters,true);
+    } else assert.equal(result.report.agent.status,"success");
   });
 }
 
@@ -694,3 +715,43 @@ for (const history of [JSON.stringify(Array.from({ length: 11 }, (_, i) => ({ ve
     finally { after.close(); }
   });
 }
+
+
+test("dream executable fallback discovers GUI user bins while explicit test PATH stays isolated", t => {
+  const f=fixture(t), previous=process.env.PATH;
+  process.env.PATH="";
+  t.after(()=>{if(previous===undefined)delete process.env.PATH;else process.env.PATH=previous;});
+  // Hide real host CLIs even for this production-fallback capability test.
+  const stat=fs.statSync;
+  fs.statSync=function(file,...args){
+    if (["muse","codex","claude","pi"].includes(path.basename(String(file))) && !String(file).startsWith(f.base+path.sep)) throw Object.assign(new Error("isolated executable lookup"),{code:"ENOENT"});
+    return stat.call(this,file,...args);
+  };
+  t.after(()=>{fs.statSync=stat;});
+  for (const [provider, dir] of [["muse",[".local","bin"]],["claude",[".t3","bin"]],["codex",[".codex","packages","standalone","current","bin"]]]) {
+    const bin=path.join(f.homeDir,...dir);fs.mkdirSync(bin,{recursive:true});
+    fs.writeFileSync(path.join(bin,provider),"#!/bin/sh\nexit 99\n",{mode:0o755});
+  }
+  const common={homeDir:f.homeDir,hubDir:f.hubDir,vaultDir:f.vaultDir,_embedFn:()=>null,_healthFn:()=>({modelId:"test",dim:2})};
+  const defaultVault=createMemoryVault(common);
+  for(const provider of ["muse","claude","codex"]) assert.equal(defaultVault.getDreamOverview().runtime.providers.find(p=>p.id===provider).status,"available");
+  for(const explicit of ["",f.bin]) {
+    const isolated=createMemoryVault({...common,_dreamPath:explicit});
+    for(const provider of ["muse","claude","codex"]) assert.equal(isolated.getDreamOverview().runtime.providers.find(p=>p.id===provider).status,"missing");
+  }
+  fakeCli(f,"pi","exit 99");process.env.PATH=f.bin;
+  assert.equal(defaultVault.getDreamOverview().runtime.providers.find(p=>p.id==="pi").status,"available");
+});
+
+test("unsupported providers and efforts cannot replace the selected safe adapter", t => {
+  const f=fixture(t);
+  for(const provider of ["antigravity","unknown-provider","local"]) {
+    const result=f.vault.updateDreamConfig({dreamMode:"agent",providerInstanceId:provider});
+    assert.equal(result.error,"unsupported-provider");
+  }
+  for(const provider of ["codex","claude","pi"]) {
+    const result=f.vault.updateDreamConfig({dreamMode:"agent",providerInstanceId:provider,reasoningEffort:"ultra"});
+    assert.equal(result.error,"unsupported-effort");
+  }
+  assert.equal(f.vault.getDreamOverview().config.providerInstanceId,"muse");
+});

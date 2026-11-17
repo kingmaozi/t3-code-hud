@@ -1,6 +1,6 @@
 "use strict";
 // Hermetic regression tests for the 4 code-review fixes in t3-code-hud.
-// Run: node --test tests/fixes.test.cjs  (or: npm test)
+// Run: node --test tests/fixes.test.cjs
 const { describe, it, before } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -10,6 +10,287 @@ const { execFileSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 
 const REPO = path.resolve(__dirname, "..");
+
+describe("GUI startup PATH and cold-launch sidecar", () => {
+  const vm = require("node:vm");
+  for (const inherited of ["/opt/homebrew/bin:/custom/bin::/usr/bin:/custom/bin:/usr/local/bin", "/opt/homebrew/bin", ""]) it(`all four entry points repair PATH: ${inherited || "empty"}`, () => {
+    const expected = [...new Set([path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"), "/opt/homebrew/bin", "/usr/local/bin", ...inherited.split(":"), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].filter(Boolean))];
+    const launcher = fs.readFileSync(path.join(REPO,"bin/t3-hud"),"utf8").split('PLUGIN_DIR=')[0];
+    const output = execFileSync("/bin/bash",["-c", launcher + '\nprintf "%s" "$PATH"'],{env:{...process.env,HOME:os.homedir(),PATH:inherited},encoding:"utf8"});
+    assert.deepEqual(output.split(path.delimiter),expected);
+    const bootstrap = fs.readFileSync(path.join(REPO,"src/bootstrap.cjs"),"utf8");
+    const ctx = vm.createContext({process:{env:{PATH:inherited}},path,os});
+    vm.runInContext(bootstrap.slice(bootstrap.indexOf("const childEnv ="),bootstrap.indexOf("const extraArgs ="))+"\nthis.result=childEnv.PATH;",ctx);
+    assert.deepEqual(ctx.result.split(path.delimiter),expected);
+    const bridge = fs.readFileSync(path.join(REPO,"src/hub-bridge.cjs"),"utf8");
+    vm.runInContext(bridge.slice(bridge.indexOf("process.env.PATH ="),bridge.indexOf("const watchPid =")),ctx);
+    assert.deepEqual(ctx.process.env.PATH.split(path.delimiter),expected);
+    const hook = fs.readFileSync(path.join(REPO,"src/main-hook.cjs"),"utf8");
+    const hookPath = hook.match(/process\.env\.PATH =[^]*?\.join\(path\.delimiter\);/);
+    assert.ok(hookPath, "main hook must also repair PATH before backend loading");
+    ctx.process.env.PATH = inherited;
+    vm.runInContext(hookPath[0],ctx);
+    assert.deepEqual(ctx.process.env.PATH.split(path.delimiter),expected);
+    assert.ok(hook.indexOf(hookPath[0]) < hook.indexOf("let backend = require(BACKEND_PATH)"));
+  });
+  const cases = [
+    ["alive", {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, true],
+    ["dead", {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["missing", null, false], ["malformed", "{", false],
+    ["invalid pid", {pid:0,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["missing token", {pid:123,watchPid:456,url:"http://127.0.0.1:4567"}, false],
+    ["missing watch PID", {pid:123,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["matching watch PID", {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, true],
+    ["zero watch PID", {pid:123,watchPid:0,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["string zero watch PID", {pid:123,watchPid:"0",url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["string matching watch PID", {pid:123,watchPid:"456",url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, true],
+    ["null watch PID", {pid:123,watchPid:null,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["empty watch PID", {pid:123,watchPid:"",url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["whitespace watch PID", {pid:123,watchPid:" ",url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["foreign watch PID", {pid:123,watchPid:999,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["invalid watch PID", {pid:123,watchPid:"invalid",url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["string PID", {pid:"123",watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["fractional PID", {pid:123.5,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, false],
+    ["empty url", {pid:123,watchPid:456,url:"",token:"synthetic-test-token"}, false],
+    ["invalid token", {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:12}, false],
+    ["embedded header", {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-test-token"}, true],
+  ];
+  for (const [name, record, expected] of cases) it(`cold-launch bridge header: ${name}`, async () => {
+    const src=fs.readFileSync(path.join(REPO,"src/main-hook.cjs"),"utf8");
+    const inject=src.match(/async function injectHudIntoWindow\([^]*?\n\}/)[0];
+    const payloads=[], kills=[];
+    // Include the real renderer's bridge READ; it must not prevent injection.
+    // Old installed files also begin with a bridge assignment, which must be
+    // replaced or stripped even when the record is missing/dead/foreign.
+    const ui = (name === "alive" ? "" : 'window.__t3HubSidecarBridge = {url:"http://stale.invalid",token:"stale-test-token"};\n') +
+      'window.__t3HubDrawerEmbedded = true;\n/* __T3_HUB_DRAWER_EMBED_START__ */\n' +
+      'window.bridgeSeen = window.__t3HubSidecarBridge;\nwindow.injected=true;';
+    const ctx=vm.createContext({path,__dirname:"/isolated/plugin",HUD_RUN_DIR:"/isolated/run",RENDERER_UI_PATH:"/isolated/renderer",httpFallbackConfig:{url:"http://127.0.0.1:1"},rpcToken:"synthetic-rpc",lastInjectError:null,
+      isHelperWindow:()=>false,isMainT3Url:()=>true,
+      fs:{readFileSync(file){if(file==="/isolated/renderer")return ui;assert.equal(file,path.join("/isolated/run","hub-bridge.json"));if(record===null)throw Error("ENOENT");return typeof record==="string"?record:JSON.stringify(record);}},
+      process:{pid:456,kill(pid,signal){kills.push([pid,signal]);if(name==="dead")throw Error("ESRCH");}},
+    });
+    vm.runInContext(inject,ctx);
+    const win={isDestroyed:()=>false,webContents:{isDestroyed:()=>false,getURL:()=>"t3code://app",executeJavaScript:async code=>{payloads.push(code);}}};
+    assert.equal(await ctx.injectHudIntoWindow(win,true),true);
+    for (const result of [{}, {__t3HubSidecarBridge:{url:"http://stale.invalid",token:"old-live-property"}}]) {
+    vm.runInNewContext(payloads[0],{window:result});
+    assert.equal(result.injected,true);
+    if(expected){assert.equal(result.__t3HubSidecarBridge.url,record.url);assert.equal(result.__t3HubSidecarBridge.token,record.token);assert.deepEqual(kills,[[123,0]]);}
+    else {
+      assert.equal(result.__t3HubSidecarBridge,undefined);
+      assert.deepEqual(kills, name === "dead" ? [[123,0]] : []);
+    }
+    assert.equal(result.bridgeSeen,result.__t3HubSidecarBridge);
+    assert.equal(result.__t3HubDrawerEmbedded,true);
+    assert.ok(!payloads[0].includes("stale-test-token"));
+    assert.equal(result.__t3HudHttpConfig.token,"synthetic-rpc");
+    }
+  });
+});
+
+describe("Supervised sidecar cold start and reload", () => {
+  const vm = require("node:vm");
+  const src = fs.readFileSync(path.join(REPO,"src/main-hook.cjs"),"utf8");
+  const valid = {pid:123,watchPid:456,url:"http://127.0.0.1:4567",token:"synthetic-token"};
+  function fixture({record=null, live=[456], bridgeExists=true, publishAfter=1, spawnError=false, publications={}}={}) {
+    const calls=[], waits=[], unlinks=[];
+    let unrefs=0, spawns=0;
+    const ctx=vm.createContext({path,__dirname:"/isolated/plugin",HUD_RUN_DIR:"/isolated/run",
+      process:{pid:456,execPath:"/isolated/Electron",env:{PATH:"/isolated/bin"},kill(pid,signal){calls.push([pid,signal]);if(!live.includes(pid))throw Error("ESRCH");}},
+      fs:{readFileSync(file){assert.equal(file,"/isolated/run/hub-bridge.json");if(record===null)throw Error("ENOENT");return typeof record==="string"?record:JSON.stringify(record);},
+        existsSync(file){assert.equal(file,"/isolated/plugin/hub-bridge.cjs");return bridgeExists;},unlinkSync(file){assert.equal(file,"/isolated/run/hub-bridge.json");unlinks.push(file);record=null;}},
+      spawn(executable,args,options){spawns++;calls.push({executable,args:Array.from(args),options:JSON.parse(JSON.stringify(options))});if(spawnError)throw Error("spawn failed");return {on(){},unref(){unrefs++;}};},
+      setTimeout(fn,ms){waits.push(ms);if(publications[waits.length]){record=publications[waits.length];live.push(record.pid);}if(spawns && waits.length===publishAfter){record={...valid};live.push(123);}queueMicrotask(fn);},
+    });
+    const fn=src.match(/async function ensureSidecarBridge\([^]*?\n\}/);
+    assert.ok(fn,"missing cold-start ensureSidecarBridge");
+    vm.runInContext("let sidecarBridgePromise = null;\n"+fn[0],ctx);
+    return {ctx,calls,waits,unlinks,get spawns(){return spawns;},get unrefs(){return unrefs;}};
+  }
+  it("spawns once across concurrent windows, waits for owned live record and retries only after failure", async () => {
+    const f=fixture({publishAfter:3});
+    const [a,b]=await Promise.all([f.ctx.ensureSidecarBridge(),f.ctx.ensureSidecarBridge()]);
+    assert.equal(a.url,valid.url);assert.equal(b.url,valid.url);
+    assert.equal(f.spawns,1);assert.equal(f.unrefs,1);assert.deepEqual(f.waits,[80,80,80]);
+    assert.deepEqual(f.calls.find(c=>c.executable),{executable:"/isolated/Electron",args:["/isolated/plugin/hub-bridge.cjs"],options:{env:{PATH:"/isolated/bin",ELECTRON_RUN_AS_NODE:"1",T3_HUD_DIR:"/isolated/plugin",T3_WATCH_PID:"456"},detached:true,stdio:"ignore"}});
+    await f.ctx.ensureSidecarBridge();assert.equal(f.spawns,1,"reuse live bridge");
+  });
+  it("reuses a valid existing bridge without spawning or waiting", async () => {
+    const f=fixture({record:valid,live:[123,456]});
+    assert.equal((await f.ctx.ensureSidecarBridge()).pid,123);assert.equal(f.spawns,0);assert.equal(f.waits.length,0);
+  });
+  for (const ownerAlive of [true,false]) it(`foreign bridge is terminated only if its owner is dead (${ownerAlive})`,async()=>{
+    const f=fixture({record:{...valid,watchPid:999},live:ownerAlive?[123,456,999]:[123,456]});
+    assert.equal((await f.ctx.ensureSidecarBridge()).watchPid,456);
+    assert.equal(f.calls.some(c=>Array.isArray(c)&&c[0]===123&&c[1]==="SIGTERM"),!ownerAlive);
+    assert.equal(f.unlinks.length,ownerAlive?0:1);
+  });
+  for (const record of ["{", {...valid,pid:0}, {...valid,pid:"123"}, {...valid,token:""}, {...valid,url:""}, {...valid,watchPid:0}, valid]) it(`repairs invalid or dead records: ${JSON.stringify(record)}`,async()=>{
+    const f=fixture({record});
+    assert.equal((await f.ctx.ensureSidecarBridge()).pid,123);assert.equal(f.spawns,1);
+  });
+  it("bounds startup polling and releases the single-flight lease after timeout",async()=>{
+    const f=fixture({publishAfter:Infinity});
+    assert.equal(await f.ctx.ensureSidecarBridge(),null);assert.deepEqual(f.waits,Array(30).fill(80));
+    assert.equal(await f.ctx.ensureSidecarBridge(),null);assert.equal(f.spawns,2);
+  });
+  it("does not accept a foreign, malformed or dead bridge while polling",async()=>{
+    const f=fixture({publishAfter:5,publications:{1:{...valid,watchPid:999},2:{...valid,token:""},3:{...valid,pid:"123"},4:{...valid,pid:0}}});
+    assert.equal((await f.ctx.ensureSidecarBridge()).pid,123);assert.equal(f.waits.length,5);
+  });
+  for (const options of [{bridgeExists:false},{spawnError:true}]) it(`fails safely when bridge cannot start: ${JSON.stringify(options)}`,async()=>{
+    const f=fixture(options);assert.equal(await f.ctx.ensureSidecarBridge(),null);assert.equal(f.waits.length,0);
+  });
+  it("checks startup readiness and refreshes a mounted window when the bridge port changes",async()=>{
+    assert.match(src,/whenReady\(\)\.then\(async \(\) => \{[^]*?await ensureSidecarBridge\(\)/);
+    const inject=src.match(/async function injectHudIntoWindow\([^]*?\n\}/)[0];
+    const page={__t3HudInitialized:true,__t3HubSidecarBridge:{url:"http://127.0.0.1:old",token:"old"}};
+    let ensures=0, reads=0;
+    const ctx=vm.createContext({path,__dirname:"/isolated/plugin",HUD_RUN_DIR:"/isolated/run",RENDERER_UI_PATH:"/renderer",httpFallbackConfig:null,lastInjectError:null,
+      ensureSidecarBridge:async()=>{ensures++;},process:{pid:456,kill(){}},isHelperWindow:()=>false,isMainT3Url:()=>true,
+      fs:{readFileSync(file){if(file==="/renderer"){reads++;return "/* __T3_HUB_DRAWER_EMBED_START__ */ window.injected=true;";}return JSON.stringify(valid);}}});
+    vm.runInContext(inject,ctx);
+    const win={isDestroyed:()=>false,webContents:{isDestroyed:()=>false,getURL:()=>"t3code://app",executeJavaScript:async code=>vm.runInNewContext(code,{window:page,document:{getElementById:()=>({})}})}};
+    assert.equal(await ctx.injectHudIntoWindow(win),true);assert.equal(page.__t3HubSidecarBridge.url,valid.url);assert.equal(ensures,1);assert.equal(reads,1);
+    await ctx.injectHudIntoWindow(win);assert.equal(reads,1,"correct bridge avoids needless reinjection");
+    ctx.fs.readFileSync=file=>file==="/renderer"?"/* __T3_HUB_DRAWER_EMBED_START__ */": "{";
+    await ctx.injectHudIntoWindow(win);assert.equal(page.__t3HubSidecarBridge,undefined,"mounted windows clear invalidated bridge");
+  });
+});
+
+describe("Unpromoted draft telemetry safety", () => {
+  const routes = ["__NEW__", "draft/draft-a", "draft/", "/draft/", "_t3_env_/local/draft/draft-a", "/draft/draft-a", "/draft/thread:server-a", "/draft/6ee0c274-d218-41d6-b277-cbfc803dfbc0",
+    "/_t3_env_/6ee0c274-d218-41d6-b277-cbfc803dfbc0/draft/draft-a",
+    "#/_t3_env_/local/draft/draft-a", "t3code://app/#/draft/draft-a?x=1"];
+  for (const route of routes) it(`cannot fall back to the most recent thread: ${route}`, () => {
+    assert.ok(backend.getThreadStats(THREAD_A).ok, "fixture must contain existing thread telemetry");
+    assert.deepEqual(backend.getThreadStats(route), { ok: false, nonThreadRoute: "new" });
+  });
+  it("extractThreadId decodes promoted thread IDs exactly once", () => {
+    const src = fs.readFileSync(path.join(REPO,"src/backend.cjs"),"utf8");
+    const extract = src.match(/function extractThreadId\([^]*?\n\}/)[0];
+    const normalize = src.match(/function normalizeT3RouteHint\([^]*?\n\}/)[0];
+    const ctx = require("node:vm").createContext({URL});
+    require("node:vm").runInContext(normalize + "\n" + extract,ctx);
+    const tid = "thread:delegated-task:command%3A7";
+    for(const prefix of ["/", "/_t3_env_/local/", "/_t3_env_/6ee0c274-d218-41d6-b277-cbfc803dfbc0/"]) {
+      assert.equal(ctx.extractThreadId(prefix + encodeURIComponent(tid)),tid);
+    }
+  });
+});
+
+describe("Scoped promoted thread routes", () => {
+  const src = fs.readFileSync(path.join(REPO, "src/backend.cjs"), "utf8");
+  const ctx = require("node:vm").createContext({ URL });
+  for (const name of ["normalizeT3RouteHint", "extractThreadId", "parseDraftProjectRoute"]) {
+    const fn = src.match(new RegExp(`function ${name}\\([^]*?\\n\\}`));
+    assert.ok(fn, `missing ${name}`);
+    require("node:vm").runInContext(fn[0], ctx);
+  }
+  const uuidEnv = "6ee0c274-d218-41d6-b277-cbfc803dfbc0";
+  for (const env of [uuidEnv, "local", "remote:west"]) {
+    for (const tid of ["legacy-thread-42", "legacy:one", "thread:delegated-task:command%3A7", "legacy%3Aone"]) {
+      const route = `/_t3_env_/${encodeURIComponent(env)}/${encodeURIComponent(tid)}`;
+      it(`extracts the exact scoped thread identity: ${route}`, () => assert.equal(ctx.extractThreadId(route), tid));
+    }
+  }
+  for (const route of ["/_t3_env_", `/_t3_env_/${uuidEnv}`, "/_t3_env_/local/%broken", `/_t3_env_/${uuidEnv}/%E0%A4%A`, `/${uuidEnv}/%broken`]) {
+    it(`rejects invalid routes without telemetry fallback: ${route}`, () => {
+      assert.equal(ctx.extractThreadId(route), "__ROUTE_invalid__");
+      assert.ok(backend.getThreadStats(THREAD_A).ok, "fixture contains recent telemetry");
+      assert.deepEqual(backend.getThreadStats(route), { ok: false, nonThreadRoute: "__ROUTE_invalid__" });
+    });
+  }
+  for (const tid of ["settings", "usage", "pair"]) it(`does not treat scoped reserved segment as thread: ${tid}`, () => {
+    const route = `/_t3_env_/${uuidEnv}/${encodeURIComponent(tid[0])}${tid.slice(1)}`;
+    assert.match(ctx.extractThreadId(route), /^__ROUTE_/);
+    assert.equal(backend.getThreadStats(route).ok, false);
+  });
+  for (const tid of ["new", "draft", "NEW", "Draft"]) it(`keeps scoped ${tid} outside telemetry`, () => {
+    assert.equal(ctx.extractThreadId(`/_t3_env_/local/${tid}`), "__NEW__");
+  });
+  it("queries a legacy thread rather than the environment UUID or recent thread", () => {
+    const db = new DatabaseSync(path.join(tmpUserdata, "statev2.sqlite"));
+    try {
+      db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,?,?,?,?,?,?,?)").run("legacy-thread-42", "p1", "legacy", "muse", "2020-01-01T00:00:00Z", "{}", null, null);
+      for (const env of [uuidEnv, "local", "remote%3Awest"]) for (const prefix of ["/", "/_t3_env_/"]) {
+        const result = backend.getThreadStats(`${prefix}${env}/legacy-thread-42`);
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.threadId, "legacy-thread-42");
+      }
+    } finally {
+      db.prepare("DELETE FROM orchestration_v2_projection_threads WHERE thread_id = ?").run("legacy-thread-42");
+      db.close();
+    }
+  });
+  it("explicit alias-like environment IDs are checked against the running environment",()=>{
+    const environmentFile=path.join(tmpUserdata,"environment-id");
+    const previous=fs.existsSync(environmentFile)?fs.readFileSync(environmentFile):null;
+    try {
+      for(const env of ["threads","_chat"]){
+        fs.writeFileSync(environmentFile,env);
+        const routeHint=`/_t3_env_/${env}/thread%3Aa`;
+        const result=backend.resolveHubContext({routeHint});
+        assert.equal(result.ok,true,JSON.stringify(result));assert.equal(result.threadId,THREAD_A);assert.equal(result.environmentId,env);
+        fs.writeFileSync(environmentFile,"other-environment");
+        assert.equal(backend.resolveHubContext({routeHint}).ok,false);
+      }
+    } finally {if(previous===null)fs.rmSync(environmentFile,{force:true});else fs.writeFileSync(environmentFile,previous);}
+  });
+  for (const prefix of ["/", "/_t3_env_/"]) it(`decodes environment identity for Hub context: ${prefix}`, () => {
+    const parsed = ctx.parseDraftProjectRoute(`${prefix}remote%3Awest/thread%3Aa`);
+    assert.equal(parsed.isDraft, false);
+    assert.equal(parsed.environmentId, "remote:west");
+  });
+  it("normalizes scoped draft project routes and keeps thread aliases environment-free", () => {
+    const parsed = ctx.parseDraftProjectRoute(`/_t3_env_/projects/${uuidEnv}/draft/new-a`);
+    assert.equal(parsed.isDraft, true);
+    assert.equal(parsed.projectId, uuidEnv);
+    for (const prefix of ["/", "/_t3_env_/"]) {
+      for (const segment of ["threads", "_chat"]) assert.equal(ctx.parseDraftProjectRoute(`${prefix}${segment}/thread%3Aa`).environmentId, prefix === "/" ? null : segment);
+    }
+    assert.doesNotThrow(() => ctx.parseDraftProjectRoute("/_t3_env_/%broken/thread%3Aa"));
+  });
+  for (const env of ["remote:west","local","threads","_chat"]) for (const tid of ["legacy-thread-42","thread:promoted/7"]) it(`native/scoped routes preserve legacy identity: ${env}/${tid}`,()=>{
+    const scoped=`/_t3_env_/${encodeURIComponent(env)}/${encodeURIComponent(tid)}`;
+    assert.equal(ctx.extractThreadId(scoped),tid);
+    if(!["threads","_chat"].includes(env))assert.equal(ctx.extractThreadId(`/${encodeURIComponent(env)}/${encodeURIComponent(tid)}`),tid);
+    assert.equal(ctx.parseDraftProjectRoute(scoped).environmentId,env);
+  });
+  for (const route of ["/_t3_env_/remote%3Awest//legacy-thread-42","/_t3_env_/a/b/c","/_t3_env_//thread%3Aa","/_t3_env_/%broken/thread%3Aa","/_t3_env_/%E0%A4%A/thread%3Aa","/_t3_env_/./thread%3Aa","/_t3_env_/%2e%2e/thread%3Aa","/_t3_env_/local/%2e","/_t3_env_/local/%2e%2e","/remote%3Awest/%broken","/%broken/legacy-thread-42","__ROUTE_invalid__","/settings"]) it(`Hub context rejects bad routes without latest-thread fallback: ${route}`,()=>{
+    assert.deepEqual(backend.resolveHubContext({routeHint:route}),{ok:false,error:"无效或非会话路由"});
+    assert.match(ctx.extractThreadId(route),/^__ROUTE_/);
+  });
+  it("malformed explicit draft environment is invalid rather than a new project",()=>{
+    for(const route of ["/_t3_env_/%broken/thread%3Aa","/_t3_env_/%broken/draft/draft-a"]){
+      assert.deepEqual(JSON.parse(JSON.stringify(ctx.parseDraftProjectRoute(route))),{isDraft:false,projectId:null,environmentId:"__INVALID_ENV__",invalidRoute:true});
+      assert.equal(backend.resolveHubContext({routeHint:route}).ok,false);
+    }
+  });
+  for(const tid of ["new","draft","%6Eew","%64raft"]) it(`native legacy new/draft routes remain drafts: ${tid}`,()=>{
+    assert.equal(ctx.extractThreadId(`/remote%3Awest/${tid}`),"__NEW__");
+  });
+  it("resolves the persisted environment after decoding scoped and native routes", () => {
+    const environmentFile = path.join(tmpUserdata, "environment-id");
+    const previous = fs.existsSync(environmentFile) ? fs.readFileSync(environmentFile) : null;
+    try {
+      fs.writeFileSync(environmentFile, "remote:west\n");
+      for (const prefix of ["/", "/_t3_env_/"]) {
+        const result = backend.resolveHubContext({ routeHint: `${prefix}remote%3Awest/thread%3Aa` });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.environmentId, "remote:west");
+        assert.equal(result.threadId, THREAD_A);
+        assert.equal(result.projectRoot, tmpRoot);
+      }
+      const foreign = backend.resolveHubContext({ routeHint: "/_t3_env_/other%3Awest/thread%3Aa" });
+      assert.equal(foreign.ok, false);
+    } finally {
+      if (previous === null) fs.rmSync(environmentFile, { force: true });
+      else fs.writeFileSync(environmentFile, previous);
+    }
+  });
+});
 
 // --- Isolated homes; MUST be set before require(backend.cjs) ---------------
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "t3-hud-test-"));

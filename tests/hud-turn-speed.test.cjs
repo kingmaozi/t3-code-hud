@@ -10,6 +10,8 @@ const { DatabaseSync } = require("node:sqlite");
 
 const repo = path.resolve(__dirname, "..");
 const rendererSource = fs.readFileSync(path.join(repo, "src/renderer-ui.js"), "utf8");
+// These VM cases isolate stats/selection handling; route promotion is covered separately.
+const stableRouteStub = "function onRouteMaybeChanged() { return false; }\n";
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "hud-turn-speed-home-"));
 process.env.HOME = home;
 process.env.T3CODE_HOME = path.join(home, "userdata");
@@ -819,7 +821,7 @@ test("R12: trailing refresh does not schedule timers while in flight and resumes
   let finish;
   ctx.callBackend = () => new Promise(resolve => { finish = resolve; });
   Object.assign(ctx, { getRouteHint: () => "r", isCurrentStatsSnapshot: () => false });
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   vm.runInContext(`let statsRequestSeq=0;${refresh}; pendingFastRefresh=true; trailingFastRefreshTimer=null;`, ctx);
   const pending = vm.runInContext("refreshStats(false)", ctx);
   finish({ ok: true });
@@ -968,7 +970,7 @@ test("R18: no-user DOM must prove a turn boundary or return null; a lone unbound
 });
 
 test("R19: rejected/timed-out stats degrade through pricing to local projection and reject stale routes", async () => {
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   for (const changeAt of [null, "stats", "price"]) {
     for (const priceFails of [false, true]) {
       const calls = []; const renders = []; let reads = 0; let route = "r19";
@@ -1053,7 +1055,7 @@ test("R25: newly selected provider never inherits unattributed stale live contex
 });
 
 test("R26: same-thread provider switch while refreshStats is in flight discards stale response and queues re-fetch", async () => {
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   let selectedProvider = "codex", finish, trailingScheduled = 0;
   const rendered = [];
   const previous = { ok: true, provider: "codex", model: "old-model", isRunning: false, cache: { turnRate: 0.9 }, tokens: { contextUsed: 9999 } };
@@ -1175,7 +1177,7 @@ test("R34: an identified old-turn DOM row mounting and growing after an empty id
 });
 
 test("R35: mid-flight provider selection when requestedProvider started empty discards pre-switch response and schedules trailing refresh", async () => {
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   let selectedProvider = "", finish, trailingScheduled = 0;
   const rendered = [];
   const staleCodex = {
@@ -1543,7 +1545,7 @@ test("R49 (#9-3): second Muse turn completing after a prior 50 tok/s native log 
 });
 
 test("R50 (#9-4): A->B->A provider/model bounce while refreshStats is in flight discards stale response and queues trailing refresh", async () => {
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   let selectedProvider = "codex", selectedModel = "old-codex", finish, trailingScheduled = 0;
   const rendered = [];
   const stalePreSwitch = {
@@ -1724,7 +1726,7 @@ test("R53: an unidentified tail cannot join growing historical rows above the fi
 });
 
 test("R55: exact A->B->A between route ticks invalidates an in-flight refresh through calls, reads and capture events", async () => {
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   const install = rendererSource.match(/  function installHudSelectionObservers\([\s\S]*?\n  \}/)?.[0];
   assert.ok(install, "selection changes need an immediate event hook");
   const read = rendererSource.match(/  function readLiveT3State\([\s\S]*?\n  \}/)[0];
@@ -1771,7 +1773,7 @@ test("R55: exact A->B->A between route ticks invalidates an in-flight refresh th
 
 test("R56: trailing refresh without timers preserves pending work without throwing", async () => {
   const scheduler = rendererSource.match(/  function scheduleTrailingFastRefresh\([\s\S]*?\n  \}/)[0];
-  const refresh = rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
+  const refresh = stableRouteStub + rendererSource.match(/  async function refreshStats\([\s\S]*?\n  \}/)[0];
   const ctx = vm.createContext({
     performance: { now: () => 2000 }, document: { hidden: false },
     getRouteHint: () => "r56", isCurrentStatsSnapshot,

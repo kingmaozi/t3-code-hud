@@ -13,7 +13,7 @@
     const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), slashCache = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
     let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, planHandle, style, palette, liveBoard;
+    let root, drawer, content, handle, planHandle, style, palette, liveBoard, occlusionBoardRect = null;
     let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
@@ -33,7 +33,7 @@
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
  clearedHostFields: new Set(Array.isArray(initial?.clearedHostFields) ? initial.clearedHostFields : []),
- scope: initial?.scope || storageGet("t3-hub-scope") || "global", libraryView: "skills", hooksOpen: false, dreamOpen: false,
+ scope: initial?.scope || storageGet("t3-hub-scope") || "global", libraryView: "skills", hooksOpen: false, dreamOpen: initial?.dreamOpen ?? readStoredDreamOpen() ?? true,
  mcpQuery: "", mcpFilter: initial?.mcpFilter || "all", hookDraft: null, historyExpanded: initial?.historyExpanded || {}, supersedeItems: [], supersedeLoading: false,
  lang: "zh", theme: storageGet("t3-hub-theme") || "white", dark: false, context: null, connected: false, threadId: null, contextError: "", projectRoot: null, refreshing: false,
  skillQuery: initial?.skillQuery || "", skillFilter: initial?.skillFilter || "all", importScope: "project", importRepo: initial?.importRepo || "",
@@ -66,6 +66,10 @@
     }
     function storageGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
     function storageSet(key, value) { try { localStorage.setItem(key, String(value)); } catch {} }
+    function readStoredDreamOpen() {
+ const value = storageGet("t3-hub:dream-open");
+ return value === "true" ? true : value === "false" ? false : null;
+    }
     function tr(zh, en) { return state.lang === "en" ? en : zh; }
     function esc(value) {
  return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -223,6 +227,8 @@
 #t3-sidecar-hub-root .hub-agent-toggle button[aria-pressed=true],#t3-sidecar-hub-root .hub-widths button.is-active{color:var(--hub-on-active)}
 #t3-sidecar-hub-root .hub-library-tabs{flex-wrap:wrap;gap:3px}#t3-sidecar-hub-root .hub-native-badge{margin-top:2px}.hub-dream-engine-row{display:flex;align-items:flex-end;flex-wrap:wrap;gap:9px;margin:14px 0}.hub-dream-engine{flex:1 1 240px;margin:0!important;min-width:0}.hub-dream-budget{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:6px 8px;border:1px solid var(--hub-border);border-radius:7px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary);line-height:1.6;overflow-wrap:anywhere}.hub-dream-consumption{margin-top:6px;color:var(--hub-ink);font-variant-numeric:tabular-nums}.hub-engine-memory{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin:11px 0 7px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-engine-memory-values{min-width:0;flex:1 1 200px;font-size:11px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.hub-engine-memory-values>span{display:block;font-weight:550}.hub-engine-memory-values>small{display:block;margin-top:2px;font-size:9px;color:var(--hub-secondary)}.hub-memory-health{font-variant-numeric:tabular-nums}.hub-memory-governance{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 14px;padding:0 1px}.hub-memory-governance .hub-hint{font-size:9px}.hub-memory-governance>.hub-btn{flex:none}
 @media(prefers-reduced-motion:reduce){#t3-sidecar-hub-root *,#t3-sidecar-hub-root *:before,#t3-sidecar-hub-root *:after{animation:none!important;transition:none!important}}
+.hub-dream-summary-title{font-weight:600}.hub-dream-summary-meta{margin-left:8px;font-size:10px;font-weight:400;color:var(--hub-secondary)}@media(max-width:639px){.hub-dream-summary-meta{display:block;margin:5px 0 0;padding-left:15px}}
+.hub-dream-card{min-width:0;border:1px solid var(--hub-border);border-radius:12px}.hub-dream-card>summary{cursor:pointer;font-size:11px;font-weight:550;line-height:1.8;overflow-wrap:anywhere}.hub-dream-card[open]>summary{margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--hub-border)}.hub-dream-card>section{min-width:0}.hub-dream-title{min-width:0;flex-wrap:wrap;overflow-wrap:anywhere}.hub-dream-form{margin-top:16px;gap:0 12px}.hub-dream-preset{grid-column:1/-1}.hub-dream-engine-actions{align-self:end}.hub-dream-engine-actions .hub-row{flex-wrap:wrap}.hub-dream-card .hub-dream-controls .hub-checkbox{flex:1 1 160px;white-space:normal;min-width:0;max-width:100%;overflow-wrap:anywhere}.hub-dream-times>span{min-width:0;overflow-wrap:anywhere}#t3-hub-drawer.is-compact .hub-dream-form{grid-template-columns:minmax(0,1fr)}
 .hub-theme-switcher{display:flex;align-items:center;gap:5px;flex:none;padding:3px}.hub-theme-dot{width:14px;height:14px;min-width:14px;padding:0;border:1px solid var(--hub-border);border-radius:50%;background:var(--hub-swatch)!important;cursor:pointer}.hub-theme-dot[aria-pressed=true]{outline:2px solid var(--hub-accent);outline-offset:2px}#t3-hub-live-board{display:flex;flex-direction:column;min-height:0}#t3-hub-live-board .hub-board-content{flex:0 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}.hub-board-toolbar{display:flex;align-items:center;flex-wrap:wrap;flex:none;gap:8px;min-width:0}.hub-board-toolbar .hub-icon-btn{width:22px;height:22px}.hub-board-open-label{display:none}.is-space-limited .hub-board-content{display:none}.is-space-limited .hub-board-toolbar{flex-wrap:nowrap}.is-space-limited :is(.hub-theme-switcher,.hub-board-toggle>span:last-child,.hub-icon-btn svg){display:none}.is-space-limited .hub-board-toggle{width:auto;min-width:0}.is-space-limited .hub-board-toggle>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.is-space-limited .hub-icon-btn{display:inline-flex;width:auto;height:22px;padding:0 2px;white-space:nowrap}.is-space-limited .hub-board-open-label{display:inline;font-size:9px}#t3-hub-live-board .hub-board-steps{gap:9px}#t3-hub-live-board .hub-step-text{overflow-wrap:anywhere}#t3-hub-live-board .hub-board-add{margin-top:14px;gap:5px}#t3-hub-live-board .hub-board-add .hub-input{padding:6px 8px;font-size:10px!important}#t3-hub-live-board .hub-board-add .hub-btn{padding:4px 7px;min-height:28px}.hub-memory-date{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-detail-meta{flex-wrap:wrap}.hub-dream-times{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:10px;color:var(--hub-secondary);margin-top:10px}
 @media(max-width:639px){.hub-title-row{flex-wrap:wrap}.hub-title-row .hub-grow{flex-basis:calc(100% - 48px)}.hub-header{padding:14px 16px}.hub-header .hub-theme-switcher{margin-right:auto}}
 .hub-mcp-mode-controls{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end;margin-top:9px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-mcp-mode-controls label{min-width:0;font-size:9px;color:var(--hub-secondary)}.hub-mcp-mode-controls label small{display:block;margin-bottom:4px}.hub-mcp-mode-controls .hub-select{font-size:10px!important;padding:6px 22px 6px 8px}.hub-mcp-mode-hint{grid-column:1/-1;margin:0;font-size:9px;line-height:1.65;color:var(--hub-secondary)}
@@ -288,6 +294,7 @@
  listen(window, "t3-hud-popover-change", positionConversationTools);
  listen(window, "hashchange", checkRoute);
  listen(window, "popstate", checkRoute);
+ listen(window, "storage", checkRoute);
  listen(window, "storage", syncEnvironment);
  listen(window, "t3-hub-theme-change", (event) => applyTheme(event.detail?.theme || storageGet("t3-hub-theme") || "white"));
  listen(document, "visibilitychange", () => { if (!document.hidden) { checkRoute(); pollBoard(); if (state.open) pollEmbed(); } });
@@ -309,7 +316,7 @@
  scheduleUpdate();
  });
  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme", "lang", "style"] });
- observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "data-theme", "style"] });
+ observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "data-theme", "style", "hidden", "aria-hidden", "aria-modal", "data-closed", "open"] });
  ensureRouterSubscription();
  routeTimer = setInterval(() => { if (!disposed && !document.hidden) { ensureRouterSubscription(); checkRoute(); syncEnvironment(); syncOcclusion(); positionConversationTools(); } }, 3000);
  lastRoute = routeKey(); lastBoardRoute = boardScopeRoute();
@@ -757,7 +764,7 @@
     }
     async function persistSubagent(id, patch = null) {
  const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id), version = contextVersion;
- if (scope === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady(scope)) return;
  if (subagentSaves.has(key)) return;
  const original = subagentItems().find((item) => subagentId(item) === id);
  const item = { ...(patch ? original || state.subagentDrafts[key] : state.subagentDrafts[key] || original), ...(patch || {}) };
@@ -805,7 +812,7 @@
  const item = subagentItems("global").find((entry) => subagentId(entry) === id);
  const projectRoot = state.projectRoot, version = contextVersion;
  if (!item) return;
- if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady()) return;
  const existing = items(cache.subagents, ["projectItems"]).find((entry) => subagentId(entry) === id);
  if (existing) { state.subagentScope = "project"; state.subagentExpanded[subagentKey(id)] = true; renderSubagents(); renderChrome(); toast(tr("已打开现有项目配置", "Opened the existing project override")); return; }
  await busy(`clone:${projectRoot}:${id}`, element, async () => {
@@ -826,7 +833,7 @@
     }
     async function deleteSubagent(id, element) {
  const scope = state.subagentScope, projectRoot = state.projectRoot, key = subagentKey(id), version = contextVersion;
- if (scope === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady(scope)) return;
  const item = subagentItems().find((entry) => subagentId(entry) === id);
  if (!item || !canDeleteSubagent(item) || subagentSaves.has(key)) return;
  await busy(`delete-subagent:${key}`, element, async () => {
@@ -919,7 +926,7 @@
  const projectRoot = state.projectRoot, version = contextVersion;
  if (!name || !["project", "global"].includes(scope) || !["off", "inherit", "lazy", "direct"].includes(choice)) return;
  if (choice === "inherit" && scope !== "project") return;
- if (scope === "project" && !projectRoot) { toast(tr("请先打开一个项目", "Open a project first"), true); return; }
+ if (!projectWriteReady(scope)) return;
  const mode = choice === "inherit" ? "inherit" : choice === "off" ? "off" : `${scope}-${choice}`;
  const payload = { name, mode, ...(scope === "project" ? { projectRoot } : {}) };
  await busy(`mcp-mode:${name}`, element, async () => {
@@ -1018,6 +1025,35 @@
  const config = dreamConfig();
  return state.dreamEngineDraft || { providerInstanceId: config.dreamMode === "local" ? "local" : config.providerInstanceId, model: config.model || "", reasoningEffort: config.reasoningEffort || "medium" };
     }
+    function dreamProviderAvailability(id) {
+ const providers = Array.isArray(cache.dream?.runtime?.providers) ? cache.dream.runtime.providers : [];
+ const entry = providers.find((provider) => provider.id === id);
+ const status = /^(agy|antigravity)$/i.test(String(id)) || providers.length && !entry ? "unsupported" : entry?.status;
+ return { entry, blocked: ["missing", "unsupported"].includes(status), suffix: status === "missing" ? tr(" · 未安装 CLI", " · CLI not installed") : status === "unsupported" ? tr(" · 暂不支持", " · unsupported") : "" };
+    }
+    function dreamPresetDraft(preset) {
+ const { entry } = dreamProviderAvailability(preset.providerInstanceId);
+ const efforts = Array.isArray(entry?.efforts) && entry.efforts.length ? entry.efforts : ["low", "medium", "high"];
+ const effort = preset.reasoningEffort || "medium";
+ return { providerInstanceId: preset.providerInstanceId, model: preset.providerInstanceId === "local" ? "mlx-vector-only" : preset.model || "", reasoningEffort: efforts.includes(effort) ? effort : efforts.includes("medium") ? "medium" : efforts[0] };
+    }
+    function dreamPresetOptions(draft = dreamEngineDraft()) {
+ const presets = dreamPresets();
+ const selected = presets.find((preset) => {
+ const value = dreamPresetDraft(preset);
+ return draft.providerInstanceId === value.providerInstanceId && draft.model === value.model && (draft.providerInstanceId === "local" || draft.reasoningEffort === value.reasoningEffort);
+ });
+ return `${!selected ? `<option value="custom" selected>${esc(tr("自定义引擎与模型", "Custom engine & model"))}</option>` : ""}${presets.map((preset) => {
+ const availability = dreamProviderAvailability(preset.providerInstanceId);
+ return `<option value="${esc(preset.id)}" ${selected === preset ? "selected" : ""} ${availability.blocked ? "disabled" : ""}>${esc(preset.label || `${preset.providerInstanceId} · ${preset.model}`)}${esc(availability.suffix)}</option>`;
+ }).join("")}`;
+    }
+    function onDreamToggle(event) {
+ const details = event.currentTarget;
+ if (!details?.isConnected || !root.contains(details)) return;
+ state.dreamOpen = details.open;
+ storageSet("t3-hub:dream-open", state.dreamOpen);
+    }
     function renderDream() {
  const node = root.querySelector("#t3-hub-dream");
  if (!node) return;
@@ -1031,10 +1067,8 @@
  const choices = ["local", "muse", "codex", "claude", "pi"];
  if (!choices.includes(draft.providerInstanceId)) choices.push(draft.providerInstanceId);
  const providerOptions = choices.map((id) => {
- const status = providers.find((entry) => entry.id === id)?.status;
- const unavailable = /^(agy|antigravity)$/i.test(id) || status === "missing" || status === "unsupported";
- const suffix = unavailable ? tr(" · 暂不可执行", " · unavailable") : "";
- return `<option value="${esc(id)}" ${draft.providerInstanceId === id ? "selected" : ""} ${unavailable ? "disabled" : ""}>${esc(providerLabels[id] || id)}${esc(suffix)}</option>`;
+ const availability = dreamProviderAvailability(id);
+ return `<option value="${esc(id)}" ${draft.providerInstanceId === id ? "selected" : ""} ${availability.blocked ? "disabled" : ""}>${esc(providerLabels[id] || id)}${esc(availability.suffix)}</option>`;
  }).join("");
  const agentProvider = providers.find((entry) => entry.id === draft.providerInstanceId);
  const draftBlocked = /^(agy|antigravity)$/i.test(String(draft.providerInstanceId)) || ["missing", "unsupported"].includes(agentProvider?.status) || providers.length > 0 && !agentProvider;
@@ -1055,7 +1089,14 @@
  const schedulerStatus = schedule.started === true ? schedule.running === true ? tr("定时器正在检查", "Scheduler checking") : tr("定时器运行中", "Scheduler running") : schedule.started === false ? tr("定时器未运行", "Scheduler stopped") : tr("定时器状态待确认", "Scheduler status unknown");
  const vectors = cache.embed?.vectorStats;
  const syncSummary = cache.embed?.vectorStatsError ? tr("记忆统计不可用", "Memory statistics unavailable") : vectors?.syncedVectors != null && vectors?.totalMemories != null ? `${Number(vectors.syncedVectors).toLocaleString()}/${Number(vectors.totalMemories).toLocaleString()} ${tr("向量同步", "vectors synced")}` : tr("统计读取中", "Loading statistics");
- node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold">AutoDream · ${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Run now"))}</summary><section aria-label="${esc(tr("梦境整理 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境整理", "Memory Dream"))} · AutoDream</span><span class="hub-badge">${esc(status)}</span></div><p class="hub-dream-description">${esc(tr("T3 和 Hub 运行时按本地时间检查是否需要整理；未运行时不会执行，唤醒补做以设置为准。", "While T3 and Hub are running, the scheduler checks the local time; it does not run while closed. Catch-up follows your setting."))}</p><div class="hub-form-grid"><label class="hub-field">${esc(tr("执行 Agent", "Agent"))}<select class="hub-select" name="dream-provider" aria-label="${esc(tr("AutoDream 执行 Agent", "AutoDream agent"))}" ${busy || !loaded ? "disabled" : ""}>${providerOptions}</select></label><label class="hub-field">${esc(tr("模型 ID", "Model ID"))}<input class="hub-input" name="dream-model" list="t3-hub-dream-models" value="${esc(draft.model)}" aria-label="${esc(tr("AutoDream 模型", "AutoDream model"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}><datalist id="t3-hub-dream-models">${presetModels.map((model) => `<option value="${esc(model)}"></option>`).join("")}</datalist></label><label class="hub-field">${esc(tr("思考程度", "Reasoning effort"))}<select class="hub-select" name="dream-effort" aria-label="${esc(tr("AutoDream 思考程度", "AutoDream reasoning effort"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}>${efforts.map((effort) => `<option value="${esc(effort)}" ${draft.reasoningEffort === effort ? "selected" : ""} ${!supportedEfforts.includes(effort) ? "disabled" : ""}>${esc(optionLabels[effort] || effort)} (${esc(effort)})${!supportedEfforts.includes(effort) ? ` · ${esc(tr("请重新选择", "select another"))}` : ""}</option>`).join("")}</select></label><div class="hub-field"><div class="hub-row">${button("save-dream-engine", tr("保存 Agent 和模型", "Save agent and model"), { small: true, primary: true, icon: "save", disabled: busy || !loaded || !state.dreamEngineDraft || draftBlocked })}${button("cancel-dream-engine", tr("取消修改", "Discard changes"), { small: true, disabled: busy || !state.dreamEngineDraft })}</div></div></div><p class="hub-hint">${esc(tr("找到可执行程序不代表已登录或有模型权限；AGY 暂不支持自动执行。", "An executable does not prove sign-in or model access. AGY automatic execution is not supported."))}</p>${selectedBlocked ? `<p class="hub-dream-error">${esc(tr("当前 Agent 暂不可执行；可更换 Agent 或关闭自动整理。", "The configured agent is unavailable; choose another or disable the schedule."))}</p>` : ""}<div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded || !data.enabled && selectedBlocked ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日整理时间", "Daily time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补做", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Organizing…") : tr("立即整理", "Run now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded || selectedBlocked || !!state.dreamEngineDraft })}</div><div class="hub-dream-times"><span>${esc(schedulerStatus)}</span><span>${esc(tr("下次计划", "Next scheduled time"))} ${nextDue}${schedule.timeZone ? ` · ${esc(schedule.timeZone)}` : ""}</span><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span>${schedule.lastCheckAt ? `<span>${esc(tr("最近调度检查", "Last scheduler check"))} ${exactTimeMarkup(schedule.lastCheckAt)}</span>` : ""}</div><div class="hub-dream-report">${schedule.lastError ? `<div class="hub-dream-error">${esc(tr("调度错误", "Scheduler error"))}：${esc(errorText(schedule.lastError))}</div>` : ""}<div>${esc(tr("本地整理", "Local result"))}：${esc(resultText(report?.local))}</div><div>${esc(tr("Agent 整理", "Agent result"))}：${esc(resultText(report?.agent))}</div>${report?.agent?.providerInstanceId || report?.agent?.model ? `<div class="hub-hint">${esc([report.agent.providerInstanceId, report.agent.model, report.agent.reasoningEffort].filter(Boolean).join(" · "))}</div>` : ""}</div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
+ node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold"><span class="hub-dream-summary-title">${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}</span><span class="hub-dream-summary-meta">${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Run now"))}</span></summary><section aria-label="${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}</span><span class="hub-badge">${esc(status)}</span></div><p class="hub-dream-description">${esc(tr("T3 和 Hub 运行时按本地时间检查是否需要整理；未运行时不会执行，唤醒补做以设置为准。", "While T3 and Hub are running, the scheduler checks the local time; it does not run while closed. Catch-up follows your setting."))}</p><div class="hub-form-grid hub-dream-form">
+<label class="hub-field hub-dream-preset">${esc(tr("预设方案", "Preset"))}<select class="hub-select" name="dream-preset" aria-label="${esc(tr("AutoDream 预设方案", "AutoDream preset"))}" ${busy || !loaded ? "disabled" : ""}>${dreamPresetOptions(draft)}</select></label>
+<label class="hub-field">${esc(tr("执行引擎", "Execution engine"))}<select class="hub-select" name="dream-provider" aria-label="${esc(tr("AutoDream 执行引擎", "AutoDream execution engine"))}" ${busy || !loaded ? "disabled" : ""}>${providerOptions}</select></label>
+<label class="hub-field">${esc(tr("模型", "Model"))}<input class="hub-input" name="dream-model" list="t3-hub-dream-models" value="${esc(draft.model)}" aria-label="${esc(tr("AutoDream 模型", "AutoDream model"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}><datalist id="t3-hub-dream-models">${presetModels.map((model) => `<option value="${esc(model)}"></option>`).join("")}</datalist></label>
+<label class="hub-field">${esc(tr("思考强度", "Reasoning effort"))}<select class="hub-select" name="dream-effort" aria-label="${esc(tr("AutoDream 思考强度", "AutoDream reasoning effort"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}>${efforts.map((effort) => `<option value="${esc(effort)}" ${draft.reasoningEffort === effort ? "selected" : ""} ${!supportedEfforts.includes(effort) ? "disabled" : ""}>${esc(optionLabels[effort] || effort)} (${esc(effort)})${!supportedEfforts.includes(effort) ? ` · ${esc(tr("请重新选择", "select another"))}` : ""}</option>`).join("")}</select></label>
+<div class="hub-field hub-dream-engine-actions"><div class="hub-row">${button("save-dream-engine", tr("保存引擎", "Save engine"), { small: true, primary: true, icon: "save", disabled: busy || !loaded || !state.dreamEngineDraft || draftBlocked })}${button("cancel-dream-engine", tr("取消修改", "Discard changes"), { small: true, disabled: busy || !state.dreamEngineDraft })}</div></div>
+</div><p class="hub-hint">${esc(tr("找到可执行程序不代表已登录或有模型权限；AGY 暂不支持自动执行。", "An executable does not prove sign-in or model access. AGY automatic execution is not supported."))}</p>${selectedBlocked ? `<p class="hub-dream-error">${esc(tr("当前 Agent 暂不可执行；可更换 Agent 或关闭自动整理。", "The configured agent is unavailable; choose another or disable the schedule."))}</p>` : ""}<div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded || !data.enabled && selectedBlocked ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日整理时间", "Daily time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补做", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Organizing…") : tr("立即整理", "Run now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded || selectedBlocked || !!state.dreamEngineDraft })}</div><div class="hub-dream-times"><span>${esc(schedulerStatus)}</span><span>${esc(tr("下次计划", "Next scheduled time"))} ${nextDue}${schedule.timeZone ? ` · ${esc(schedule.timeZone)}` : ""}</span><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span>${schedule.lastCheckAt ? `<span>${esc(tr("最近调度检查", "Last scheduler check"))} ${exactTimeMarkup(schedule.lastCheckAt)}</span>` : ""}</div><div class="hub-dream-report">${schedule.lastError ? `<div class="hub-dream-error">${esc(tr("调度错误", "Scheduler error"))}：${esc(errorText(schedule.lastError))}</div>` : ""}<div>${esc(tr("本地整理", "Local result"))}：${esc(resultText(report?.local))}</div><div>${esc(tr("Agent 整理", "Agent result"))}：${esc(resultText(report?.agent))}</div>${report?.agent?.providerInstanceId || report?.agent?.model ? `<div class="hub-hint">${esc([report.agent.providerInstanceId, report.agent.model, report.agent.reasoningEffort].filter(Boolean).join(" · "))}</div>` : ""}</div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
+ node.querySelector?.("details.hub-dream-card")?.addEventListener("toggle", onDreamToggle);
     }
     async function saveDreamEngine() {
  if (!state.dreamEngineDraft) return;
@@ -1140,6 +1181,7 @@
  await loadMemories();
     }
     async function promoteMemory(id, element) {
+ if (!memoryWriteReady()) return;
  const version = contextVersion, payload = memoryPayload();
  await busy(`memory-promote:${id}`, element, async () => {
  await request("memory:promote", { ...payload, id, scope: "project" });
@@ -1499,24 +1541,37 @@
  if (slashSession) positionSlash();
     }
     function boardMismatch() {
- const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+ const route = routeHint(), prefixed = /^\/?_t3_env_(?:\/|[?#]|$)/i.test(route);
+ const explicitPair = route.match(/^\/?_t3_env_\/([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/i);
+ if (prefixed && (!explicitPair || /\/\//.test(route.replace(/[?#].*$/, "")))) return true;
  if (state.threadId === "__NEW__") {
- const match = routeHint().match(new RegExp(`^/?(?:projects?|workspaces?)/(${uuid})/(?:new|draft)(?:[/?#]|$)`, "i"));
+ const match = route.match(new RegExp(`^/?(?:_t3_env_/)?(?:projects?|workspaces?)/(${UUID_RE})/(?:new|draft)(?:[/?#]|$)`, "i"));
  const projectId = match?.[1];
  return !projectId || state.context?.draftProjectVerified !== true || state.context?.threadId !== "__NEW__" ||
  String(state.context?.projectId || "").toLowerCase() !== projectId.toLowerCase() || !state.projectRoot || state.context?.projectRoot !== state.projectRoot;
  }
- const nativePair = routeHint().match(/^\/?([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/);
- const pair = nativePair && !["threads", "_chat"].includes(nativePair[1].toLowerCase()) ? nativePair : null;
- let routeThreadId = pair?.[2];
- try { if (routeThreadId) routeThreadId = decodeURIComponent(routeThreadId); } catch { return true; }
- if (pair && (String(state.context?.environmentId || "").toLowerCase() !== pair[1].toLowerCase() || String(state.threadId || "") !== routeThreadId || !state.projectRoot || state.context?.projectRoot !== state.projectRoot)) return true;
+ const rawPair = !explicitPair && route.match(/^\/?([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/);
+ const candidate = explicitPair || rawPair;
+ let routeEnvId = candidate?.[1], routeThreadId = candidate?.[2];
+ try { if (candidate) { routeEnvId = decodeURIComponent(routeEnvId); routeThreadId = decodeURIComponent(routeThreadId); } } catch { return true; }
+ const pair = candidate && !/^(?:projects?|workspaces?)$/i.test(routeEnvId) && (explicitPair || !/^(?:threads|_chat)$/i.test(routeEnvId)) ? candidate : null;
+ if (pair && (String(state.context?.environmentId || "").toLowerCase() !== routeEnvId.toLowerCase() || String(state.threadId || "") !== routeThreadId || !state.projectRoot || state.context?.projectRoot !== state.projectRoot)) return true;
  const contextId = state.context?.threadId || state.context?.thread?.id;
  if (!pair && currentThreadId() !== (state.threadId || "__NEW__")) return true;
  return !!(contextId && state.threadId && String(contextId) !== String(state.threadId));
     }
     function projectContextReady() {
  return Boolean(state.connected && !contextLoading && state.projectRoot && state.context?.threadId && state.context?.projectRoot === state.projectRoot && routeKey() === lastRoute && !boardMismatch());
+    }
+    function projectWriteReady(scope = "project") {
+ if (scope !== "project" || projectContextReady()) return true;
+ toast(tr("请先确认当前项目，等待连接完成后重试", "Wait for the current project to connect and retry"), true);
+ return false;
+    }
+    function memoryWriteReady(scope = "project") {
+ if (scope === "global") return !(contextLoading && state.memoryScope !== "global") || projectWriteReady("project");
+ if (state.memoryProject !== "current" && state.memoryProject !== "global") return true;
+ return state.memoryProject === "current" ? projectWriteReady("project") : (projectWriteReady("project"), false);
     }
     function boardProblem() {
  if (contextLoading) return tr("读取中", "Loading");
@@ -2394,11 +2449,73 @@
  else if (typeof unsub?.unsubscribe === "function") unsubscribeRouter = () => unsub.unsubscribe();
  } catch {}
     }
+    function resolvePromotedDraftRoute(rawPath) {
+ const match = String(rawPath || "").match(/^\/?(?:_t3_env_\/([^/?#]+)\/)?draft\/([^/?#]+)(?:[/?#]|$)/i);
+ if (!match) return null;
+ let envFromPath = "", draftId;
+ try { envFromPath = match[1] ? decodeURIComponent(match[1]) : ""; draftId = decodeURIComponent(match[2]); } catch { return null; }
+ const routeFor = (ref) => {
+ const threadId = typeof ref?.threadId === "string" ? ref.threadId.trim() : "";
+ if (!threadId) return null;
+ const environmentId = (typeof ref.environmentId === "string" ? ref.environmentId.trim() : "") || envFromPath;
+ return `${environmentId ? `/_t3_env_/${encodeURIComponent(environmentId)}` : ""}/${encodeURIComponent(threadId)}`;
+ };
+ try {
+ const parsed = JSON.parse(storageGet("t3code:composer-drafts:v1") || "null"), store = parsed?.state || parsed;
+ const promoted = routeFor(store?.promotedDraftRedirects?.[draftId]) || routeFor(store?.drafts?.[draftId]?.promotedTo) || routeFor(store?.draftThreadsByThreadKey?.[draftId]?.promotedTo);
+ if (promoted) return promoted;
+ } catch {}
+ try {
+ const host = document.getElementById("root");
+ const key = host && Object.keys(host).find((name) => name.startsWith("__reactContainer") || name.startsWith("__reactFiber"));
+ let entry = key ? host[key] : null;
+ const ancestors = new Set();
+ while (entry?.return && !entry.stateNode?.current && ancestors.size < 400 && !ancestors.has(entry)) {
+ ancestors.add(entry); entry = entry.return;
+ }
+ if (entry?.return && !entry.stateNode?.current) return null;
+ const committed = entry?.stateNode?.current || entry?.current || entry;
+ const stack = committed ? [committed] : [], seen = new Set(), hooks = new Set();
+ while (stack.length && seen.size < 400) {
+ const fiber = stack.pop();
+ if (!fiber || typeof fiber !== "object" || seen.has(fiber)) continue;
+ seen.add(fiber);
+ const candidates = [fiber.memoizedProps, fiber.pendingProps, fiber.memoizedState];
+ for (let hook = fiber.memoizedState; hook && typeof hook === "object" && hooks.size < 400 && !hooks.has(hook); hook = hook.next) {
+ hooks.add(hook); candidates.push(hook.memoizedState);
+ }
+ for (const props of candidates) {
+ if (props?.draftId === draftId && props.isServerThread === true) {
+ let promoted = routeFor(props) || routeFor(props.threadRef) || routeFor(props.activeThreadKey) || routeFor({ environmentId: props.environmentId || props.thread?.environmentId, threadId: props.thread?.id });
+ if (!promoted && typeof props.activeThreadKey === "string") {
+ const activeKey = props.activeThreadKey.trim(), explicitEnv = String(props.environmentId || props.thread?.environmentId || envFromPath || "").trim();
+ const slash = activeKey.indexOf("/"), separator = activeKey.indexOf(":");
+ let ref;
+ if (activeKey.startsWith("thread:")) ref = { environmentId: explicitEnv, threadId: activeKey };
+ else if (explicitEnv && (activeKey.startsWith(`${explicitEnv}:`) || activeKey.startsWith(`${explicitEnv}/`))) ref = { environmentId: explicitEnv, threadId: activeKey.slice(explicitEnv.length + 1) };
+ else if (slash > 0) ref = { environmentId: activeKey.slice(0, slash), threadId: activeKey.slice(slash + 1) };
+ else if (separator >= 0) ref = { environmentId: activeKey.slice(0, separator), threadId: activeKey.slice(separator + 1) };
+ else ref = { environmentId: explicitEnv, threadId: activeKey };
+ promoted = routeFor(ref);
+ }
+ if (promoted) return promoted;
+ }
+ }
+ if (fiber.sibling) stack.push(fiber.sibling);
+ if (fiber.child) stack.push(fiber.child);
+ }
+ } catch {}
+ return null;
+    }
+    function rawRouteHint() {
+ return location.hash?.slice(1) || findRouter()?.state?.location?.pathname || location.pathname || "/";
+    }
     function routeHint() {
- return location.hash.slice(1) || findRouter()?.state?.location?.pathname || location.pathname || "/";
+ const raw = rawRouteHint();
+ return resolvePromotedDraftRoute(raw) || raw;
     }
     function routeKey() {
- return `${location.href}|${routeHint()}`;
+ return `${location.href || ""}|${location.search || ""}|${findRouter()?.state?.location?.searchStr || ""}|${routeHint()}`;
     }
     const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
     let scopeAnchor = null;
@@ -2408,9 +2525,9 @@
  let pEnv = "", pProj = "", pWs = "";
  for (const raw of [location.hash?.slice(1), location.pathname, routeHint()]) {
  const p = stripQ(raw); if (!p) continue;
- let m = !pProj && p.match(/^\/?projects?\/([^/?#]+)/i); if (m) pProj = decQ(m[1]);
- m = !pWs && p.match(/^\/?workspaces?\/([^/?#]+)/i); if (m) pWs = decQ(m[1]);
- m = !pEnv && !/^\/?(?:projects?|workspaces?)\//i.test(p) && p.match(new RegExp(`^\\/?(${UUID_RE})(?:\\/[^/?#]+)?\\/?$`, "i")); if (m) pEnv = m[1].toLowerCase();
+ let m = !pProj && p.match(/^\/?(?:_t3_env_\/)?projects?\/([^/?#]+)/i); if (m) pProj = decQ(m[1]);
+ m = !pWs && p.match(/^\/?(?:_t3_env_\/)?workspaces?\/([^/?#]+)/i); if (m) pWs = decQ(m[1]);
+ m = !pEnv && !/^\/?(?:_t3_env_\/)?(?:projects?|workspaces?)\//i.test(p) && p.match(new RegExp(`^\\/?(?:_t3_env_\\/)?(${UUID_RE})(?:\\/[^/?#]+)?\\/?$`, "i")); if (m) pEnv = m[1].toLowerCase();
  }
  const vals = { e: [], p: [], r: [], w: [] }, map = { env: "e", environment: "e", environmentId: "e", project: "p", projectId: "p", projectRoot: "r", workspaceRoot: "r", workspace: "w", workspaceId: "w" };
  for (const src of [location.search, ...[location.href, location.hash, location.pathname, routeHint()].map(s => (String(s || "").match(/\?([^#]*)/) || [])[1]), findRouter()?.state?.location?.searchStr]) {
@@ -2426,6 +2543,10 @@
  }
  return { stripQ, pEnv, pProj, pWs, e: vals.e.join(","), p: vals.p.join(","), r: vals.r.join(","), w: vals.w.join(",") };
     }
+    function contextIdentityToken() {
+ const sp = parseScopeParts();
+ return `${routeKey()}|${sp.e}|${sp.p}|${sp.r}|${sp.w}`;
+    }
     function resetScopeAnchor(sp = parseScopeParts()) {
  scopeAnchor = { e: sp.e || sp.pEnv, eT: sp.e && sp.e !== sp.pEnv ? `e=${sp.e}` : "", p: sp.p || sp.pProj, pT: sp.p && sp.p !== sp.pProj ? `p=${sp.p}` : "", r: sp.r, rT: sp.r ? `r=${sp.r}` : "", w: sp.w || sp.pWs, wT: sp.w && sp.w !== sp.pWs ? `w=${sp.w}` : "" };
     }
@@ -2439,9 +2560,20 @@
  return tid && tid !== "__NEW__" ? `t:${tid}|${base}` : `d:${base}`;
     }
     function currentThreadId() {
- const paths = [location.hash?.slice(1), location.pathname, routeHint()].filter(Boolean);
+ const paths = [rawRouteHint(), location.pathname].filter(Boolean);
  for (const path of paths) {
- if (/(?:^|\/)(?:draft|new)(?:\/|[?#]|$)/i.test(path) || new RegExp(`^\\/?(?:projects?|workspaces?)\\/${UUID_RE}\\/?(?:[?#]|$)`, "i").test(path) || new RegExp(`^\\/?${UUID_RE}\\/?(?:[?#]|$)`, "i").test(path)) return "__NEW__";
+ const promoted = resolvePromotedDraftRoute(path);
+ if (promoted) { try { return decodeURIComponent(promoted.slice(promoted.lastIndexOf("/") + 1)); } catch { return "__ROUTE_invalid__"; } }
+ if (/(?:^|\/)(?:draft|new)(?:\/|[?#]|$)/i.test(path) || new RegExp(`^\\/?(?:_t3_env_\\/)?(?:projects?|workspaces?)\\/${UUID_RE}\\/?(?:[?#]|$)`, "i").test(path) || new RegExp(`^\\/?${UUID_RE}\\/?(?:[?#]|$)`, "i").test(path)) return "__NEW__";
+ if (/^\/?_t3_env_(?:\/|[?#]|$)/i.test(path)) {
+ if (/\/\//.test(path.replace(/[?#].*$/, ""))) return "__ROUTE_invalid__";
+ const pair = path.match(/^\/?_t3_env_\/([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/i);
+ if (!pair) return "__ROUTE_invalid__";
+ try {
+ const environmentId = decodeURIComponent(pair[1]), threadId = decodeURIComponent(pair[2]);
+ if (!/^(?:projects?|workspaces?)$/i.test(environmentId)) return threadId;
+ } catch { return "__ROUTE_invalid__"; }
+ }
  const match = path.match(/(?:^|\/)(?:threads|_chat)\/([^/?#]+)/i);
  if (match) { const d = decQ(match[1]); return d.toLowerCase() === "new" ? "__NEW__" : d; }
  const native = path.match(new RegExp(`^\\/?${UUID_RE}\\/([^/?#]+)(?:[/?#]|$)`, "i"));
@@ -2453,28 +2585,56 @@
     function syncThread(force = false) {
  const threadId = currentThreadId(); if (!force && threadId === state.threadId) return false;
  state.threadId = threadId; boardScopeVersion++; artifactVersion++;
+ occlusionBoardRect = null;
  cache.board = null; state.artifact = null; state.boardDraft = ""; delete errors.board;
  boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = "";
  renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab();
  return true;
+    }
+    function resetProjectData() {
+ boardScopeVersion++; requestVersion++; memoryVersion++;
+ for (const k of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[k] = null; delete errors[k]; }
+ if (state.scope === "project" && !state.projectRoot) state.scope = "global";
+ state.importScope = defaultScope(); state.subagentScope = defaultScope(); state.agentsTarget = defaultScope();
+ state.memoryProject = state.projectRoot && state.memoryScope !== "global" ? "current" : "global";
+ state.artifact = null; state.boardDraft = ""; state.orchestrationDraft = null; state.settingsDirty = false; state.settingsDraft = {}; state.clearedHostFields.clear(); state.settingsRuleDirty = false; state.settingsRule = ""; settingsSelectionVersion++;
+ boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = ""; renderLiveBoard();
+ state.hookDraft = null; state.supersedeItems = []; state.selectedMemory = null;
+ if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
     }
     function checkRoute() {
  const route = routeKey(), changed = route !== lastRoute, prevScope = lastBoardRoute, scopeChanged = boardScopeRoute() !== prevScope;
  if (scopeChanged) resetScopeAnchor();
  const scopeRoute = boardScopeRoute();
  if (changed) lastRoute = route; lastBoardRoute = scopeRoute;
- if (scopeChanged) { boardScopeVersion++; state.context = null; }
+ if (scopeChanged || changed && currentThreadId() === "__NEW__") {
+ contextVersion++; contextLoading = true;
+ state.connected = false; state.context = null; state.threadId = null; state.projectRoot = null; state.contextError = "";
+ resetProjectData();
+ }
  const threadChanged = syncThread(scopeChanged);
  if (changed && state.open && ["agents", "subagents"].includes(state.tab)) renderTab();
  if (changed) refreshContext(false, { sameScopeRoute: !scopeChanged && state.connected });
  if (threadChanged && !changed) pollBoard();
     }
     async function refreshContext(force = false, { sameScopeRoute = false } = {}) {
+ const requestedRoute = routeHint();
+ const requestedIdentity = contextIdentityToken();
+ if (disposed) return;
+ const unpromotedDraft = requestedRoute === "__NEW__" || /^\/?(?:_t3_env_\/[^/?#]+\/)?draft(?:\/|[?#]|$)/i.test(requestedRoute);
  if (lastBoardRoute && boardScopeRoute() !== lastBoardRoute) {
  resetScopeAnchor(); lastRoute = routeKey(); lastBoardRoute = boardScopeRoute();
  boardScopeVersion++; state.context = null; syncThread(true); sameScopeRoute = false;
  }
  const version = ++contextVersion, before = state.projectRoot, beforeThread = state.threadId, startRoute = boardScopeRoute();
+ const isCurrent = () => {
+ const routeChanged = routeHint() !== requestedRoute || contextIdentityToken() !== requestedIdentity;
+ if (disposed || version !== contextVersion || routeChanged) {
+ if (!disposed && routeChanged) checkRoute();
+ return false;
+ }
+ return true;
+ };
  const liveSameScopeDraft = () => {
  if (!state.open || state.tab !== "board" || boardScopeRoute() !== startRoute) return false;
  const v = boardViewSnapshots.get(content), inp = content.querySelector('[name="board-step-draft"]');
@@ -2483,8 +2643,10 @@
  const hadSameScopeBoardDraft = liveSameScopeDraft();
  if (!sameScopeRoute) contextLoading = true; closeSlash();
  try {
- const context = await request("hub:getContext", { threadHint: location.href, routeHint: routeHint() });
- if (disposed || version !== contextVersion) return;
+ if (unpromotedDraft) throw new Error(tr("草稿尚未创建会话，请先发送消息", "Send a message to create a conversation for this draft"));
+ const rawRoute = rawRouteHint(), promotedRoute = resolvePromotedDraftRoute(rawRoute);
+ const context = await request("hub:getContext", { threadHint: promotedRoute ? `t3code://app/#${promotedRoute}` : location.href, routeHint: requestedRoute });
+ if (!isCurrent()) return;
  const sameScope = boardScopeRoute() === startRoute;
  state.context = context; state.projectRoot = context.projectRoot || context.project?.root || context.project?.path || null;
  if (scopeAnchor && sameScope) {
@@ -2495,8 +2657,6 @@
  if (!scopeAnchor.w && (context.workspaceId || context.workspace?.id)) scopeAnchor.w = String(context.workspaceId || context.workspace?.id);
  if (scopeAnchor.e === (new RegExp(`^${UUID_RE}$`, "i").test(cEnv) ? cEnv.toLowerCase() : cEnv)) scopeAnchor.eT = "";
  if (scopeAnchor.r === String(state.projectRoot || "").replace(/\/+$/, "")) scopeAnchor.rT = "";
- // Context may resolve after the initial query was cached. Align the board
- // key and existing views without replacing a same-session draft input.
  lastRoute = routeKey(); lastBoardRoute = boardScopeRoute();
  for (const surface of [content, liveBoard]) {
  const view = boardViewSnapshots.get(surface);
@@ -2505,24 +2665,18 @@
  }
  state.connected = true; state.contextError = "";
  } catch (error) {
- if (disposed || version !== contextVersion) return;
+ if (!isCurrent()) return;
  state.contextError = errorText(error); state.context = null;
- state.projectRoot = (hadSameScopeBoardDraft && boardScopeRoute() === startRoute && content.querySelector('[name="board-step-draft"]')) || liveSameScopeDraft() ? before : null;
+ state.projectRoot = !unpromotedDraft && ((hadSameScopeBoardDraft && boardScopeRoute() === startRoute && content.querySelector('[name="board-step-draft"]')) || liveSameScopeDraft()) ? before : null;
+ if (unpromotedDraft) state.threadId = null;
  state.connected = false;
  }
+ if (!isCurrent()) return;
  contextLoading = false;
- const keepDisconnectedDraft = Boolean(!state.connected && ((hadSameScopeBoardDraft && boardScopeRoute() === startRoute && content.querySelector('[name="board-step-draft"]')) || liveSameScopeDraft()));
+ const keepDisconnectedDraft = Boolean(!unpromotedDraft && !state.connected && ((hadSameScopeBoardDraft && boardScopeRoute() === startRoute && content.querySelector('[name="board-step-draft"]')) || liveSameScopeDraft()));
  if (!(keepDisconnectedDraft && currentThreadId() === "__NEW__" && beforeThread && beforeThread !== "__NEW__")) syncThread();
  if (before !== state.projectRoot) {
- boardScopeVersion++; requestVersion++; memoryVersion++;
- for (const k of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[k] = null; delete errors[k]; }
- if (state.scope === "project" && !state.projectRoot) state.scope = "global";
- state.importScope = defaultScope(); state.subagentScope = defaultScope(); state.agentsTarget = defaultScope();
- state.memoryProject = state.projectRoot && state.memoryScope !== "global" ? "current" : "global";
- state.artifact = null; state.boardDraft = ""; state.orchestrationDraft = null; state.settingsDirty = false; state.settingsDraft = {}; state.clearedHostFields.clear(); state.settingsRuleDirty = false; state.settingsRule = ""; settingsSelectionVersion++;
- boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = ""; renderLiveBoard();
- state.hookDraft = null; state.supersedeItems = []; state.selectedMemory = null;
- if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
+ resetProjectData();
  } else if (!state.projectRoot) {
  state.scope = state.subagentScope = state.agentsTarget = state.importScope = "global";
  if (state.memoryProject === "current") state.memoryProject = "global";
@@ -2538,8 +2692,8 @@
  boardRenderedSignature = ""; boardTabRenderPending = true; if (force) boardEditorNeedsSync = true;
  toast(state.contextError || tr("连接失败，已保留草稿，等待自动同步或手动刷新重试", "Connection failed; draft preserved. Waiting for automatic sync or a manual refresh."), true);
  } else content.innerHTML = inlineError(state.contextError);
- } else if (hadDraft) { await boardPoll; primeCatalogs(); }
- else { renderTab(); await loadTab(force); primeCatalogs(); }
+ } else if (hadDraft) { await boardPoll; if (isCurrent()) primeCatalogs(); }
+ else { renderTab(); await loadTab(force); if (isCurrent()) primeCatalogs(); }
  }
     }
     async function readCatalog(key, action, payload) {
@@ -2551,7 +2705,7 @@
     }
     const catalogInflight = new Set();
     async function primeCatalogs() {
- const projectRoot = state.projectRoot, version = contextVersion;
+ const projectRoot = state.projectRoot, version = contextVersion, identity = contextIdentityToken();
  const domains = [["mcp", "mcp:list"], ["skills", "skills:list"], ["plugins", "plugins:list"], ["hooks", "hooks:list"], ["subagents", "subagents:list"], ["overview", "memory:overview"]];
  await Promise.all(domains.map(async ([key, action]) => {
  const token = `${version}:${key}`;
@@ -2559,7 +2713,7 @@
  catalogInflight.add(token);
  try {
  const data = await readCatalog(key, action, { projectRoot });
- if (disposed || version !== contextVersion || projectRoot !== state.projectRoot) return;
+ if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || contextIdentityToken() !== identity) return;
  cache[key] = data; delete errors[key]; renderChrome();
  if (state.open && (state.tab === key || state.tab === "agents")) renderTab();
  } catch {} finally { catalogInflight.delete(token); }
@@ -2570,16 +2724,18 @@
  const tab = state.tab;
  const version = ++requestVersion;
  const projectRoot = state.projectRoot;
+ const identity = typeof contextIdentityToken === "function" ? contextIdentityToken() : "", ctxVer = typeof contextVersion === "number" ? contextVersion : 0;
+ const isCurrent = () => !disposed && version === requestVersion && (typeof contextVersion !== "number" || ctxVer === contextVersion) && projectRoot === state.projectRoot && (typeof contextIdentityToken !== "function" || contextIdentityToken() === identity);
  const load = async (key, action, payload) => {
  if (cache[key] && !force) return;
  delete errors[key];
  try {
  const data = await readCatalog(key, action, payload);
- if (disposed || version !== requestVersion || projectRoot !== state.projectRoot) return;
+ if (!isCurrent()) return;
  cache[key] = data;
  if (key === "agents") seedAgentDrafts(data, projectRoot);
  } catch (error) {
- if (!disposed && version === requestVersion) errors[key] = error;
+ if (isCurrent()) errors[key] = error;
  }
  };
  if (tab === "board") await pollBoard();
@@ -2592,9 +2748,9 @@
  if (tab === "settings") await loadSettings(force);
  if (tab === "memory") {
  await Promise.all([load("overview", "memory:overview", { projectRoot }), load("worktree", "memory:worktreeInfo", { projectRoot }), load("dream", "memory:dream:get", {}), load("health", "memory:health", { projectRoot }), refreshEmbed(false, force)]);
- if (!disposed && version === requestVersion) await loadMemories(false);
+ if (isCurrent()) await loadMemories(false);
  }
- if (disposed || version !== requestVersion || state.tab !== tab) return;
+ if (!isCurrent() || state.tab !== tab) return;
  if (tab === "board" && boardEditorActive()) boardTabRenderPending = true;
  else renderTab();
  renderChrome();
@@ -2723,7 +2879,30 @@
     }
     function syncOcclusion() {
  if (!root || disposed) return;
- const nativeDialog = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].some((element) => !root.contains(element) && element.getClientRects().length && getComputedStyle(element).visibility !== "hidden" && getComputedStyle(element).display !== "none");
+ const visible = (element) => {
+ if (!element || element.hidden || !element.getClientRects().length) return false;
+ for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+ if (ancestor.hidden || ancestor.getAttribute?.("aria-hidden") === "true" || ancestor.getAttribute?.("data-closed") != null || ancestor.tagName === "DIALOG" && !ancestor.open) return false;
+ const css = getComputedStyle(ancestor);
+ if (css.display === "none" || css.visibility === "hidden" || css.visibility === "collapse" || css.opacity != null && css.opacity !== "" && Number(css.opacity) === 0) return false;
+ }
+ return true;
+ };
+ const editor = visibleComposer(), composer = editor && composerSurface(editor);
+ const surfaces = [composer, handle, planHandle, liveBoard, palette, ...(state.open ? [drawer] : [])].filter((element) => element && !element.hidden && element.getClientRects().length);
+ const wasOccluded = root.classList.contains("is-occluded");
+ if (liveBoard && !liveBoard.hidden && liveBoard.getClientRects().length) occlusionBoardRect = liveBoard.getBoundingClientRect();
+ else if (!wasOccluded || state.open) occlusionBoardRect = null;
+ const surfaceRects = surfaces.map((surface) => surface.getBoundingClientRect());
+ if (wasOccluded && occlusionBoardRect) surfaceRects.push(occlusionBoardRect);
+ const overlaps = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+ const nativeDialog = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].some((element) => {
+ if (root.contains(element) || !visible(element)) return false;
+ const rect = element.getBoundingClientRect();
+ if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= innerWidth || rect.top >= innerHeight) return false;
+ if (element.getAttribute("aria-modal") === "true" || element.getAttribute("role") === "alertdialog" || element.matches?.(":modal")) return true;
+ return surfaceRects.some((surface) => overlaps(rect, surface));
+ });
  root.classList.toggle("is-occluded", nativeDialog);
     }
     function positionHandle() {
@@ -2823,7 +3002,7 @@
  else if (action === "memory-scope-filter") setMemoryScope(target.dataset.scope);
  else if (action === "open-memory-folder") busy("memory-folder", target, () => request("memory:openFolder", memoryPayload()));
  else if (action === "promote-memory") promoteMemory(id, target);
- else if (action === "dream-fold") { state.dreamOpen = !state.dreamOpen; }
+ else if (action === "dream-fold") return; // Native <details> toggles; its toggle event persists the final state.
  else if (action === "toggle-dream") saveDream({ enabled: !dreamConfig().enabled });
  else if (action === "save-dream-engine") saveDreamEngine();
  else if (action === "cancel-dream-engine") { state.dreamEngineDraft = null; renderDream(); }
@@ -2916,7 +3095,7 @@
  else if (action === "cancel-new-memory") { if (drafts.__new) drafts.__new.open = false; renderNewMemory(); }
  else if (action === "create-memory") saveMemory(null, target);
  else if (action === "save-memory") saveMemory(id, target);
- else if (action === "pin-memory") busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot: selectedMemoryRoot() }); if (!disposed) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } });
+ else if (action === "pin-memory" && memoryWriteReady()) busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot: selectedMemoryRoot() }); if (!disposed) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } });
  else if (action === "delete-memory") target.closest(".hub-memory-detail").querySelector("[data-delete-confirm]").hidden = false;
  else if (action === "cancel-delete-memory") target.closest("[data-delete-confirm]").hidden = true;
  else if (action === "confirm-delete-memory") deleteMemory(id, target);
@@ -2934,6 +3113,7 @@
  if (name === "board-step-draft") { state.boardDraft = input.value; boardDraftEditSeq++; return; }
  if (name === "dream-model") {
  state.dreamEngineDraft = { ...dreamEngineDraft(), model: input.value };
+ const preset = root.querySelector('[name="dream-preset"]'); if (preset) preset.innerHTML = dreamPresetOptions();
  const save = root.querySelector('[data-action="save-dream-engine"]'); if (save) save.disabled = false;
  const cancel = root.querySelector('[data-action="cancel-dream-engine"]'); if (cancel) cancel.disabled = false;
  const run = root.querySelector('[data-action="run-dream"]'); if (run) run.disabled = true;
@@ -2977,6 +3157,13 @@
     function onChange(event) {
  const input = event.target;
  const name = input.name;
+ if (name === "dream-preset") {
+ const preset = dreamPresets().find((item) => item.id === input.value);
+ if (!preset || state.dreamSaving || state.dreamRunning || dreamProviderAvailability(preset.providerInstanceId).blocked) return;
+ state.dreamEngineDraft = dreamPresetDraft(preset);
+ renderDream();
+ return;
+ }
  if (name === "dream-provider") {
  const provider = input.value, available = cache.dream?.runtime?.providers || [], entry = available.find((item) => item.id === provider);
  if (!["local", "muse", "codex", "claude", "pi"].includes(provider) || ["missing", "unsupported"].includes(entry?.status) || available.length && !entry) return;
@@ -3197,6 +3384,7 @@
     }
     function memorySelection() { const payload = memoryPayload(); return JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]); }
     async function consolidateMemory(element) {
+ if (!memoryWriteReady()) return;
  const projectRoot = selectedMemoryRoot(), selection = memorySelection();
  if (!projectRoot) return;
  await busy(`consolidate:${projectRoot}`, element, async () => {
@@ -3214,6 +3402,7 @@
     }
     async function rollbackMemory(id, targetVersion, revisionId, element) {
  if (!Number.isInteger(targetVersion) || targetVersion < 1) return;
+ if (typeof memoryWriteReady === "function" && !memoryWriteReady()) return;
  const selection = memorySelection(), projectRoot = selectedMemoryRoot(), key = memoryDraftKey(id);
  if (drafts[key]) { toast(tr("请先保存这条记忆的修改，再回滚", "Save your memory edits before restoring a version"), true); return; }
  await busy(`rollback:${id}`, element, async () => {
@@ -3229,11 +3418,11 @@
  const repoInput = state.importRepo.trim();
  if (!repoInput) { toast(tr("请填写 GitHub 仓库地址", "Enter a GitHub repository"), true); return; }
  const scope = state.importScope;
- const projectRoot = state.projectRoot;
- if (scope === "project" && !projectRoot) { toast(projectTitle(), true); return; }
+ const projectRoot = scope === "project" || projectContextReady() ? state.projectRoot : undefined, version = contextVersion, identity = contextIdentityToken();
+ if (!projectWriteReady(scope)) return;
  await busy("import", element, async () => {
  const result = await request("skills:importGitHub", { repoInput, scope, projectRoot });
- if (disposed) return;
+ if (disposed || version !== contextVersion || (scope === "project" && projectRoot !== state.projectRoot) || contextIdentityToken() !== identity) return;
  state.importRepo = "";
  cache.skills = null;
  toast(result.message || tr("导入完成，技能已按范围启用", "Imported and enabled for the selected scope"));
@@ -3241,11 +3430,11 @@
  });
     }
     async function setSkillScope(id, scope, element) {
- const projectRoot = state.projectRoot;
- if (scope === "project" && !projectRoot) return;
+ const projectRoot = scope === "project" || projectContextReady() ? state.projectRoot : undefined, version = contextVersion, identity = contextIdentityToken();
+ if (!projectWriteReady(scope)) return;
  await busy(`scope:${id}`, element, async () => {
  const result = await request("skills:setScope", { id, scope, projectRoot });
- if (disposed || projectRoot !== state.projectRoot) return;
+ if (disposed || version !== contextVersion || (scope === "project" && projectRoot !== state.projectRoot) || contextIdentityToken() !== identity) return;
  const item = items(cache.skills, ["items", "skills", "plugins"]).find((entry) => String(entry.id) === id);
  if (item) Object.assign(item, result.item || {}, { scope });
  renderSkillList(); renderChrome();
@@ -3307,6 +3496,7 @@
  const key = id == null ? null : memoryDraftKey(id);
  await busy(`memory-save:${id || "new"}`, element, async () => {
  const saveScope = id == null ? draft.scope || (state.memoryScope === "worktree" ? "worktree" : payload.scope) : record?.scope || payload.scope;
+ if (!memoryWriteReady(saveScope)) return;
  const result = await request("memory:save", { ...payload, ...(saveScope === "global" ? { projectRoot: null, projectSlug: "_global" } : {}), scope: saveScope, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
  if (disposed) return;
  if (id == null) delete drafts.__new;
@@ -3323,6 +3513,7 @@
  });
     }
     async function deleteMemory(id, element) {
+ if (!memoryWriteReady()) return;
  const payload = memoryPayload();
  const key = memoryDraftKey(id);
  await busy(`memory-delete:${id}`, element, async () => {
@@ -3340,7 +3531,7 @@
     async function saveAgents(element) {
  const draft = agentDraft();
  if (!draft) return;
- if (state.agentsTarget === "project" && !projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady(state.agentsTarget)) return;
  const key = agentKey();
  const target = state.agentsTarget;
  const projectRoot = state.projectRoot, version = contextVersion;
@@ -3364,7 +3555,7 @@
     }
     async function injectSoftRoute(element) {
  const projectRoot = state.projectRoot, version = contextVersion;
- if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady()) return;
  const draft = agentDraft();
  if (draft && draft.content !== draft.saved) { toast(tr("请先保存当前修改，再注入模板", "Save your edits before inserting the template"), true); return; }
  await busy("inject-route", element, async () => {
@@ -3383,7 +3574,7 @@
     }
     async function syncProjectRuleReference(element) {
  const projectRoot = state.projectRoot, version = contextVersion;
- if (!projectContextReady()) { toast(tr("请先确认当前项目", "Confirm the current project first"), true); return; }
+ if (!projectWriteReady()) return;
  await busy("project-rule-reference", element, async () => {
  if (!projectContextReady() || version !== contextVersion || projectRoot !== state.projectRoot) return;
  await request("agentsMd:syncProjectReference", { projectRoot });
@@ -3396,7 +3587,7 @@
 
     const api = {
  options: opts, open: () => setOpen(true), close: () => setOpen(false), toggle: () => setOpen(!state.open), refresh, selectTab: (tab) => switchTab(tab),
- snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, dreamEngineDraft: state.dreamEngineDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
+ snapshot: () => ({ dreamOpen: state.dreamOpen, boardBackground: state.boardBackground, boardDraft: state.boardDraft, dreamEngineDraft: state.dreamEngineDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
  destroy: () => {
  if (disposed) return;
  closeSlash(); slashCache.clear(); disposed = true;

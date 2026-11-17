@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+IFS=: read -r -a t3_hud_path_dirs <<< "$HOME/.local/bin:$HOME/.t3/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-}:/usr/bin:/bin:/usr/sbin:/sbin"
+t3_hud_search_path=""
+for t3_hud_bin_dir in "${t3_hud_path_dirs[@]}"; do
+  [[ -n "$t3_hud_bin_dir" ]] || continue
+  case ":$t3_hud_search_path:" in
+    *":$t3_hud_bin_dir:"*) ;;
+    *) t3_hud_search_path="${t3_hud_search_path:+$t3_hud_search_path:}$t3_hud_bin_dir" ;;
+  esac
+done
+export PATH="$t3_hud_search_path"
+unset t3_hud_path_dirs t3_hud_search_path t3_hud_bin_dir
 
 PLUGIN_DIR="${T3_HUD_DIR:-$HOME/.t3/hud-plugin}"
 RUN_DIR="$PLUGIN_DIR/run"

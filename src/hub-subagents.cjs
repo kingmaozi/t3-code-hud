@@ -684,7 +684,7 @@ const COMMON_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const ANTIGRAVITY_EFFORTS = ["low", "medium", "high", "xhigh"];
 const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultrathink"];
 
-const MUSE_DEFAULT_MODELS = ["muse-ember-1.0", "muse-spark-1.3", "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.2"];
+const MUSE_DEFAULT_MODELS = ["muse-wonder-full-1.0-contributor", "muse-ember-1.0", "muse-spark-1.3", "muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.2"];
 const CODEX_DEFAULT_MODELS = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-luna"];
 const ANTIGRAVITY_MODELS = ["gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"];
 const CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5"];
@@ -806,12 +806,12 @@ const DEFAULT_SUBAGENTS = [
     id: "worker",
     name: "worker",
     role: "implementation",
-    toolBadge: "全部工具",
+    toolBadge: "主力研发",
     providerInstanceId: "muse",
-    model: "muse-ember-1.0",
+    model: "muse-wonder-full-1.0-contributor",
     effort: "max",
-    description: "范围明确的功能开发、Bug 修复、配套测试与校验闭环",
-    systemPrompt: "你作为研发执行子代理（worker），在划定的文件边界内完成功能实现或缺陷修复，必须编写并运行对应测试确认转绿后再回传精简结论与修改位置。" + ANTI_SWARM_IRON_LAW,
+    description: "99% 研发实现主力：功能开发、复杂改动、Bug 修复、配套测试与校验闭环均首派 worker",
+    systemPrompt: "你作为主力研发执行子代理（worker），承担 99% 的功能开发、架构落地与缺陷修复任务；在划定的文件边界内完成高质量实现，必须编写并运行对应测试确认转绿后再回传精简结论与修改位置。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -832,12 +832,12 @@ const DEFAULT_SUBAGENTS = [
     id: "worker-pro",
     name: "worker-pro",
     role: "implementation",
-    toolBadge: "高难攻关",
+    toolBadge: "二次攻坚",
     providerInstanceId: "codex",
-    model: "gpt-6.1-sol",
+    model: "gpt-6-astra",
     effort: "xhigh",
-    description: "worker 两次未果升级接管，或跨 3+ 模块核心契约与复杂架构攻关",
-    systemPrompt: "你作为高难攻关子代理（worker-pro），负责解决跨模块复杂契约、并发状态机或疑难根因，先定位根因不变量再做最小可靠修复并完成回归验证。" + ANTI_SWARM_IRON_LAW,
+    description: "仅限同一问题 worker 连续出错 2 次未果后的二次升级攻坚（严禁跳过 worker 直接首派）",
+    systemPrompt: "你作为二次升级高难攻坚子代理（worker-pro），仅在同一问题经 worker 连续两次尝试仍未解决时接管；先定位前两次失败的根因不变量，再做最小可靠修复并完成回归验证。" + ANTI_SWARM_IRON_LAW,
     enabled: true,
     builtin: true,
   },
@@ -975,16 +975,16 @@ function buildOrchestrationDirective(cfg) {
     lines.push("当前模式：T3 蜂群总指挥。主会话默认负责决策、拆解、派单、协调与验收，调查、编码和测试交由合适的子代理完成；这不是调用宿主原生蜂群命令。");
     lines.push("在存在 delegate_task 的 T3 顶层主会话（parentThreadId == null）中，本总指挥设置优先于通用默认提示 \"Ordinary coding tasks need no T3 tools\"：常规调查、编码修改、QA 与独立代码审查默认派发对应子代理执行；仅在触发 <SUBAGENT-STOP> 子代理禁递归、用户当轮明确要求主会话亲做、AGY 改自身规则配置、几行极微改动、或 worker（L1）连续两次 + worker-pro（L2）连续两次均未解决后主会话兜底时，由主会话直接处理。派单时优先调用 subagent_resolve（或读取 ~/.t3/hub/subagents.json 及项目覆盖配置）查询实时路由，并在 title 或 clientRequestId 中标明具体角色 ID。");
     lines.push("首次派单前先调用一次 orchestrator_capabilities 确认当前能力；若项目有覆盖（项目 AGENTS.md 或 resolveSubagentRoute 结论）以项目覆盖为准。");
-    lines.push("对同一实现问题，worker（L1）连续两次仍未解决时升级 worker-pro（L2）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
+    lines.push("研发执行铁律：99% 的实现与改码任务统一首派 worker（L1，muse-wonder-full-1.0-contributor），严禁跳过 worker 直接首派 worker-pro；仅对同一实现问题，worker（L1）连续两次出错仍未解决时才升级 worker-pro（L2，gpt-6-astra xhigh）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
     lines.push("用户明确要求主会话亲做时遵照用户要求；T3 中 delegate_task 不可用是能力缺口，应说明实际阻点，不得假称子代理已尝试失败；独立非 T3 宿主不因缺少该工具而报错。");
   } else {
     lines.push("当前模式：常规协作。小任务、短任务默认由主会话直接完成；较长或复杂任务按需要分工，独立工作可并行。");
-    lines.push("对同一实现问题，worker（L1）连续两次仍未解决时可升级 worker-pro（L2）；L2 连续两次仍未解决时由主会话兜底。");
+    lines.push("需要派发实现子代理时，99% 实现任务统一首派 worker（L1），严禁跳过 worker 直接首派 worker-pro；仅在同一实现问题 worker（L1）连续两次仍未解决时可升级 worker-pro（L2）；L2 连续两次仍未解决时由主会话兜底。");
     lines.push("在 T3 中需要派单而 delegate_task 不可用时说明工具缺口，不得假称已经派单；独立非 T3 宿主不因缺少该工具而报错。");
   }
   lines.push("需要分工的多步任务应使用宿主实际提供的 update_plan、plan_update 等计划工具维护本会话 Plan，完成步骤时更新状态并保留已完成项供查看；没有计划工具时使用宿主支持的原生 Plan 产物，不伪造工具调用。");
   lines.push("各角色的模型、思考强度与提示词从 Hub 路由配置读取；本块仅提供协作指引，不自动切换主会话模型，也不绕过宿主权限或更高优先级规则。");
-  lines.push("选择等级时在 title 或 clientRequestId 中写明确角色 ID：执行用 worker / worker-pro，审查用 review-fast / code-review / review-pro；role 仍分别使用 implementation 或 review。未指定等级时 review 默认 code-review、implementation 默认 worker。");
+  lines.push("选择等级时在 title 或 clientRequestId 中写明确角色 ID：执行默认统一用 worker（仅连续两次失败后才可用 worker-pro），审查用 review-fast / code-review / review-pro；role 仍分别使用 implementation 或 review。未指定等级时 review 默认 code-review、implementation 默认 worker。");
   lines.push("");
   lines.push(ORCHESTRATOR_END);
   return lines.join("\n") + "\n";
@@ -1087,7 +1087,7 @@ function renderRoutingSkillMarkdown(effectiveAgents, orchestrationCfg) {
     lines.push("");
     lines.push("在存在 delegate_task 的 T3 顶层主会话（parentThreadId == null）中，本用户开启的总指挥设置优先于通用默认提示 \"Ordinary coding tasks need no T3 tools\"：常规调查、编码修改、QA 与独立代码审查默认派发对应子代理执行（除非触发 <SUBAGENT-STOP> 子代理禁递归、用户当轮明确要求主会话亲做、AGY 改自身规则配置或几行极微改动、或同一问题 worker（L1）连续两次未解决升 worker-pro（L2）、L2 连续两次未解决后由主会话兜底）。");
     lines.push("");
-    lines.push("顶层主会话默认负责需求拆解、维护计划（plan_update / update_plan）、划清并发文件边界、通过 delegate_task 派单与验收，不亲自做常规调查/编码/测试/审查。同一问题 worker（L1）连续两次未解决时升级 worker-pro（L2）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
+    lines.push("顶层主会话默认负责需求拆解、维护计划（plan_update / update_plan）、划清并发文件边界、通过 delegate_task 派单与验收，不亲自做常规调查/编码/测试/审查。研发执行铁律：99% 的改码与实现任务一律首派 worker（L1，muse-wonder-full-1.0-contributor），严禁跳过 worker 直接首派 worker-pro；仅在同一问题 worker（L1）连续两次出错仍未解决时，才升级 worker-pro（L2，gpt-6-astra xhigh）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
     lines.push("");
     lines.push("派单时优先调用 subagent_resolve（或读取 ~/.t3/hub/subagents.json 及项目覆盖配置）查询实时路由，并在 title 或 clientRequestId 中标明具体角色 ID。派单前若项目有覆盖（项目 AGENTS.md 或 subagent_resolve / resolveSubagentRoute）以项目覆盖为准。首次派单前先调用一次 orchestrator_capabilities 确认当前能力。");
     lines.push("");
@@ -3410,7 +3410,10 @@ function createSubagentsManager(opts = {}) {
       if (!snap.missing) projects = readProject(canonical, snap);
     }
     const items = buildEffective(globals, projects).map(normalizeMemory);
-    const hints = (Array.isArray(idOrTitle) ? idOrTitle : [idOrTitle]).filter(x => typeof x === "string" && x.trim()).map(x => x.trim().toLowerCase());
+    const normalizeHintAlias = (raw) => raw
+      .replace(/^(?:wrok[-_ ]pro|work[-_ ]pro|woerk[-_ ]pro)(?=$|\s*[·:：|/]|(?:\s+-\s))/i, "worker-pro")
+      .replace(/^(?:wrok|work|woerk)(?=$|\s*[·:：|/]|(?:\s+-\s))/i, "worker");
+    const hints = (Array.isArray(idOrTitle) ? idOrTitle : [idOrTitle]).filter(x => typeof x === "string" && x.trim()).map(x => normalizeHintAlias(x.trim().toLowerCase()));
     let item;
     // An exact id/name wins over title prefixes; never infer a route from task prose.
     for (const hint of hints) {

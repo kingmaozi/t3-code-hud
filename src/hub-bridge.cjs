@@ -5,6 +5,15 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 
+// GUI launches do not inherit the user's shell PATH. Set this before loading
+// backend modules so every Dream subprocess sees the same executable search.
+process.env.PATH = [...new Set([
+  path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
+  "/opt/homebrew/bin", "/usr/local/bin",
+  ...(process.env.PATH || "").split(path.delimiter),
+  "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+].filter(Boolean))].join(path.delimiter);
+
 const watchPid = Number(process.env.T3_WATCH_PID || 0);
 const pluginDir = process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin");
 const runDir = path.join(pluginDir, "run");

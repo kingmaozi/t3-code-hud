@@ -35,7 +35,7 @@ function mountUi(hubRpc) {
     localStorage: { getItem: () => null, setItem() {} },
     setTimeout: () => 1, clearTimeout() {}, console,
   };
-  const testExpose = `if (opts.__testHarness) { root = opts.root; content = opts.content; return { state, cache, errors, onClick, onChange, resourceFilters, renderSkillList, renderMcpList, resourceMatches, agentActivationState, setProjectRoot(projectRoot) { state.projectRoot = projectRoot; contextVersion++; } }; }\n`;
+  const testExpose = `if (opts.__testHarness) { root = opts.root; content = opts.content; return { state, cache, errors, onClick, onChange, resourceFilters, renderSkillList, renderMcpList, resourceMatches, agentActivationState, setProjectRoot(projectRoot) { state.projectRoot = projectRoot; state.connected = true; contextLoading = false; state.threadId = "thread-a"; state.context = { threadId: "thread-a", projectRoot }; lastRoute = routeKey(); contextVersion++; } }; }\n`;
   const instrumented = drawerSource.replace("    const api = {", `    ${testExpose}    const api = {`);
   assert.notEqual(instrumented, drawerSource, "test hook anchor must exist");
   vm.runInNewContext(instrumented, context, { filename: "hub-drawer-ui.js" });

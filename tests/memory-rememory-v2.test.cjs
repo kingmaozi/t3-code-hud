@@ -409,7 +409,7 @@ test("memory drawer keeps the selected revision ID from history button through r
     items: item => item.history, memoryId: item => item.id, memoryDraftKey: id => id,
     state: { historyExpanded: {}, tab: "plugins" }, esc: String, icon: () => "", tr: zh => zh,
     button: (action, label, options) => { buttons.push(options.attrs); return `<button data-action="${action}" ${options.attrs}>${label}</button>`; },
-    memorySelection: () => "project", selectedMemoryRoot: () => "/sandbox/project", drafts: {},
+    memorySelection: () => "project", selectedMemoryRoot: () => "/sandbox/project", memoryWriteReady: () => true, drafts: {},
     busy: async (key, element, action) => action(), request: async (action, payload) => calls.push({ action, payload }),
     disposed: false, renderChrome: () => {}, toast: () => {},
     exactTimeMarkup: value => String(value || ""),

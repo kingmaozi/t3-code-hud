@@ -4541,8 +4541,14 @@ function createMemoryVault(opts = {}) {
   // Capability is deliberately a static PATH check: no help/login/version
   // process, authentication access or model request is performed here.
   function findDreamExecutable(provider) {
-    const searchPath = opts._dreamPath != null ? String(opts._dreamPath) : String(process.env.PATH || "");
-    for (const dir of searchPath.split(path.delimiter)) {
+    // Explicit test paths never fall back to the host's installed CLIs.
+    const dirs = opts._dreamPath != null ? String(opts._dreamPath).split(path.delimiter) : [
+      ...String(process.env.PATH || "").split(path.delimiter),
+      path.join(homeDir, ".local", "bin"), path.join(homeDir, ".t3", "bin"),
+      path.join(homeDir, ".codex", "packages", "standalone", "current", "bin"),
+      "/opt/homebrew/bin", "/usr/local/bin",
+    ];
+    for (const dir of new Set(dirs)) {
       if (!dir || !path.isAbsolute(dir)) continue;
       const executable = path.join(dir, provider);
       try {
@@ -4555,7 +4561,7 @@ function createMemoryVault(opts = {}) {
     const providers = DREAM_PROVIDERS.map((id) => {
       if (id === "local") return { id, status: "available", reason: "local-only", efforts: [] };
       if (id === "antigravity") return { id, status: "unsupported", reason: "no-compatible-adapter", efforts: [] };
-      if (id !== "muse") return { id, status: "unsupported", reason: "adapter-unverified", efforts: [] };
+      if (!["muse", "codex", "claude", "pi"].includes(id)) return { id, status: "unsupported", reason: "adapter-unverified", efforts: [] };
       const installed = Boolean(findDreamExecutable(id));
       return { id, status: installed ? "available" : "missing", reason: installed ? "auth-and-model-unverified" : "executable-not-found", efforts: DREAM_PROVIDER_EFFORTS[id] || [] };
     });
@@ -4648,7 +4654,7 @@ function createMemoryVault(opts = {}) {
     }
     if ("providerInstanceId" in p) {
       const v = String(p.providerInstanceId || "").toLowerCase();
-      if (!DREAM_PROVIDERS.includes(v)) return { ok: false, error: "invalid providerInstanceId (expected local|muse|codex|claude|antigravity|pi)" };
+      if (!DREAM_PROVIDERS.includes(v)) return { ok: false, error: "unsupported-provider" };
       next.providerInstanceId = v;
     }
     if ("model" in p) {
@@ -4677,7 +4683,7 @@ function createMemoryVault(opts = {}) {
       next.maxInputTokens = clampMaxInputTokens(n, current.maxInputTokens);
     }
     const changingAgent = ["dreamMode", "providerInstanceId", "reasoningEffort"].some((key) => key in p);
-    const unsupportedAgent = next.dreamMode === "agent" && next.providerInstanceId !== "muse";
+    const unsupportedAgent = next.dreamMode === "agent" && !["muse", "codex", "claude", "pi"].includes(next.providerInstanceId);
     const changedSelection = ["dreamMode", "providerInstanceId", "model", "reasoningEffort"].some((key) => key in p && next[key] !== current[key]);
     if (unsupportedAgent && (changedSelection || (next.enabled && !current.enabled))) return { ok: false, error: "unsupported-provider" };
     if (changingAgent && next.dreamMode === "agent" && !unsupportedAgent) {
@@ -5019,13 +5025,20 @@ function createMemoryVault(opts = {}) {
               try {
                 const prompt = fullPrompt;
                 const prov = String(providerInstanceId).toLowerCase();
-                if (prov !== "muse") throw new Error("unsupported-provider");
+                if (!["muse", "codex", "claude", "pi"].includes(prov)) throw new Error("unsupported-provider");
                 const cmd = findDreamExecutable(prov);
                 if (!cmd) throw new Error("executable-not-found");
-                const args = ["exec", "--model", model, "--reasoning-effort", reasoningEffort, "--preset", "empty", "--prompt-file", "", "--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--disable-request-user-input", "--no-foreign-personal-context", "--no-session-log", "--approval-mode", "never"];
+                const args = {
+                  muse: ["exec", "--model", model, "--reasoning-effort", reasoningEffort, "--preset", "empty", "--prompt-file", "", "--disable-write", "--disable-shell", "--disable-web-tools", "--disable-reminders", "--disable-request-user-input", "--no-foreign-personal-context", "--no-session-log", "--approval-mode", "never"],
+                  codex: ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-m", model, "-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`, "-c", "mcp_servers={}", "-"],
+                  // Keep Keychain OAuth available (no --bare), while disabling
+                  // user MCP servers and hooks as well as built-in tools.
+                  claude: ["-p", "--model", model, "--effort", reasoningEffort, "--output-format", "text", "--tools", "", "--no-session-persistence", "--permission-mode", "plan", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--settings", '{"disableAllHooks":true}'],
+                  pi: ["-p", "--model", model, "--thinking", reasoningEffort, "--no-tools", "--no-session", "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files"],
+                }[prov];
                 try {
                   // 纯异步非阻塞执行：await 让出事件循环，深睡等待期间 Node 仍可并发响应。
-                  const res = await runDreamAgentCli({ cmd, args, prompt, promptFile: true, timeoutMs: 60000, maxOutputBytes: 512 * 1024 });
+                  const res = await runDreamAgentCli({ cmd, args, prompt, promptFile: prov === "muse", timeoutMs: 60000, maxOutputBytes: 512 * 1024 });
                   const txt = String(res.stdout || "").trim();
                   // 截取首个 JSON
                   const m = txt.match(/\{[\s\S]*\}/);

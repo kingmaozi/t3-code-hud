@@ -17,7 +17,15 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const electron = require("electron");
+if (process.env) {
+  process.env.PATH = [...new Set([
+    path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
+    "/opt/homebrew/bin", "/usr/local/bin", ...(process.env.PATH || "").split(path.delimiter),
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+  ].filter(Boolean))].join(path.delimiter);
+}
 const BACKEND_PATH = path.join(__dirname, "backend.cjs");
 let backend = require(BACKEND_PATH);
 function reloadBackend() {
@@ -172,6 +180,48 @@ function getMainWindows() {
   });
 }
 
+let sidecarBridgePromise = null;
+async function ensureSidecarBridge() {
+  if (sidecarBridgePromise) return sidecarBridgePromise;
+  sidecarBridgePromise = (async () => {
+    const bridgeFile = path.join(HUD_RUN_DIR, "hub-bridge.json");
+    const readRecord = () => {
+      try { return JSON.parse(fs.readFileSync(bridgeFile, "utf8")); } catch { return null; }
+    };
+    const isOwnedLiveBridge = (b) => {
+      if (!b || !Number.isInteger(b.pid) || b.pid <= 0 || typeof b.url !== "string" || !b.url ||
+          typeof b.token !== "string" || !b.token || !(process.pid > 0) || Number(b.watchPid) !== process.pid) return false;
+      try { process.kill(b.pid, 0); return true; } catch { return false; }
+    };
+    const previous = readRecord();
+    if (isOwnedLiveBridge(previous)) return previous;
+    if (previous?.pid > 0 && Number(previous.watchPid) > 0 && Number(previous.watchPid) !== process.pid) {
+      let ownerDead = false;
+      try { process.kill(Number(previous.watchPid), 0); } catch { ownerDead = true; }
+      if (ownerDead) {
+        try { process.kill(previous.pid, "SIGTERM"); } catch {}
+        try { fs.unlinkSync(bridgeFile); } catch {}
+      }
+    }
+    const bridgePath = path.join(__dirname, "hub-bridge.cjs");
+    if (!fs.existsSync(bridgePath)) return null;
+    const child = spawn(process.execPath, [bridgePath], {
+      env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: __dirname, T3_WATCH_PID: String(process.pid) },
+      detached: true,
+      stdio: "ignore",
+    });
+    child.on("error", () => {});
+    child.unref();
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const b = readRecord();
+      if (isOwnedLiveBridge(b)) return b;
+    }
+    return null;
+  })().catch(() => null).finally(() => { sidecarBridgePromise = null; });
+  return sidecarBridgePromise;
+}
+
 async function injectHudIntoWindow(win, forceReload = false) {
   if (!win || win.isDestroyed() || isHelperWindow(win)) return false;
   const wc = win.webContents;
@@ -181,18 +231,37 @@ async function injectHudIntoWindow(win, forceReload = false) {
   if (!isMainT3Url(url)) return false;
 
   try {
+    if (typeof ensureSidecarBridge === "function") await ensureSidecarBridge();
+    let validBridge = null;
+    try {
+      const b = JSON.parse(fs.readFileSync(path.join(HUD_RUN_DIR, "hub-bridge.json"), "utf8"));
+      if (b && Number.isInteger(b.pid) && b.pid > 0 && typeof b.url === "string" && b.url && typeof b.token === "string" && b.token &&
+          process.pid > 0 && Number(b.watchPid) === process.pid) {
+        process.kill(b.pid, 0);
+        validBridge = { url: b.url, token: b.token };
+      }
+    } catch {}
     if (!forceReload) {
+      const bridgeMatches = validBridge
+        ? `window.__t3HubSidecarBridge?.url === ${JSON.stringify(validBridge.url)} && window.__t3HubSidecarBridge?.token === ${JSON.stringify(validBridge.token)}`
+        : "!window.__t3HubSidecarBridge";
       const alreadyMounted = await wc.executeJavaScript(
-        "Boolean(window.__t3HudInitialized && document.getElementById('t3-hud-topbar'))",
+        `Boolean(window.__t3HudInitialized && document.getElementById('t3-hud-topbar') && (${bridgeMatches}))`,
         true
       );
       if (alreadyMounted) return true;
     }
 
     let uiCode = fs.readFileSync(RENDERER_UI_PATH, "utf8");
-    const bootstrapCfg = httpFallbackConfig
+    // Installed bundles can carry another T3 process's old bridge header.
+    // Strip assignments, never use a bridge READ in the renderer as a guard.
+    uiCode = uiCode.replace(/^(?:window\.__t3HubSidecarBridge\s*=\s*[^\n]*|delete window\.__t3HubSidecarBridge;)\n?/gm, "");
+    let bootstrapCfg = httpFallbackConfig
       ? `window.__t3HudHttpConfig = ${JSON.stringify({ url: httpFallbackConfig.url, token: rpcToken })};\n`
       : "";
+    bootstrapCfg = (validBridge
+      ? `window.__t3HubSidecarBridge = ${JSON.stringify(validBridge)};\n`
+      : "delete window.__t3HubSidecarBridge;\n") + bootstrapCfg;
     // CSP-free path: append the drawer in the same payload instead of
     // relying on a later (0, eval), which script-src blocks in t3code://app.
     if (!uiCode.includes("__T3_HUB_DRAWER_EMBED_START__")) {
@@ -448,6 +517,7 @@ if (electron.app) {
 
   electron.app.whenReady().then(async () => {
     await startLoopbackFallbackServer();
+    await ensureSidecarBridge();
     registerIpcAndPreload();
     for (const win of electron.BrowserWindow.getAllWindows()) {
       attachWindowHooks(win);

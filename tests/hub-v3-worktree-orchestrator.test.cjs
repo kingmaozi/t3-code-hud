@@ -267,7 +267,7 @@ describe("hub-subagents orchestration Carbon/Argon + /swarm", () => {
     assert.equal(explorer.effort, "max");
     const workerPro = list.globalItems.find((i) => i.id === "worker-pro");
     assert.equal(workerPro.providerInstanceId, "codex");
-    assert.equal(workerPro.model, "gpt-6.1-sol");
+    assert.equal(workerPro.model, "gpt-6-astra");
     assert.equal(workerPro.effort, "xhigh");
     const codeReview = list.globalItems.find((i) => i.id === "code-review");
     assert.equal(codeReview.providerInstanceId, "codex");
