@@ -17,16 +17,34 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 let vaultMod = null;
-for (const cand of [
-  "../src/memory-vault.cjs",
-  "../memory-vault.cjs",
-  "../hud-plugin/memory-vault.cjs",
-  path.join(process.env.HOME || os.homedir(), ".t3", "hud-plugin", "memory-vault.cjs"),
-]) {
-  try { vaultMod = require(cand); if (vaultMod) break; } catch {}
+let vaultModuleLoaded = false;
+function getVaultModule() {
+  if (vaultModuleLoaded) return vaultMod;
+  vaultModuleLoaded = true;
+  for (const cand of [
+    "../src/memory-vault.cjs",
+    "../memory-vault.cjs",
+    "../hud-plugin/memory-vault.cjs",
+    path.join(process.env.HOME || os.homedir(), ".t3", "hud-plugin", "memory-vault.cjs"),
+  ]) {
+    try { vaultMod = require(cand); if (vaultMod) break; } catch {}
+  }
+  if (!vaultMod) throw new Error("Cannot locate memory-vault.cjs (run install.sh first)");
+  return vaultMod;
 }
-if (!vaultMod) throw new Error("Cannot locate memory-vault.cjs (run install.sh first)");
-const { createMemoryVault } = vaultMod;
+
+function defaultAccessManager() {
+  for (const cand of [
+    "../src/hub-memory-access.cjs",
+    "../hub-memory-access.cjs",
+    "../hud-plugin/hub-memory-access.cjs",
+    path.join(process.env.HOME || os.homedir(), ".t3", "hud-plugin", "hub-memory-access.cjs"),
+  ]) {
+    try { return require(cand).createMemoryAccessManager(); }
+    catch (error) { if (error?.code !== "MODULE_NOT_FOUND") throw error; }
+  }
+  return null;
+}
 
 function parseCliArgs(argv) {
   const [subcommand, ...rest] = argv;
@@ -60,6 +78,14 @@ function toTags(raw) {
     .filter(Boolean);
 }
 
+function agentWriteTags(raw) {
+  const tags = toTags(raw);
+  if (tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase()))) {
+    throw new Error("reserved tags pinned/core are human-only and cannot be assigned by Agent writes");
+  }
+  return tags;
+}
+
 function truncate(s, n) {
   const x = String(s || "").trim();
   return x.length > n ? x.slice(0, n) : x;
@@ -72,7 +98,7 @@ function buildVault(flags) {
   if (flags["hub-dir"]) opts.hubDir = String(flags["hub-dir"]);
   if (flags["embed-url"]) opts.embeddingUrl = String(flags["embed-url"]);
   else if (process.env.T3_EMBED_URL) opts.embeddingUrl = process.env.T3_EMBED_URL;
-  return createMemoryVault(opts);
+  return getVaultModule().createMemoryVault(opts);
 }
 
 export async function main(options = {}) {
@@ -86,6 +112,8 @@ export async function main(options = {}) {
       return 0;
     }
     const { subcommand, flags } = parseCliArgs(argv);
+    const access = options.accessManager || defaultAccessManager();
+    if (!access || !access.isAccessEnabled()) throw new Error("T3 Hub Memory agent access is disabled or unavailable");
     const projectRoot = (flags.root || flags.project) ? path.resolve(String(flags.root || flags.project)) : process.cwd();
     const vault = options.vault || buildVault(flags);
     if (subcommand === "consolidate") {
@@ -119,14 +147,16 @@ export async function main(options = {}) {
       if (!text.trim()) throw new Error("缺少必填字段 text");
       const description = flags.description ? String(flags.description) : "";
       const title = description.trim() ? description.trim() : truncate(text, 80);
+      const tags = agentWriteTags(flags.tags);
       const res = vault.saveMemory({
         projectRoot,
         kind,
         title,
         content: text,
         agent: flags.agent ? String(flags.agent) : "user",
-        tags: toTags(flags.tags),
+        tags,
         supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
+        rejectProtectedSupersedes: true,
       });
       if (!res.ok) throw new Error(res.error || "rule failed");
       stdout(`Vault rule slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);
@@ -153,6 +183,7 @@ export async function main(options = {}) {
         outcome = outcome0 + `（验收核对：${String(flags.condition).trim()}）`;
       }
       const title = truncate(lesson, 80) || truncate(situation, 80);
+      const tags = agentWriteTags(flags.tags);
       const parts = [];
       if (situation) parts.push("情境：" + situation);
       if (action) parts.push("动作：" + action);
@@ -165,8 +196,9 @@ export async function main(options = {}) {
         title,
         content: parts.join("\n\n"),
         agent: flags.agent ? String(flags.agent) : "user",
-        tags: toTags(flags.tags),
+        tags,
         supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
+        rejectProtectedSupersedes: true,
       });
       if (!res.ok) throw new Error(res.error || "experience failed");
       stdout(`Vault experience slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);
@@ -179,6 +211,7 @@ export async function main(options = {}) {
       if (!title.trim()) title = truncate(content.split("\n")[0], 80);
       const module = flags.module ? String(flags.module) : undefined;
       const kind = flags.kind ? String(flags.kind) : undefined;
+      const tags = agentWriteTags(flags.tags);
       const res = vault.saveMemory({
         projectRoot,
         module,
@@ -186,8 +219,9 @@ export async function main(options = {}) {
         title: title.trim(),
         content,
         agent: flags.agent ? String(flags.agent) : "user",
-        tags: toTags(flags.tags),
+        tags,
         supersedesId: flags.supersedes ? String(flags.supersedes) : undefined,
+        rejectProtectedSupersedes: true,
       });
       if (!res.ok) throw new Error(res.error || "write failed");
       stdout(`Vault write slug=${res.item.projectSlug} id=${res.item.id} created=${!res.deduplicated}\n`);

@@ -7,7 +7,6 @@ const { spawn } = require("node:child_process");
 const http = require("node:http");
 const https = require("node:https");
 const crypto = require("node:crypto");
-
 const HOME_DIR = process.env.HOME || os.homedir();
 const HUB_DIR = process.env.T3_HUB_DIR || path.join(HOME_DIR, ".t3", "hub");
 const STATE_PATH = path.join(HUB_DIR, "state.json");
@@ -16,15 +15,38 @@ const SCHEMA_CACHE_PATH = path.join(HUB_DIR, "mcp-schema-cache.json");
 const IDLE_MS = 3 * 60 * 1000;
 const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 const SKILL_READ_MAX_BYTES = 64 * 1024;
+let memoryAccess = null;
+for (const cand of [
+  process.env.T3_HUB_MEMORY_ACCESS ? path.resolve(process.env.T3_HUB_MEMORY_ACCESS) : null,
+  path.join(__dirname, "..", "src", "hub-memory-access.cjs"),
+  path.join(__dirname, "..", "hud-plugin", "hub-memory-access.cjs"),
+  path.join(HOME_DIR, ".t3", "hud-plugin", "hub-memory-access.cjs"),
+].filter(Boolean)) {
+  try { memoryAccess = require(cand).createMemoryAccessManager({ homeDir: HOME_DIR, hubDir: HUB_DIR, userDataDir: process.env.T3CODE_HOME || path.join(HOME_DIR, ".t3", "userdata") }); break; } catch {}
+}
+const MEMORY_ONLY_MODE = process.argv.includes("--memory-only");
+
+function memoryAccessStatus() {
+  try { return memoryAccess ? memoryAccess.readMemoryOnlyStatus() : { ok: false, enabled: false, state: "unknown", serverVersion: "1", vaultAvailable: false }; }
+  catch { return { ok: false, enabled: false, state: "unknown", serverVersion: "1", vaultAvailable: false }; }
+}
+function agentMemoryEnabled() { return memoryAccessStatus().state === "enabled"; }
+function isMemoryTool(name) { return typeof name === "string" && name.startsWith("memory_") && name !== "memory_status"; }
 
 let memoryVault = null;
-for (const cand of [
-  process.env.T3_MEMORY_VAULT ? path.resolve(process.env.T3_MEMORY_VAULT) : null,
-  path.join(__dirname, "..", "src", "memory-vault.cjs"),
-  path.join(__dirname, "..", "hud-plugin", "memory-vault.cjs"),
-  path.join(HOME_DIR, ".t3", "hud-plugin", "memory-vault.cjs"),
-].filter(Boolean)) {
-  try { memoryVault = require(cand); if (memoryVault) break; } catch {}
+let memoryVaultLoaded = false;
+function getMemoryVault() {
+  if (memoryVaultLoaded) return memoryVault;
+  memoryVaultLoaded = true;
+  for (const cand of [
+    process.env.T3_MEMORY_VAULT ? path.resolve(process.env.T3_MEMORY_VAULT) : null,
+    path.join(__dirname, "..", "src", "memory-vault.cjs"),
+    path.join(__dirname, "..", "hud-plugin", "memory-vault.cjs"),
+    path.join(HOME_DIR, ".t3", "hud-plugin", "memory-vault.cjs"),
+  ].filter(Boolean)) {
+    try { memoryVault = require(cand); if (memoryVault) break; } catch {}
+  }
+  return memoryVault;
 }
 
 function readJson(p, fb) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fb; } }
@@ -298,20 +320,58 @@ function enabledServers() {
   return { servers: out, projectRoot };
 }
 function vaultFn(...names) {
-  if (!memoryVault) return null;
-  for (const n of names) if (typeof memoryVault[n] === "function") return (...a) => memoryVault[n](...a);
+  const vault = getMemoryVault();
+  if (!vault) return null;
+  for (const n of names) if (typeof vault[n] === "function") return (...a) => vault[n](...a);
   return null;
 }
 const vaultSearch = memoizeVault(["search", "memorySearch", "memory_search", "recall", "listMemories"]);
+function compactMemorySearchItem(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+  const { history, ...current } = item;
+  return current;
+}
+function compactMemorySearchResult(result) {
+  if (Array.isArray(result)) return result.map(compactMemorySearchItem);
+  if (!result || typeof result !== "object") return result;
+  if (Array.isArray(result.items)) return { ...result, items: result.items.map(compactMemorySearchItem) };
+  // Preserve legacy vault adapters that return MCP text-wrapped JSON while
+  // keeping search and explicit memory_read revision history separate.
+  if (Array.isArray(result.content)) {
+    let changed = false;
+    const content = result.content.map((entry) => {
+      if (!entry || typeof entry.text !== "string") return entry;
+      try {
+        const decoded = JSON.parse(entry.text);
+        const compact = compactMemorySearchResult(decoded);
+        if (compact === decoded) return entry;
+        changed = true;
+        return { ...entry, text: JSON.stringify(compact) };
+      } catch { return entry; }
+    });
+    return changed ? { ...result, content } : result;
+  }
+  return result;
+}
 const vaultRead = (...args) => {
+  const memoryVault = getMemoryVault();
   const fn = vaultFn("read", "memoryRead", "memory_read");
   if (fn) return fn(...args);
   if (memoryVault && typeof memoryVault.listMemories === "function") {
     const a = args[0] || {};
-    const res = memoryVault.listMemories({ projectRoot: a.projectRoot, module: a.module || "all", includeGlobal: true, limit: 200 });
+    const listArgs = { projectRoot: a.projectRoot, module: a.module || "all", includeGlobal: a.includeGlobal !== false, id: a.id, scope: a.scope, scopeFilter: a.scopeFilter };
+    const res = memoryVault.listMemories({ ...listArgs, limit: a.id ? 1 : 200 });
     if (a.id && res && Array.isArray(res.items)) {
       const found = res.items.find((it) => it.id === a.id);
-      return { ok: Boolean(found), item: found || null };
+      if (found) return { ok: true, projectSlug: res.projectSlug, item: found };
+      // Older adapters may ignore the new id filter. Retry within the same
+      // bounded project/scope listing so existing adapters remain compatible.
+      const { id, ...legacyArgs } = listArgs;
+      const legacy = memoryVault.listMemories({ ...legacyArgs, limit: 200 });
+      const legacyFound = legacy && Array.isArray(legacy.items)
+        ? legacy.items.find((it) => it.id === a.id)
+        : null;
+      return { ok: Boolean(legacyFound), projectSlug: legacy && legacy.projectSlug || res.projectSlug, item: legacyFound || null };
     }
     return res;
   }
@@ -357,16 +417,16 @@ function memoizeVault(names) {
   };
 }
 function memoryTools() {
-  const tools = [];
-  if (memoryVault) {
-    tools.push(
+  const tools = [
+    { name: "memory_status", description: "Report whether Agent memory access is enabled and whether a local vault already exists. This does not initialize or create the vault.", inputSchema: { type: "object", properties: {} } },
+  ];
+  tools.push(
       { name: "memory_search", description: "Search shared project memory (rules, pitfalls, decisions).", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, includeGlobal: { type: "boolean" }, limit: { type: "number" }, scope: { type: "string", enum: ["shared", "worktree", "global"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "global", "all"] }, projectRoot: { type: "string" } }, required: ["query"] } },
       { name: "memory_read", description: "Read a memory module entry.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" }, projectRoot: { type: "string" } } } },
-      { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint. Pinned is human-only: agent-supplied pinned is always stripped to false.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" }, pinned: { type: "boolean" }, scope: { type: "string", enum: ["shared", "worktree", "global"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "global", "all"] }, projectRoot: { type: "string" } }, required: ["module", "title", "content"] } },
-      { name: "memory_consolidate", description: "Consolidate overlapping project memories, or preview candidate pairs with dryRun.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string" }, dryRun: { type: "boolean" } } } },
-      { name: "memory_rollback", description: "Roll back an evolved memory item to a previous version from its history.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string" } }, required: ["id"] } },
-    );
-  }
+      { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint. Pinned/core tags and entries are human-only: agents cannot create, auto-evolve, supersede, or explicitly edit them; use the Hub UI for human edits.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" }, pinned: { type: "boolean" }, scope: { type: "string", enum: ["shared", "worktree", "global"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "global", "all"] }, projectRoot: { type: "string" } }, required: ["module", "title", "content"] } },
+      { name: "memory_consolidate", description: "Consolidate overlapping unprotected project memories, or preview candidate pairs with dryRun. Pinned/core and secret-bearing entries are always excluded.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string" }, dryRun: { type: "boolean" } } } },
+      { name: "memory_rollback", description: "Roll back an unprotected memory item to a previous version from its history. Pinned/core entries require an explicit human rollback from the Hub UI.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string" } }, required: ["id"] } },
+  );
   if (hubSubagentsMod && typeof hubSubagentsMod.resolveSubagentRoute === "function") {
     tools.push({ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } });
   }
@@ -722,9 +782,18 @@ function writeResponse(res, framed) {
   }
 }
 async function handleToolsList() {
+  const enabled = agentMemoryEnabled();
+  const memoryOnlyTools = memoryTools().filter((tool) => {
+    if (tool.name === "memory_status" || tool.name === "plan_update") return true;
+    return enabled && isMemoryTool(tool.name);
+  });
+  if (MEMORY_ONLY_MODE) return { tools: memoryOnlyTools };
   const { servers, projectRoot } = enabledServers();
-  const tools = [];
-  for (const t of memoryTools()) tools.push(t);
+  const tools = memoryTools().filter((tool) => {
+    if (tool.name === "memory_status" || tool.name === "plan_update") return true;
+    if (isMemoryTool(tool.name) || tool.name === "context_search") return enabled;
+    return true;
+  });
   const lazy = servers.filter((s) => s.mode === "project-lazy" || s.mode === "global-lazy");
   const direct = servers.filter((s) => s.mode === "project-direct" || s.mode === "global-direct");
   if (lazy.length) { tools.push(HUB_LIST_DEF, HUB_CALL_DEF); }
@@ -739,28 +808,41 @@ async function handleToolsList() {
 async function handleToolsCall(params) {
   const name = params?.name;
   const args = params?.arguments || {};
+  if (MEMORY_ONLY_MODE && name !== "memory_status" && name !== "plan_update" && !isMemoryTool(name)) {
+    throw new Error("tool unavailable in memory-only mode");
+  }
+  if (name === "memory_status") {
+    return { content: [{ type: "text", text: JSON.stringify(memoryAccessStatus()) }] };
+  }
+  if ((isMemoryTool(name) || name === "context_search") && !agentMemoryEnabled()) {
+    throw new Error("Agent memory access is disabled or unavailable");
+  }
   if (name === "memory_search") {
-    if (!memoryVault) throw new Error("memory-vault not available");
+    if (!getMemoryVault()) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultSearch({ projectRoot, query: args.query, module: args.module, includeGlobal: args.includeGlobal !== false, limit: args.limit, scope: args.scope, scopeFilter: args.scopeFilter });
+    const res = compactMemorySearchResult(await vaultSearch({ projectRoot, query: args.query, module: args.module, includeGlobal: args.includeGlobal !== false, limit: args.limit, scope: args.scope, scopeFilter: args.scopeFilter }));
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "memory_read") {
-    if (!memoryVault) throw new Error("memory-vault not available");
+    if (!getMemoryVault()) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
     const res = await vaultRead({ projectRoot, module: args.module, id: args.id });
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "memory_write") {
-    if (!memoryVault) throw new Error("memory-vault not available");
+    if (!getMemoryVault()) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
     // Pin Shield (Runelay security model): pinned memories get permanent
     // high-priority injection into every agent. Only a human in the Hub UI
     // may set them. Agent-supplied pinned:true from web/issue injection is
     // always stripped to false so an attacker cannot plant an immortal memory.
-    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent, supersedesId: args.supersedesId, autoEvolve: args.autoEvolve, pinned: false, scope: args.scope, scopeFilter: args.scopeFilter });
+    const reservedTags = Array.isArray(args.tags) && args.tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase()));
+    if (reservedTags) {
+      return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "pinned/core tags are human-only" }) }] };
+    }
+    const res = await vaultWrite({ projectRoot, module: args.module, title: args.title, content: args.content, kind: args.kind, tags: args.tags, agent: args.agent, supersedesId: args.supersedesId, autoEvolve: args.autoEvolve, pinned: false, rejectProtectedSupersedes: true, scope: args.scope, scopeFilter: args.scopeFilter });
     if (res && Array.isArray(res.content)) return res;
     return { content: [{ type: "text", text: JSON.stringify(res ?? true) }] };
   }
@@ -771,7 +853,7 @@ async function handleToolsCall(params) {
     const projectRoot = args.projectRoot || resolveProjectRoot();
     const startedAt = Date.now();
     let memories = [];
-    if (memoryVault) {
+    if (getMemoryVault()) {
       try {
         const res = await vaultSearch({ projectRoot, query, module: args.module, includeGlobal: true, limit, scope: args.scope, scopeFilter: args.scopeFilter });
         if (res && Array.isArray(res.items)) memories = res.items;
@@ -826,15 +908,15 @@ async function handleToolsCall(params) {
     return { content: [{ type: "text", text: JSON.stringify({ slug: skill.id, relativePath, path: target, content, truncated, size }) }] };
   }
   if (name === "memory_consolidate") {
-    if (!memoryVault) throw new Error("memory-vault not available");
+    if (!getMemoryVault()) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultConsolidate({ projectRoot, projectSlug: args.projectSlug, dryRun: args.dryRun });
+    const res = await vaultConsolidate({ projectRoot, projectSlug: args.projectSlug, dryRun: args.dryRun, excludeProtected: true });
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "memory_rollback") {
-    if (!memoryVault) throw new Error("memory-vault not available");
+    if (!getMemoryVault()) throw new Error("memory-vault not available");
     const projectRoot = args.projectRoot || resolveProjectRoot();
-    const res = await vaultRollback({ projectRoot, projectSlug: args.projectSlug, id: args.id, targetVersion: args.targetVersion, revisionId: args.revisionId });
+    const res = await vaultRollback({ projectRoot, projectSlug: args.projectSlug, id: args.id, targetVersion: args.targetVersion, revisionId: args.revisionId, rejectProtectedRollback: true });
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "plan_update") {

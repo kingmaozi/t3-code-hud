@@ -1098,6 +1098,7 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
       branch: null,
       gitConfig: "[core]\n\trepositoryformatversion = 0\n",
       gitHead: "ref: refs/heads/main\n",
+      resolvedHeadSha: SHA2,
       packedRefs: `${SHA2} refs/heads/main\n`,
       headLog,
       vcsRefs: [{ sha: SHA1, ref: "refs/heads/feature-x" }],
@@ -1122,6 +1123,105 @@ describe("Fix C: remote Git bundle (getRemoteGitGraph / getRemoteCommitDetail)",
     assert.ok(g.commits[1].refs.some((r) => r.label === "feature-x"), JSON.stringify(g.commits[1].refs));
     assert.equal(g.workingTree.total, 2);
     assert.equal(g.dirtyCount, 2);
+  });
+
+  it("marks the exact symbolic branch ref as HEAD after a checkout entry", async () => {
+    const mainSha = "c".repeat(40), featureSha = "d".repeat(40);
+    const reflog = [
+      `${ZERO} ${mainSha} Jane Doe <jane@example.com> ${nowSec - 7200} +0000\tcommit (initial): main work`,
+      `${mainSha} ${featureSha} Jane Doe <jane@example.com> ${nowSec - 3600} +0000\tcommit: feature work`,
+      `${featureSha} ${mainSha} Jane Doe <jane@example.com> ${nowSec - 1800} +0000\tcheckout: moving from feature to main`,
+    ].join("\n") + "\n";
+    const g = await backend.getRemoteGitGraph({
+      cwd: "/remote/myrepo",
+      gitHead: "ref: refs/heads/main\n",
+      resolvedHeadSha: mainSha,
+      packedRefs: `${mainSha} refs/heads/main\n${featureSha} refs/heads/feature\n`,
+      headLog: reflog,
+    });
+    assert.equal(g.ok, true);
+    const main = g.commits.find((commit) => commit.hash === mainSha);
+    const feature = g.commits.find((commit) => commit.hash === featureSha);
+    assert.ok(main?.refs.some((ref) => ref.isHead), JSON.stringify(main?.refs));
+    assert.equal(feature?.refs.some((ref) => ref.isHead), false, JSON.stringify(feature?.refs));
+  });
+
+  it("uses only a verified loose branch SHA and never trusts a stale packed ref", async () => {
+    const mainSha = "c".repeat(40), featureSha = "d".repeat(40);
+    const reflog = [
+      `${ZERO} ${mainSha} Jane Doe <jane@example.com> ${nowSec - 7200} +0000\tcommit (initial): main work`,
+      `${mainSha} ${featureSha} Jane Doe <jane@example.com> ${nowSec - 3600} +0000\tcommit: feature work`,
+    ].join("\n") + "\n";
+    const bundle = {
+      cwd: "/remote/myrepo",
+      gitHead: "ref: refs/heads/main\n",
+      resolvedHeadSha: mainSha,
+      packedRefs: `${featureSha} refs/heads/feature\n${featureSha} refs/heads/main\n`,
+      headLog: reflog,
+    };
+    const verified = await backend.getRemoteGitGraph(bundle);
+    const verifiedMain = verified.commits.find((commit) => commit.hash === mainSha);
+    assert.ok(verifiedMain?.refs.some((ref) => ref.isHead));
+    assert.ok(verifiedMain?.refs.some((ref) => ref.label === "main"));
+    assert.equal(verified.commits.find((commit) => commit.hash === featureSha)?.refs.some((ref) => ref.isHead), false);
+    assert.equal(verified.commits.find((commit) => commit.hash === featureSha)?.refs.some((ref) => ref.label === "main"), false);
+
+    const unresolved = await backend.getRemoteGitGraph({
+      ...bundle,
+      resolvedHeadSha: null,
+      packedRefs: `${featureSha} refs/heads/main\n`,
+      nativeCommits: [{ hash: featureSha, subject: "feature work", parents: [mainSha] }],
+      nativeHistoryTruncated: true,
+    });
+    assert.equal(unresolved.commits[0].refs.some((ref) => ref.isHead), false, JSON.stringify(unresolved.commits[0].refs));
+    assert.equal(unresolved.commits[0].refs.some((ref) => ref.label === "main"), false, JSON.stringify(unresolved.commits[0].refs));
+  });
+
+  it("detached HEAD preserves real branch refs without attaching stale branch hints", async () => {
+    const detached = "d".repeat(40), main = "e".repeat(40);
+    const graph = await backend.getRemoteGitGraph({
+      cwd: "/remote/detached-checkout",
+      gitConfig: "",
+      gitHead: detached + "\n",
+      branch: "main",
+      vcsStatus: { refName: "main" },
+      packedRefs: `${main} refs/heads/main\n`,
+      branchCommits: { commits: [
+        { sha: detached, subject: "detached commit", committedAt: "2026-01-02T00:00:00Z" },
+        { sha: main, subject: "branch tip", committedAt: "2026-01-01T00:00:00Z" },
+      ] },
+    });
+    assert.equal(graph.ok, true);
+    assert.equal(graph.branch, null);
+    assert.equal(graph.commits.find(c => c.hash === detached).refs.some(r => r.isHead), true);
+    assert.equal(graph.commits.find(c => c.hash === detached).refs.some(r => r.label === "main"), false);
+    assert.equal(graph.commits.find(c => c.hash === main).refs.some(r => r.label === "main"), true);
+  });
+
+  it("merges short reflog tips with the available branch history without inventing parents", async () => {
+    const tip = "e".repeat(40), middle = "f".repeat(40), base = "1".repeat(40);
+    const reflog = `${ZERO} ${tip} Jane Doe <jane@example.com> ${nowSec - 60} +0000\tcommit (initial): imported work\n`;
+    const g = await backend.getRemoteGitGraph({
+      cwd: "/remote/clone-with-short-reflog",
+      gitHead: "ref: refs/heads/main\n",
+      resolvedHeadSha: tip,
+      packedRefs: `${tip} refs/heads/main\n`,
+      headLog: reflog,
+      branchCommits: [
+        { sha: tip, subject: "imported work", parents: [middle] },
+        { sha: middle, subject: "older work", parents: [base] },
+        { sha: base, subject: "base work" },
+      ],
+    });
+
+    assert.equal(g.ok, true, JSON.stringify(g));
+    assert.equal(g.commits.length, 3);
+    assert.deepEqual(g.commits.map((commit) => commit.hash), [tip, middle, base]);
+    assert.deepEqual(g.commits[0].parents, [middle]);
+    assert.deepEqual(g.commits[1].parents, [base]);
+    assert.deepEqual(g.commits[2].parents, []);
+    assert.ok(g.commits[0].refs.some((ref) => ref.isHead));
+    assert.equal(g.commits.filter((commit) => commit.hash === tip).length, 1);
   });
 
   it("github remote URL is extracted; unreachable API falls back to local history", async () => {

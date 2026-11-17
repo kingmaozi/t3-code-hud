@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
+const { TextEncoder } = require("node:util");
 const { createHostSettingsManager, CODEX_EDITABLE_KEYS, MUSE_KEYS, PI_KEYS } = require("../src/hub-host-settings.cjs");
 
 const repo = path.resolve(__dirname, "..");
@@ -21,7 +23,7 @@ function node() {
     setAttribute: (key, value) => attrs.set(key, String(value)), getAttribute: (key) => attrs.get(key) ?? null, removeAttribute: (key) => attrs.delete(key),
     getClientRects: () => [{ width: 200, height: 30 }], getBoundingClientRect: () => ({ left: 100, right: 700, top: 600, bottom: 720, width: 600, height: 120 }),
     appendChild(child) { child.parentElement = this; this.children.push(child); this.lastElementChild = child; },
-    closest: () => null, matches: () => false, addEventListener() {}, removeEventListener() {}, remove() {},
+    closest: () => null, matches: () => false, addEventListener() {}, removeEventListener() {}, remove() { this.removed = true; },
     classList: { add: (s) => classes.add(s), remove: (s) => classes.delete(s), toggle(s, on) { on ? classes.add(s) : classes.delete(s); }, contains: (s) => classes.has(s) },
     querySelector: () => null, querySelectorAll: () => [], contains: () => false,
   };
@@ -43,34 +45,493 @@ function harness(rpc = async () => ({}), environment = {}) {
     innerWidth: environment.innerWidth ?? 1280, innerHeight: environment.innerHeight ?? 800, getComputedStyle: () => ({ visibility: "visible" }),
     CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     localStorage: environment.localStorage || { getItem: () => null, setItem() {} },
-    setTimeout: () => 1, clearTimeout() {}, console,
+    setTimeout: () => 1, clearTimeout() {}, console, crypto: webcrypto, TextEncoder,
   };
   const expose = `if (opts.__testHarness) {
     root = opts.root; content = opts.content;
-    handle = root.querySelector("#t3-hub-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board"); palette = root.querySelector("#t3-hub-slash-palette");
+    handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings,
-      onInput, onChange, onClick, onEditorKeydown, renderMemoryList, renderHooks, renderSkillList, renderMcpList, renderDream, saveDream, saveDreamEngine, runDream,
+      onInput, onChange, onClick, onEditorKeydown, renderMemory, renderMemoryConnections, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
       renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
-      composerToken, composerSurface, positionSlash, closeSlash, selectSlash, onComposerInput, onComposerKeydown,
-      findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory, renderDream,
+      composerSurface, findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory,
       refreshContext, routeHint, routeKey, boardMismatch, projectContextReady, syncOcclusion,
-      runImport, setSkillScope, saveMcpMode, primeCatalogs, parseScopeParts,
+      findConversationTitleAnchor, placePlanHandle, handlePlanPointerDown, handlePlanPointerEnter, handlePlanPointerLeave, handlePlanClick, setPlanPopover,
+      normalizeRemoteThreadPlan, normalizeRemotePlanMirror, newestRemotePlan, planMirrorRelativePath, remotePlanEnvironmentId, remotePlanContextReady, resetProjectData,
+      switchTab,
+      runImport, setSkillScope, saveMcpMode, renderChrome, renderTab, parseScopeParts,
+      renderMemoryAgentAccess, setMemoryAgentAccess, runMemorySetup, copyMemorySetupPrompt, renderMemoryRuntime, memoryMcpConfigText, copyMemoryMcpConfig, refreshMemoryAgentAccess, openMemoryFromTitle, toggleMemoryAccessFromTitle, renderMemoryTitleControls,
+      planStepProgress,
       saveMemory, deleteMemory, promoteMemory, consolidateMemory, rollbackMemory,
       isContextLoading: () => contextLoading,
-      onDreamToggle: typeof onDreamToggle === "function" ? onDreamToggle : undefined,
       snapshot: ${drawerSource.match(/snapshot: (.*),\n destroy:/)[1]}, ready: () => { contextLoading = false; },
       setCurrentRoute: () => { lastRoute = routeKey(); lastBoardRoute = boardScopeRoute(); },
       routeScope: () => ({ cached: lastBoardRoute, current: boardScopeRoute() }),
-      setSlash: (session) => { slashSession = session; }, getSlash: () => slashSession,
-      setStyle: (fn) => { getComputedStyle = fn; }};
+      titleControls, memoryHandle, memoryToggle,
+      setStyle: (fn) => { getComputedStyle = fn; }, destroy: () => { disposed = true; liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); }};
   }`;
   vm.runInNewContext(drawerSource.replace("    const api = {", expose + "\n    const api = {"), sandbox, { filename: "hub-drawer-ui.js" });
   const ui = sandbox.window.__t3MountSidecarHub({ __testHarness: true, root, content, hubRpc: rpc });
   if (!sandbox.document.body) sandbox.document.body = node();
   return { ...ui, root, content, nodes, sandbox };
 }
+
+test("Hub exposes only the lightweight memory workspace", () => {
+  const ui = harness();
+  ui.renderChrome();
+  const nav = ui.root.querySelector(".hub-tabs").innerHTML;
+  assert.deepEqual([...nav.matchAll(/data-tab="([^"]+)"/g)].map((match) => match[1]), ["memory"]);
+  assert.match(nav, /记忆/);
+  assert.doesNotMatch(nav, /个性化|子智能体|技能与 MCP|插件|Hooks/);
+});
+
+test("legacy Hub tabs migrate to memory without deleting saved data", () => {
+  for (const legacyTab of ["skills", "mcp", "plugins", "hooks", "agents", "settings", "subagents", "board"]) {
+    const writes = [];
+    const ui = harness(async () => ({}), { localStorage: { getItem: (key) => key === "t3-hub-tab" ? legacyTab : null, setItem: (...args) => writes.push(args) } });
+    assert.equal(ui.state.tab, "memory", `${legacyTab} page is migrated`);
+    assert.ok(writes.some(([key, value]) => key === "t3-hub-tab" && value === "memory"));
+  }
+});
+
+test("opening memory reads local access and vector status without Dream or hidden catalogs", async () => {
+  const calls = [];
+  const ui = harness(async action => { calls.push(action); return { items: [], agents: [] }; });
+  ui.ready();
+  Object.assign(ui.state, { open: true, connected: true, projectRoot: "/fixture" });
+  await ui.loadTab();
+  assert.ok(calls.includes("memory:connections"));
+  assert.ok(calls.includes("memory:agentAccess:get"));
+  assert.ok(calls.includes("memory:list"));
+  assert.ok(calls.includes("memory:overview"));
+  assert.ok(calls.includes("memory:worktreeInfo"));
+  assert.ok(calls.includes("embed:status"), "the memory page reads actual model and service status");
+  assert.doesNotMatch(calls.join(" "), /mcp:list|skills:list|plugins:list|hooks:list|subagents:list|memory:dream|memory:health|embed:switch|download|restart|orchestration/);
+  ui.renderMemory();
+  assert.doesNotMatch(ui.content.innerHTML, /AutoDream|梦境|自动整理计划|memory:dream/);
+});
+
+test("local memory onboarding reports pending providers without claiming setup, and disable keeps memories", async () => {
+  const calls = [], setupSummary = {
+    configured: 1, missing: 0, conflict: 0, unsupported: 0, unknown: 0, pending: 1, runtime: "unverified",
+    providers: [
+      { instanceId: "codex", displayName: "Codex", status: "configured" },
+      { instanceId: "agy", displayName: '<img src=x onerror=alert(1)>', status: "pending", reason: "agy_native_helper_compatibility" },
+    ],
+  };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "memory:agentAccess:get") return { ok: true, enabled: false, state: "disabled", setupSummary };
+    if (action === "memory:setup") return { ok: false, enabled: true, state: "enabled", setupSummary };
+    if (action === "memory:agentAccess:set") return { ok: true, enabled: false, state: "disabled", setupSummary };
+    if (action === "memory:list") return { items: [{ id: "keep", title: "Existing local note", content: "Retain this memory" }] };
+    return {};
+  });
+  ui.ready(); Object.assign(ui.state, { open: true, connected: true, projectRoot: "/fixture" });
+  await ui.loadTab();
+  ui.renderMemory();
+  let html = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.match(html, /允许本机 T3 Agent 使用记忆/);
+  assert.match(html, /检查并接入/);
+  assert.match(html, /复制首次接入提示词/);
+  assert.match(html, /AGY/);
+  assert.match(html, /待处理/);
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+  assert.match(html, /本机设置，不用于 Connect 远端会话/);
+
+  await ui.runMemorySetup();
+  html = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.ok(calls.some(({ action }) => action === "memory:setup"));
+  assert.match(html, /待处理/);
+  assert.doesNotMatch(html, /已接入成功/);
+
+  const priorMemory = ui.cache.memory;
+  await ui.setMemoryAgentAccess(false);
+  html = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.ok(calls.some(({ action, payload }) => action === "memory:agentAccess:set" && payload.enabled === false));
+  assert.match(html, /已关闭/);
+  assert.equal(ui.cache.memory, priorMemory, "disabling agent access does not delete stored memories");
+});
+
+test("title memory switch treats unknown as off, controls local access, and reports the resulting state", async () => {
+  const calls = [], setupSummary = { configured: 1, missing: 0, conflict: 0, unsupported: 0, unknown: 0, pending: 0, runtime: "unverified", providers: [{ instanceId: "codex", displayName: "Codex", status: "configured" }] };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "memory:agentAccess:set") return { ok: true, enabled: payload.enabled, state: payload.enabled ? "enabled" : "disabled", setupSummary };
+    return {};
+  });
+  ui.renderMemoryTitleControls();
+  assert.equal(ui.memoryToggle.getAttribute("aria-checked"), "mixed", "unknown is never shown as already enabled");
+  await ui.toggleMemoryAccessFromTitle();
+  assert.ok(calls.some(({ action, payload }) => action === "memory:agentAccess:set" && payload.enabled === true));
+  assert.equal(ui.memoryToggle.getAttribute("aria-checked"), "true");
+  assert.match(ui.memoryToggle.innerHTML, /开/);
+  await ui.toggleMemoryAccessFromTitle();
+  assert.ok(calls.some(({ action, payload }) => action === "memory:agentAccess:set" && payload.enabled === false));
+  assert.equal(ui.memoryToggle.getAttribute("aria-checked"), "false");
+  assert.match(ui.memoryToggle.innerHTML, /关/);
+  assert.match(drawerSource, /本机设置，不用于 Connect 远端会话/);
+});
+
+test("memory services show backend model and port separately from stdio MCP, and copy a private-data-free config", async () => {
+  const copied = [], ui = harness(undefined, { window: { navigator: { clipboard: { writeText: async (value) => copied.push(value) } } } });
+  ui.cache.embed = { mode: "mlx", running: true, activeModelId: "active/model", configuredModelId: "configured/model", port: 9234 };
+  ui.cache.agentAccess = { enabled: true, setupSummary: { configured: 3, conflict: 0, missing: 0, unsupported: 0, unknown: 0, pending: 0, runtime: "unverified", providers: [
+    { instanceId: "codex", displayName: "Codex", status: "configured" }, { instanceId: "muse", displayName: "Muse", status: "configured" }, { instanceId: "claude", displayName: "Claude", status: "configured" },
+  ] } };
+  ui.cache.connections = { agents: [{ id: "t3", mcp: { status: "unknown", summary: "Matrix aggregate has no row" }, runtime: { status: "unknown", summary: "Current chat not verified" } }] };
+  ui.renderMemoryRuntime();
+  const html = ui.root.querySelector("#t3-hub-memory-runtime").innerHTML;
+  assert.match(html, /active\/model/);
+  assert.match(html, /configured\/model/);
+  assert.match(html, /http:\/\/127\.0\.0\.1:9234/);
+  assert.match(html, /本机 stdio/);
+  assert.match(html, /不是 HTTP 地址/);
+  assert.match(html, /已配置 3 个 Agent/);
+  assert.match(html, /冲突 0/);
+  assert.doesNotMatch(html, /Hub MCP 配置（Agent 汇总）<\/span><strong data-status="unknown">无法确认/);
+  assert.match(html, /未验证/);
+  ui.cache.agentAccess.enabled = null;
+  ui.renderMemoryRuntime();
+  assert.match(ui.root.querySelector("#t3-hub-memory-runtime").innerHTML, /已配置 3 个 Agent/, "known setup summary remains visible when only the access switch is unknown");
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+  await ui.copyMemoryMcpConfig();
+  const config = JSON.parse(copied[0]);
+  assert.deepEqual(config.mcpServers.t3_hub, { command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'] });
+  assert.doesNotMatch(copied[0], /\/Users\/|token|secret|127\.0\.0\.1|~\/\.t3/);
+});
+
+test("first memory setup prompt uses the fixed local commands and verifies memory_status", async () => {
+  const copied = [], ui = harness(undefined, { window: { navigator: { clipboard: { writeText: async (value) => copied.push(value) } } } });
+  await ui.copyMemorySetupPrompt();
+  assert.equal(copied.length, 1);
+  assert.match(copied[0], /~\/\.t3\/bin\/t3-memory-setup status/);
+  assert.match(copied[0], /~\/\.t3\/bin\/t3-memory-setup setup/);
+  assert.match(copied[0], /memory_status/);
+  assert.match(copied[0], /只改 Hub MCP/);
+  assert.match(copied[0], /不要修改.*认证.*模型.*原生路由/);
+  assert.match(copied[0], /不要重启 T3/);
+});
+
+test("memory connection matrix safely shows all agent states without claiming a live connection", () => {
+  const malicious = '<img src=x onerror=alert(1)>';
+  const ui = harness();
+  ui.cache.connections = { ok: true, checkedAt: "2026-11-17T00:00:00.000Z", agents: [
+    { id: "t3", mcp: { status: "configured", summary: "配置已发现", evidence: [malicious] }, skill: { status: "missing", summary: "没有托管 Skill" }, hook: { status: "unsupported", summary: "不支持 Hook" }, runtime: { status: "unverified", summary: "当前会话未验证" } },
+    { id: "codex", label: malicious, mcp: { status: "configured", summary: malicious, evidence: [malicious] }, skill: { status: "unknown", summary: "无法确认", evidence: [] }, hook: { status: "unsupported", summary: "不适用", evidence: [] }, runtime: { status: "unverified", summary: "当前会话未验证" } },
+    { id: "muse", mcp: { status: "missing", summary: "未配置" }, skill: { status: "missing", summary: "未配置" }, hook: { status: "unsupported", summary: "非必需" }, runtime: { status: "unverified", summary: "未验证" } },
+    { id: "agy", mcp: { status: "configured", summary: "Provider 本地配置" }, skill: { status: "unknown", summary: "无法确认" }, hook: { status: "unsupported", summary: "非必需" }, runtime: { status: "unverified", summary: "未验证" } },
+    { id: "claude", mcp: { status: "unknown", summary: "无法确认" }, skill: { status: "missing", summary: "未托管" }, hook: { status: "configured", summary: "找到记忆 Hook" }, runtime: { status: "unverified", summary: "未验证" } },
+    { id: "pi", mcp: { status: "missing", summary: "未配置" }, skill: { status: "missing", summary: "未托管" }, hook: { status: "unsupported", summary: "非必需" }, runtime: { status: "unverified", summary: "未验证" } },
+  ] };
+  ui.renderMemoryConnections();
+  const html = ui.nodes.get("#t3-hub-memory-connections").innerHTML;
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /已配置/);
+  assert.match(html, /未配置/);
+  assert.match(html, /不支持/);
+  assert.match(html, /无法确认/);
+  assert.match(html, /当前会话未验证/);
+  assert.match(html, /AGY/);
+  assert.match(html, /Hook 属于可选能力/);
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+});
+
+test("memory connection failures degrade safely and offer refresh", () => {
+  const ui = harness();
+  ui.errors.connections = new Error("private config path should not leak");
+  ui.renderMemoryConnections();
+  const html = ui.nodes.get("#t3-hub-memory-connections").innerHTML;
+  assert.match(html, /暂时无法读取接入状态/);
+  assert.match(html, /data-action="refresh-memory-connections"/);
+  assert.doesNotMatch(html, /private config path/);
+});
+
+test("title controls follow the native Thread actions heading without a floating Hub handle", () => {
+  const parent = { inserted: null };
+  const button = { parentElement: parent, after(element) { parent.inserted = element; element.parentElement = parent; element.previousElementSibling = this; }, appendChild() { throw new Error("plan button must not be nested inside native button"); } };
+  const heading = {
+    textContent: "Current chat", tagName: "H1", parentElement: button,
+    getBoundingClientRect: () => ({ left: 40, right: 220, top: 18, bottom: 44, width: 180, height: 26 }),
+    getClientRects: () => [{ width: 180, height: 26 }], getAttribute: () => null,
+    closest: (selector) => selector === "button,[role=button]" ? button : null,
+  };
+  const ui = harness(undefined, { document: { querySelectorAll: (selector) => selector.includes("thread-actions") ? [heading] : [] } });
+  const entry = ui.root.querySelector("#t3-hub-plan-handle");
+  const controls = ui.titleControls;
+  assert.equal(ui.findConversationTitleAnchor(), heading, "breadcrumb headings in native navigation remain eligible");
+  controls.appendChild(entry);
+  assert.equal(ui.placePlanHandle(), true);
+  assert.equal(parent.inserted, controls);
+  assert.equal(controls.parentElement, parent);
+  assert.equal(entry.parentElement, controls, "the current plan pill stays in the inline title controls");
+  assert.equal(entry.style.WebkitAppRegion, "no-drag");
+  assert.match(drawerSource, /id="t3-hub-memory-handle"[^>]*data-action="open-memory"/);
+  assert.match(drawerSource, /id="t3-hub-memory-toggle" role="switch"/);
+  assert.doesNotMatch(drawerSource, /<button type="button" id="t3-hub-handle"/);
+  assert.doesNotMatch(drawerSource, /#t3-hub-handle\{position:fixed/);
+  ui.applyTheme("dark");
+  assert.equal(entry.style.getPropertyValue("--hub-ink"), "#f8fafc");
+  ui.destroy();
+  assert.equal(entry.removed, true, "destroy removes a button already moved outside the Hub root");
+  assert.equal(controls.removed, true, "destroy removes the whole external title control group");
+  assert.match(drawerSource, /getElementById\("t3-hub-title-controls"\)\?\.remove\(\)/, "a hot rebuild removes the previous external title controls");
+});
+
+test("plan indicator hover, touch and keyboard activation keep the popover usable", () => {
+  const ui = harness(), entry = ui.root.querySelector("#t3-hub-plan-handle");
+  ui.ready();
+  const heading = { textContent: "Current chat", parentElement: null, getBoundingClientRect: () => ({ left: 40, right: 220, top: 18, bottom: 44, width: 180, height: 26 }), getClientRects: () => [{ width: 180, height: 26 }], getAttribute: () => null, closest: () => null, after(element) { element.parentElement = this.parentElement; element.previousElementSibling = this; } };
+  ui.sandbox.document.querySelectorAll = (selector) => selector.includes("thread-actions") ? [heading] : [];
+  ui.state.connected = true; ui.state.threadId = "thread-a"; ui.cache.board = { steps: [{ id: "step", text: "Plan", status: "pending" }] };
+  ui.renderLiveBoard();
+  assert.equal(entry.hidden, false);
+  const event = (detail = 1) => ({ detail, preventDefault() {}, stopPropagation() {} });
+  ui.handlePlanPointerEnter({ pointerType: "touch" });
+  assert.equal(ui.state.planOpen, false, "touch pointerenter does not act like hover");
+  ui.handlePlanPointerDown({ pointerType: "touch" });
+  ui.handlePlanClick(event());
+  assert.equal(ui.state.planOpen, true); assert.equal(ui.state.planPinned, true);
+  ui.handlePlanPointerLeave({ relatedTarget: null });
+  assert.equal(ui.state.planPinned, true, "pointerleave cannot dismiss a touch-pinned popover");
+  ui.handlePlanPointerDown({ pointerType: "touch" });
+  ui.handlePlanClick(event());
+  assert.equal(ui.state.planOpen, false, "a second touch click closes the pinned popover");
+
+  ui.handlePlanPointerEnter({ pointerType: "mouse" });
+  assert.equal(ui.state.planOpen, true); assert.equal(ui.state.planPinned, false, "mouse hover opens without pinning");
+  ui.handlePlanPointerLeave({ relatedTarget: null });
+  ui.handlePlanClick(event(0));
+  assert.equal(ui.state.planPinned, true, "keyboard activation pins the popover for reading");
+});
+
+test("title plan pill shows the active step in a blue progress ring and marks a finished plan", () => {
+  const ui = harness();
+  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a", context: { threadId: "thread-a" } });
+  ui.cache.board = { steps: [
+    { id: "1", text: "First", status: "completed" }, { id: "2", text: "Second", status: "in-progress" },
+    { id: "3", text: "Third", status: "pending" }, { id: "4", text: "Fourth", status: "pending" },
+    { id: "5", text: "Fifth", status: "pending" }, { id: "6", text: "Sixth", status: "pending" },
+  ], progress: { completed: 1, total: 6 } };
+  ui.renderLiveBoard();
+  const pill = ui.root.querySelector("#t3-hub-plan-handle");
+  assert.match(pill.innerHTML, /hub-plan-ring/);
+  assert.match(pill.innerHTML, /第 2 \/ 6 步/);
+  assert.match(drawerSource, /\.hub-plan-ring-progress\{[^}]*stroke:#3980f6/);
+  assert.equal(ui.planStepProgress().current, 2);
+
+  ui.cache.board = { steps: Array.from({ length: 6 }, (_, index) => ({ id: String(index), text: `Done ${index + 1}`, status: "completed" })), progress: { completed: 6, total: 6 } };
+  ui.renderLiveBoard();
+  assert.match(pill.innerHTML, /第 6 \/ 6 步 · 已完成/);
+  assert.match(pill.innerHTML, /stroke-dashoffset="0\.00"/);
+});
+
+test("project changes invalidate connection status before the next memory refresh", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { agents: [] }; });
+  Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot: "/project-b" });
+  ui.cache.connections = { agents: [{ id: "codex", mcp: { status: "configured" } }] };
+  ui.errors.connections = new Error("stale project error");
+  ui.resetProjectData();
+  assert.equal(ui.cache.connections, null);
+  assert.equal(ui.errors.connections, undefined);
+  await ui.loadTab();
+  assert.ok(calls.some(({ action }) => action === "memory:connections"));
+});
+
+test("switching project scopes clears prior memory before the new project responds", async () => {
+  const envA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", envB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", calls = [];
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return { threadId: "thread-b", environmentId: envB, projectRoot: "/project-b" };
+    if (action === "memory:connections") return { agents: [] };
+    if (action === "memory:overview") return { currentProjectSlug: "project-b" };
+    if (action === "memory:worktreeInfo") return {};
+    if (action === "memory:list") return { items: [] };
+    return {};
+  });
+  ui.ready();
+  Object.assign(ui.state, { open: true, connected: true, tab: "memory", threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", environmentId: envA, projectRoot: "/project-a" } });
+  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${envA}/thread-a`, href: `t3code://app/#/${envA}/thread-a` });
+  ui.setCurrentRoute();
+  ui.cache.memory = { items: [{ id: "secret-a", title: "Private from project A", content: "Private from project A" }] };
+  ui.renderMemoryList();
+  assert.match(ui.root.querySelector("#t3-hub-memory-list").innerHTML, /Private from project A/);
+
+  Object.assign(ui.sandbox.location, { hash: `#/${envB}/thread-b`, href: `t3code://app/#/${envB}/thread-b` });
+  ui.checkRoute();
+  assert.equal(ui.cache.memory, null);
+  assert.equal(ui.cache.connections, null);
+  assert.doesNotMatch(ui.root.querySelector("#t3-hub-memory-list").innerHTML, /Private from project A/, "old memory disappears synchronously on scope switch");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.doesNotMatch(ui.root.querySelector("#t3-hub-memory-list").innerHTML, /Private from project A/);
+  assert.ok(calls.some((entry) => entry.action === "memory:list" && entry.payload.projectRoot === "/project-b"));
+});
+
+test("Connect plan projection selects only the latest matching main-thread plan", () => {
+  const ui = harness(), threadId = "main-thread", env = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const projection = {
+    thread: { id: threadId },
+    plans: [
+      { id: "old", threadId, kind: "todo_list", status: "active", steps: [{ id: "old-step", text: "Old plan", status: "pending" }] },
+      { id: "latest", threadId, kind: "proposed_plan", status: "active", steps: [{ id: "done", title: "Completed", status: "completed" }, { id: "next", title: "Next", status: "running" }] },
+      { id: "superseded", threadId, kind: "proposed_plan", status: "superseded", steps: [{ text: "Superseded" }] },
+      { id: "child", threadId: "child-thread", kind: "todo_list", status: "active", steps: [{ text: "Child task" }] },
+    ],
+    turnItems: [
+      { threadId, type: "todo_list", planId: "old", updatedAt: "2026-11-17T09:00:00Z" },
+      { threadId, type: "proposed_plan", planId: "latest", updatedAt: "2026-11-17T10:00:00Z" },
+      { threadId, type: "todo_list", planId: "latest", updatedAt: "2026-11-17T12:00:00Z" },
+      { threadId: "sibling-thread", type: "proposed_plan", planId: "latest", updatedAt: "2026-11-17T13:00:00Z" },
+    ],
+    visibleTurnItems: [{ item: { threadId, type: "proposed_plan", planId: "latest", updatedAt: "2026-11-17T10:00:00Z" } }],
+  };
+  const board = ui.normalizeRemoteThreadPlan(projection, env, threadId);
+  assert.equal(board.remote, true); assert.equal(board.environmentId, env); assert.equal(board.threadId, threadId);
+  assert.equal(board.source, "t3-connect");
+  assert.deepEqual(JSON.parse(JSON.stringify(board.steps)), [
+    { id: "done", text: "Completed", status: "completed" }, { id: "next", text: "Next", status: "in-progress" },
+  ]);
+  assert.equal(board.updatedAt, "2026-11-17T10:00:00Z");
+  assert.doesNotMatch(JSON.stringify(board), /Old plan|Superseded|Child task/);
+  assert.throws(() => ui.normalizeRemoteThreadPlan({ ...projection, thread: { id: "sibling-thread" } }, env, threadId), /remote thread mismatch/);
+});
+
+test("Connect can read only the validated Hub plan mirror from the current remote project", async () => {
+  const environment = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", threadId = "11111111-1111-4111-8111-111111111111", projectRoot = "/remote/current-project", calls = [];
+  const mirror = { schemaVersion: 1, threadId, projectRoot, steps: [{ id: "a", text: "First", status: "completed" }, { id: "b", text: "Next", status: "running" }, { id: "xss", text: '<img src=x onerror=alert(1)>', status: "pending" }], progress: { completed: 1, inProgress: 1, pending: 0, total: 2, label: "1/2", percent: 50 }, source: "hub-mcp", updatedAt: "2026-11-17T12:00:00.000Z" };
+  const ui = harness(async (action, payload) => { calls.push({ local: true, action, payload }); return {}; }, {
+    location: { pathname: `/${environment}/${threadId}`, hash: `#/${environment}/${threadId}` },
+    window: { __TSR_ROUTER__: { state: { location: { pathname: `/${environment}/${threadId}`, searchStr: "" } } }, __t3HudRemoteProject: (identity) => {
+      calls.push({ remote: true, tag: "projectResolver", payload: identity });
+      return identity.environmentId === environment && identity.threadId === threadId ? { environmentId: environment, threadId, projectRoot } : null;
+    }, __t3HudRemoteRpc: async (environmentId, tag, payload) => {
+      calls.push({ remote: true, environmentId, tag, payload });
+      return tag === "orchestration.getThreadProjection" ? { ok: true, value: { thread: { id: threadId }, plans: [], turnItems: [], visibleTurnItems: [] } } : { ok: true, value: { contents: JSON.stringify(mirror) } };
+    } },
+  });
+  ui.ready(); Object.assign(ui.state, { threadId, connected: false, context: { threadId, environmentId: environment, remote: true, projectRoot: "/stale-context-project" }, projectRoot: "/local/project" });
+  await ui.pollBoard();
+  const fileRead = calls.find((call) => call.remote && call.tag === "projects.readFile");
+  assert.equal(fileRead.environmentId, environment);
+  assert.deepEqual(JSON.parse(JSON.stringify(fileRead.payload)), { cwd: projectRoot, relativePath: `.t3-hub/plans/${threadId}.json`, allowMissing: true });
+  assert.equal(ui.cache.board.source, "hub-mirror");
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.cache.board.steps)), [{ id: "a", text: "First", status: "completed" }, { id: "b", text: "Next", status: "in-progress" }, { id: "xss", text: '<img src=x onerror=alert(1)>', status: "pending" }]);
+  ui.renderLiveBoard();
+  const planHtml = ui.root.querySelector("#t3-hub-live-board").innerHTML;
+  assert.match(planHtml, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(planHtml, /<img src=x onerror=alert\(1\)>/);
+  assert.equal(calls.some((call) => call.local && call.action === "board:get"), false);
+
+  const olderMirror = ui.normalizeRemotePlanMirror(JSON.stringify({ ...mirror, updatedAt: "2026-11-17T11:00:00.000Z" }), environment, threadId, projectRoot);
+  const newerNative = ui.normalizeRemoteThreadPlan({ thread: { id: threadId }, plans: [{ id: "native", threadId, kind: "todo_list", status: "active", steps: [{ text: "Native" }] }], turnItems: [{ threadId, type: "todo_list", planId: "native", updatedAt: "2026-11-17T12:30:00.000Z" }] }, environment, threadId);
+  assert.equal(ui.newestRemotePlan(newerNative, olderMirror).source, "t3-connect");
+  const newerClear = ui.normalizeRemotePlanMirror(JSON.stringify({ ...mirror, source: "hub-clear", cleared: true, steps: [], updatedAt: "2026-11-17T13:00:00.000Z" }), environment, threadId, projectRoot);
+  assert.equal(ui.newestRemotePlan(newerNative, newerClear).cleared, true, "a newer Hub clear suppresses the older native plan");
+  const sameTimeClear = ui.normalizeRemotePlanMirror(JSON.stringify({ ...mirror, source: "hub-clear", cleared: true, steps: [], updatedAt: newerNative.updatedAt }), environment, threadId, projectRoot);
+  assert.equal(ui.newestRemotePlan(newerNative, sameTimeClear).cleared, true, "a clear marker wins a timestamp tie rather than reviving the native plan");
+  const newerUnavailable = ui.normalizeRemotePlanMirror(JSON.stringify({ schemaVersion: 1, threadId, projectRoot, steps: [], progress: {}, source: "hub-unavailable", unavailable: true, updatedAt: "2026-11-17T13:30:00.000Z" }), environment, threadId, projectRoot);
+  assert.equal(ui.newestRemotePlan(newerNative, newerUnavailable).unavailable, true, "a newer oversized-plan marker suppresses an older native plan");
+  assert.throws(() => ui.normalizeRemotePlanMirror(JSON.stringify({ ...mirror, projectRoot: "/other/project" }), environment, threadId, projectRoot), /remote plan unavailable/);
+  assert.throws(() => ui.normalizeRemotePlanMirror(JSON.stringify({ ...mirror, threadId: "other-thread" }), environment, threadId, projectRoot), /remote plan unavailable/);
+});
+
+test("Connect never borrows the stale context or local project when its strict project lookup misses", async () => {
+  const environment = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", threadId = "thread-a", calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ local: true, action, payload }); throw new Error("remote route leaked to local board"); }, {
+    location: { pathname: `/${environment}/${threadId}`, hash: `#/${environment}/${threadId}` },
+    window: {
+      __TSR_ROUTER__: { state: { location: { pathname: `/${environment}/${threadId}`, searchStr: "" } } },
+      __t3HudRemoteProject: () => ({ environmentId: environment, threadId: "another-thread", projectRoot: "/remote/wrong-thread" }),
+      __t3HudRemoteRpc: async (environmentId, tag, payload) => {
+        calls.push({ remote: true, environmentId, tag, payload });
+        return { ok: true, value: { thread: { id: threadId }, plans: [], turnItems: [] } };
+      },
+    },
+  });
+  ui.ready(); Object.assign(ui.state, { connected: false, threadId, context: { threadId, environmentId: environment, remote: true, projectRoot: "/stale-context-project" }, projectRoot: "/local/project" });
+  await ui.pollBoard();
+  assert.equal(calls.some(({ remote, tag }) => remote && tag === "projects.readFile"), false);
+  assert.equal(calls.some(({ local, action }) => local && action === "board:get"), false);
+  assert.equal(ui.cache.board.remote, true);
+  assert.equal(ui.cache.board.steps.length, 0, "an empty remote projection never borrows a local plan");
+  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true);
+});
+
+test("Hub plan mirror path is a stable UUID and cannot inject a path segment", async () => {
+  const ui = harness();
+  const first = await ui.planMirrorRelativePath("main-thread:local"), second = await ui.planMirrorRelativePath("main-thread:local");
+  assert.equal(first, second);
+  assert.match(first, /^\.t3-hub\/plans\/[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/);
+});
+
+test("Connect plan uses the active router environment despite a stale hash and never falls back locally", async () => {
+  const envA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", envB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", calls = [];
+  const projection = { thread: { id: "thread-b" }, plans: [], turnItems: [] };
+  const ui = harness(async (action, payload) => { calls.push({ local: true, action, payload }); return {}; }, {
+    location: { pathname: `/${envA}/thread-a`, hash: `#/${envA}/thread-a` },
+    window: {
+      __TSR_ROUTER__: { state: { location: { pathname: `/${envB}/thread-b`, searchStr: "" } } },
+      __t3HudRemoteRpc: async (environmentId, tag, payload) => { calls.push({ remote: true, environmentId, tag, payload }); return { ok: true, value: projection }; },
+    },
+  });
+  ui.ready();
+  Object.assign(ui.state, { connected: false, context: null, contextError: "无法确认当前运行环境", threadId: "thread-b" });
+  assert.equal(ui.remotePlanEnvironmentId(), envB);
+  await ui.pollBoard();
+  const remote = calls.find((call) => call.remote);
+  assert.equal(remote.environmentId, envB);
+  assert.equal(remote.tag, "orchestration.getThreadProjection");
+  assert.deepEqual(JSON.parse(JSON.stringify(remote.payload)), { threadId: "thread-b" });
+  assert.equal(calls.some((call) => call.local && call.action === "board:get"), false);
+  assert.equal(ui.cache.board.environmentId, envB);
+  assert.equal(ui.remotePlanContextReady(), true);
+
+  const down = harness(async action => { calls.push({ local: true, action }); return {}; }, {
+    location: { pathname: `/${envB}/thread-b`, hash: "" },
+    window: { __t3HudRemoteRpc: async (environmentId) => { calls.push({ remote: true, environmentId }); return { ok: false, error: "forbidden" }; } },
+  });
+  down.ready(); Object.assign(down.state, { connected: false, context: null, contextError: "remote", threadId: "thread-b" });
+  await down.pollBoard();
+  assert.equal(down.errors.board.message, "remote plan unavailable");
+  assert.equal(calls.some((call) => call.local && call.action === "board:get"), false, "remote denial never leaks into a local board read");
+});
+
+test("a late Connect plan reply from the previous environment cannot replace the new thread", async () => {
+  const envA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", envB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const pending = new Map(), routed = [];
+  const ui = harness(async () => { assert.fail("a remote thread must never read the local board"); }, {
+    location: { pathname: `/${envA}/thread-a`, hash: `#/${envA}/thread-a` },
+    window: { __TSR_ROUTER__: { state: { location: { pathname: `/${envA}/thread-a`, searchStr: "" } } }, __t3HudRemoteRpc: (environmentId, tag, payload) => {
+      routed.push({ environmentId, tag, payload });
+      if (tag === "projects.readFile") return Promise.resolve({ ok: true, value: { contents: "" } });
+      return new Promise((resolve) => pending.set(environmentId, resolve));
+    } },
+  });
+  ui.ready(); Object.assign(ui.state, { threadId: "thread-a", context: { threadId: "thread-a", environmentId: envA, remote: true, projectRoot: "/remote/a" }, connected: false });
+  const oldRead = ui.pollBoard();
+  ui.sandbox.window.__TSR_ROUTER__.state.location.pathname = `/${envB}/thread-b`;
+  ui.state.context = { threadId: "thread-b", environmentId: envB, remote: true, projectRoot: "/remote/b" };
+  ui.syncThread(true);
+  ui.state.threadId = "thread-b";
+  const newRead = ui.pollBoard();
+  assert.deepEqual(routed.filter((entry) => entry.tag === "orchestration.getThreadProjection").map((entry) => entry.environmentId), [envA, envB]);
+  assert.equal(ui.remotePlanEnvironmentId(), envB, "the router's active environment wins over a stale location hash");
+  pending.get(envB)({ ok: true, value: { thread: { id: "thread-b" }, plans: [], turnItems: [], visibleTurnItems: [] } });
+  await newRead;
+  assert.equal(ui.cache.board.environmentId, envB);
+  pending.get(envA)({ ok: true, value: { thread: { id: "thread-a" }, plans: [{ id: "old", threadId: "thread-a", kind: "todo_list", steps: [{ text: "old plan" }] }], turnItems: [] } });
+  await oldRead;
+  assert.equal(ui.cache.board.environmentId, envB, "the late old response is discarded");
+  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true, "an empty current-thread projection has no plan button");
+});
+
+test("Hub no longer intercepts native composer input or keyboard shortcuts", () => {
+  assert.doesNotMatch(drawerSource, /listen\(document,\s*"(?:input|focusin|click|keyup|keydown)"[^;]*onComposer/);
+  assert.doesNotMatch(drawerSource, /function (?:openPicker|renderSlash|onComposerKeydown)\b/);
+  assert.doesNotMatch(drawerSource, /t3-hub-slash-palette|request\("slash:list"/);
+});
 
 function fixture(t) {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "hub-v3-frontend-"));
@@ -592,182 +1053,14 @@ test("hooks, skills, MCP, agents, models and task-board templates keep hostile v
   assert.ok(ui.boardMarkup(true).includes(ui.esc(attack)));
 });
 
-test("AutoDream run consumes the backend journal while preserving presets and its wrapped config", async () => {
-  const source = drawerSource.match(/    async function runDream\([^]*?\n    \}/)[0];
-  const runtime = { scheduler: { started: true } };
-  const cache = { dream: { config: { enabled: true }, presets: [{ id: "keep" }], journal: [{ id: "old" }], runtime }, overview: {} };
-  const context = {
-    cache, state: { projectRoot: "/fixture", tab: "board" }, errors: {}, disposed: false, contextVersion: 1,
-    dreamConfig: () => cache.dream.config, hubRpc: async () => ({ config: { enabled: true }, journal: [{ id: "new" }], report: { merged: 1 } }),
-    renderDream() {}, refreshMemoryOverview() {}, refreshEmbed() {}, loadMemories() {}, toast() {}, tr: (zh) => zh,
-  };
-  await vm.runInNewContext(source + ";runDream()", context);
-  assert.equal(cache.dream.journal[0].id, "new");
-  assert.equal(cache.dream.presets[0].id, "keep");
-  assert.equal(cache.dream.config.lastReport.merged, 1);
-  assert.equal(cache.dream.runtime, runtime);
-});
-
-test("AutoDream opens by default and exposes all six curated presets with its Chinese and English title", () => {
-  const ui = harness();
-  ui.cache.dream = { config: { dreamTime: "03:30" } };
-  assert.equal(ui.state.dreamOpen, true);
-  ui.renderDream();
-  let html = ui.nodes.get("#t3-hub-dream").innerHTML;
-  assert.match(html, /<details class="hub-dream-card" open>/);
-  assert.match(html, /<summary[^>]*><span class="hub-dream-summary-title">梦境系统 · AutoDream/);
-  assert.match(html, /<section aria-label="梦境系统 · AutoDream"/);
-  const presets = html.match(/<select\b[^>]*name="dream-preset"[^>]*>([^]*?)<\/select>/)?.[1];
-  assert.ok(presets, "presets must be a visible select, not only a datalist");
-  assert.deepEqual([...presets.matchAll(/<option value="([^"]+)"/g)].map((match) => match[1]), ["local-zero", "muse-ember", "codex-terra", "codex-sol", "claude-sonnet", "pi-magpie"]);
-  assert.match(html, /执行引擎/); assert.match(html, /思考强度/); assert.match(html, /保存引擎/);
-  ui.state.lang = "en"; ui.renderDream(); html = ui.nodes.get("#t3-hub-dream").innerHTML;
-  assert.match(html, /<summary[^>]*><span class="hub-dream-summary-title">Memory Dream · AutoDream/);
-  assert.match(html, /<section aria-label="Memory Dream · AutoDream"/);
-});
-
-test("AutoDream native details toggle persists collapse and survives snapshots without a double toggle", () => {
-  const values = new Map(), storage = { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
-  const ui = harness(undefined, { localStorage: storage });
-  const card = node(), summary = node();
-  card.isConnected = true; card.open = true;
-  summary.dataset = { action: "dream-fold" }; summary.closest = () => card;
-  ui.root.contains = (target) => target === summary || target === card;
-  ui.onClick({ target: { closest: () => summary } });
-  assert.equal(ui.state.dreamOpen, true, "the browser owns summary activation until its toggle event");
-  card.open = false;
-  assert.equal(typeof ui.onDreamToggle, "function"); ui.onDreamToggle({ currentTarget: card });
-  assert.equal(ui.state.dreamOpen, false); assert.equal(values.get("t3-hub:dream-open"), "false");
-  assert.equal(ui.snapshot().dreamOpen, false);
-  assert.equal(harness(undefined, { localStorage: storage }).state.dreamOpen, false);
-  const restored = harness(undefined, { localStorage: storage, window: { __t3SidecarHub: { snapshot: () => ({ dreamOpen: true }) } } });
-  assert.equal(restored.state.dreamOpen, true, "a live snapshot wins over persisted preference");
-  card.open = true; ui.onDreamToggle({ currentTarget: card });
-  assert.equal(values.get("t3-hub:dream-open"), "true");
-  card.isConnected = false; card.open = false; ui.onDreamToggle({ currentTarget: card });
-  assert.equal(ui.state.dreamOpen, true, "a detached old render must not change the current preference");
-  values.set("t3-hub:dream-open", "invalid"); assert.equal(harness(undefined, { localStorage: storage }).state.dreamOpen, true);
-  assert.match(drawerSource, /addEventListener\("toggle", onDreamToggle\)/);
-});
-
-test("AutoDream preset selection stays a draft, can be customized or cancelled, and saves the wrapped response", async () => {
-  const calls = [], journal = [{ id: "keep-journal" }];
-  let config = { enabled: false, dreamTime: "03:30", dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium" };
-  const runtime = { providers: [{ id: "local", status: "available", efforts: [] }, { id: "muse", status: "available", efforts: ["medium", "max"] }, { id: "codex", status: "available", efforts: ["medium", "high"] }], scheduler: { started: true } };
-  const presets = [{ id: "muse-ember", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium", label: "Muse" }, { id: "codex-sol", providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high", label: "Codex Sol" }];
-  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") { config = { ...config, ...payload }; return { config }; } return { config }; });
-  ui.cache.dream = { config, runtime, presets, journal };
-  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
-  assert.deepEqual(JSON.parse(JSON.stringify(ui.state.dreamEngineDraft)), { providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high" });
-  assert.equal(calls.length, 0); assert.equal(ui.cache.dream.config.model, "muse-ember-1.0");
-  ui.onChange({ target: { name: "dream-effort", value: "medium" } });
-  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /<option value="custom" selected/);
-  ui.onChange({ target: { name: "dream-preset", value: "muse-ember" } });
-  ui.onInput({ target: { name: "dream-model", value: "custom-model" } });
-  assert.match(ui.nodes.get('[name="dream-preset"]').innerHTML, /<option value="custom" selected/);
-  const cancel = node(); cancel.dataset = { action: "cancel-dream-engine" }; ui.root.contains = (target) => target === cancel;
-  ui.onClick({ target: { closest: () => cancel } });
-  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
-  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
-  await ui.saveDreamEngine();
-  assert.equal(calls.length, 2); assert.equal(calls[0].action, "memory:dream:save");
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamMode: "agent", providerInstanceId: "codex", model: "gpt-6.1-sol", reasoningEffort: "high" });
-  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(ui.cache.dream.config.model, "gpt-6.1-sol");
-  assert.equal(ui.cache.dream.presets, presets); assert.equal(ui.cache.dream.journal, journal); assert.equal(ui.cache.dream.runtime, runtime);
-});
-
-test("AutoDream differentiates missing CLI and unsupported providers on both selectors and rejects unavailable presets", () => {
-  const calls = [], ui = harness(async (action) => { calls.push(action); return {}; });
-  ui.cache.dream = { config: { dreamTime: "03:30" }, runtime: { providers: [{ id: "local", status: "available" }, { id: "muse", status: "available", efforts: ["medium"] }, { id: "codex", status: "missing" }, { id: "claude", status: "unsupported" }, { id: "pi", status: "available" }] } };
-  ui.renderDream(); const html = ui.nodes.get("#t3-hub-dream").innerHTML;
-  for (const name of ["dream-preset", "dream-provider"]) {
-    const select = html.match(new RegExp(`<select\\b[^>]*name="${name}"[^>]*>([^]*?)<\\/select>`))[1];
-    assert.match(select, new RegExp(`<option value="${name === "dream-preset" ? "codex-sol" : "codex"}"[^>]*disabled[^>]*>[^<]*· 未安装 CLI`));
-    assert.match(select, new RegExp(`<option value="${name === "dream-preset" ? "claude-sonnet" : "claude"}"[^>]*disabled[^>]*>[^<]*· 暂不支持`));
-  }
-  ui.onChange({ target: { name: "dream-preset", value: "codex-sol" } });
-  ui.onChange({ target: { name: "dream-preset", value: "claude-sonnet" } });
-  ui.onChange({ target: { name: "dream-preset", value: "unknown" } });
-  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
-});
-
-test("AutoDream escapes preset IDs, labels, model, provider and effort fields", () => {
-  const ui = harness(), attack = attacks.join(" ");
-  ui.cache.dream = { config: { dreamTime: "03:30", providerInstanceId: attack, model: attack, reasoningEffort: attack }, presets: [{ id: attack, providerInstanceId: attack, model: attack, reasoningEffort: attack, label: attack }], runtime: { providers: [{ id: attack, status: "unsupported", efforts: [attack] }] } };
-  ui.renderDream(); const html = ui.nodes.get("#t3-hub-dream").innerHTML;
-  assert.match(html, /name="dream-preset"/); assert.ok(html.includes(ui.esc(attack)));
-  assert.doesNotMatch(html, /<img src=x|<svg onload=|" autofocus onfocus="/);
-});
-
-test("AutoDream edits Agent, custom model and effort as a single read-back-confirmed setting", async () => {
+test("the memory workbench contains no Dream controls or Dream RPC path", async () => {
   const calls = [];
-  let config = { enabled: false, dreamTime: "03:30", catchUpOnWake: true, dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "medium" };
-  const runtime = { providers: [{ id: "local", status: "available", efforts: [] }, { id: "muse", status: "available", efforts: ["medium", "max"] }, { id: "codex", status: "available", efforts: ["low", "medium", "high"] }, { id: "antigravity", status: "unsupported", efforts: [] }], selected: { id: "muse", status: "available" }, scheduler: { nextDueAt: "2026-11-17T03:30:00Z", timeZone: "Asia/Singapore" } };
-  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") { config = { ...config, ...payload }; return { config }; } return { config, runtime }; });
-  ui.cache.dream = { config, runtime, presets: [{ id: "codex", providerInstanceId: "codex", model: "gpt-6.1-terra" }] };
-  ui.onChange({ target: { name: "dream-provider", value: "codex" } });
-  ui.onInput({ target: { name: "dream-model", value: "custom-model" } });
-  ui.onChange({ target: { name: "dream-effort", value: "high" } });
-  assert.equal(calls.length, 0, "draft selection must not write partial provider/model values");
-  await ui.saveDreamEngine();
-  assert.equal(calls.length, 2); assert.equal(calls[0].action, "memory:dream:save");
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamMode: "agent", providerInstanceId: "codex", model: "custom-model", reasoningEffort: "high" });
-  assert.equal(calls[1].action, "memory:dream:get"); assert.equal(ui.cache.dream.config.model, "custom-model");
-  assert.equal(ui.state.dreamEngineDraft, null);
-});
-
-test("an unsaved AutoDream engine draft can be discarded without writing or running", async () => {
-  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return {}; });
-  ui.cache.dream = { config: { enabled: false, dreamMode: "agent", providerInstanceId: "muse", model: "old", reasoningEffort: "medium", dreamTime: "03:30" } };
-  ui.onInput({ target: { name: "dream-model", value: "new" } });
-  await ui.runDream(); assert.equal(calls.length, 0);
-  const button = node(); button.dataset = { action: "cancel-dream-engine" };
-  ui.root.contains = (target) => target === button;
-  ui.onClick({ target: { closest: () => button } });
-  assert.equal(ui.state.dreamEngineDraft, null); assert.equal(calls.length, 0);
-});
-
-test("AutoDream shows next check and separate local/agent outcomes without hiding partial errors", () => {
-  const ui = harness();
-  ui.cache.dream = { config: { enabled: true, dreamMode: "agent", providerInstanceId: "muse", model: "m", dreamTime: "03:30", lastReport: { local: { status: "success" }, agent: { status: "failed", error: "failure & <bad>" } } }, runtime: { providers: [{ id: "muse", status: "available", efforts: ["medium", "max"] }], scheduler: { started: false, nextDueAt: "2026-11-17T03:30:00Z", timeZone: "Asia/Singapore" } } };
-  ui.renderDream();
-  const html = ui.nodes.get("#t3-hub-dream").innerHTML;
-  assert.match(html, /下次计划/); assert.match(html, /定时器未运行/); assert.match(html, /Asia\/Singapore/);
-  assert.match(html, /本地整理.*完成/); assert.match(html, /Agent 整理.*失败/);
-  assert.match(html, /failure &amp; &lt;bad&gt;/); assert.doesNotMatch(html, /failure & <bad>/);
-  ui.cache.dream.runtime.scheduler.started = true; ui.cache.dream.runtime.scheduler.running = false;
-  ui.renderDream(); assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /定时器运行中/);
-});
-
-test("historical AGY config can change schedule but cannot start or newly select AGY", async () => {
-  const calls = [];
-  let config = { enabled: false, dreamTime: "03:00", dreamMode: "agent", providerInstanceId: "antigravity", model: "old-agy", reasoningEffort: "medium" };
-  const runtime = { providers: [{ id: "antigravity", status: "unsupported", efforts: [] }], selected: { id: "antigravity", status: "unsupported" }, scheduler: {} };
-  const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "memory:dream:save") config = { ...config, ...payload }; return { config, runtime }; });
-  ui.cache.dream = { config, runtime };
-  ui.renderDream();
-  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /value="antigravity" selected disabled/);
-  assert.match(ui.nodes.get("#t3-hub-dream").innerHTML, /当前 Agent 暂不可执行/);
-  await ui.runDream(); assert.equal(calls.length, 0);
-  ui.state.dreamEngineDraft = { providerInstanceId: "antigravity", model: "old-agy", reasoningEffort: "medium" };
-  await ui.saveDreamEngine(); assert.equal(calls.length, 0);
-  ui.state.dreamEngineDraft = null;
-  await ui.saveDream({ dreamTime: "03:30" });
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), { dreamTime: "03:30" });
-  assert.equal(ui.cache.dream.config.providerInstanceId, "antigravity");
-});
-
-test("partial AutoDream failure keeps the completed local report and reports the agent failure", async () => {
-  const config = { enabled: true, dreamMode: "agent", providerInstanceId: "muse", model: "m", dreamTime: "03:30" };
-  const report = { local: { status: "success" }, agent: { status: "failed", error: "agent_unavailable" } };
-  const ui = harness(async (action) => action === "memory:dream:run" ? { ok: false, status: "partial", error: "agent_unavailable", config, report } : { items: [] });
-  ui.cache.dream = { config, runtime: { selected: { id: "muse", status: "available" } } };
-  Object.assign(ui.state, { projectRoot: "/fixture", tab: "board" });
-  await ui.runDream();
-  assert.equal(ui.cache.dream.config.lastReport.local.status, "success");
-  assert.equal(ui.cache.dream.config.lastReport.agent.status, "failed");
-  assert.match(String(ui.errors.dream), /agent_unavailable/);
-  assert.doesNotMatch(ui.root.querySelector(".hub-toast").innerHTML, /整理周期已结束/);
+  const ui = harness(async (action) => { calls.push(action); return { items: [] }; });
+  ui.ready(); Object.assign(ui.state, { open: true, connected: true, projectRoot: "/fixture" });
+  await ui.loadTab(); ui.renderMemory();
+  assert.doesNotMatch(ui.content.innerHTML, /AutoDream|梦境|memory:dream|自动整理计划/);
+  assert.doesNotMatch(drawerSource, /memory:dream:(?:get|run)/);
+  assert.doesNotMatch(calls.join(" "), /memory:dream/);
 });
 
 test("edits made during a settings save, including reverting to the old value, remain unsaved drafts", async (t) => {
@@ -946,13 +1239,14 @@ test("switching hosts discards scoped clear intent without deleting the new host
   assert.equal(f.manager.getSettingsSnapshot().muse.editableValues.model, "muse-only");
 });
 
-test("core tabs and their literal/dynamic RPC actions have backend dispatch cases", () => {
+test("the memory-only Hub keeps its supported RPCs dispatched and exposes no legacy page routes", () => {
   const backend = fs.readFileSync(path.join(repo, "src/backend.cjs"), "utf8");
   const cases = new Set([...backend.matchAll(/case\s+"([\w:]+)"\s*:/g)].map((m) => m[1]));
   const actions = new Set([...drawerSource.matchAll(/"((?:hub|plugins|hooks|skills|subagents|mcp|memory|board|settings|agentsMd|embed|slash):[\w:]+)"/g)].map((m) => m[1]));
   for (const domain of ["skills", "mcp"]) for (const op of ["list", "toggleAgent"]) actions.add(`${domain}:${op}`);
   for (const action of actions) assert.ok(cases.has(action), `missing backend RPC: ${action}`);
-  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"]);
+  assert.deepEqual(JSON.parse(drawerSource.match(/const tabKeys = (\[[^;]+\]);/)[1]), ["memory"]);
+  for (const tab of ["skills", "mcp", "plugins", "hooks", "subagents", "settings", "board", "agents"]) assert.ok(drawerSource.includes(`case "${tab}"` ) === false, `${tab} must not be a routable page`);
 });
 
 test("renderer escapes both quote types and file change counts, and tolerates a missing detail hash", () => {
@@ -980,7 +1274,7 @@ test("appearance defaults to pure white regardless of the OS, validates saved va
     for (const theme of ["dark", "sky", "emerald", "violet", "white"]) {
       ui.setTheme(theme);
       assert.equal(persisted.get("t3-hub-theme"), theme);
-      for (const surface of [ui.root, ...["#t3-hub-handle", "#t3-hub-live-board", "#t3-hub-slash-palette"].map((id) => ui.nodes.get(id))]) {
+      for (const surface of [ui.root, ...["#t3-hub-title-controls", "#t3-hub-plan-handle", "#t3-hub-live-board"].map((id) => ui.nodes.get(id))]) {
         assert.equal(surface.dataset.theme, theme);
         assert.equal(surface.style.getPropertyValue("--hub-bg"), ui.hubThemes[theme].bg);
       }
@@ -1040,55 +1334,45 @@ function relationFixture() {
   return { ui, card, section, label, sidebar };
 }
 
-test("dashboard is independent of the native inspector and remains inside the Hub root", () => {
-  const { ui, card, sidebar } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board");
-  ui.positionConversationTools();
-  assert.equal(board.parentElement, ui.root);
-  assert.equal(board.hidden, false);
-  assert.equal(board.style.width, "320px");
-  card.isConnected = false;
-  sidebar.querySelectorAll = () => [];
-  ui.positionConversationTools();
-  assert.equal(board.hidden, false, "a missing inspector does not hide the floating dashboard");
-  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true);
-  assert.doesNotMatch(drawerSource, /anchor\.card\.appendChild\(liveBoard\)/);
-});
 
-test("plan entry distinguishes no plan, loading, read failure, and a mismatched session", async () => {
+test("title-side plan entry appears only for the current main plan and is read-only", async () => {
   const calls = [];
-  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { steps: [] }; });
-  const entry = ui.root.querySelector("#t3-hub-plan-handle");
-  ui.ready();
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a", context: { threadId: "thread-a" } });
+  const heading = {
+    textContent: "Current chat", parentElement: null,
+    getBoundingClientRect: () => ({ left: 40, right: 220, top: 18, bottom: 44, width: 180, height: 26 }),
+    getClientRects: () => [{ width: 180, height: 26 }], getAttribute: () => null,
+    closest: () => null,
+    after(element) { const parent = { inserted: element }; element.parentElement = parent; element.previousElementSibling = this; this.inserted = element; },
+  };
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return {}; }, { document: { querySelectorAll: (selector) => selector.includes("thread-actions") ? [heading] : [] } });
+  ui.ready(); Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a", context: { threadId: "thread-a", projectRoot: "/fixture" } });
+  ui.cache.board = { source: "t3-native", steps: [] }; ui.renderLiveBoard();
+  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true, "no plan means no header entry");
+  ui.cache.board = { source: "t3-native", steps: [
+    { id: "done", text: "Completed step", status: "completed" },
+    { id: "todo", text: "Next step", status: "pending" },
+  ], artifacts: [{ name: "private.md" }], subagents: [{ title: "Child task" }] };
   ui.renderLiveBoard();
-  assert.match(entry.textContent, /读取中/);
-  ui.cache.board = { steps: [] };
-  ui.renderLiveBoard();
-  assert.match(entry.textContent, /暂无计划/);
-  ui.renderBoardTab();
-  assert.match(ui.content.innerHTML, /当前没有计划步骤|暂无计划|暂无主计划/);
-  ui.errors.board = new Error("unavailable");
-  ui.renderLiveBoard();
-  assert.match(entry.textContent, /读取失败/);
-  ui.state.context = { threadId: "other-thread" };
-  ui.renderLiveBoard();
-  assert.match(entry.textContent, /会话未匹配/);
+  const entry = ui.root.querySelector("#t3-hub-plan-handle"), popover = ui.root.querySelector("#t3-hub-live-board");
+  assert.equal(entry.hidden, false);
+  assert.equal(popover.hidden, true, "the progress list is hidden until hover, focus or click");
+  entry.closest = () => null;
+  ui.setPlanPopover(true);
+  assert.equal(popover.hidden, false);
+  assert.match(popover.innerHTML, /Completed step/); assert.match(popover.innerHTML, /Next step/);
+  assert.match(popover.innerHTML, /第 2 \/ 2 步/);
+  assert.match(popover.innerHTML, /已完成 1 项/);
+  assert.doesNotMatch(popover.innerHTML, /private\.md|Child task|data-action=|<button/);
   await ui.pollBoard();
-  assert.equal(calls.filter((item) => item.action === "board:get").length, 0);
-  ui.state.boardDraft = "must not be saved";
-  await ui.updateBoard(null, "add");
-  assert.equal(calls.filter((item) => item.action === "board:update").length, 0);
-  const draftProject = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${draftProject}/new`, href: `t3code://app/#/projects/${draftProject}/new` });
-  ui.state.threadId = "__NEW__";
-  ui.state.context = { threadId: "__NEW__", projectId: draftProject, projectRoot: "/fixture", draftProjectVerified: true };
-  delete ui.errors.board;
-  ui.renderLiveBoard();
-  assert.match(entry.textContent, /暂无计划/);
+  assert.equal(calls[0].action, "board:get");
+  assert.equal(calls[0].payload.threadId, "thread-a");
+  assert.equal(calls[0].payload.strictThreadMatch, true);
+  assert.equal(calls[0].payload.excludeSubagentInference, true);
+  assert.equal(calls[0].payload.environmentId, undefined);
 });
 
-test("a mismatched or unresolved board response never claims there is no plan", async () => {
+
+test("a mismatched or unresolved plan stays hidden and cannot open a removed board page", async () => {
   for (const returnedThread of ["another-thread", ""]) {
     const ui = harness(async () => ({ threadId: returnedThread, steps: [] }));
     const entry = ui.root.querySelector("#t3-hub-plan-handle");
@@ -1096,49 +1380,23 @@ test("a mismatched or unresolved board response never claims there is no plan", 
     Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture" });
     await ui.pollBoard();
     assert.equal(ui.cache.board, null);
-    assert.match(entry.textContent, /会话未匹配/);
-    ui.renderBoardTab();
-    assert.match(ui.content.innerHTML, /会话未匹配/);
+    assert.equal(entry.hidden, true, "unknown or mismatched data is not presented as a plan");
+    ui.switchTab("board");
+    assert.equal(ui.state.tab, "memory", "legacy board navigation is unreachable");
+    ui.renderTab();
+    assert.match(ui.content.innerHTML, /记忆工作台/);
   }
 });
 
-test("draft plan read/write needs the current route's verified project", async () => {
-  const projectA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", calls = [];
-  let board = { threadId: "__NEW__", steps: [] };
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "board:update") board = { threadId: "__NEW__", source: "hub-mcp", steps: payload.steps };
-    if (action === "board:clear") board = { threadId: "__NEW__", steps: [] };
-    return action === "board:get" ? board : {};
-  });
-  ui.ready();
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${projectB}/new`, href: `t3code://app/#/projects/${projectB}/new` });
-  Object.assign(ui.state, { connected: true, threadId: "__NEW__", projectRoot: "/tmp/project-a", context: { threadId: "__NEW__", projectId: projectA, projectRoot: "/tmp/project-a", draftProjectVerified: true }, boardDraft: "draft" });
-  ui.cache.board = { steps: [] };
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
-  assert.equal(calls.filter((entry) => /^board:/.test(entry.action)).length, 0, "a stale project must never be read or written");
-  ui.state.context = { threadId: "__NEW__", projectId: projectB, projectRoot: "/tmp/project-b", draftProjectVerified: true };
-  ui.state.projectRoot = "/tmp/project-b";
-  for (const hash of [`#/draft/${projectB}`, `#/${projectB}/new`]) {
-    Object.assign(ui.sandbox.location, { hash, href: `t3code://app/${hash}` });
-    calls.length = 0;
-    await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
-    assert.equal(calls.length, 0, `${hash} cannot prove project ownership even when the UUID matches`);
-  }
-  Object.assign(ui.sandbox.location, { hash: `#/projects/${projectB}/new`, href: `t3code://app/#/projects/${projectB}/new` });
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
-  const requests = calls.filter((entry) => /^board:/.test(entry.action));
-  assert.ok(requests.some((entry) => entry.action === "board:update"));
-  assert.ok(requests.some((entry) => entry.action === "board:clear"));
-  for (const entry of requests) { assert.equal(entry.payload.threadId, "__NEW__"); assert.equal(entry.payload.projectRoot, "/tmp/project-b"); }
-  ui.state.context.draftProjectVerified = false;
-  calls.length = 0;
-  await ui.pollBoard(); await ui.updateBoard(null, "add");
-  assert.equal(calls.length, 0, "legacy unverified contexts must not write a draft");
-  ui.state.connected = false;
-  ui.state.contextError = "无法确认新会话所属项目，请先选择项目";
-  ui.renderLiveBoard();
-  assert.match(ui.root.querySelector("#t3-hub-plan-handle").textContent, /未确认所属项目/);
+test("plan progress is display-only and legacy mutation routes are not reachable", () => {
+  const ui = harness();
+  ui.renderTab();
+  assert.equal(ui.state.tab, "memory");
+  assert.doesNotMatch(ui.content.innerHTML, /data-action="board-(?:add|clear|step)"|name="board-step-draft"/);
+  ui.switchTab("board");
+  assert.equal(ui.state.tab, "memory");
+  ui.renderChrome();
+  assert.equal(ui.root.querySelector(".hub-tabs").innerHTML.match(/data-tab=/g)?.length || 0, 1);
 });
 
 test("native thread routes bind the environment and thread rather than the project UUID", async () => {
@@ -1154,11 +1412,11 @@ test("native thread routes bind the environment and thread rather than the proje
   assert.equal(calls[0].payload.projectRoot, "/tmp/a");
   calls.length = 0;
   ui.state.context.environmentId = otherEnvironment;
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  await ui.pollBoard();
   assert.equal(calls.length, 0, "a different environment must not use the local context");
-  assert.match(ui.root.querySelector("#t3-hub-plan-handle").textContent, /会话未匹配/);
+  assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true);
   delete ui.state.context.environmentId;
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  await ui.pollBoard();
   assert.equal(calls.length, 0, "an unverified environment must fail closed");
   ui.state.context.environmentId = environment;
   ui.state.context.projectRoot = "/tmp/other-project";
@@ -1174,11 +1432,12 @@ test("non-UUID thread routes cannot use a stale local context from another envir
   ui.cache.board = { steps: [] };
   for (const id of ["thread:local", "thread%3Alocal", "thread%3alocal"]) {
     Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${remote}/${id}`, href: `t3code://app/#/${remote}/${id}` });
-    await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+    await ui.pollBoard();
     assert.equal(calls.length, 0, `${id} must not read or write the previous local context`);
   }
   Object.assign(ui.sandbox.location, { hash: `#/${local}/thread%3Alocal`, href: `t3code://app/#/${local}/thread%3Alocal` });
   assert.equal(ui.currentThreadId(), "thread:local", "the native route decodes the actual thread ID");
+  ui.syncThread(true);
   await ui.pollBoard();
   assert.equal(calls.length, 1, "the matching local environment can read its thread");
   assert.equal(calls[0].payload.threadId, "thread:local");
@@ -1187,9 +1446,10 @@ test("non-UUID thread routes cannot use a stale local context from another envir
   ui.state.context.threadId = "thread-a";
   Object.assign(ui.sandbox.location, { hash: `#/${remote}/thread-a`, href: `t3code://app/#/${remote}/thread-a` });
   assert.equal(ui.currentThreadId(), "thread-a");
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
+  await ui.pollBoard();
   assert.equal(calls.length, 0, "plain string thread IDs still require the matching environment");
   Object.assign(ui.sandbox.location, { hash: `#/${local}/thread-a`, href: `t3code://app/#/${local}/thread-a` });
+  ui.syncThread(true);
   await ui.pollBoard();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].payload.threadId, "thread-a");
@@ -1249,21 +1509,6 @@ test("Round-2 P2 #7 thread wrappers are environments only with an explicit prefi
   }
 });
 
-test("floating dashboard clamps to viewport and hides for dialogs and settings", () => {
-  const { ui } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board");
-  ui.sandbox.innerWidth = 390; ui.sandbox.innerHeight = 260;
-  ui.positionConversationTools();
-  assert.equal(board.hidden, false);
-  assert.equal(board.style.width, "320px");
-  assert.ok(parseFloat(board.style.left) >= 8);
-  assert.ok(parseFloat(board.style.top) + parseFloat(board.style.maxHeight) <= 252);
-  ui.root.classList.add("is-occluded"); ui.positionConversationTools();
-  assert.equal(board.hidden, true);
-  ui.root.classList.remove("is-occluded");
-  Object.assign(ui.sandbox.location, { pathname: "/settings", hash: "", href: "https://fixture.test/settings" });
-  ui.positionConversationTools(); assert.equal(board.hidden, true);
-});
 
 test("dialog occlusion ignores hidden, closed and transparent elements including hidden ancestors", () => {
   const dialog = node(), parent = node(); dialog.parentElement = parent; dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
@@ -1286,44 +1531,13 @@ test("non-modal inline dialogs occlude only overlapping composer or visible Hub 
   dialog.getBoundingClientRect = () => ({ left: 0, top: 0, right: 70, bottom: 50, width: 70, height: 50 });
   dialog.setAttribute("aria-modal", "true"); ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true, "a real modal remains a blocker even outside Hub geometry");
   dialog.removeAttribute("aria-modal");
-  const editor = node(); editor.isConnected = true; editor.tagName = "TEXTAREA"; editor.closest = () => null; editor.parentElement = null;
+  const editor = node(); editor.nodeType = 1; editor.isConnected = true; editor.tagName = "TEXTAREA"; editor.closest = (selector) => selector.includes("textarea") ? editor : null; editor.parentElement = null;
   editor.getBoundingClientRect = dialog.getBoundingClientRect;
   ui.sandbox.document.querySelectorAll = (selector) => selector.includes('[role="dialog"]') ? [dialog] : selector.includes("textarea") ? [editor] : [];
   ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true, "composer overlap also hides Hub controls");
 });
 
-test("non-modal popover over only the dashboard does not make occlusion oscillate after positioning hides it", () => {
-  const dialog = node(), ui = harness(undefined, { document: { querySelectorAll: (selector) => selector.includes('[role="dialog"]') ? [dialog] : [] } });
-  const board = ui.nodes.get("#t3-hub-live-board");
-  dialog.getBoundingClientRect = board.getBoundingClientRect = () => ({ left: 900, top: 100, right: 1200, bottom: 300, width: 300, height: 200 });
-  ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
-  board.hidden = true; board.getClientRects = () => [];
-  ui.syncOcclusion(); ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), true);
-  dialog.hidden = true; ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false);
-  dialog.hidden = false; ui.syncOcclusion(); assert.equal(ui.root.classList.contains("is-occluded"), false, "dismissal drops the previously occluded board's cached geometry");
-});
 
-test("dragging persists a clamped position, supports cancel and preserves viewport bounds", () => {
-  const data = new Map(), storage = { getItem: (key) => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) };
-  const ui = harness(undefined, { localStorage: storage });
-  const board = ui.nodes.get("#t3-hub-live-board");
-  board.getBoundingClientRect = () => ({ left: parseFloat(board.style.left), top: parseFloat(board.style.top) });
-  ui.positionConversationTools();
-  const target = { closest: () => target };
-  ui.startBoardDrag({ button: 0, pointerId: 1, clientX: 950, clientY: 100, target });
-  ui.moveBoardDrag({ pointerId: 1, clientX: 20, clientY: 900, preventDefault() {} });
-  ui.endBoardDrag({ pointerId: 1 });
-  const saved = JSON.parse(data.get("t3-hub-dashboard-position-v1"));
-  assert.equal(saved.x, 8); assert.equal(saved.y, 642);
-  const next = harness(undefined, { localStorage: storage });
-  next.positionConversationTools();
-  assert.equal(next.nodes.get("#t3-hub-live-board").style.left, "8px");
-  assert.equal(next.nodes.get("#t3-hub-live-board").style.top, "642px");
-  next.sandbox.innerWidth = 240; next.sandbox.innerHeight = 200;
-  next.positionConversationTools();
-  assert.equal(next.nodes.get("#t3-hub-live-board").style.width, "224px");
-  assert.equal(next.nodes.get("#t3-hub-live-board").style.top, "42px");
-});
 
 test("narrow inspector can be found without accepting an unscoped left-side title", () => {
   const { ui, sidebar, card, label } = relationFixture();
@@ -1336,146 +1550,10 @@ test("narrow inspector can be found without accepting an unscoped left-side titl
   assert.equal(ui.findSessionRelationsCard(), null);
 });
 
-test("dashboard grows downward and has a bounded scrolling content area", () => {
-  const { ui } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board");
-  ui.state.boardExpanded = false; ui.positionConversationTools();
-  const left = board.style.left, top = board.style.top;
-  ui.state.boardExpanded = true; ui.positionConversationTools();
-  assert.equal(board.style.left, left); assert.equal(board.style.top, top);
-  assert.equal(board.parentElement, ui.root);
-  assert.match(drawerSource, /#t3-hub-live-board\{[^}]*display:flex[^}]*flex-direction:column/);
-  assert.match(drawerSource, /#t3-hub-live-board \.hub-board-content\{[^}]*min-height:0[^}]*overflow:auto/);
-});
 
-test("progress defaults to open even after the old version saved it collapsed", () => {
-  const legacy = { getItem: (key) => key === "t3-hub-board-expanded" ? "false" : null, setItem() {} };
-  const oldUi = { snapshot: () => ({ boardExpanded: false }), destroy() {} };
-  assert.equal(harness(undefined, { localStorage: legacy, window: { __t3SidecarHub: oldUi } }).state.boardExpanded, true);
-  const migrated = { getItem: (key) => key === "t3-hub-dashboard-expanded-v1" ? "false" : null, setItem() {} };
-  assert.equal(harness(undefined, { localStorage: migrated }).state.boardExpanded, false, "a new explicit collapse is remembered");
-});
 
-test("plan scrolling survives polling and geometry updates but resets for a new thread", () => {
-  const { ui } = relationFixture();
-  const board = ui.nodes.get("#t3-hub-live-board");
-  let scroll = { scrollTop: 220 }, html = "";
-  board.dataset.threadId = "thread-a";
-  board.dataset.projectRoot = "";
-  board.querySelector = (selector) => selector === ".hub-board-content" ? scroll : null;
-  Object.defineProperty(board, "innerHTML", { get: () => html, set: (value) => { html = value; scroll = { scrollTop: 0 }; } });
-  Object.defineProperty(board.style, "maxHeight", { set: (value) => { if (value === "none") scroll.scrollTop = Math.min(scroll.scrollTop, 180); } });
-  ui.state.threadId = "thread-a";
-  ui.state.boardExpanded = true;
-  ui.renderLiveBoard();
-  assert.equal(scroll.scrollTop, 220, "poll redraw must retain the user's scroll position");
-  ui.positionConversationTools();
-  assert.equal(scroll.scrollTop, 220, "resizing must retain the user's scroll position");
-  ui.state.projectRoot = "/another-project";
-  ui.renderLiveBoard();
-  assert.equal(scroll.scrollTop, 0, "the same thread ID in another project cannot inherit scroll state");
-  scroll.scrollTop = 220;
-  ui.state.threadId = "thread-b";
-  ui.renderLiveBoard();
-  assert.equal(scroll.scrollTop, 0, "new threads start at the top");
-});
 
-test("dashboard shows only the main plan while the full task panel keeps all subagents", () => {
-  const { ui } = relationFixture(), board = ui.nodes.get("#t3-hub-live-board");
-  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
-  ui.cache.board = { source: "t3-native", steps: [] }; ui.renderLiveBoard();
-  assert.equal(board.hidden, false); assert.match(board.innerHTML, /暂无主计划/);
-  for (const name of ["open-board-studio", "toggle-board", "reset-dashboard-position"]) assert.ok(board.innerHTML.includes(`data-action="${name}"`));
-  assert.match(board.innerHTML, /任务面板/);
-  assert.doesNotMatch(board.innerHTML, /计划进度|子代理任务进度|hub-dashboard-links|data-action="dashboard-tab"/);
-  ui.cache.board = { source: "t3-native", steps: [{ text: "核对页面", status: "pending" }] }; ui.renderLiveBoard();
-  assert.match(board.innerHTML, /0\/1/); assert.match(board.innerHTML, /role="progressbar"/);
-  assert.doesNotMatch(board.innerHTML, /data-action="board-step"/);
-  ui.cache.board = { source: "t3-native", planMarkdown: "# 真实计划\n<img src=x>", steps: [] }; ui.renderLiveBoard();
-  assert.match(board.innerHTML, /计划原文/); assert.match(board.innerHTML, /&lt;img src=x&gt;/);
-  assert.doesNotMatch(board.innerHTML, /暂无主计划|role="progressbar"/);
-  ui.cache.board = { steps: [], subagents: [{ title: "任务一", rawStatus: "failed" }, { title: "任务二", rawStatus: "completed" }, { title: "任务三", rawStatus: "unknown" }] }; ui.renderLiveBoard();
-  assert.match(board.innerHTML, /暂无计划/); assert.match(board.innerHTML, /暂无主计划/);
-  assert.doesNotMatch(board.innerHTML, /子代理任务进度|本会话子任务|任务一|任务二|任务三|data-tab="subagents"/);
-  assert.doesNotMatch(board.innerHTML, /data-tab="hooks"|data-tab="plugins"/);
-  assert.doesNotMatch(board.innerHTML, /role="progressbar"/);
-  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /任务面板/);
-  for (const expected of ["本会话子任务", "任务一", "任务二", "任务三", "失败 1", "已完成 1", "状态未知 1"]) assert.ok(ui.content.innerHTML.includes(expected));
-  ui.cache.board = { source: "t3-native", steps: [{ text: "主计划步骤", status: "pending" }], subagents: [{ title: "计划下的子任务", rawStatus: "running" }] };
-  ui.renderLiveBoard(); assert.match(board.innerHTML, /主计划步骤/); assert.doesNotMatch(board.innerHTML, /计划下的子任务/);
-  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /主计划步骤/); assert.match(ui.content.innerHTML, /计划下的子任务/);
-});
 
-test("floating dashboard retains document access and original artifact indices", () => {
-  const { ui } = relationFixture(), board = ui.nodes.get("#t3-hub-live-board");
-  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [{ name: "report.md", path: "/session/report.md" }, { name: "implementation_plan.md", path: "/session/implementation_plan.md" }, { name: "task.md", path: "/session/task.md" }] };
-  ui.renderLiveBoard();
-  assert.match(board.innerHTML, /data-action="read-artifact" data-index="0"[^>]*report\.md/);
-  assert.match(board.innerHTML, /data-action="read-artifact" data-index="1"[^>]*implementation_plan\.md/);
-  assert.match(board.innerHTML, /data-action="read-artifact" data-index="2"[^>]*task\.md/);
-  assert.equal((board.innerHTML.match(/class="hub-artifact-card"/g) || []).length, 3);
-  assert.match(board.innerHTML, /hub-artifact-icon/);
-  ui.renderBoardTab(); assert.match(ui.content.innerHTML, /report\.md/);
-});
-
-test("floating artifact cards reveal the verified file while the full panel still previews Markdown", async () => {
-  const calls = [];
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "board:openArtifact") return payload.operation === "reveal" ? { kind: "revealed" } : { kind: "markdown", name: "A.md", content: "预览正文" };
-    return {};
-  });
-  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-  const board = ui.nodes.get("#t3-hub-live-board"), target = node();
-  target.dataset = { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" }; target.closest = () => target; target.isConnected = true;
-  ui.root.contains = (item) => item === target;
-  let floating = true;
-  board.contains = (item) => floating && item === target;
-  ui.content.contains = (item) => !floating && item === target;
-  const a = { path: "/fixture/A.md", name: "A.md" }, c = { path: "/fixture/C.md", name: "C.md" };
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.renderLiveBoard();
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [c, a] };
-  ui.onClick({ target }); await new Promise(setImmediate);
-  let opens = calls.filter((call) => call.action === "board:openArtifact");
-  assert.equal(opens.length, 1); assert.equal(opens[0].payload.path, "/fixture/A.md"); assert.equal(opens[0].payload.operation, "reveal");
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [c] };
-  ui.onClick({ target }); await new Promise(setImmediate);
-  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "a removed file cannot reveal its replacement");
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a, a] };
-  ui.onClick({ target }); await new Promise(setImmediate);
-  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "ambiguous paths cannot reveal a file");
-  ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.state.projectRoot = "/another-project";
-  ui.onClick({ target }); await new Promise(setImmediate);
-  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "another project cannot reveal an old file");
-  ui.state.projectRoot = "/fixture"; ui.sandbox.location.pathname = "/threads/thread-b"; ui.sandbox.location.href = "https://fixture.test/threads/thread-b";
-  ui.onClick({ target }); await new Promise(setImmediate);
-  assert.equal(calls.filter((call) => call.action === "board:openArtifact").length, 1, "another session cannot reveal an old file");
-  ui.sandbox.location.pathname = "/threads/thread-a"; ui.sandbox.location.href = "https://fixture.test/threads/thread-a";
-  floating = false; ui.cache.board = { source: "t3-native", steps: [], artifacts: [a] }; ui.renderBoardTab();
-  ui.onClick({ target }); await new Promise(setImmediate);
-  opens = calls.filter((call) => call.action === "board:openArtifact");
-  assert.equal(opens.length, 2); assert.equal(opens[1].payload.path, "/fixture/A.md");
-  assert.notEqual(opens[1].payload.operation, "reveal"); assert.equal(ui.state.artifact.content, "预览正文");
-});
-
-test("Hub steps containing CRLF and CR can be toggled without losing identity", async () => {
-  for (const text of ["第一行\r\n第二行", "第一行\r第二行", "第一行\n第二行"]) {
-    const calls = [], snapshot = { source: "hub-mcp", steps: [{ id: "hub-a", text, status: "pending" }] };
-    const ui = harness(async (action, payload) => { calls.push({ action, payload }); return action === "board:get" ? snapshot : {}; });
-    ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-    ui.cache.board = snapshot; ui.renderBoardTab();
-    const htmlValue = ui.content.innerHTML.match(/data-step-text="([^"]*)"/)[1];
-    // HTML tokenization normalizes raw CR / CRLF before resolving character references.
-    const datasetValue = htmlValue.replace(/\r\n?/g, "\n").replace(/&#13;/g, "\r");
-    const target = node(); target.dataset = { action: "board-step", index: "0", stepId: "hub-a", stepText: datasetValue }; target.closest = () => target;
-    ui.root.contains = (item) => item === target; ui.content.contains = (item) => item === target;
-    ui.onClick({ target }); await new Promise(setImmediate);
-    const update = calls.find((call) => call.action === "board:update");
-    assert.ok(update, `unchanged ${JSON.stringify(text)} should remain clickable`);
-    assert.equal(update.payload.steps[0].text, text); assert.equal(update.payload.steps[0].status, "completed");
-  }
-});
 
 function issue8BoardFixture(t) {
   const { DatabaseSync } = require("node:sqlite");
@@ -1734,168 +1812,12 @@ function issue8DraftDom(ui) {
   };
 }
 
-for (const focused of [true, false]) test(`Issue #8 recheck3 [1] failed post-save read preserves ${focused ? "focused" : "unfocused"} draft DOM and recovery advances the Enter baseline`, async () => {
-  let save, failRead = true, plan = issue8Plan("r1", "original");
-  const writes = [], ui = issue8Ui(async (action, payload) => {
-    if (action === "board:update") {
-      writes.push(payload);
-      const finish = () => { plan = { ...plan, steps: payload.steps, planRevision: `r${writes.length + 1}` }; return {}; };
-      if (writes.length === 1) return new Promise(resolve => { save = () => resolve(finish()); });
-      return finish();
-    }
-    if (failRead) throw new Error("post-save read failed");
-    return plan;
-  });
-  const dom = issue8DraftDom(ui); ui.cache.board = plan; ui.renderBoardTab();
-  dom.type("第一条"); const pending = ui.updateBoard(dom.add, "add");
-  dom.type("  第二条 <draft>  ", 2, 6, "backward");
-  if (focused) dom.editor.focus();
-  const oldEditor = dom.editor, oldHtml = ui.content.innerHTML, renders = dom.renders;
-  save(); await pending;
-  assert.equal(dom.editor, oldEditor, "read failure must not replace the editor");
-  assert.equal(ui.content.innerHTML, oldHtml, "the visible list stays intact until a successful read");
-  ui.renderBoardTab({ preserveDraftEditor: true });
-  assert.equal(dom.renders, renders, "explicit preserved rendering must also protect an unfocused draft");
-  assert.equal(dom.editor.value, "  第二条 <draft>  ");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "backward"]);
-  assert.equal(ui.sandbox.document.activeElement, focused ? dom.editor : null);
-  assert.match(ui.root.querySelector(".hub-toast").innerHTML, /读取失败|Read failed/);
-  failRead = false; await ui.pollBoard();
-  assert.match(ui.content.innerHTML, />第一条</, "recovery renders even while the editor remains focused");
-  assert.equal(dom.editor.value, "  第二条 <draft>  ");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "backward"]);
-  assert.equal(ui.sandbox.document.activeElement, focused ? dom.editor : null);
-  dom.editor.focus(); dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 2, "no blur or extra Enter is required after recovery");
-  assert.equal(writes[1].expectedRevision, "r2");
-  assert.deepEqual(Array.from(plan.steps, step => step.text), ["original", "第一条", "第二条 <draft>"]);
-});
 
-test("Issue #8 recheck3 [1] a planReadError readback recovers its focused editor without an explicit render", async () => {
-  let failRead = true;
-  const ui = issue8Ui(async action => action === "board:update" ? {} : failRead ? { ...issue8Plan("r2", "saved step"), planReadError: "unsafe_path" } : issue8Plan("r2", "saved step"));
-  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("first"); const pending = ui.updateBoard(dom.editor, "add");
-  dom.type("next draft", 2, 5, "forward"); const editor = dom.editor; await pending;
-  assert.equal(dom.editor, editor, "an unusable snapshot must preserve the draft DOM");
-  failRead = false; await ui.pollBoard();
-  assert.match(ui.content.innerHTML, /saved step/, "recovery must synchronize even when board:get did not throw");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor); assert.equal(dom.editor.value, "next draft");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "forward"]);
-});
 
-test("Issue #8 recheck3 [1] recovery to a native read-only plan releases editor sync state", async () => {
-  let failRead = true;
-  const native = { ...issue8Plan("native", "native step"), source: "t3-native" };
-  const ui = issue8Ui(async action => {
-    if (action === "board:update") return {};
-    if (failRead) throw new Error("post-save read failed");
-    return native;
-  });
-  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("first"); const pending = ui.updateBoard(dom.add, "add");
-  dom.type("keep draft", 1, 4, "forward"); await pending;
-  assert.ok(dom.editor?.isConnected, "the failed read preserves the active input");
-  failRead = false; await ui.pollBoard();
-  assert.match(ui.content.innerHTML, /native step/);
-  assert.ok(dom.editor?.isConnected, "unsaved draft remains visible on read-only native plan");
-  assert.equal(dom.editor.value, "keep draft");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 4, "forward"]);
-  const renders = dom.renders; await ui.pollBoard();
-  assert.equal(dom.renders, renders, "read-only recovery clears pending editor synchronization");
-});
 
-for (const failRead of [false, true]) test(`Issue #8 recheck3 [2] focused conflict refresh ${failRead ? "recovers after a read failure" : "renders immediately"} without losing draft or selection`, async () => {
-  let readingFails = failRead, plan = { ...issue8Plan("r2", "original"), steps: [...issue8Plan("r1", "original").steps, { id: "hub-external", text: "external step", status: "pending" }] };
-  const writes = [], ui = issue8Ui(async (action, payload) => {
-    if (action === "board:update") {
-      writes.push(payload);
-      if (writes.length === 1) return { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT" } };
-      plan = { ...plan, steps: payload.steps, planRevision: "r3" }; return {};
-    }
-    if (readingFails) throw new Error("conflict refresh failed");
-    return plan;
-  });
-  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1", "original"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("  keep conflict draft  ", 3, 9, "forward");
-  const oldEditor = dom.editor; await ui.updateBoard(dom.editor, "add");
-  if (failRead) {
-    assert.equal(dom.editor, oldEditor); ui.renderBoardTab({ preserveDraftEditor: true });
-    assert.equal(dom.editor, oldEditor, "conflict read failure protects the same DOM");
-    readingFails = false; await ui.pollBoard();
-  }
-  assert.match(ui.content.innerHTML, /external step/, "the external addition must be visible without blur");
-  assert.equal(ui.state.boardDraft, "  keep conflict draft  "); assert.equal(dom.editor.value, ui.state.boardDraft);
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [3, 9, "forward"]);
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 2); assert.equal(writes[1].expectedRevision, "r2");
-  assert.ok(plan.steps.some(step => step.text === "external step"));
-});
 
-test("Issue #8 recheck3 [2] stale Enter refresh advances the focused editor baseline before retry", async () => {
-  const writes = [], latest = issue8Plan("r2", "external step");
-  const ui = issue8Ui(async (action, payload) => { if (action === "board:update") writes.push(payload); return latest; });
-  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("next draft", 1, 5, "backward");
-  await ui.pollBoard(); assert.doesNotMatch(ui.content.innerHTML, /external step/, "ordinary polling defers replacing an active editor");
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 0, "the stale click itself must not write");
-  assert.match(ui.content.innerHTML, /external step/, "stale-click recovery must show the refreshed plan while focused");
-  assert.equal(dom.editor.value, "next draft"); assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 5, "backward"]);
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 1); assert.equal(writes[0].expectedRevision, "r2");
-});
 
-test("Issue #8 final [1] two Enter additions render each saved plan and advance its CAS baseline while restoring the draft selection", async () => {
-  const calls = []; let save, revision = 0, plan = issue8Plan("r0", "original");
-  const ui = issue8Ui(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "board:update") return new Promise(resolve => { save = () => {
-      assert.equal(payload.expectedRevision, plan.planRevision, "each save uses the visible plan version");
-      plan = { ...plan, steps: payload.steps, planRevision: `r${++revision}` }; resolve(plan);
-    }; });
-    return plan;
-  });
-  const dom = issue8DraftDom(ui); ui.cache.board = plan; ui.renderBoardTab();
-  dom.editor.focus(); dom.type("第一条"); dom.enter();
-  assert.ok(save); assert.equal(dom.add.disabled, true); assert.equal(dom.editor.disabled, false);
-  dom.type("  第二条 <draft>  ", 2, 5, "backward");
-  dom.enter(); await ui.updateBoard(dom.add, "add");
-  assert.equal(calls.filter(c => c.action === "board:update").length, 1, "Enter and button share one in-flight lock");
-  const oldEditor = dom.editor, before = dom.renders;
-  save(); await new Promise(setImmediate);
-  assert.ok(dom.renders > before, "saving must actually refresh the list, not only change its revision");
-  assert.match(ui.content.innerHTML, />第一条</);
-  assert.notEqual(dom.editor, oldEditor);
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.equal(dom.editor.value, "  第二条 <draft>  ");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "backward"]);
-  assert.equal(dom.add.disabled, false);
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(calls.filter(c => c.action === "board:update").length, 2, "the second Enter must submit immediately after the first save finishes");
-  assert.equal(calls.filter(c => c.action === "board:update")[1].payload.expectedRevision, "r1");
-  save(); await new Promise(setImmediate);
-  assert.deepEqual(Array.from(plan.steps, step => step.text), ["original", "第一条", "第二条 <draft>"]);
-  assert.match(ui.content.innerHTML, />第二条 &lt;draft&gt;</);
-  assert.equal(dom.editor.value, ""); assert.equal(ui.state.boardDraft, "");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-});
 
-test("Issue #8 final [2] editing away and back to identical text during save preserves the new draft and selection", async () => {
-  let save;
-  const ui = issue8Ui(action => action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved")));
-  const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("old"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("repeat"); const pending = ui.updateBoard(dom.add, "add");
-  dom.type("different"); dom.type("repeat", 1, 4, "forward");
-  save({}); await pending;
-  assert.equal(ui.state.boardDraft, "repeat", "a new edit is not the old submission even when its text is equal");
-  assert.equal(dom.editor.value, "repeat"); assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [1, 4, "forward"]);
-  assert.match(ui.content.innerHTML, />saved</);
-});
 
 for (const change of ["revision", "route", "project", "thread"]) test(`Issue #8 [2] old clear rejects a changed ${change}`, async () => {
   const calls = [], ui = issue8Ui(async (action, payload) => { calls.push({ action, payload }); return issue8Plan("new"); });
@@ -1910,181 +1832,15 @@ for (const change of ["revision", "route", "project", "thread"]) test(`Issue #8 
   assert.equal(ui.root.querySelector(".hub-toast").hidden, false);
 });
 
-test("Issue #8 [2] clear carries the rendered plan revision", async () => {
-  const calls = [], ui = issue8Ui(async (action, payload) => { calls.push({ action, payload }); return issue8Plan("r1"); });
-  ui.cache.board = issue8Plan("r1"); ui.renderBoardTab();
-  await ui.updateBoard(issue8Button(ui, "board-clear"), "clear");
-  assert.equal(calls.find(c => c.action === "board:clear")?.payload.expectedRevision, "r1");
-});
 
-for (const action of ["toggle", "add"]) test(`Issue #8 [3] ${action} carries CAS revision and refreshes a conflict without losing concurrent steps`, async () => {
-  const f = [], old = issue8Plan("r1", "A"), latest = { ...issue8Plan("r2", "A"), steps: [...old.steps, { id: "hub-c", text: "concurrent C", status: "pending" }] };
-  const ui = issue8Ui(async (method, payload) => {
-    f.push({ method, payload });
-    if (method === "board:update") return { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT: 计划已被其他窗口更新" } };
-    return latest;
-  });
-  ui.cache.board = old; ui.state.boardDraft = "new draft"; ui.renderBoardTab();
-  const button = issue8Button(ui, action === "toggle" ? "board-step" : "board-add", { index: "0", stepId: "hub-a", stepText: "A" });
-  await ui.updateBoard(button, action, 0);
-  assert.equal(f.find(c => c.method === "board:update")?.payload.expectedRevision, "r1");
-  assert.ok(f.some(c => c.method === "board:get"), "conflicts must reload the current plan");
-  assert.ok(ui.cache.board.steps.some(s => s.text === "concurrent C"));
-  assert.equal(ui.state.boardDraft, "new draft", "a rejected save must keep the input draft");
-});
 
-for (const outcome of ["success", "failure"]) test(`Issue #8 [4] late loadTab ${outcome} preserves a newly focused editor`, async () => {
-  let finish;
-  const ui = issue8Ui(() => new Promise((resolve, reject) => { finish = () => outcome === "success" ? resolve(issue8Plan("new")) : reject(new Error("late read failure")); }));
-  ui.cache.board = issue8Plan("old"); ui.renderBoardTab();
-  const displayed = ui.content.innerHTML, pending = ui.loadTab(true), editor = node();
-  ui.content.contains = item => item === editor; ui.sandbox.document.activeElement = editor;
-  ui.state.boardDraft = "typing while the request is pending";
-  finish(); await pending;
-  assert.equal(ui.content.innerHTML, displayed, "loadTab must not replace the active input after pollBoard preserved it");
-  ui.sandbox.document.activeElement = null; ui.flushBoardRender();
-  assert.match(ui.content.innerHTML, outcome === "success" ? /new/ : /读取失败/);
-});
 
-test("Issue #8 [5] saving one step preserves a newer draft and focused editor", async () => {
-  let save;
-  const ui = issue8Ui((action, payload) => action === "board:update" ? new Promise(resolve => { save = () => resolve({}); }) : Promise.resolve(issue8Plan("saved")));
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "first step"; ui.renderBoardTab();
-  const pending = ui.updateBoard(dom.add, "add");
-  assert.ok(save, "the first step is in flight");
-  dom.editor.focus(); dom.type("next draft  \nkeep whitespace", 3, 8, "backward");
-  save(); await pending;
-  assert.equal(ui.state.boardDraft, "next draft  \nkeep whitespace");
-  assert.match(ui.content.innerHTML, />saved</);
-  assert.equal(dom.editor.value, ui.state.boardDraft);
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [3, 8, "backward"]);
-});
 
-test("Issue #8 tail [3] Enter keeps the input editable and focused while saving the previous draft", async () => {
-  let save;
-  const calls = [], ui = issue8Ui((action, payload) => {
-    calls.push({ action, payload });
-    return action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved"));
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "first step"; ui.renderBoardTab();
-  const button = dom.add, editor = dom.editor; editor.focus();
-  let prevented = false;
-  ui.onEditorKeydown({ target: editor, currentTarget: editor, key: "Enter", preventDefault() { prevented = true; } });
-  assert.equal(prevented, true); assert.ok(save, "keyboard submission must reach the save RPC");
-  assert.equal(editor.disabled, false, "the active draft input must never be disabled");
-  assert.equal(ui.sandbox.document.activeElement, editor, "Enter must preserve focus during the request");
-  assert.equal(button.disabled, true, "only the sibling Add button becomes busy");
-  dom.type("next draft  keep whitespace ");
-  ui.onEditorKeydown({ target: editor, key: "Enter", preventDefault() {} });
-  assert.equal(calls.filter(call => call.action === "board:update").length, 1, "a second Enter is serialized without disabling typing");
-  save({}); await new Promise(setImmediate);
-  assert.equal(ui.state.boardDraft, "next draft  keep whitespace "); assert.equal(dom.editor.value, ui.state.boardDraft);
-  assert.equal(dom.editor.disabled, false); assert.equal(dom.add.disabled, false);
-  assert.equal(ui.sandbox.document.activeElement, dom.editor); assert.match(ui.content.innerHTML, />saved</);
-});
-test("Issue #8 [5] an unchanged submitted draft clears and restores focus after rendering the saved list", async () => {
-  let save;
-  const ui = issue8Ui(action => action === "board:update" ? new Promise(resolve => { save = resolve; }) : Promise.resolve(issue8Plan("saved")));
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("old"); ui.state.boardDraft = "only draft"; ui.renderBoardTab();
-  dom.editor.focus(); const pending = ui.updateBoard(dom.add, "add");
-  save({}); await pending;
-  assert.equal(ui.state.boardDraft, ""); assert.equal(dom.editor.value, "");
-  assert.match(ui.content.innerHTML, />saved</); assert.equal(ui.sandbox.document.activeElement, dom.editor);
-});
 
-test("Issue #8 [6] every real render updates the signature through A to B to A", async () => {
-  const a = issue8Plan("A"), b = issue8Plan("B"); let data = a;
-  const ui = issue8Ui(async () => data);
-  await ui.pollBoard(); assert.match(ui.content.innerHTML, /value=""/);
-  const editor = node(); ui.content.contains = item => item === editor; ui.sandbox.document.activeElement = editor;
-  data = b; await ui.pollBoard(); assert.doesNotMatch(ui.content.innerHTML, />B</);
-  ui.sandbox.document.activeElement = null;
-  ui.state.boardBackground = true; ui.renderBoardTab(); assert.match(ui.content.innerHTML, />B</);
-  data = a; await ui.pollBoard(); assert.match(ui.content.innerHTML, />A</);
-  assert.doesNotMatch(ui.content.innerHTML, />B</);
-});
 
-test("the full task panel applies the latest snapshot after the user leaves its focused editor", async () => {
-  const ui = harness(async () => ({ threadId: "thread-a", source: "t3-native", steps: [{ text: "最新主计划", status: "pending" }], subagents: [{ title: "最新子任务", rawStatus: "running" }] }));
-  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-  let editing = true; ui.content.contains = () => editing;
-  ui.content.innerHTML = "用户正在编辑的内容";
-  await ui.pollBoard();
-  assert.equal(ui.content.innerHTML, "用户正在编辑的内容", "polling must not replace a focused editor");
-  editing = false;
-  await ui.pollBoard();
-  assert.match(ui.content.innerHTML, /最新主计划/);
-  assert.match(ui.content.innerHTML, /最新子任务/);
-});
 
-test("a task-panel read failure preserves focused editing and displays the error after blur", async () => {
-  const ui = harness(async () => { throw new Error("temporary failure"); });
-  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-  let editing = true; ui.content.contains = () => editing; ui.content.innerHTML = "用户正在编辑的内容";
-  await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
-  editing = false; await ui.pollBoard(); assert.match(ui.content.innerHTML, /读取失败/);
-});
 
-test("a task-panel failure recovering while focused renders fresh data after blur", async () => {
-  let fail = true;
-  const ui = harness(async () => { if (fail) throw new Error("temporary failure"); return { threadId: "thread-a", source: "t3-native", steps: [{ text: "恢复后的计划", status: "pending" }] }; });
-  ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-  let editing = true; ui.content.contains = () => editing; ui.content.innerHTML = "用户正在编辑的内容";
-  await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
-  fail = false; await ui.pollBoard(); assert.equal(ui.content.innerHTML, "用户正在编辑的内容");
-  editing = false; await ui.pollBoard(); assert.match(ui.content.innerHTML, /恢复后的计划/);
-});
 
-test("stale task-panel buttons never target a different step or artifact", async () => {
-  async function scenario(oldBoard, newBoard, dataset, beforeClick = () => {}) {
-    const calls = [];
-    const ui = harness(async (action, payload) => { calls.push({ action, payload }); if (action === "board:get") return newBoard; if (action === "board:openArtifact") return { kind: "revealed" }; return {}; });
-    ui.ready(); Object.assign(ui.state, { connected: true, open: true, tab: "board", threadId: "thread-a", projectRoot: "/fixture", context: { threadId: "thread-a" } });
-    const editor = node(), target = node(); target.dataset = dataset; target.closest = () => target;
-    ui.content.contains = (item) => item === editor || item === target;
-    ui.root.contains = (item) => item === target;
-    ui.sandbox.document.activeElement = editor; ui.cache.board = oldBoard; ui.renderBoardTab();
-    const displayed = ui.content.innerHTML;
-    await ui.pollBoard(); assert.equal(ui.content.innerHTML, displayed, "focused editor keeps its old DOM");
-    beforeClick(ui); ui.onClick({ target }); await new Promise(setImmediate);
-    return { calls, ui };
-  }
-  const oldSteps = { source: "hub-mcp", steps: [{ id: "hub-a", text: "A", status: "pending" }], artifacts: [] };
-  const newSteps = { threadId: "thread-a", source: "hub-mcp", steps: [{ id: "hub-c", text: "C", status: "pending" }], artifacts: [] };
-  const step = await scenario(oldSteps, newSteps, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
-  assert.equal(step.calls.filter((call) => call.action === "board:update").length, 0, "old A must never toggle new C");
-  const oldArtifacts = { source: "t3-native", steps: [], artifacts: [{ path: "/fixture/A.md", name: "A.md" }] };
-  const newArtifacts = { threadId: "thread-a", source: "t3-native", steps: [], artifacts: [{ path: "/fixture/C.md", name: "C.md" }] };
-  const artifact = await scenario(oldArtifacts, newArtifacts, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
-  assert.equal(artifact.calls.filter((call) => call.action === "board:openArtifact").length, 0, "old A.md must never open C.md");
-  const reordered = await scenario(oldSteps, { ...newSteps, steps: [newSteps.steps[0], oldSteps.steps[0]] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
-  const update = reordered.calls.find((call) => call.action === "board:update");
-  assert.equal(update.payload.steps[0].status, "pending"); assert.equal(update.payload.steps[1].status, "completed", "unique stable A may follow a reorder");
-  const changedStatus = await scenario(oldSteps, { ...newSteps, steps: [{ ...oldSteps.steps[0], status: "completed" }] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
-  assert.equal(changedStatus.calls.filter((call) => call.action === "board:update").length, 0, "a changed status cannot reverse an unseen update");
-  const duplicate = await scenario({ ...oldSteps, steps: [oldSteps.steps[0], oldSteps.steps[0]] }, { ...newSteps, steps: [oldSteps.steps[0]] }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" });
-  assert.equal(duplicate.calls.filter((call) => call.action === "board:update").length, 0, "duplicate IDs are ambiguous");
-  const synthetic = { ...oldSteps, steps: [{ id: "step-1", text: "A", status: "pending" }, { id: "step-2", text: "B", status: "pending" }] };
-  const positional = await scenario(synthetic, { ...newSteps, steps: [synthetic.steps[0], { id: "step-2", text: "C", status: "pending" }] }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
-  assert.equal(positional.calls.filter((call) => call.action === "board:update").length, 0, "a positional ID cannot establish identity after list changes");
-  const unchanged = await scenario(synthetic, { ...newSteps, steps: synthetic.steps }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
-  assert.equal(unchanged.calls.filter((call) => call.action === "board:update").length, 1, "an unchanged unique positional plan remains editable");
-  const repeatedSynthetic = { ...synthetic, steps: [synthetic.steps[0], { id: "step-2", text: "A", status: "pending" }] };
-  const ambiguousSynthetic = await scenario(repeatedSynthetic, { ...newSteps, steps: repeatedSynthetic.steps }, { action: "board-step", index: "0", stepId: "step-1", stepText: "A" });
-  assert.equal(ambiguousSynthetic.calls.filter((call) => call.action === "board:update").length, 0, "duplicate positional rows remain ambiguous even before a reorder");
-  const movedArtifact = await scenario(oldArtifacts, { ...newArtifacts, artifacts: [newArtifacts.artifacts[0], oldArtifacts.artifacts[0]] }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
-  assert.equal(movedArtifact.calls.find((call) => call.action === "board:openArtifact").payload.path, "/fixture/A.md");
-  const duplicateArtifact = await scenario(oldArtifacts, { ...newArtifacts, artifacts: [oldArtifacts.artifacts[0], oldArtifacts.artifacts[0]] }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" });
-  assert.equal(duplicateArtifact.calls.filter((call) => call.action === "board:openArtifact").length, 0, "duplicate artifact paths are ambiguous");
-  const otherProject = await scenario(oldSteps, { ...newSteps, steps: oldSteps.steps }, { action: "board-step", index: "0", stepId: "hub-a", stepText: "A" }, (ui) => { ui.state.projectRoot = "/another-project"; });
-  assert.equal(otherProject.calls.filter((call) => call.action === "board:update").length, 0, "a different project cannot reuse the old view");
-  const otherThread = await scenario(oldArtifacts, { ...newArtifacts, artifacts: oldArtifacts.artifacts }, { action: "read-artifact", index: "0", artifactPath: "/fixture/A.md" }, (ui) => { ui.sandbox.location.pathname = "/threads/thread-b"; ui.sandbox.location.href = "https://fixture.test/threads/thread-b"; });
-  assert.equal(otherThread.calls.filter((call) => call.action === "board:openArtifact").length, 0, "a different route cannot reuse the old view");
-});
 
 test("thread IDs follow threads, _chat, hash, UUID, then current context", () => {
   const ui = harness();
@@ -2098,26 +1854,6 @@ test("thread IDs follow threads, _chat, hash, UUID, then current context", () =>
   assert.equal(ui.currentThreadId(), "context-thread");
 });
 
-test("native two-UUID routes use the thread UUID; drafts and project-only routes never reuse stale context", async () => {
-  const calls = [];
-  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return { steps: [] }; });
-  const environment = "6ee0c274-d218-41d6-b277-cbfc803dfbc0";
-  const project = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-  const thread = "3972c780-3288-4f8b-9990-c6cd999f70ba";
-  ui.state.context = { threadId: "stale-thread" };
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/${environment}/${thread}`, href: `t3code://app/#/${environment}/${thread}` });
-  assert.equal(ui.currentThreadId(), thread);
-  ui.state.context = { threadId: thread, projectId: project, projectRoot: "/fixture", environmentId: environment };
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: ui.currentThreadId() });
-  await ui.pollBoard();
-  const call = calls.find((entry) => entry.action === "board:get");
-  assert.equal(call.payload.threadId, thread);
-  assert.equal(call.payload.strictThreadMatch, true);
-  for (const hash of [`#/draft/${project}`, `#/draft/${project}/${thread}`, `#/${project}`, `#/projects/${project}`, `#/${project}/new`, `#/projects/${project}/new`, `#/workspace/${project}/new`, `#/projects/${project}/draft/${thread}`]) {
-    ui.sandbox.location.hash = hash;
-    assert.equal(ui.currentThreadId(), "__NEW__", `${hash} must not look up another thread`);
-  }
-});
 
 for (const source of ["promotedTo", "promotedDraftRedirects"]) for (const wrapped of [false, true]) {
   test(`promoted draft ${source} (${wrapped ? "persisted state" : "flat store"}) resolves context and loads only its server plan`, async () => {
@@ -2450,59 +2186,7 @@ for (const source of ["search", "href", "router"]) for (const outcome of ["resol
   assert.ok(!calls.some((entry) => entry.action !== "hub:getContext" && entry.payload.projectRoot === "/project-a"));
 });
 
-for (const phase of ["board", "skills"]) test(`Round-2 P2 #1 scope identity is rechecked after awaiting ${phase === "board" ? "boardPoll" : "loadTab"}`, async () => {
-  const envA = "environment-a", envB = "environment-b", calls = [];
-  let finishPhase, finishB, contextCalls = 0;
-  const ui = issue8Ui(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "hub:getContext") return ++contextCalls === 1 ? { environmentId: envA, projectRoot: "/fixture", threadId: "thread-a" } : new Promise((resolve) => { finishB = resolve; });
-    if (contextCalls === 1 && action === (phase === "board" ? "board:get" : "skills:list")) return new Promise((resolve) => { finishPhase = resolve; });
-    return { threadId: "thread-a", steps: [], items: [] };
-  }, { location: { search: `?environmentId=${envA}` } });
-  ui.state.context = { environmentId: envA, projectRoot: "/fixture", threadId: "thread-a" };
-  ui.state.tab = phase;
-  ui.setCurrentRoute();
-  if (phase === "board") {
-    const dom = issue8DraftDom(ui); ui.cache.board = issue8Plan("r1", "old environment plan"); ui.renderBoardTab();
-    dom.editor.focus(); dom.type("unsaved environment A draft", 1, 5, "forward");
-  }
-  const pending = ui.refreshContext();
-  await new Promise(setImmediate);
-  assert.equal(typeof finishPhase, "function");
-  ui.sandbox.location.search = `?environmentId=${envB}`;
-  finishPhase(phase === "board" ? issue8Plan("r2", "late environment A plan") : { items: [{ id: "late-environment-a-skill" }] });
-  await pending;
-  assert.equal(typeof finishB, "function", "the post-await guard must process scope changes");
-  assert.ok(!calls.some((entry) => entry.action === "subagents:list"), "the old refresh must not prime catalogs after its await");
-  finishB({ environmentId: envB, projectRoot: "/project-b", threadId: "thread-a" });
-  await new Promise(setImmediate);
-  assert.equal(ui.state.context.environmentId, envB); assert.equal(ui.state.projectRoot, "/project-b");
-  assert.doesNotMatch(JSON.stringify({ board: ui.cache.board, skills: ui.cache.skills }), /late environment A plan|late-environment-a-skill/);
-});
 
-test("checkRoute synchronously disconnects an unpromoted draft and rejects an in-flight project catalog", async () => {
-  const calls = [];
-  let finishSkills;
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "skills:list") return new Promise((resolve) => { finishSkills = resolve; });
-    if (action === "hub:getContext") return new Promise(() => {});
-    return {};
-  });
-  Object.assign(ui.state, { open: true, tab: "skills", connected: true, projectRoot: "/project-a", threadId: "thread-a", context: { projectRoot: "/project-a", threadId: "thread-a" } });
-  ui.ready(); ui.setCurrentRoute();
-  const pending = ui.loadTab();
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: "#/draft/draft-b", href: "t3code://app/#/draft/draft-b" });
-  ui.checkRoute();
-  assert.equal(ui.state.connected, false);
-  assert.equal(ui.state.context, null);
-  assert.equal(ui.state.projectRoot, null);
-  assert.equal(ui.state.threadId, "__NEW__");
-  finishSkills({ items: [{ id: "stale-project-a-skill" }] });
-  await pending;
-  assert.equal(ui.cache.skills, null);
-  assert.ok(!calls.some((entry) => entry.action === "hub:getContext"));
-});
 
 test("unpromoted draft with stale row IDs, other redirects and unrelated server Fibers stays isolated", async () => {
   const calls = [], environmentId = "6ee0c274-d218-41d6-b277-cbfc803dfbc0", draftId = "unpromoted";
@@ -2527,131 +2211,10 @@ test("promoted draft router and pathname candidates resolve without borrowing st
   }
 });
 
-test("route changes clear old plans and artifacts synchronously, request the new thread, and reject late old replies", async () => {
-  const calls = [], replies = new Map();
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, ...payload });
-    if (action === "hub:getContext") return { projectRoot: "/fixture" };
-    if (action === "board:get") return new Promise((resolve) => replies.set(payload.threadId, resolve));
-    return {};
-  });
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a" });
-  const old = ui.pollBoard();
-  ui.cache.board = { steps: [{ text: "old", status: "completed" }] };
-  ui.state.artifact = { content: "old artifact" };
-  Object.assign(ui.sandbox.location, { pathname: "/_chat/thread-b", href: "https://fixture.test/_chat/thread-b" });
-  ui.checkRoute();
-  assert.equal(ui.state.threadId, "thread-b");
-  assert.equal(ui.cache.board, null);
-  assert.equal(ui.state.artifact, null);
-  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /任务面板<[^>]*><span[^>]*>读取中/);
-  await new Promise(setImmediate);
-  assert.ok(calls.some((x) => x.action === "board:get" && x.threadId === "thread-b" && x.excludeSubagentInference === true));
-  replies.get("thread-b")({ steps: [{ text: "new plan" }] });
-  await new Promise(setImmediate);
-  replies.get("thread-a")({ steps: [{ text: "old late plan" }] });
-  await old;
-  assert.equal(ui.cache.board.steps[0].text, "new plan");
-});
 
-test("inline add, check and clear send the captured current thread on every mutation", async () => {
-  const calls = [];
-  let data = { steps: [] };
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "board:update") data = { source: "hub-mcp", steps: payload.steps };
-    if (action === "board:clear") data = { steps: [] };
-    return action === "board:get" ? data : {};
-  });
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-b", boardDraft: "追加步骤" });
-  Object.assign(ui.sandbox.location, { pathname: "/threads/thread-b", href: "https://fixture.test/threads/thread-b" });
-  await ui.updateBoard(null, "add");
-  assert.equal(ui.cache.board.steps[0].text, "追加步骤");
-  await ui.updateBoard(null, "toggle", 0);
-  assert.equal(ui.cache.board.steps[0].status, "completed");
-  await ui.updateBoard(null, "clear");
-  assert.equal(ui.cache.board.steps.length, 0);
-  for (const call of calls) {
-    assert.equal(call.payload.threadId, "thread-b");
-    assert.equal(call.payload.projectRoot, "/fixture");
-  }
-});
 
-for (const prefix of ["$", "￥"]) test(`${prefix} triggers a left-aligned palette and replaces the token without damaging adjacent text`, () => {
-  class Textarea {
-    constructor(value) { Object.assign(this, node()); this.tagName = "TEXTAREA"; this.value = value; this.selectionStart = this.selectionEnd = 9; this.isConnected = true; }
-    get value() { return this._value; } set value(value) { this._value = value; }
-    focus() {} setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; } dispatchEvent(event) { this.lastEvent = event; }
-  }
-  const editor = new Textarea(`请核验 ${prefix}mem 保留后文`);
-  editor.selectionStart = editor.selectionEnd = 8;
-  const ui = harness();
-  ui.sandbox.HTMLTextAreaElement = Textarea;
-  ui.sandbox.InputEvent = class { constructor(type, detail) { this.type = type; Object.assign(this, detail); } };
-  ui.ready();
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture" });
-  const token = ui.composerToken(editor);
-  assert.equal(token.raw, `${prefix}mem`);
-  assert.equal(token.query, "mem");
-  assert.equal(token.start, 4);
-  const palette = ui.nodes.get("#t3-hub-slash-palette");
-  const session = { editor, token, manual: false, projectRoot: "/fixture", route: ui.routeKey(), rows: [{ type: "skill", trigger: "$memory" }], aria: {} };
-  ui.setSlash(session);
-  palette.hidden = false;
-  ui.positionSlash();
-  assert.equal(palette.style.left, "100px");
-  assert.equal(palette.style.bottom, "206px", "palette bottom is exactly 6px above the visible input top");
-  ui.selectSlash(0);
-  assert.equal(editor.value, "请核验 $memory  保留后文");
-  assert.equal(editor.lastEvent.type, "input");
-  assert.equal(palette.hidden, true);
-  assert.equal(ui.getSlash(), null);
-});
 
-test("plain / is native, compositionend triggers $/￥ immediately, and Escape closes the palette", () => {
-  const ui = harness();
-  for (const value of ["/plan", "text/plan", "a$mem", "￥bad/name", "$bad/name", "no token", ""]) {
-    assert.equal(ui.composerToken({ tagName: "TEXTAREA", value, selectionStart: value.length, selectionEnd: value.length }), null, value);
-  }
-  for (const value of ["$", "￥", "你好\n￥技能", "text $plugin"]) {
-    const token = ui.composerToken({ tagName: "TEXTAREA", value, selectionStart: value.length, selectionEnd: value.length });
-    assert.ok(token, value);
-  }
-  assert.match(drawerSource, /listen\(document, "compositionend", \(event\) => \{ composing = false; onComposerInput\(event\); \}/);
-  const editor = { focus() {} };
-  const palette = ui.nodes.get("#t3-hub-slash-palette");
-  palette.hidden = false;
-  ui.setSlash({ editor, aria: {} });
-  ui.onComposerKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {} });
-  assert.equal(ui.getSlash(), null);
-  assert.equal(palette.hidden, true);
-});
-
-test("HUD is centered on the visible rounded surface with a 2px gap on desktop and narrow viewports", () => {
-  const find = rendererSource.match(/  function findComposerSurface\([^]*?\n  \}/)[0];
-  const update = rendererSource.match(/  function updateLayoutPosition\([^]*?\n  \}/)[0];
-  for (const [viewportWidth, rect] of [[1280, { left: 250, top: 650, width: 640 }], [390, { left: 16, top: 650, width: 358 }]]) {
-    const topbar = node(); topbar.offsetWidth = viewportWidth < 500 ? 270 : 520; topbar.offsetHeight = 27;
-    const surface = node(); surface.getBoundingClientRect = () => ({ ...rect, right: rect.left + rect.width, bottom: 780, height: 130 });
-    const wrapper = node(); wrapper.parentElement = surface;
-    const editor = { parentElement: wrapper };
-    const shell = node(); shell.querySelector = () => editor; shell.contains = () => true;
-    const column = node(); column.getBoundingClientRect = () => ({ left: rect.left - 20, width: rect.width + 40 });
-    const header = node(); header.getBoundingClientRect = () => ({ top: 0, height: 55, width: rect.width });
-    const sandbox = { innerWidth: viewportWidth, window: { innerWidth: viewportWidth }, topbar, branchBtnText: node(), drawer: node(), popover: node(), t: (x) => x,
-      document: { hidden: false, querySelector: (selector) => selector === '[data-slot="composer-shell"]' ? shell : selector === '[data-chat-column]' ? column : header },
-      getComputedStyle: (el) => el === surface ? { borderRadius: "18px", backgroundColor: "rgb(255, 255, 255)", borderTopWidth: "1px", borderTopStyle: "solid" } : { borderRadius: "0px", backgroundColor: "rgba(0, 0, 0, 0)", borderTopWidth: "0px" },
-      customDrawerPos: null, ensureLayoutObservers() {}, syncUiVisibility: () => true, setComposerTopSpacing() {}, lastLayoutState: {} };
-    vm.runInNewContext(find + "\n" + update + "\nupdateLayoutPosition();", sandbox);
-    assert.equal(Number.parseInt(topbar.style.left) + topbar.offsetWidth / 2, rect.left + rect.width / 2);
-    assert.equal(Number.parseInt(topbar.style.top) + topbar.offsetHeight, rect.top - 2);
-    assert.equal(topbar.style.maxWidth, `${Math.max(200, Math.min(rect.width - 16, viewportWidth - 24))}px`);
-  }
-  assert.doesNotMatch(update, /- 153/);
-  assert.doesNotMatch(rendererSource, /padding-top:40px/);
-});
-
-test("memory list/detail, version rollback, recall and both AutoDream watermarks show local YYYY-MM-DD HH:mm", () => {
+test("memory list/detail, version rollback and recall show local YYYY-MM-DD HH:mm", () => {
   const ui = harness();
   const timestamp = new Date(2026, 10, 15, 22, 55, 37).toISOString();
   assert.equal(ui.formatExactTime(timestamp), "2026-11-15 22:55");
@@ -2669,44 +2232,10 @@ test("memory list/detail, version rollback, recall and both AutoDream watermarks
   assert.ok(html.includes("最近召回"));
   assert.ok(html.includes("v1"));
   assert.match(html, /class="hub-history-list" >/, "revision history is expanded and its exact time is visible");
-  ui.cache.dream = { config: { enabled: true, lastDreamAt: timestamp, lastAgentDreamAt: timestamp } };
-  ui.renderDream();
-  const dream = ui.nodes.get("#t3-hub-dream").innerHTML;
-  assert.ok(dream.includes("最近浅睡"));
-  assert.ok(dream.includes("最近深睡"));
-  assert.equal([...dream.matchAll(/2026-11-15 22:55<\/time>/g)].length, 2);
 });
 
 
-test("a plan mutation invalidates a pre-write poll so its late reply cannot revert a checked step", async () => {
-  let release;
-  const ui = harness(async (action) => {
-    if (action === "board:get" && !release) return new Promise((resolve) => { release = resolve; });
-    if (action === "board:get") return { steps: [{ id: "step", text: "checked", status: "completed" }] };
-    return {};
-  });
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "thread-a" });
-  ui.cache.board = { source: "hub-mcp", steps: [{ id: "step", text: "checked", status: "pending" }] };
-  const old = ui.pollBoard();
-  await ui.updateBoard(null, "toggle", 0);
-  release({ steps: [{ id: "step", text: "old poll", status: "pending" }] });
-  await old;
-  assert.equal(ui.cache.board.steps[0].status, "completed");
-  assert.equal(ui.cache.board.steps[0].text, "checked");
-});
 
-for (const prefix of ["$", "￥"]) test(`${prefix} is detected across adjacent contenteditable text nodes`, () => {
-  const ui = harness();
-  const first = { nodeType: 3, data: `第一行\n${prefix}` }, second = { nodeType: 3, data: "memory" };
-  const editor = { tagName: "DIV", nodeType: 1, childNodes: [first, second], contains: (node) => node === first || node === second };
-  ui.sandbox.window.getSelection = () => ({ rangeCount: 1, isCollapsed: true, anchorNode: second, anchorOffset: 3 });
-  const token = ui.composerToken(editor);
-  assert.equal(token.query, "mem");
-  assert.equal(token.raw, `${prefix}memory`);
-  assert.equal(token.point(token.start).node, first);
-  assert.equal(token.point(token.end).node, second);
-  assert.equal(token.point(token.end).offset, 6);
-});
 
 test("native card lookup falls back past unrelated asides and accepts shadow-drawn borders", () => {
   const { ui, sidebar, card, label } = relationFixture();
@@ -2716,46 +2245,6 @@ test("native card lookup falls back past unrelated asides and accepts shadow-dra
   assert.equal(ui.findSessionRelationsCard().card, card);
 });
 
-test("[P1] unscoped drafts are blocked; verified project drafts stay strictly isolated", async () => {
-  const calls = [];
-  let boardData = { steps: [] };
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "board:get") return boardData;
-    if (action === "board:update") { boardData = { source: "hub-mcp", steps: payload.steps }; return {}; }
-    if (action === "board:clear") { boardData = { steps: [] }; return {}; }
-    return {};
-  });
-  for (const [pathname, hash] of [["/threads/new", ""], ["/_chat/new", ""], ["/threads/NEW", ""], ["/", "#/threads/new"]]) {
-    Object.assign(ui.sandbox.location, { pathname, hash, href: `https://fixture.test${pathname}${hash}` });
-    assert.equal(ui.currentThreadId(), "__NEW__", `${pathname}${hash}`);
-  }
-  Object.assign(ui.state, { connected: true, projectRoot: "/fixture", threadId: "__NEW__", boardDraft: "草稿步骤" });
-  ui.cache.board = { steps: [] };
-  calls.length = 0;
-  await ui.pollBoard(); await ui.updateBoard(null, "add"); await ui.updateBoard(null, "clear");
-  assert.equal(calls.length, 0, "unscoped drafts must not use a fallback project");
-  const projectId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-  Object.assign(ui.sandbox.location, { pathname: "/", hash: `#/projects/${projectId}/new`, href: `t3code://app/#/projects/${projectId}/new` });
-  ui.state.context = { threadId: "__NEW__", projectId, projectRoot: "/fixture", draftProjectVerified: true };
-  await ui.pollBoard();
-  const pollCall = calls.find((x) => x.action === "board:get");
-  assert.equal(pollCall.payload.threadId, "__NEW__");
-  assert.equal(pollCall.payload.strictThreadMatch, true);
-  assert.equal(pollCall.payload.excludeSubagentInference, true);
-  calls.length = 0;
-  boardData = { steps: [] };
-  await ui.updateBoard(null, "add");
-  const updateCall = calls.find((x) => x.action === "board:update");
-  assert.equal(updateCall.payload.threadId, "__NEW__");
-  assert.equal(updateCall.payload.strictThreadMatch, true);
-  assert.equal(updateCall.payload.projectRoot, "/fixture");
-  calls.length = 0;
-  await ui.updateBoard(null, "clear");
-  const clearCall = calls.find((x) => x.action === "board:clear");
-  assert.equal(clearCall.payload.threadId, "__NEW__");
-  assert.equal(clearCall.payload.strictThreadMatch, true);
-});
 
 test("[P1] clear on thread-a sends only that threadId, never a bare projectRoot wipe", async () => {
   const calls = [];
@@ -2774,19 +2263,18 @@ test("[P1] clear on thread-a sends only that threadId, never a bare projectRoot 
 });
 
 
-test("navigation exposes plugins and Hooks without adding a plugin market", () => {
-  const tabs = drawerSource.match(/const tabs = (\[\["memory"[^;]+);/)[1];
-  assert.deepEqual([...tabs.matchAll(/\["(memory|skills|plugins|subagents|hooks|settings)"/g)].map(x => x[1]), ["memory", "skills", "plugins", "subagents", "hooks", "settings"]);
-  assert.match(drawerSource, /function renderPlugins\b/);
-  assert.doesNotMatch(drawerSource, /function installMarketplace\b/);
-  const slash = drawerSource.slice(drawerSource.indexOf("function scopedSlashItems"), drawerSource.indexOf("function nativeSlashMenu"));
-  assert.doesNotMatch(slash, /type: "plugin"/);
-  const palette = drawerSource.slice(drawerSource.indexOf("function renderSlash"), drawerSource.indexOf("function setSlashActive"));
-  assert.doesNotMatch(palette, /\["plugin"/);
-  // The approved card catalog, scoped artifact preview and host/rules controls
-  // expand the former 300 KB navigation-only budget. Keep a bounded allowance
-  // without minifying maintained source or weakening the behavioral checks.
-  assert.ok(Buffer.byteLength(drawerSource) < 380000);
+
+test("memory-only navigation loads its live data without requesting hidden catalogs", async () => {
+  const calls = [], ui = harness(async (action) => { calls.push(action); return { items: [], agents: [] }; });
+  ui.ready(); Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot: "/fixture", threadId: "thread-a", context: { threadId: "thread-a", projectRoot: "/fixture" } });
+  ui.renderChrome();
+  const tabs = ui.root.querySelector(".hub-tabs").innerHTML;
+  assert.deepEqual([...tabs.matchAll(/data-tab="([^"]+)"/g)].map((match) => match[1]), ["memory"]);
+  await ui.loadTab();
+  assert.ok(calls.includes("memory:connections"));
+  assert.ok(calls.includes("memory:list"));
+  assert.doesNotMatch(calls.join(" "), /mcp:list|skills:list|plugins:list|hooks:list|subagents:list|memory:dream|orchestration/);
+  assert.doesNotMatch(drawerSource, /listen\(document,\s*"(?:input|focusin|click|keyup|keydown)"[^;]*onComposer/);
 });
 
 test("project tier edits start with effective inherited values and save only that project item", async () => {
@@ -2847,68 +2335,8 @@ test("incomplete mode rollback warns that rule files need inspection", async () 
   assert.match(ui.renderCommander(), /待同步/);
 });
 
-test("polling unchanged data preserves focus, and changed data restores focus only within the same thread", async () => {
-  let data = { threadId: "thread-a", source: "hub-mcp", steps: [{ text: "one", status: "pending" }] };
-  const ui = harness(async () => data), board = ui.nodes.get("#t3-hub-live-board");
-  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
-  let html = "", redraws = 0, focusCalls = 0;
-  Object.defineProperty(board, "innerHTML", { get: () => html, set: (value) => { html = value; redraws++; } });
-  const focusNode = (drag, index) => ({ dataset: drag ? {} : { action: "board-step", index: String(index), stepId: "hub-1", stepText: "one" }, matches: (selector) => selector === "[data-board-drag],button[data-action]" || drag && selector === "[data-board-drag]", focus: () => { focusCalls++; } });
-  let restored = focusNode(true);
-  board.contains = (element) => !!element;
-  board.querySelector = (selector) => selector === "[data-board-drag]" ? restored : null;
-  board.querySelectorAll = (selector) => selector === 'button[data-action="board-step"]' ? [restored] : [];
-  await ui.pollBoard();
-  ui.sandbox.document.activeElement = focusNode(true);
-  const before = redraws; await ui.pollBoard();
-  assert.equal(redraws, before); assert.equal(focusCalls, 0);
-  data = { ...data, steps: [{ text: "one", status: "completed" }] }; await ui.pollBoard();
-  assert.equal(redraws, before + 1); assert.equal(focusCalls, 1, "drag handle regains focus after a real change");
-  ui.sandbox.document.activeElement = focusNode(false, 0); restored = focusNode(false, 0);
-  data = { ...data, steps: [{ text: "one", status: "pending" }] }; await ui.pollBoard();
-  assert.equal(focusCalls, 2, "the matching step button regains focus");
-  ui.state.threadId = "thread-b"; ui.renderLiveBoard();
-  assert.equal(focusCalls, 2, "focus must not move into a different thread");
-});
 
-test("changed task lists never move keyboard focus to a different step", async () => {
-  let data = { threadId: "thread-a", source: "hub-mcp", steps: [{ id: "hub-a", text: "A" }, { id: "hub-b", text: "B" }, { id: "hub-c", text: "C" }] };
-  const ui = harness(async () => data), board = ui.nodes.get("#t3-hub-live-board");
-  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a" });
-  const focused = [];
-  const button = (id, text, index) => ({ dataset: { action: "board-step", stepId: id, stepText: text, index: String(index) }, matches: (sel) => sel === "[data-board-drag],button[data-action]", focus() { focused.push(id); } });
-  const header = { focus() { focused.push("header"); } };
-  let buttons = [];
-  board.contains = (element) => !!element;
-  board.querySelector = (selector) => selector === "[data-board-drag]" ? header : null;
-  board.querySelectorAll = (selector) => selector === 'button[data-action="board-step"]' ? buttons : [];
-  await ui.pollBoard();
-  ui.sandbox.document.activeElement = button("hub-b", "B", 1);
-  buttons = [button("hub-c", "C", 0), button("hub-b", "B", 1)];
-  data = { ...data, steps: [{ id: "hub-c", text: "C" }, { id: "hub-b", text: "B" }] };
-  await ui.pollBoard(); assert.equal(focused.pop(), "hub-b", "same stable step regains focus after reordering");
-  ui.sandbox.document.activeElement = button("hub-b", "B", 1);
-  buttons = [button("hub-a", "A", 0), button("hub-c", "C", 1)];
-  data = { ...data, steps: [{ id: "hub-a", text: "A" }, { id: "hub-c", text: "C" }] };
-  await ui.pollBoard(); assert.equal(focused.pop(), "header", "removed B must never focus C at B's former index");
-  ui.sandbox.document.activeElement = button("step-2", "B", 1);
-  buttons = [button("step-2", "B", 1)]; data = { ...data, steps: [{ id: "step-2", text: "B" }] };
-  await ui.pollBoard(); assert.equal(focused.pop(), "header", "positional synthetic IDs are not trusted");
-  ui.sandbox.document.activeElement = { dataset: { action: "read-artifact", index: "1" }, matches: (sel) => sel === "[data-board-drag],button[data-action]" };
-  data = { ...data, artifacts: [{ path: "first.md" }, { path: "second.md" }] };
-  await ui.pollBoard(); assert.equal(focused.pop(), "header", "artifact focus cannot jump to the first of several files");
-});
 
-test("a native plan is read-only and plan read failures never claim it is absent", async () => {
-  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return {}; });
-  ui.ready(); Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/fixture", boardDraft: "manual" });
-  ui.cache.board = { source: "t3-native", steps: [{ text: "native", status: "pending" }] };
-  await ui.updateBoard(null, "toggle", 0); await ui.updateBoard(null, "clear"); await ui.updateBoard(null, "add");
-  assert.equal(calls.length, 0);
-  ui.cache.board = { planReadError: "too_large", steps: [] }; ui.renderLiveBoard();
-  assert.match(ui.nodes.get("#t3-hub-live-board").innerHTML, /计划文件过大/);
-  assert.doesNotMatch(ui.nodes.get("#t3-hub-live-board").innerHTML, /暂无主计划/);
-});
 
 test("hook project writes require the resolved current project and exclude other project hooks", async () => {
   const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return action === "hooks:list" ? { items: [{ id: "global", scope: "off", configured: false, configurationStatus: "not-configured" }] } : { item: { scope: payload.scope } }; });
@@ -3037,485 +2465,16 @@ test('stale host rule editor refuses to overwrite a newly injected role block', 
   assert.match(ui.nodes.get('.hub-toast').innerHTML,/变更|重新读取/);
 });
 
-test("Issue #8 recheck4 [1] conflict to native read-only plan keeps unsaved draft, focus, and selection visible", async () => {
-  const native = { ...issue8Plan("r2", "native step"), source: "t3-native" };
-  const ui = issue8Ui(async action => action === "board:update"
-    ? { ok: false, error: { code: "PLAN_CONFLICT", message: "PLAN_CONFLICT" } }
-    : native);
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("r1", "old step"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("unsaved draft", 2, 7, "backward");
-  await ui.updateBoard(dom.editor, "add");
-  assert.match(ui.content.innerHTML, /native step/);
-  assert.ok(dom.editor?.isConnected, "unsaved draft input remains in DOM");
-  assert.equal(dom.editor.value, "unsaved draft");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
-  assert.match(ui.content.innerHTML, /unsaved draft/);
-});
 
-test("Issue #8 recheck4 [3] failed manual refresh preserves protected draft editor and reconnects cleanly", async () => {
-  let finish, online = false, plan = issue8Plan("r2", "synced step");
-  const ui = issue8Ui(async action => {
-    if (action === "board:update") return new Promise(resolve => { finish = () => resolve({}); });
-    if (!online && (action === "board:get" || action === "hub:getContext")) throw new Error("fixture connection failed");
-    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
-    if (action === "board:get") return plan;
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("r1", "old step"); ui.renderBoardTab();
-  dom.editor.focus(); dom.type("submitted");
-  const pending = ui.updateBoard(dom.editor, "add");
-  dom.type("unsaved draft", 2, 7, "backward");
-  const protectedEditor = dom.editor;
-  finish(); await pending;
-  assert.equal(dom.editor, protectedEditor);
-  const refreshBtn = node();
-  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
-  refreshBtn.closest = () => refreshBtn;
-  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
-  ui.onClick({ target: refreshBtn });
-  await new Promise(setImmediate);
-  assert.equal(dom.editor, protectedEditor, "failed manual refresh keeps protected draft editor intact");
-  assert.equal(ui.sandbox.document.activeElement, protectedEditor);
-  assert.equal(dom.editor.value, "unsaved draft");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
-  online = true;
-  ui.onClick({ target: refreshBtn });
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.match(ui.content.innerHTML, /synced step/);
-  assert.equal(dom.editor.value, "unsaved draft");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
-});
 
-test("Issue #8 recheck4 [4] saving while hidden syncs focused board list and CAS baseline upon return", async () => {
-  const writes = [];
-  let finish, reads = 0, plan = issue8Plan("r1", "old step");
-  const ui = issue8Ui(async (action, payload) => {
-    if (action === "board:update") {
-      writes.push(payload);
-      if (writes.length === 1) return new Promise(resolve => { finish = () => {
-        plan = { ...plan, steps: payload.steps, planRevision: "r2" };
-        resolve({});
-      }; });
-      plan = { ...plan, steps: payload.steps, planRevision: "r3" };
-      return {};
-    }
-    if (action === "board:get") { reads++; return plan; }
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = plan; ui.renderBoardTab();
-  dom.editor.focus(); dom.type("first step");
-  const pending = ui.updateBoard(dom.editor, "add");
-  dom.type("next draft", 2, 5, "backward");
-  ui.sandbox.document.hidden = true;
-  finish(); await pending;
-  assert.equal(reads, 0, "hidden window skips background poll");
-  ui.sandbox.document.hidden = false;
-  await ui.pollBoard();
-  assert.equal(reads, 1);
-  assert.match(ui.content.innerHTML, />first step</, "first visible poll updates focused board list");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.equal(dom.editor.value, "next draft");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 5, "backward"]);
-  await ui.updateBoard(dom.editor, "add");
-  assert.equal(writes.length, 2, "next Enter submits immediately with synced r2 baseline");
-  assert.equal(writes[1].expectedRevision, "r2");
-});
 
-test("Issue #8 recheck5 [1] same-scope manual refresh while task save is in flight clears submitted draft and syncs without duplicate submit", async () => {
-  const writes = [];
-  let finishSave, plan = issue8Plan("r1", "old step");
-  const ui = issue8Ui(async (action, payload) => {
-    if (action === "board:update") {
-      writes.push(payload);
-      return new Promise(resolve => {
-        finishSave = () => {
-          plan = { ...plan, steps: payload.steps, planRevision: "r2" };
-          resolve({});
-        };
-      });
-    }
-    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
-    if (action === "board:get") return plan;
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = plan; ui.renderBoardTab();
-  dom.editor.focus(); dom.type("task one");
-  const pendingSave = ui.updateBoard(dom.editor, "add");
-  const refreshBtn = node();
-  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
-  refreshBtn.closest = () => refreshBtn;
-  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
-  ui.onClick({ target: refreshBtn });
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  finishSave();
-  await pendingSave;
-  assert.equal(dom.editor.value, "", "submitted draft must clear even after same-scope manual refresh");
-  assert.equal(ui.state.boardDraft, "");
-  assert.match(ui.content.innerHTML, />task one</);
-  await ui.updateBoard(dom.editor, "add");
-  assert.equal(writes.length, 1, "subsequent Enter on cleared input must not submit a duplicate task");
-});
 
-test("Issue #8 recheck5 [2] typing a board draft while refreshContext is already in flight preserves editor and selection on disconnect", async () => {
-  let rejectContext;
-  const ui = issue8Ui(async action => {
-    if (action === "hub:getContext") {
-      return new Promise((_resolve, reject) => {
-        rejectContext = () => reject(new Error("fixture mid-flight disconnect"));
-      });
-    }
-    if (action === "board:get") throw new Error("fixture board offline");
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = issue8Plan("r1", "existing step");
-  ui.renderBoardTab();
-  // Start refresh while draft input is blurred and empty!
-  const refreshBtn = node();
-  Object.assign(refreshBtn, { dataset: { action: "refresh" }, tagName: "BUTTON", isConnected: true });
-  refreshBtn.closest = () => refreshBtn;
-  ui.root.contains = target => target === refreshBtn || ui.content.contains(target);
-  ui.onClick({ target: refreshBtn });
-  await new Promise(setImmediate);
-  // User focuses and types a draft while hub:getContext is still pending:
-  const activeEditor = dom.editor;
-  activeEditor.focus();
-  dom.type("mid-flight draft", 4, 10, "backward");
-  rejectContext();
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.equal(dom.editor, activeEditor, "mid-flight draft editor DOM node must remain intact on disconnect");
-  assert.equal(ui.sandbox.document.activeElement, activeEditor);
-  assert.equal(dom.editor.value, "mid-flight draft");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [4, 10, "backward"]);
-});
 
-test("Issue #8 recheck6 [1] same-session query parameter change preserves unsaved board draft, DOM editor, focus, and selection", async () => {
-  let plan = issue8Plan("r1", "existing step");
-  const ui = issue8Ui(async action => {
-    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
-    if (action === "board:get") return plan;
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = plan;
-  ui.renderBoardTab();
-  const originalEditor = dom.editor;
-  originalEditor.focus();
-  dom.type("important draft", 2, 7, "backward");
 
-  ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
-  ui.sandbox.location.search = "?view=chat";
-  ui.checkRoute();
 
-  assert.equal(ui.state.threadId, "thread-a");
-  assert.equal(ui.state.projectRoot, "/fixture");
-  assert.equal(dom.editor, originalEditor, "same-thread query param change must not replace editor DOM node");
-  assert.equal(dom.editor.value, "important draft");
-  assert.equal(ui.state.boardDraft, "important draft");
-  assert.equal(ui.sandbox.document.activeElement, originalEditor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
 
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.equal(dom.editor, originalEditor, "async refreshContext for same thread+project must keep editor DOM node");
-  assert.equal(dom.editor.value, "important draft");
-  assert.equal(ui.sandbox.document.activeElement, originalEditor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
 
-  ui.sandbox.location.href = "https://fixture.test/threads/thread-b";
-  ui.sandbox.location.pathname = "/threads/thread-b";
-  ui.sandbox.location.search = "";
-  ui.checkRoute();
-  assert.equal(ui.state.threadId, "thread-b");
-  assert.equal(ui.state.boardDraft, "");
-});
 
-test("Issue #8 recheck7 [3] same-session query param change coinciding with read recovery keeps original draft input DOM node connected", async () => {
-  for (const planChangedDuringOutage of [false, true]) {
-    let failBoardRead = false;
-    let plan = issue8Plan("r1", "existing step");
-    const ui = issue8Ui(async action => {
-      if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
-      if (action === "board:get") {
-        if (failBoardRead) throw new Error("transient board read failure");
-        return plan;
-      }
-      return {};
-    });
-    const dom = issue8DraftDom(ui);
-    ui.cache.board = plan;
-    ui.renderBoardTab();
-    const originalEditor = dom.editor;
-    originalEditor.focus();
-    dom.type("important draft", 2, 7, "backward");
-
-    failBoardRead = true;
-    await ui.pollBoard();
-    assert.equal(originalEditor.isConnected, true);
-    assert.equal(dom.editor, originalEditor);
-
-    failBoardRead = false;
-    if (planChangedDuringOutage) plan = issue8Plan("r2", "updated background step");
-    ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
-    ui.sandbox.location.search = "?view=chat";
-    ui.checkRoute();
-    await new Promise(setImmediate);
-    await new Promise(setImmediate);
-
-    assert.equal(originalEditor.isConnected, true, `planChanged=${planChangedDuringOutage}: original input DOM node must stay connected`);
-    assert.equal(dom.editor, originalEditor, `planChanged=${planChangedDuringOutage}: editor DOM node must not be replaced`);
-    assert.equal(ui.sandbox.document.activeElement, originalEditor);
-    assert.equal(dom.editor.value, "important draft");
-    assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 7, "backward"]);
-  }
-});
-
-test("Issue #8 recheck8 [1] post-save read failure + query param recovery + Enter keeps original input DOM node connected continuously", async () => {
-  let save, failRead = true, plan = issue8Plan("r1", "original");
-  const writes = [];
-  const ui = issue8Ui(async (action, payload) => {
-    if (action === "hub:getContext") return { projectRoot: "/fixture", threadId: "thread-a" };
-    if (action === "board:update") {
-      writes.push(payload);
-      const finish = () => {
-        plan = { ...plan, steps: payload.steps, planRevision: `r${writes.length + 1}` };
-        return {};
-      };
-      if (writes.length === 1) return new Promise(resolve => { save = () => resolve(finish()); });
-      return finish();
-    }
-    if (action === "board:get") {
-      if (failRead) throw new Error("post-save read failed");
-      return plan;
-    }
-    return {};
-  });
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = plan;
-  ui.renderBoardTab();
-  dom.type("first");
-  const pending = ui.updateBoard(dom.add, "add");
-  dom.type("  second draft  ", 2, 8, "backward");
-  dom.editor.focus();
-  const oldEditor = dom.editor;
-
-  save();
-  await pending;
-  assert.equal(oldEditor.isConnected, true);
-
-  ui.sandbox.location.href = "https://fixture.test/threads/thread-a?view=chat";
-  ui.sandbox.location.search = "?view=chat";
-  ui.checkRoute();
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.equal(oldEditor.isConnected, true);
-
-  failRead = false;
-  await ui.pollBoard();
-  assert.equal(oldEditor.isConnected, true, "recovery render must update board container in-place without disconnecting oldEditor");
-  assert.equal(dom.editor, oldEditor);
-  assert.match(ui.content.innerHTML, />first</, "saved step must appear after recovery");
-  assert.equal(ui.sandbox.document.activeElement, oldEditor);
-  assert.equal(dom.editor.value, "  second draft  ");
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 8, "backward"]);
-
-  dom.enter();
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.equal(writes.length, 2);
-  assert.equal(writes[1].expectedRevision, "r2");
-  assert.equal(dom.editor.isConnected, true);
-  assert.match(ui.content.innerHTML, />second draft</);
-});
-
-test("Issue #8 recheck8 [2] cross-environment route change sharing same threadId immediately hides previous environment plan and draft even on context disconnect", async () => {
-  const envA = "11111111-1111-1111-1111-111111111111";
-  const envB = "22222222-2222-2222-2222-222222222222";
-  let failContext = false;
-  const planA = issue8Plan("r1", "secret step from env A");
-  const ui = issue8Ui(async action => {
-    if (action === "hub:getContext") {
-      if (failContext) throw new Error("env B offline");
-      return { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
-    }
-    if (action === "board:get") return planA;
-    return {};
-  }, {
-    location: { pathname: `/${envA}/thread-a`, href: `https://fixture.test/${envA}/thread-a`, hash: "", search: "" },
-  });
-  ui.state.projectRoot = "/fixture-a";
-  ui.state.context = { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = planA;
-  ui.renderBoardTab();
-  dom.editor.focus();
-  dom.type("secret draft from env A", 1, 7, "forward");
-  assert.match(ui.content.innerHTML, /secret step from env A/);
-
-  failContext = true;
-  ui.sandbox.location.pathname = `/${envB}/thread-a`;
-  ui.sandbox.location.href = `https://fixture.test/${envB}/thread-a`;
-  ui.checkRoute();
-
-  assert.equal(ui.cache.board, null, "cross-environment route change must clear cached board immediately");
-  assert.equal(ui.state.boardDraft, "", "cross-environment route change must clear draft immediately");
-  assert.doesNotMatch(ui.content.innerHTML, /secret step from env A/, "must not show env A plan synchronously after switching to env B");
-  assert.doesNotMatch(ui.root.querySelector("#t3-hub-live-board").innerHTML, /secret step from env A/);
-
-  await new Promise(setImmediate);
-  await new Promise(setImmediate);
-  assert.equal(ui.state.projectRoot, null, "failed context for env B must not retain env A projectRoot");
-  assert.equal(ui.state.boardDraft, "");
-  assert.doesNotMatch(ui.content.innerHTML, /secret step from env A/, "must not leak env A plan after env B context failure");
-  assert.doesNotMatch(ui.content.innerHTML, /secret draft from env A/, "must not leak env A draft after env B context failure");
-});
-
-for (const booting of [false, true]) for (const queryMode of ["url", "url+pathname", "pathname-only"]) for (const replacement of ["environmentId", "remove", "projectRoot"]) test(`Issue #8 closure [1] initial scope query canonicalizes (${booting ? "pending context" : "known context"}, ${queryMode}, ${replacement})`, async () => {
-  const envA = "abcdef11-1111-4111-8111-111111111111";
-  const pathname = queryMode === "pathname-only" ? "/thread-a" : `/${envA}/thread-a`, base = `https://fixture.test${pathname}`;
-  const locationFor = query => ({ pathname: pathname + (queryMode === "url" ? "" : query), href: base + (queryMode === "pathname-only" ? "" : query), search: queryMode === "pathname-only" ? "" : query });
-  const initial = replacement === "projectRoot" ? `?environmentId=${envA.toUpperCase()}` : "?projectRoot=%2Ffixture";
-  const context = { projectRoot: "/fixture", threadId: "thread-a", environmentId: envA };
-  const plan = issue8Plan("r1", "private plan");
-  let confirmContext, offline = false;
-  const ui = issue8Ui(async action => {
-    if (action === "hub:getContext") {
-      if (offline) throw new Error("other scope offline");
-      if (booting && !confirmContext) return new Promise(resolve => { confirmContext = () => resolve(context); });
-      return context;
-    }
-    if (action === "board:get") return plan;
-    return {};
-  }, { location: locationFor(initial) });
-  if (booting) { ui.state.projectRoot = null; ui.state.context = null; ui.state.open = false; }
-  else ui.state.context = context;
-  ui.setCurrentRoute(); // This is set before the initial getContext resolves in the real mount.
-  if (booting) {
-    const loading = ui.refreshContext(); confirmContext(); await loading; ui.state.open = true;
-    assert.equal(ui.routeScope().cached, ui.routeScope().current, "getContext must align the cached scope before any board render");
-    assert.doesNotMatch(ui.routeScope().cached, /\|r=|\|e=/, "confirmed redundant queries are absent from the cached key");
-  }
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = plan; ui.renderBoardTab();
-  const original = dom.editor;
-  original.focus(); dom.type("private draft", 2, 7, "backward");
-  const renders = dom.renders;
-  const query = replacement === "environmentId" ? `?environmentId=${envA}` : replacement === "projectRoot" ? "?projectRoot=%2Ffixture%2F" : "";
-  Object.assign(ui.sandbox.location, locationFor(query));
-  ui.checkRoute();
-  const preserved = () => {
-    assert.equal(ui.state.boardDraft, "private draft", "equivalent replacement must keep draft synchronously and after RPC");
-    assert.equal(dom.editor, original); assert.equal(original.isConnected, true);
-    assert.equal(dom.renders, renders, "no content replacement may disconnect the input");
-    assert.equal(ui.sandbox.document.activeElement, original);
-    assert.deepEqual([original.selectionStart, original.selectionEnd, original.selectionDirection], [2, 7, "backward"]);
-  };
-  preserved(); await new Promise(setImmediate); preserved();
-  // Explicit foreign values must still isolate immediately, including during a disconnect.
-  offline = true;
-  const foreign = replacement === "environmentId" ? "?projectRoot=%2Fother" : "?environmentId=22222222-2222-4222-8222-222222222222";
-  Object.assign(ui.sandbox.location, locationFor(foreign));
-  ui.checkRoute();
-  assert.equal(ui.state.boardDraft, ""); assert.equal(ui.cache.board, null);
-  assert.doesNotMatch(ui.content.innerHTML, /private plan|private draft/);
-  assert.doesNotMatch(ui.root.querySelector("#t3-hub-live-board").innerHTML, /private plan|private draft/);
-  await new Promise(setImmediate);
-  assert.equal(ui.state.projectRoot, null); assert.equal(ui.cache.board, null);
-});
-
-for (const queryKind of ["environmentId", "projectRoot"]) test(`Issue #8 final [1, 4, 5] equivalent ${queryKind} query preserves focused draft, stale Enter refresh, and post-save recovery`, async () => {
-  const envA = "abcdef11-1111-4111-8111-111111111111";
-  const base = `https://fixture.test/${envA}/thread-a`;
-  const context = { projectRoot: "/fixture-a", threadId: "thread-a", environmentId: envA };
-  let currentPlan = issue8Plan("r1", "step one"), failRead = false, finishSave;
-  const writes = [];
-  const ui = issue8Ui(async (action, payload) => {
-    if (action === "hub:getContext") return context;
-    if (action === "board:get") {
-      if (failRead) throw new Error("post-save read failed");
-      return currentPlan;
-    }
-    if (action === "board:update") {
-      writes.push(payload);
-      const save = () => {
-        currentPlan = { ...currentPlan, planRevision: `r${writes.length + 2}`, steps: payload.steps };
-        return {};
-      };
-      if (writes.length === 1) return new Promise(resolve => { finishSave = () => resolve(save()); });
-      return save();
-    }
-    return {};
-  }, { location: { pathname: `/${envA}/thread-a`, href: base, hash: "", search: "" } });
-  assert.equal(typeof ui.sandbox.URLSearchParams, "undefined");
-  ui.state.projectRoot = context.projectRoot; ui.state.context = context;
-  const dom = issue8DraftDom(ui);
-  ui.cache.board = currentPlan;
-  ui.renderBoardTab(); ui.setCurrentRoute();
-  const originalEditor = dom.editor;
-  originalEditor.focus(); dom.type("keep my draft", 2, 6, "forward");
-
-  const query = queryKind === "environmentId" ? `?environmentId=${envA.toUpperCase()}` : `?projectRoot=${encodeURIComponent(context.projectRoot + "/")}`;
-  ui.sandbox.location.search = query; ui.sandbox.location.href = base + query;
-  ui.checkRoute(); await new Promise(setImmediate);
-  assert.equal(dom.editor, originalEditor, "equivalent query preserves the original input");
-  assert.equal(originalEditor.isConnected, true);
-  assert.equal(ui.state.boardDraft, "keep my draft");
-  assert.equal(ui.sandbox.document.activeElement, originalEditor);
-  assert.deepEqual([originalEditor.selectionStart, originalEditor.selectionEnd, originalEditor.selectionDirection], [2, 6, "forward"]);
-
-  // The authoritative recheck3 contract defers ordinary focused polls. A stale
-  // first Enter refreshes the visible plan; the second uses that visible CAS.
-  currentPlan = issue8Plan("r2", "external step r2");
-  await ui.pollBoard();
-  assert.equal(dom.editor, originalEditor);
-  assert.equal(originalEditor.isConnected, true);
-  assert.doesNotMatch(ui.content.innerHTML, /external step r2/);
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 0, "stale Enter must refresh before it writes");
-  assert.match(ui.content.innerHTML, /external step r2/);
-  assert.equal(dom.editor.value, "keep my draft");
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.deepEqual([dom.editor.selectionStart, dom.editor.selectionEnd, dom.editor.selectionDirection], [2, 6, "forward"]);
-  dom.enter();
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0].expectedRevision, "r2");
-
-  // Preserve this newer draft through failed readback and same-session query
-  // recovery. Updating sibling slots must keep the protected input connected.
-  dom.type("next <draft>", 1, 5, "backward");
-  const protectedEditor = dom.editor, rendersBeforeRecovery = dom.renders;
-  failRead = true; finishSave(); await new Promise(setImmediate);
-  ui.sandbox.location.search = query + "&view=chat";
-  ui.sandbox.location.href = base + ui.sandbox.location.search;
-  ui.checkRoute(); await new Promise(setImmediate);
-  assert.equal(protectedEditor.isConnected, true);
-  failRead = false; await ui.pollBoard();
-  assert.equal(dom.editor, protectedEditor);
-  assert.equal(protectedEditor.isConnected, true);
-  assert.equal(dom.renders, rendersBeforeRecovery, "recovery updates siblings, not content.innerHTML");
-  assert.match(ui.content.innerHTML, />external step r2</);
-  assert.match(ui.content.innerHTML, />keep my draft</);
-  assert.match(ui.content.innerHTML, /value="next &lt;draft&gt;"/);
-  assert.equal(dom.editor.value, "next <draft>");
-  assert.equal(ui.sandbox.document.activeElement, protectedEditor);
-  assert.deepEqual([protectedEditor.selectionStart, protectedEditor.selectionEnd, protectedEditor.selectionDirection], [1, 5, "backward"]);
-  dom.enter(); await new Promise(setImmediate);
-  assert.equal(writes.length, 2, "first Enter after recovery submits with the refreshed baseline");
-  assert.equal(writes[1].expectedRevision, "r3");
-  assert.match(ui.content.innerHTML, />next &lt;draft&gt;</);
-  assert.equal(dom.editor.isConnected, true);
-  assert.equal(ui.sandbox.document.activeElement, dom.editor);
-  assert.equal(dom.editor.value, "");
-});
 
 for (const change of ["thread", "environment", "project"]) test(`Round-3 #1 scope switch clears the whole project context synchronously (${change})`, async () => {
   const calls = [];
@@ -3554,29 +2513,6 @@ function round3McpModeButton(scope = "project") {
   return button;
 }
 
-for (const phase of ["loading", "disconnected", "route-before-listener", "context-pending", "context-mismatch", "same-root-refresh"]) test(`Round-3 #1 project skill and MCP writes require a verified live context (${phase})`, async () => {
-  const calls = [], route = "/_t3_env_/remote%3Awest/thread%3Aone";
-  const ui = harness(async (action, payload) => {
-    calls.push({ action, payload });
-    if (action === "hub:getContext") return new Promise(() => {});
-    return { items: [{ name: "fixture-server", mode: "project-direct", modeScope: "project" }] };
-  }, { location: { pathname: "/", hash: `#${route}`, href: `t3code://app/#${route}` } });
-  Object.assign(ui.state, { connected: true, threadId: "thread:one", projectRoot: "/project-a", context: { environmentId: "remote:west", threadId: "thread:one", projectRoot: "/project-a" }, importRepo: "owner/fixture", importScope: "project" });
-  ui.setCurrentRoute();
-  if (phase !== "loading") ui.ready();
-  if (phase === "disconnected") ui.state.connected = false;
-  if (phase === "context-mismatch") ui.state.context.environmentId = "remote:east";
-  if (["route-before-listener", "context-pending"].includes(phase)) ui.sandbox.location.hash = "#/_t3_env_/remote%3Aeast/thread%3Aone";
-  if (phase === "context-pending") { ui.checkRoute(); ui.state.importScope = "project"; }
-  if (phase === "same-root-refresh") void ui.refreshContext();
-  assert.equal(ui.projectContextReady(), false);
-  for (const write of [() => ui.runImport(), () => ui.setSkillScope("fixture-skill", "project"), () => ui.saveMcpMode(round3McpModeButton())]) {
-    ui.root.querySelector(".hub-toast").innerHTML = "";
-    await write();
-    assert.match(ui.root.querySelector(".hub-toast").innerHTML, /当前项目/, "blocked writes explain that the current project must be confirmed");
-  }
-  assert.equal(calls.filter(call => ["skills:importGitHub", "skills:setScope", "mcp:setMode"].includes(call.action)).length, 0);
-});
 
 for (const scope of ["project", "global"]) test(`Round-3 #1 verified project writes and independent global writes remain available (${scope})`, async () => {
   const calls = [], ui = harness(async (action, payload) => {
@@ -3595,36 +2531,10 @@ for (const scope of ["project", "global"]) test(`Round-3 #1 verified project wri
   if (scope === "project") for (const call of writes) assert.equal(call.payload.projectRoot, "/verified-project");
 });
 
-for (const source of ["hash", "search", "router", "context-version"]) for (const outcome of ["resolve", "reject"]) test(`Round-3 #1 loadTab rejects stale ${outcome} before cache or error writes (${source})`, async () => {
-  let finish;
-  const ui = harness(async action => {
-    if (action === "skills:list") return new Promise((resolve, reject) => { finish = () => outcome === "resolve" ? resolve({ items: [{ id: "stale-skill" }] }) : reject(new Error("stale-catalog-error")); });
-    if (action === "hub:getContext") return new Promise(() => {});
-    return { items: [] };
-  }, source === "router" ? { window: { __TSR_ROUTER__: { state: { location: { pathname: "/threads/thread-a", searchStr: "" } } } } } : {});
-  ui.ready(); Object.assign(ui.state, { open: true, connected: true, tab: "skills", threadId: "thread-a", projectRoot: "/same-root", context: { threadId: "thread-a", projectRoot: "/same-root" } });
-  ui.setCurrentRoute();
-  const pending = ui.loadTab();
-  if (source === "hash") ui.sandbox.location.hash = "#/threads/thread-b";
-  if (source === "search") ui.sandbox.location.search = "?environmentId=remote:east";
-  if (source === "router") ui.sandbox.window.__TSR_ROUTER__.state.location.searchStr = "?projectRoot=%2Fanother-root";
-  if (source === "context-version") void ui.refreshContext();
-  // Deliberately keep the same projectRoot and never run checkRoute.
-  finish(); await pending;
-  assert.equal(ui.cache.skills, null);
-  assert.equal(ui.errors.skills, undefined);
-  assert.doesNotMatch(ui.content.innerHTML, /stale-skill|stale-catalog-error/);
-});
 
-test("Round-3 #1 background catalog reads also reject a route change before listeners run", async () => {
-  let finish;
-  const ui = harness(async action => action === "skills:list" ? new Promise(resolve => { finish = resolve; }) : { items: [] });
-  Object.assign(ui.state, { projectRoot: "/same-root", context: { threadId: "thread-a", projectRoot: "/same-root" } });
-  const pending = ui.primeCatalogs();
-  ui.sandbox.location.search = "?environmentId=another-environment";
-  finish({ items: [{ id: "stale-background-skill" }] });
-  await pending;
-  assert.equal(ui.cache.skills, null);
+test("removed background catalog loader is not exposed", () => {
+  const ui = harness();
+  assert.equal(ui.primeCatalogs, undefined);
 });
 
 for (const action of ["import", "set-scope"]) test(`Round-3 #1 late skill ${action} replies cannot change a new route's form or cache`, async () => {

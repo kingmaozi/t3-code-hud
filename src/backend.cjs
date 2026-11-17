@@ -10,10 +10,12 @@ const { DatabaseSync } = require("node:sqlite");
 const hubSkills = require("./hub-skills.cjs");
 const mcpRouter = require("./mcp-router.cjs");
 const memoryVault = require("./memory-vault.cjs");
+const { createMemoryAccessManager } = require("./hub-memory-access.cjs");
 const embedManager = require("./embed-manager.cjs");
 const hubSubagents = require("./hub-subagents.cjs");
 const hubPlugins = require("./hub-plugins.cjs");
 const hubHooks = require("./hub-hooks.cjs");
+const hubMemoryConnections = require("./hub-memory-connections.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
@@ -48,6 +50,30 @@ function isTestEnv() {
   return !!(process.env.NODE_ENV === "test" || process.env.T3_HUB_TEST || process.env.UNDER_TEST);
 }
 
+const MEMORY_ACCESS_RUNTIME_KEY = Symbol.for("t3.hud.memory.agent-access.v1");
+const priorMemoryAccessRuntime = globalThis[MEMORY_ACCESS_RUNTIME_KEY];
+try { priorMemoryAccessRuntime?.stopWatching?.(); } catch {}
+let memoryAccessRuntime = null;
+let memoryAccessRuntimeKey = "";
+function getMemoryAccessRuntime() {
+  const homeDir = process.env.HOME || os.homedir();
+  const hubDir = process.env.T3_HUB_DIR || path.join(homeDir, ".t3", "hub");
+  const userDataDir = process.env.T3CODE_HOME || path.join(homeDir, ".t3", "userdata");
+  const key = `${homeDir}\0${hubDir}\0${userDataDir}`;
+  if (memoryAccessRuntime && memoryAccessRuntimeKey === key) return memoryAccessRuntime;
+  try { memoryAccessRuntime?.stopWatching?.(); } catch {}
+  memoryAccessRuntime = createMemoryAccessManager({ homeDir, hubDir, userDataDir });
+  memoryAccessRuntimeKey = key;
+  globalThis[MEMORY_ACCESS_RUNTIME_KEY] = memoryAccessRuntime;
+  return memoryAccessRuntime;
+}
+function startMemoryAccessRuntime() {
+  const runtime = getMemoryAccessRuntime();
+  if (!isTestEnv()) runtime.startWatching({ reconcileOnStart: true });
+  return runtime;
+}
+if (!isTestEnv()) startMemoryAccessRuntime();
+
 function getMemoryVault() {
   try {
     if (memoryVault && typeof memoryVault.getDefaultMemoryVault === "function") return memoryVault.getDefaultMemoryVault();
@@ -65,7 +91,10 @@ const dreamScheduler = createDreamScheduler({
 });
 globalThis[DREAM_SCHEDULER_KEY] = dreamScheduler;
 function ensureDreamScheduler() {
-  return dreamScheduler.start();
+  // Older bridge instances may still call this during a hot reload. Keep the
+  // export for compatibility, but never restart Dream automation from Hub.
+  dreamScheduler.stop();
+  return dreamScheduler.getStatus();
 }
 function stopDreamScheduler() {
   return dreamScheduler.stop();
@@ -3344,6 +3373,20 @@ async function hubCall(action, payload = {}) {
       case "hooks:delete":
       case "hooks:remove": return hubHooks.deleteCustomHook(payload);
       case "hooks:setPlugin": return hubHooks.setPluginHooks(payload);
+      case "memory:connections": return hubMemoryConnections.getMemoryConnections(payload || {});
+      case "memory:agentAccess:get": return getMemoryAccessRuntime().getAgentAccess();
+      case "memory:agentAccess:set": {
+        const runtime = getMemoryAccessRuntime();
+        const result = runtime.setAgentAccess(payload || {});
+        if (!isTestEnv()) runtime.startWatching();
+        return result;
+      }
+      case "memory:setup": {
+        const runtime = getMemoryAccessRuntime();
+        const result = runtime.setup();
+        if (!isTestEnv()) runtime.startWatching();
+        return result;
+      }
       case "memory:overview": return memoryVault.getOverview(payload);
       case "memory:list":
       case "memory:search": return await memoryVault.listMemories(payload);
@@ -3950,6 +3993,26 @@ function parsePackedRefs(packedRefsText) {
   return refs;
 }
 
+function resolveRemoteHeadSha(bundle, parsedHead) {
+  // A detached HEAD is its own full SHA and remains authoritative. A symbolic
+  // HEAD must be resolved by the Connect caller, which can check the loose ref
+  // before packed-refs. A packed ref alone is not enough: a loose ref may
+  // override it, and an unreadable loose ref must not make us display an older
+  // packed commit as the current HEAD.
+  if (parsedHead?.headSha) return parsedHead.headSha;
+  if (!bundle || !Object.prototype.hasOwnProperty.call(bundle, "resolvedHeadSha")) return null;
+  const explicit = typeof bundle.resolvedHeadSha === "string" ? bundle.resolvedHeadSha.trim().toLowerCase() : "";
+  return /^[0-9a-f]{40}$/.test(explicit) ? explicit : null;
+}
+
+function refsWithoutUnverifiedCurrentBranch(refs, branch, headSha) {
+  if (!branch) return refs;
+  const currentRef = `refs/heads/${branch}`;
+  // A stale packed copy can coexist with a newer loose current branch ref.
+  // Drop it unless it agrees with the SHA verified by the Connect caller.
+  return refs.filter((ref) => ref?.ref !== currentRef || (!!headSha && String(ref.sha || "").toLowerCase() === headSha));
+}
+
 function parseHeadLog(headLogText) {
   const entries = [];
   if (typeof headLogText !== "string") return entries;
@@ -4137,24 +4200,27 @@ async function getRemoteGitGraph(bundle) {
 
   const { githubRepo } = parseRemoteGitConfig(b.gitConfig);
   const head = parseGitHead(b.gitHead);
-  const branch = head.branch || b.vcsStatus?.refName || b.vcsRefs?.refs?.find(ref => ref.current)?.name || (typeof b.branch === "string" && b.branch.trim()) || null;
-  const headSha = head.headSha || null;
+  // A detached HEAD is authoritative; stale UI/status branch hints must not
+  // move a real branch badge onto it or remove that branch's actual ref.
+  const branch = head.headSha ? null : head.branch || b.vcsStatus?.refName || b.vcsRefs?.refs?.find(ref => ref.current)?.name || (typeof b.branch === "string" && b.branch.trim()) || null;
   const headLogEntries = parseHeadLog(b.headLog);
   const packedRefs = parsePackedRefs(b.packedRefs);
+  const headSha = resolveRemoteHeadSha(b, head);
   const vcsRefsList = normalizeVcsRefs(b.vcsRefs);
+  const branchSafeRefs = refsWithoutUnverifiedCurrentBranch([...packedRefs, ...vcsRefsList], branch, headSha);
   const branchCommits = normalizeBranchCommits(b.branchCommits);
   const dirtyCount = parseDirtyCount(b.vcsStatus);
 
   const nativeCommits = normalizeBranchCommits(b.nativeCommits);
   if (nativeCommits.length) {
     const known = new Map([...branchCommits, ...headLogEntries.map(entry => ({ hash: entry.newSha, ...entry }))].map(commit => [commit.hash, commit]));
-    const badges = buildBadgeMapFromRefs([...packedRefs, ...vcsRefsList], nativeCommits[0].hash, branch);
+    const badges = buildBadgeMapFromRefs(branchSafeRefs, headSha, branch);
     for (const commit of nativeCommits) {
       const meta = known.get(commit.hash);
       if (meta) { commit.author = meta.author || commit.author; commit.timestamp = meta.timestamp || commit.timestamp; commit.relTime = meta.relTime || commit.relTime; }
       commit.refs = badges.get(commit.hash) || [];
     }
-    return { ...buildRemoteGraphResult({ cwd, branch, headSha: nativeCommits[0].hash, dirtyCount, commits: nativeCommits, remoteSource: "t3-connect", githubRepo }), partialHistory: !!b.nativeHistoryTruncated, firstParentOnly: true, parentsUnavailable: false };
+    return { ...buildRemoteGraphResult({ cwd, branch, headSha, dirtyCount, commits: nativeCommits, remoteSource: "t3-connect", githubRepo }), partialHistory: !!b.nativeHistoryTruncated, firstParentOnly: true, parentsUnavailable: false };
   }
 
   // Local tip commits from the remote reflog (never in GitHub's set while unpushed).
@@ -4212,15 +4278,13 @@ async function getRemoteGitGraph(bundle) {
           .filter((c) => !ghShaSet.has(c.hash))
           .map((c) => ({ ...c, refs: Array.isArray(c.refs) ? c.refs : [] }));
         const merged = [...unpushed, ...remoteCommits];
-        // Attach HEAD/badge refs for the tip.
-        if (merged.length) {
-          const tip = merged[0];
-          if (!Array.isArray(tip.refs)) tip.refs = [];
-          if (!tip.refs.some((r) => r.isHead)) {
-            tip.refs = [{ kind: "head", label: "HEAD", isHead: true }, ...(tip.refs || [])];
-            if (branch && !tip.refs.some((r) => r.label === branch)) {
-              tip.refs.splice(1, 0, { kind: "branch", label: branch, isHead: false });
-            }
+        // Mark only the verified current HEAD. The GitHub branch tip and the
+        // newest reflog commit may both belong to a different checkout.
+        if (headSha) {
+          const tip = merged.find((commit) => commit.hash === headSha);
+          if (tip) {
+            const badges = buildBadgeMapFromRefs(branchSafeRefs, headSha, branch).get(headSha) || [];
+            tip.refs = [...badges, ...(Array.isArray(tip.refs) ? tip.refs : []).filter((ref) => !badges.some((badge) => badge.kind === ref.kind && badge.label === ref.label))];
           }
         }
         return { ...buildRemoteGraphResult({
@@ -4237,12 +4301,38 @@ async function getRemoteGitGraph(bundle) {
   }
 
   // Pure local repo on the remote (no GitHub remote, or API unreachable): the
-  // reflog + refs are the history.
-  const commits = localCommits.length ? localCommits : branchCommits;
+  // reflog + review range are complementary evidence. Reflog can contain a
+  // recent local commit not present in the review range, while the range can
+  // retain older commits that a short reflog does not include. Merge by SHA;
+  // never infer parent edges from either source.
+  const commitByHash = new Map();
+  const commitOrder = [];
+  for (const commit of [...localCommits, ...branchCommits]) {
+    const prior = commitByHash.get(commit.hash);
+    if (!prior) {
+      commitByHash.set(commit.hash, { ...commit, parents: [...(commit.parents || [])] });
+      commitOrder.push(commit.hash);
+      continue;
+    }
+    const merged = {
+      ...commit,
+      ...prior,
+      parents: prior.parents?.length ? [...prior.parents] : [...(commit.parents || [])],
+      refs: [...(prior.refs || []), ...(commit.refs || []).filter((ref) => !(prior.refs || []).some((old) => old.kind === ref.kind && old.label === ref.label))],
+    };
+    commitByHash.set(commit.hash, merged);
+  }
+  const commits = commitOrder.map((hash) => commitByHash.get(hash));
+  // When the exact HEAD is in the available partial set, keep it at the top
+  // even if reflog ordering contains commits from a recently visited branch.
+  if (headSha) {
+    const headIndex = commits.findIndex((commit) => commit.hash === headSha);
+    if (headIndex > 0) commits.unshift(commits.splice(headIndex, 1)[0]);
+  }
   if (!commits.length) return { ok: false, error: "Remote Git history unavailable through the authorized connection" };
-  const badgeBySha = buildBadgeMapFromRefs([...packedRefs, ...vcsRefsList], commits[0]?.hash || headSha, branch);
+  const badgeBySha = buildBadgeMapFromRefs(branchSafeRefs, headSha, branch);
   for (const c of commits) {
-    c.refs = badgeBySha.get(c.hash) || (c.hash === (commits[0]?.hash || "") ? [{ kind: "head", label: "HEAD", isHead: true }] : []);
+    c.refs = badgeBySha.get(c.hash) || [];
   }
   return { ...buildRemoteGraphResult({
     cwd,

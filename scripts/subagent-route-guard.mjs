@@ -49,12 +49,19 @@ try {
   if (!mod) process.exit(0);
   const hubDir = process.env.T3_HUB_DIR || path.join(homeDir, '.t3', 'hub');
   const manager = mod.createSubagentsManager({ homeDir, hubDir });
+  // The global saved switch is authoritative: project overrides may narrow an
+  // enabled global route, but cannot reactivate Hub routing after global off.
+  const globalConfig = typeof manager.getOrchestrationConfig === 'function' ? manager.getOrchestrationConfig() : null;
+  if (globalConfig?.swarmMode !== 'on') process.exit(0);
   const hints = [input.clientRequestId, input.title].filter(x => typeof x === 'string' && x.trim());
   // Role can itself be an agent id; a generic role may select only a single route.
   let resolved = manager.resolveSubagentRoute({ idOrTitle: hints, role: input.role, projectRoot: payload.cwd || process.cwd() });
   if (!resolved.matched && !resolved.explicitUnavailable && input.role) resolved = manager.resolveSubagentRoute({ idOrTitle: input.role, role: input.role, projectRoot: payload.cwd || process.cwd() });
   if (!resolved.matched || (input.role && resolved.item?.role && input.role !== resolved.item.role)) process.exit(0);
   const orch = resolved.orchestration && typeof resolved.orchestration === 'object' ? resolved.orchestration : { swarmMode: 'off', source: 'global' };
+  // Hub route rewriting is opt-in. An effective off/auto mode must leave the
+  // host's original delegate_task input and permission path entirely alone.
+  if (orch.swarmMode !== 'on') process.exit(0);
   const orchNote = ` 生效模式：${orch.swarmMode}（来源：${orch.source}）。`;
   const updated = { ...input };
   const oldTarget = input.target && typeof input.target === 'object' && !Array.isArray(input.target) ? input.target : {};

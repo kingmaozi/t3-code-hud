@@ -1595,6 +1595,9 @@ function createMemoryVault(opts = {}) {
           if (row && row.project_slug !== slug) return { ok: false, error: "memory belongs to another project" };
           if (!row && args.supersedesId) return { ok: false, error: "memory not found: " + targetId };
           existing = row ? rowToItem(row) : null;
+          if (args.rejectProtectedSupersedes === true && args.supersedesId && existing && isAutoEvolveProtectedItem(existing)) {
+            return { ok: false, error: "protected memory requires a human edit" };
+          }
           incoming.id = String(targetId);
           action = args.supersedesId && !args.id ? "superseded" : "updated";
           reason = action === "superseded" ? "superseded" : "manual-edit";
@@ -1621,6 +1624,8 @@ function createMemoryVault(opts = {}) {
             } catch {
               candidates = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY updated_at DESC, id ASC").all(slug).map(rowToItem);
             }
+            // Pin Shield: natural-language similarity cannot modify human-pinned or core rules.
+            candidates = candidates.filter((item) => !isAutoEvolveProtectedItem(item));
             vectors = vectorsFor(db, [...candidates, incoming]);
             const ranked = candidates.map((item) => ({ item, sim: similarity(incoming, item, vectors) }));
             ranked.sort((a, b) => (b.sim.cosine ?? b.sim.lexicalSim) - (a.sim.cosine ?? a.sim.lexicalSim));
@@ -1965,10 +1970,15 @@ function createMemoryVault(opts = {}) {
             conds.push("module = ?");
             params.push(module);
           }
+          if (args.id != null && String(args.id).trim()) {
+            conds.push("id = ?");
+            params.push(String(args.id));
+          }
           return { conds, params, filt, worktreeId: worktreeIdForFilter, isLinked: isLinkedForFilter, autoIncludeGlobal };
         };
         function rowMatchesScope(row, filterInfo) {
           const r = row;
+          if (args.id != null && String(args.id).trim() && String(r.id) !== String(args.id)) return false;
           const ps = r.project_slug;
           const ms = r.memory_scope || "shared";
           const wid = r.worktree_id || "";
@@ -2025,7 +2035,7 @@ function createMemoryVault(opts = {}) {
             .map((t) => '"' + String(t).replace(/"/g, '""') + '"')
             .join(" OR ");
           try {
-            const qualified = whereSuffix.replace(/project_slug/g, "m.project_slug").replace(/memory_scope/g, "m.memory_scope").replace(/worktree_id/g, "m.worktree_id").replace(/\bmodule\b/g, "m.module");
+            const qualified = whereSuffix.replace(/project_slug/g, "m.project_slug").replace(/memory_scope/g, "m.memory_scope").replace(/worktree_id/g, "m.worktree_id").replace(/\bmodule\b/g, "m.module").replace(/\bid\b/g, "m.id");
             const filterInfoForFts = buildFilter();
             const rows = db
               .prepare("SELECT m.*, bm25(memories_fts) AS _rank FROM memories_fts JOIN memories m ON m.id = memories_fts.id WHERE memories_fts MATCH ?" + (whereSuffix ? qualified : ""))
@@ -2158,8 +2168,12 @@ function createMemoryVault(opts = {}) {
       syncFromMarkdownIfChanged(slug, lock);
       const db = openDb();
       try {
+        // Consolidation is always an automated rewrite/removal operation,
+        // including when an agent explicitly invokes memory_consolidate.
+        // Pinned/core and secret-bearing entries remain available to search,
+        // but can only be changed through an explicit human edit/rollback.
         const sourceRows = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY created_at ASC, id ASC").all(slug)
-          .filter((row) => args.excludeProtected !== true || !isDreamProtectedRow(row));
+          .filter((row) => !isDreamProtectedRow(row));
         const items = sourceRows.map(rowToItem);
         const originals = new Map(sourceRows.map((row) => [row.id, row]));
         const roots = new Map(sourceRows.map((row) => [row.id, String(row.project_root || "")]));
@@ -2214,12 +2228,14 @@ function createMemoryVault(opts = {}) {
         db.exec("PRAGMA synchronous = FULL");
         db.exec("BEGIN IMMEDIATE");
         try {
-          const checkLiveStmt = db.prepare(args.exactOnly === true ? "SELECT * FROM memories WHERE id = ?" : "SELECT version, updated_at, content_hash FROM memories WHERE id = ?");
+          const checkLiveStmt = db.prepare("SELECT * FROM memories WHERE id = ?");
           const liveReferences = args.exactOnly === true ? referencedDreamIds(db) : new Set();
           const rowStillMatchesSnapshot = (snapItem) => {
-            if (changed.has(snapItem.id)) return true;
             const live = checkLiveStmt.get(snapItem.id);
-            if (!live) return false;
+            // Recheck protection after BEGIN IMMEDIATE, immediately before a
+            // merge/delete. A tag edit racing the candidate scan must win.
+            if (!live || isDreamProtectedRow(live) || isAutoEvolveProtectedItem(snapItem)) return false;
+            if (changed.has(snapItem.id)) return true;
             if (args.exactOnly === true) return !isDreamProtectedRow(live) && dreamRowFingerprint(live) === dreamRowFingerprint(originals.get(snapItem.id));
             return Number(live.version) === Number(snapItem.version)
               && String(live.updated_at || "") === String(snapItem.updatedAt || "")
@@ -2308,22 +2324,37 @@ function createMemoryVault(opts = {}) {
       syncFromMarkdownIfChanged(slug, rbTxLock);
       const db = openDb();
       try {
-        const row = db.prepare("SELECT * FROM memories WHERE project_slug=? AND id=?").get(slug, String(args.id));
-        if (!row) return { ok: false, error: "memory not found: " + args.id };
-        const current = rowToItem(row);
-        const matches = args.revisionId != null
-          ? current.history.filter((entry) => entry.revisionId === args.revisionId)
-          : args.targetVersion != null
-            ? current.history.filter((entry) => entry.version === Number(args.targetVersion))
-            : current.history.slice(-1);
-        if (matches.length > 1) return { ok: false, error: "ambiguous history version; revisionId required" };
-        const target = matches[0];
-        if (!target) return { ok: false, error: "history version not found" };
-        if (containsSecret(target.title) || containsSecret(target.content)) return { ok: false, error: SECRET_ERROR };
-        const item = { ...current, title: target.title, content: target.content, agent: target.agent,
-          version: current.version + 1, updatedAt: nowIso(), history: archiveRevision(current, "rollback") };
-        upsertRow(db, { ...item, projectRoot: row.project_root });
-        db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
+        db.exec("BEGIN IMMEDIATE");
+        let item;
+        let target;
+        try {
+          // Read and check protection in the same transaction as the write so
+          // an agent rollback cannot race a human pin/core tag change.
+          const row = db.prepare("SELECT * FROM memories WHERE project_slug=? AND id=?").get(slug, String(args.id));
+          if (!row) { db.exec("ROLLBACK"); return { ok: false, error: "memory not found: " + args.id }; }
+          if (args.rejectProtectedRollback === true && isDreamProtectedRow(row)) {
+            db.exec("ROLLBACK");
+            return { ok: false, error: "protected memory requires a human edit" };
+          }
+          const current = rowToItem(row);
+          const matches = args.revisionId != null
+            ? current.history.filter((entry) => entry.revisionId === args.revisionId)
+            : args.targetVersion != null
+              ? current.history.filter((entry) => entry.version === Number(args.targetVersion))
+              : current.history.slice(-1);
+          if (matches.length > 1) { db.exec("ROLLBACK"); return { ok: false, error: "ambiguous history version; revisionId required" }; }
+          target = matches[0];
+          if (!target) { db.exec("ROLLBACK"); return { ok: false, error: "history version not found" }; }
+          if (containsSecret(target.title) || containsSecret(target.content)) { db.exec("ROLLBACK"); return { ok: false, error: SECRET_ERROR }; }
+          item = { ...current, title: target.title, content: target.content, agent: target.agent,
+            version: current.version + 1, updatedAt: nowIso(), history: archiveRevision(current, "rollback") };
+          upsertRow(db, { ...item, projectRoot: row.project_root });
+          db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
+          db.exec("COMMIT");
+        } catch (e) {
+          try { db.exec("ROLLBACK"); } catch {}
+          throw e;
+        }
         rewriteModules(db, slug, [item.module]);
         touchProject(slug, item.updatedAt);
         triggerBackgroundEmbedding(item.id, item.title, item.content);
@@ -3285,12 +3316,14 @@ function createMemoryVault(opts = {}) {
       row.memory_scope, row.worktree_id, row.branch_name, row.version, row.history_json, row.supersedes_id,
       row.content_hash, row.hit_count, row.last_recalled_at]);
   }
-  function dreamRowPinned(row) {
-    const tags = rowToItem(row).tags;
-    return tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase()));
+  function isAutoEvolveProtectedItem(item) {
+    const tags = Array.isArray(item && item.tags) ? item.tags : [];
+    return tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase())) ||
+      containsSecret(item && item.title) || containsSecret(item && item.content) ||
+      tags.some((tag) => containsSecret(tag));
   }
   function isDreamProtectedRow(row) {
-    return dreamRowPinned(row) || containsSecret(row && row.title) || containsSecret(row && row.content) || containsSecret(row && row.tags_json);
+    return isAutoEvolveProtectedItem(rowToItem(row)) || containsSecret(row && row.tags_json);
   }
   function dreamArchiveHistorySafe(row) {
     try {

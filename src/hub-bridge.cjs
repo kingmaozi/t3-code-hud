@@ -39,7 +39,6 @@ function loadBackend() {
   }
   const next = require(backendPath);
   backend = next;
-  try { if (typeof next.ensureDreamScheduler === "function") next.ensureDreamScheduler(); } catch {}
   return next;
 }
 backend = loadBackend();

@@ -537,6 +537,40 @@ function parseTomlTopLevel(text) {
   return out;
 }
 
+// Read a small set of typed values using the same validated lexical spans as
+// settings edits. Comments and table-looking text inside strings are not data.
+function readTomlTable(text, tablePath, keys) {
+  const { tableStarts, assignments } = scanToml(text);
+  const index = tableStarts.findIndex(table => {
+    const header = parseTableHeader(text, skipSpacesTabs(text, table.lineStart));
+    return !header.isArray && header.parts.length === tablePath.length && header.parts.every((part, i) => part === tablePath[i]);
+  });
+  if (index < 0) return null;
+  const start = tableStarts[index].headerEnd, end = tableStarts[index + 1]?.lineStart ?? text.length;
+  const out = Object.create(null);
+  function value(raw) {
+    if (raw[0] === '"' || raw[0] === "'") return parseTomlValue(raw);
+    if (raw === "true" || raw === "false") return raw === "true";
+    if (raw[0] !== "[") throw new Error("unsupported TOML status value");
+    const values = [];
+    let i = skipArrayTrivia(raw, 1);
+    while (raw[i] !== "]") {
+      if (raw[i] !== '"' && raw[i] !== "'") throw new Error("expected TOML string array");
+      const next = scanValueEnd(raw, i);
+      values.push(parseTomlValue(raw.slice(i, next)));
+      i = skipArrayTrivia(raw, next);
+      if (raw[i] === ",") i = skipArrayTrivia(raw, i + 1);
+    }
+    return values;
+  }
+  for (const assignment of assignments) {
+    if (assignment.keyStart < start || assignment.keyStart >= end || !keys.includes(assignment.parts[0])) continue;
+    if (assignment.parts.length !== 1) throw new Error("unsupported dotted status key");
+    out[assignment.parts[0]] = value(text.slice(assignment.valueStart, assignment.valueEnd));
+  }
+  return out;
+}
+
 function countMcpServersInToml(text) {
   try {
     const src = String(text || "");
@@ -1063,6 +1097,7 @@ function createHostSettingsManager(opts = {}) {
 module.exports = {
   createHostSettingsManager,
   parseTomlTopLevel,
+  readTomlTable,
   countMcpServersInToml,
   CODEX_EDITABLE_KEYS,
   MUSE_KEYS,

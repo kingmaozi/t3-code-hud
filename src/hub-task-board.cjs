@@ -12,6 +12,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFile } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { performance } = require("node:perf_hooks");
@@ -266,6 +267,93 @@ function planFileKey(input) {
   }
   if (projectRoot) return "p-" + hash(path.resolve(projectRoot));
   return "default";
+}
+
+const PLAN_MIRROR_DIR = ".t3-hub/plans";
+const PLAN_MIRROR_MARKER = "# t3-hub connect plan mirror v1 (local only)";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function planMirrorUuid(threadId) {
+  const value = String(threadId || "");
+  if (!value || value === "__NEW__") throw new Error("invalid mirror thread id");
+  if (UUID_RE.test(value)) return value.toLowerCase();
+  const chars = createHash("sha256").update("t3-hub-plan-mirror-v1\0" + value).digest("hex").slice(0, 32).split("");
+  chars[12] = "5";
+  chars[16] = "89ab"[parseInt(chars[16], 16) & 3];
+  const hex = chars.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+function planMirrorRelativePath(threadId) {
+  return `${PLAN_MIRROR_DIR}/${planMirrorUuid(threadId)}.json`;
+}
+function runLocalGit(cwd, args) {
+  return new Promise(resolve => execFile("git", args, { cwd, encoding: "utf8", windowsHide: true, timeout: 3000, maxBuffer: 1024 * 1024 },
+    (error, stdout) => resolve(error ? null : String(stdout || "").replace(/\r?\n$/, ""))));
+}
+function insidePath(root, target) {
+  const rel = path.relative(root, target);
+  return !!rel && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
+}
+function assertNoSymlinkPath(target, allowMissingTail = true) {
+  const absolute = path.resolve(target), parsed = path.parse(absolute);
+  let current = parsed.root;
+  for (const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    let st;
+    try { st = fs.lstatSync(current); }
+    catch (error) { if (allowMissingTail && error.code === "ENOENT") break; throw error; }
+    if (st.isSymbolicLink()) throw new Error("unsafe symlink path");
+  }
+}
+async function ensureLocalPlanIgnore(projectRoot, repoRoot, gitDir, mirrorRelPath) {
+  const mirrorRelDir = path.posix.dirname(mirrorRelPath);
+  const tracked = await runLocalGit(repoRoot, ["ls-files", "-z", "--", mirrorRelDir]);
+  if (tracked == null) return { ok: false, reason: "git_unavailable" };
+  if (tracked) return { ok: false, reason: "mirror_dir_tracked" };
+  const excludePath = await runLocalGit(projectRoot, ["rev-parse", "--git-path", "info/exclude"]);
+  if (!excludePath) return { ok: false, reason: "exclude_unavailable" };
+  const absoluteExclude = path.resolve(projectRoot, excludePath);
+  const canonicalGitDir = fs.realpathSync(gitDir);
+  if (!insidePath(canonicalGitDir, absoluteExclude)) return { ok: false, reason: "exclude_outside_gitdir" };
+  try { assertNoSymlinkPath(absoluteExclude); } catch { return { ok: false, reason: "exclude_unsafe" }; }
+  try {
+    fs.mkdirSync(path.dirname(absoluteExclude), { recursive: true, mode: 0o700 });
+    let content = "";
+    try {
+      const st = fs.lstatSync(absoluteExclude);
+      if (!st.isFile() || st.nlink !== 1 || (typeof process.getuid === "function" && st.uid !== process.getuid())) return { ok: false, reason: "exclude_unsafe" };
+      content = fs.readFileSync(absoluteExclude, "utf8");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const pattern = "/" + mirrorRelDir.replace(/[\\*?\[\] ]/g, "\\$&") + "/";
+    const lines = content.split(/\r?\n/);
+    if (!lines.includes(pattern)) {
+      const addition = `${content && !content.endsWith("\n") ? "\n" : ""}${PLAN_MIRROR_MARKER}\n${pattern}\n`;
+      fs.writeFileSync(absoluteExclude, addition, { encoding: "utf8", flag: "a", mode: 0o600 });
+    }
+    const ignored = await runLocalGit(repoRoot, ["check-ignore", "-q", "--no-index", "--", mirrorRelPath]);
+    if (ignored == null) return { ok: false, reason: "exclude_not_effective" };
+    return { ok: true, excludePath: absoluteExclude, mirrorRelDir };
+  } catch {
+    return { ok: false, reason: "exclude_write_failed" };
+  }
+}
+function safePlanMirrorPayload(input) {
+  const steps = (Array.isArray(input.steps) ? input.steps : []).map((step, index) => ({
+    id: String(step && step.id || `step-${index + 1}`),
+    text: String(step && step.text || ""),
+    status: normalizeStepStatus(step && step.status),
+  }));
+  return {
+    schemaVersion: 1,
+    threadId: String(input.threadId),
+    projectRoot: String(input.projectRoot),
+    steps,
+    progress: computeProgress(steps),
+    source: input.cleared ? "hub-clear" : "hub-mcp",
+    updatedAt: String(input.updatedAt || new Date().toISOString()),
+    ...(input.cleared ? { cleared: true } : {}),
+  };
 }
 
 function validatePlanInput(input = {}) {
@@ -1115,6 +1203,231 @@ function createTaskBoard(opts = {}) {
     finally { try { db.close(); } catch {} }
   }
 
+  function mirrorBinding(record) {
+    let db;
+    try {
+      if (!record.threadId || record.threadId === "__NEW__" || !record.projectRoot) return null;
+      db = openDbReadOnly(t3DbPath);
+      const picked = db && pickThreadsTable(db);
+      if (!picked) return null;
+      const columns = tableColumns(db, picked.table);
+      const row = db.prepare(`SELECT * FROM ${picked.table} WHERE thread_id = ?`).get(record.threadId);
+      if (!row || row.deleted_at) return null;
+      const payload = safeJson(row.payload_json, null);
+      if (picked.modern) {
+        if (!payload?.lineage || !Object.hasOwn(payload.lineage, "parentThreadId")) return null;
+        if (payload.lineage.parentThreadId != null) return { unsupported: true };
+      } else if (!columns.has("parent_thread_id")) return null;
+      else if (row.parent_thread_id != null) return { unsupported: true };
+      if (tableExists(db, "orchestration_v2_projection_subagents") && tableColumns(db, "orchestration_v2_projection_subagents").has("child_thread_id") &&
+          db.prepare("SELECT 1 FROM orchestration_v2_projection_subagents WHERE child_thread_id = ? LIMIT 1").get(record.threadId)) return { unsupported: true };
+      const workspace = lookupThreadWorkspaceRoot(db, picked, record.threadId);
+      const worktree = payload?.worktreePath;
+      if (!workspace || !path.isAbsolute(workspace) || /[\u0000-\u001f\u007f]/.test(workspace)) return null;
+      if (worktree != null && (typeof worktree !== "string" || !path.isAbsolute(worktree) || /[\u0000-\u001f\u007f]/.test(worktree))) return null;
+      const cwd = canonicalProjectPath(worktree || workspace);
+      if (!sameProject(record.projectRoot, workspace) && !sameProject(record.projectRoot, cwd)) return { unsupported: true };
+      assertNoSymlinkPath(cwd, false);
+      return { workspace: canonicalProjectPath(workspace), cwd, threadId: record.threadId };
+    } catch { return null; }
+    finally { try { db?.close(); } catch {} }
+  }
+
+  function existingMirror(file, binding) {
+    assertNoSymlinkPath(file);
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 256 * 1024 || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return false;
+      const text = fs.readFileSync(file, "utf8"), data = JSON.parse(text);
+      if (data.schemaVersion !== 1 || data.threadId !== binding.threadId || data.projectRoot !== binding.cwd ||
+          !["hub-mcp", "hub-clear", "hub-unavailable"].includes(data.source) || !Array.isArray(data.steps)) return false;
+      return { text, data, mode: stat.mode & 0o777 };
+    } catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  }
+  function currentMirrorData(binding, previous, intent = {}) {
+    const roots = [...new Set([binding.workspace, binding.cwd])];
+    const candidates = roots.map(projectRoot => findHubPlan(hubPlansDir, { threadId: binding.threadId, projectRoot })).filter(Boolean);
+    candidates.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.planRevision).localeCompare(String(b.planRevision)));
+    const current = candidates[0];
+    if (!current && !previous && !intent.cleared) return null;
+    const data = safePlanMirrorPayload({ ...(current || { steps: [], cleared: true, updatedAt: intent.cleared && intent.updatedAt ? intent.updatedAt : previous?.data.cleared ? previous.data.updatedAt : new Date(nowFn()).toISOString() }), threadId: binding.threadId, projectRoot: binding.cwd });
+    if (Buffer.byteLength(JSON.stringify(data)) > 240 * 1024) return { ...data, steps: [], progress: computeProgress([]), source: "hub-unavailable", unavailable: true };
+    return data;
+  }
+  const mirrorQueue = new Map();
+  const mirrorActive = new Map();
+  const mirrorVerified = new Map();
+  const mirrorRetries = new Map();
+  let mirrorDrain = null;
+  let mirrorStopped = false;
+  let mirrorRetryTimer = null;
+  function disposePlanMirrors() {
+    mirrorStopped = true;
+    clearTimeout(mirrorRetryTimer);
+    mirrorRetries.clear(); mirrorQueue.clear();
+  }
+  const mirrorRuntimes = globalThis[Symbol.for("t3-hub.plan-mirror.runtimes")] ||= new Map();
+  const runtimeKey = path.resolve(hubPlansDir);
+  mirrorRuntimes.get(runtimeKey)?.();
+  mirrorRuntimes.set(runtimeKey, disposePlanMirrors);
+  function markerPath(scope) {
+    return assertSafeFsPath(hubPlansDir, path.join(hubPlansDir, ".mirror-pending-" + createHash("sha256").update(planFileKey(scope)).digest("hex")));
+  }
+  function fingerprint(file) {
+    try { const st = fs.lstatSync(file); return [st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs, st.mode].join(":"); } catch { return "missing"; }
+  }
+  function readMirrorMarker(scope) {
+    try { return safeReadJson(markerPath(scope)); } catch { return null; }
+  }
+  function quarantineOwnedMirror(file, binding) {
+    const previous = existingMirror(file, binding);
+    if (!previous) return;
+    const before = fs.lstatSync(file);
+    const backup = assertSafeFsPath(hubPlansDir, path.join(hubPlansDir, ".mirror-quarantine-" + planMirrorUuid(binding.threadId) + "-" + Date.now() + "-" + Math.random().toString(16).slice(2)));
+    fs.writeFileSync(backup, previous.text, { flag: "wx", mode: 0o600 });
+    const after = fs.lstatSync(file);
+    if (before.dev === after.dev && before.ino === after.ino && before.mtimeMs === after.mtimeMs && before.size === after.size) fs.unlinkSync(file);
+    mirrorVerified.delete(file);
+  }
+  async function publishPlanMirror(scope) {
+    if (mirrorStopped) return false;
+    const binding = mirrorBinding(scope);
+    if (!binding) return false;
+    if (binding.unsupported) return true;
+    const file = path.join(binding.cwd, planMirrorRelativePath(binding.threadId));
+    let previous = existingMirror(file, binding);
+    if (previous === false) return false;
+    const first = currentMirrorData(binding, previous, scope);
+    if (!first) return true;
+    const candidate = JSON.stringify(first, null, 2) + "\n";
+    const cached = mirrorVerified.get(file);
+    const unchanged = previous && previous.text === candidate && previous.mode === 0o600;
+    if (unchanged && cached && cached.until > Date.now() && cached.files.every(([name, signature]) => fingerprint(name) === signature)) return true;
+    const [repoRoot, commonRaw, workspaceCommonRaw, indexRaw] = await Promise.all([
+      runLocalGit(binding.cwd, ["rev-parse", "--show-toplevel"]), runLocalGit(binding.cwd, ["rev-parse", "--git-common-dir"]),
+      runLocalGit(binding.workspace, ["rev-parse", "--git-common-dir"]), runLocalGit(binding.cwd, ["rev-parse", "--git-path", "index"]),
+    ]);
+    if (!repoRoot || !commonRaw || !workspaceCommonRaw || !indexRaw || !insidePath(repoRoot, file)) return false;
+    const common = canonicalProjectPath(path.resolve(binding.cwd, commonRaw));
+    if (common !== canonicalProjectPath(path.resolve(binding.workspace, workspaceCommonRaw))) return false;
+    const relative = path.relative(repoRoot, file).split(path.sep).join("/");
+    const ignored = await ensureLocalPlanIgnore(binding.cwd, repoRoot, common, relative);
+    if (!ignored.ok) {
+      if (ignored.reason === "exclude_not_effective") quarantineOwnedMirror(file, binding);
+      return false;
+    }
+    if (mirrorStopped) return false;
+    const stillBound = mirrorBinding(scope);
+    if (!stillBound || stillBound.cwd !== binding.cwd || stillBound.workspace !== binding.workspace) return false;
+    // All slow Git work has finished. This lock only covers the final home
+    // re-read and atomic write, with at most a short 25 ms lock budget.
+    try {
+      withPlansLock(hubPlansDir, { threadId: binding.threadId, projectRoot: binding.cwd }, () => {
+        previous = existingMirror(file, binding);
+        if (previous === false) throw new Error("unmanaged mirror");
+        const current = currentMirrorData(binding, previous, scope);
+        if (!current) return;
+        const text = JSON.stringify(current, null, 2) + "\n";
+        if (previous?.text === text && previous.mode === 0o600) return;
+        assertNoSymlinkPath(file);
+        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        const temporary = file + ".tmp-" + process.pid + "-" + Math.random().toString(16).slice(2);
+        try { fs.writeFileSync(temporary, text, { flag: "wx", mode: 0o600 }); fs.renameSync(temporary, file); }
+        finally { try { fs.unlinkSync(temporary); } catch {} }
+      }, { ...lockOptions, timeoutMs: 25 });
+    } catch { return false; }
+    const files = [ignored.excludePath, path.resolve(binding.cwd, indexRaw), path.join(common, "config"), binding.cwd, binding.workspace, path.join(binding.cwd, ".git"), path.join(binding.workspace, ".git")];
+    for (let dir = path.dirname(file); dir === repoRoot || insidePath(repoRoot, dir); dir = path.dirname(dir)) {
+      files.push(path.join(dir, ".gitignore"));
+      if (dir === repoRoot) break;
+    }
+    mirrorVerified.set(file, { until: Date.now() + 60000, files: files.map(name => [name, fingerprint(name)]) });
+    if (mirrorVerified.size > 64) mirrorVerified.delete(mirrorVerified.keys().next().value);
+    return true;
+  }
+  async function drainMirrors() {
+    while (!mirrorStopped && mirrorQueue.size) {
+      const [key, job] = mirrorQueue.entries().next().value;
+      mirrorQueue.delete(key);
+      mirrorActive.set(key, job);
+      let succeeded = false;
+      try {
+        if (await publishPlanMirror(job.scope)) {
+          succeeded = true;
+          const marker = markerPath(job.scope);
+          const pending = safeReadJson(marker);
+          if (pending?.token === job.token) fs.unlinkSync(marker);
+        }
+      } catch {}
+      mirrorRetries.delete(key);
+      // Only mutations with durable intent retry automatically; routine
+      // snapshots remain read-triggered. A single shared timer fairly drains
+      // due jobs, so an unavailable provider cannot consume a retry slot.
+      if (!succeeded && !mirrorStopped && (job.volatile || readMirrorMarker(job.scope)?.token === job.token)) {
+        const attempt = (job.attempt || 0) + 1;
+        mirrorRetries.set(key, { ...job, attempt, retryAt: Date.now() + Math.min(60000, 100 * 2 ** Math.min(attempt - 1, 10)) });
+      }
+      if (mirrorActive.get(key) === job) mirrorActive.delete(key);
+    }
+    armMirrorRetry();
+  }
+  function armMirrorRetry() {
+    clearTimeout(mirrorRetryTimer);
+    if (mirrorStopped || !mirrorRetries.size) return;
+    const next = Math.min(...[...mirrorRetries.values()].map(job => job.retryAt));
+    mirrorRetryTimer = setTimeout(() => {
+      for (const [key, job] of [...mirrorRetries.entries()].filter(([, job]) => job.retryAt <= Date.now()).sort((a, b) => a[1].retryAt - b[1].retryAt).slice(0, 16)) {
+        mirrorRetries.delete(key);
+        if (!mirrorQueue.has(key)) mirrorQueue.set(key, job);
+      }
+      startMirrorDrain(); armMirrorRetry();
+    }, Math.max(20, next - Date.now()));
+    mirrorRetryTimer.unref?.();
+  }
+  function queuePlanMirror(scope, persist = false) {
+    if (!scope.threadId || scope.threadId === "__NEW__" || !scope.projectRoot) return;
+    const key = planFileKey(scope), token = Math.random().toString(16).slice(2);
+    // Read-only polling must not replace a stronger queued/in-flight mutation
+    // intent, especially a volatile clear whose durable marker was unavailable.
+    if (!persist && (mirrorActive.has(key) || mirrorQueue.has(key))) return;
+    if (!persist && mirrorRetries.has(key)) {
+      mirrorQueue.set(key, mirrorRetries.get(key)); mirrorRetries.delete(key);
+      startMirrorDrain(); armMirrorRetry(); return;
+    }
+    const job = { scope: { threadId: scope.threadId, projectRoot: scope.projectRoot, ...(scope.cleared ? { cleared: true, updatedAt: scope.updatedAt } : {}) }, token };
+    if (persist) {
+      try {
+        const marker = markerPath(scope), temporary = marker + ".tmp-" + process.pid + "-" + token;
+        if (fs.existsSync(marker)) {
+          const stat = fs.lstatSync(marker), old = safeReadJson(marker);
+          if (!stat.isFile() || stat.nlink !== 1 || (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+              typeof old?.token !== "string" || old?.scope?.threadId !== scope.threadId || !sameProject(old?.scope?.projectRoot, scope.projectRoot)) throw new Error("unmanaged mirror metadata");
+        }
+        try { fs.writeFileSync(temporary, JSON.stringify(job), { flag: "wx", mode: 0o600 }); fs.renameSync(temporary, marker); }
+        finally { try { fs.unlinkSync(temporary); } catch {} }
+      } catch { job.volatile = true; } // Never block the authoritative home operation.
+    } else {
+      const pending = readMirrorMarker(scope);
+      if (pending?.scope?.threadId === scope.threadId && sameProject(pending.scope.projectRoot, scope.projectRoot)) { job.token = pending.token; job.scope = pending.scope; }
+    }
+    mirrorRetries.delete(key);
+    mirrorQueue.set(key, job);
+    startMirrorDrain();
+  }
+  function startMirrorDrain() {
+    if (!mirrorStopped && !mirrorDrain && mirrorQueue.size) mirrorDrain = new Promise(resolve => setImmediate(resolve)).then(drainMirrors).finally(() => { mirrorDrain = null; startMirrorDrain(); });
+  }
+  async function flushPlanMirrors() { while (mirrorDrain) await mirrorDrain; }
+  // Recover only metadata describing an unfinished mirror operation, never
+  // read or publish arbitrary project files during startup.
+  try {
+    checkPlansStore();
+    for (const name of fs.readdirSync(hubPlansDir).filter(name => /^\.mirror-pending-[a-f0-9]{64}$/.test(name))) {
+      const pending = safeReadJson(assertSafeFsPath(hubPlansDir, path.join(hubPlansDir, name)));
+      if (pending?.scope) { validatePlanInput(pending.scope); queuePlanMirror(pending.scope); }
+    }
+  } catch {}
+
   function getBoardSnapshot(query = {}) {
     const q = query || {};
     validatePlanInput(q);
@@ -1235,6 +1548,7 @@ function createTaskBoard(opts = {}) {
     const artifactScope = verifyArtifactScope({ projectRoot: q.projectRoot, threadId: requestedThreadId || resolved.threadId });
     const agy = artifactScope.ok ? readAgyBrain(brainRoots, candidateIds, { strictThreadMatch: true, homeDir }) : null;
     const hub = findHubPlan(hubPlansDir, { threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
+    if (q.projectRoot && (resolved.threadId || q.threadId)) queuePlanMirror({ threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
 
     const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) =>
       (c.steps && c.steps.length) || (typeof c.planMarkdown === "string" && c.planMarkdown.trim()) || c.planReadError);
@@ -1297,6 +1611,7 @@ function createTaskBoard(opts = {}) {
       const file = planPath(hubPlansDir, planFileKey({ threadId: threadId || undefined, projectRoot: projectRoot || undefined }) + ".json");
       const matched = matchingHubPlans(listHubPlans(hubPlansDir), { threadId, projectRoot });
       assertPlanVersion(o, findHubPlan(hubPlansDir, { threadId, projectRoot }, matched));
+      queuePlanMirror(record, true);
       writeJsonAtomic(file, record);
       // Consolidate legacy names under the same lock as the scope-wide CAS.
       for (const plan of matched) {
@@ -1323,6 +1638,7 @@ function createTaskBoard(opts = {}) {
       } catch { plansAnchor = undefined; }
       const matched = matchingHubPlans(listHubPlans(hubPlansDir, undefined, plansAnchor), o);
       assertPlanVersion(o, findHubPlan(hubPlansDir, o, matched));
+      queuePlanMirror({ ...o, cleared: true, updatedAt: new Date(nowFn()).toISOString() }, true);
       for (const p of matched) {
         checkPlansStore(); assertSafeFsPath(hubPlansDir, p.file); fs.unlinkSync(p.file); deleted += 1;
       }
@@ -1330,7 +1646,7 @@ function createTaskBoard(opts = {}) {
     }, lockOptions);
   }
 
-  return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope };
+  return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope, flushPlanMirrors, disposePlanMirrors };
 }
 
 module.exports = {

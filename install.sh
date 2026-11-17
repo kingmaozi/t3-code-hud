@@ -43,7 +43,7 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$DEST_DIR/"
 
 # Ensure sidecar modules present (explicit list for older clones)
-for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
+for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs hub-memory-access.cjs hub-memory-connections.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
   if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
 done
 
@@ -960,9 +960,17 @@ fi
 cp "$SCRIPT_DIR/bin/t3-hud" "$BIN_DIR/t3-hud"
 chmod +x "$BIN_DIR/t3-hud"
 if [[ -f "$SCRIPT_DIR/bin/t3-mcp-router" ]]; then cp "$SCRIPT_DIR/bin/t3-mcp-router" "$BIN_DIR/t3-mcp-router"; chmod +x "$BIN_DIR/t3-mcp-router"; fi
+if [[ -f "$SCRIPT_DIR/bin/t3-memory-setup" ]]; then
+  if [[ -L "$BIN_DIR/t3-memory-setup" ]]; then
+    echo "[t3-hud] 保留已有的 t3-memory-setup 链接，请在 Hub 中完成记忆接入。" >&2
+  else
+    cp "$SCRIPT_DIR/bin/t3-memory-setup" "$BIN_DIR/t3-memory-setup"
+    chmod +x "$BIN_DIR/t3-memory-setup"
+  fi
+fi
 if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$BIN_DIR/pc-lite.mjs"; chmod +x "$BIN_DIR/pc-lite.mjs"; fi
 if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then mkdir -p "$HOME/.t3/hub/bin"; cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$HOME/.t3/hub/bin/pc-lite.mjs"; chmod +x "$HOME/.t3/hub/bin/pc-lite.mjs"; fi
-for hs in pc-lite.mjs memory-stop-hook.mjs subagent-route-guard.mjs; do
+for hs in pc-lite.mjs memory-setup.mjs memory-stop-hook.mjs subagent-route-guard.mjs; do
   if [[ -f "$SCRIPT_DIR/scripts/$hs" ]]; then
     mkdir -p "$BIN_DIR" "$HOME/.t3/hub/bin" "$DEST_DIR/scripts" 2>/dev/null || true
     cp "$SCRIPT_DIR/scripts/$hs" "$BIN_DIR/$hs"

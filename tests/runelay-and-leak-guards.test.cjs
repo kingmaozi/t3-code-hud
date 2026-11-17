@@ -98,7 +98,11 @@ function record(kind, obj) {
 module.exports = {
   search: async (args) => {
     record("search", args);
-    return { ok: true, items: [{ id: "mem-1", title: "deploy pitfall embed collision", content: "embed port colliding on 8001", module: "pitfalls", score: 0.9 }] };
+    return { ok: true, items: [{ id: "mem-1", projectSlug: "proj", title: "deploy pitfall embed collision", content: "embed port colliding on 8001", module: "pitfalls", scope: "shared", memory_scope: "shared", memoryScope: "shared", updatedAt: "2026-01-01T00:00:00.000Z", version: 3, score: 0.9, history: [{ version: 2, content: "older copy" }] }] };
+  },
+  read: async (args) => {
+    record("read", args);
+    return { ok: true, item: { id: "mem-1", title: "deploy pitfall embed collision", content: "embed port colliding on 8001", module: "pitfalls", version: 3, history: [{ version: 2, content: "older copy" }] } };
   },
   write: async (args) => {
     record("write", args);
@@ -106,6 +110,21 @@ module.exports = {
   },
   consolidateMemories: async (args) => { record("consolidate", args); return { ok: true }; },
   rollbackMemory: async (args) => { record("rollback", args); return { ok: true }; },
+};
+`;
+  fs.writeFileSync(vaultPath, code, "utf8");
+}
+function makeLegacyReadStubVault(vaultPath) {
+  const code = `"use strict";
+const fs = require("node:fs");
+function record(obj) { try { fs.appendFileSync(process.env.STUB_RECORD_PATH, JSON.stringify(obj) + "\\n"); } catch {} }
+const items = [
+  { id: "recent-id", title: "Recent", content: "recent body", module: "constraints", history: [] },
+  { id: "legacy-id", title: "Older", content: "older body", module: "constraints", history: [{ version: 1, content: "older revision" }] },
+];
+module.exports = {
+  // This older adapter silently ignores an unknown id parameter.
+  listMemories: (args) => { record(args); return { ok: true, projectSlug: "proj", items: items.slice(0, Number(args.limit) || 50) }; },
 };
 `;
   fs.writeFileSync(vaultPath, code, "utf8");
@@ -302,6 +321,48 @@ describe("t3-mcp-router pinned shield + context/skill meta tools", () => {
       setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);
     }
   });
+  it("keeps search results compact while memory_read retains full revision history", async () => {
+    const fx = setupRouterFixture();
+    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: fx.projDir });
+    try {
+      const searched = await r.callTool("memory_search", { query: "deploy", projectRoot: fx.projDir });
+      const searchPayload = JSON.parse(searched.result.content[0].text);
+      const item = searchPayload.items[0];
+      assert.ok(item.id && item.title && item.content && item.module && item.scope && item.updatedAt && item.version);
+      assert.equal(Object.hasOwn(item, "history"), false, "search omits old revisions from prompt context");
+      assert.equal(item.memory_scope, "shared", "legacy scope aliases remain compatible");
+
+      const read = await r.callTool("memory_read", { id: "mem-1", projectRoot: fx.projDir });
+      const readPayload = JSON.parse(read.result.content[0].text);
+      assert.equal(readPayload.item.history[0].version, 2, "full history remains available on explicit read");
+    } finally {
+      r.kill();
+      setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);
+    }
+  });
+  it("falls back to scoped legacy listing when an adapter ignores the id filter", async () => {
+    const fx = setupRouterFixture();
+    makeLegacyReadStubVault(fx.vaultPath);
+    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: fx.projDir });
+    try {
+      const response = await r.callTool("memory_read", { id: "legacy-id", projectRoot: fx.projDir }, 8000);
+      const result = JSON.parse(response.result.content[0].text);
+      assert.equal(result.ok, true);
+      assert.equal(result.item.id, "legacy-id");
+      assert.equal(result.item.history[0].content, "older revision");
+      const calls = fs.readFileSync(fx.recordPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      assert.equal(calls.length, 2, "one exact-ID probe followed by the bounded compatibility lookup");
+      assert.equal(calls[0].id, "legacy-id");
+      assert.equal(calls[0].limit, 1);
+      assert.equal(calls[1].id, undefined, "legacy fallback omits the unsupported filter");
+      assert.equal(calls[1].limit, 200);
+      assert.equal(calls[1].projectRoot, fx.projDir, "fallback keeps the selected project scope");
+      assert.equal(calls[1].includeGlobal, true);
+    } finally {
+      r.kill();
+      setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);
+    }
+  });
   it("memory_write strips agent pinned:true to pinned:false", async () => {
     const fx = setupRouterFixture();
     const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: fx.projDir });
@@ -312,6 +373,17 @@ describe("t3-mcp-router pinned shield + context/skill meta tools", () => {
       const w = records.find((x) => x.kind === "write");
       assert.ok(w, "stub write recorded");
       assert.equal(w.obj.pinned, false, "pinned must be forced false, got " + JSON.stringify(w.obj));
+      assert.equal(w.obj.tags, undefined);
+      const core = await r.callTool("memory_write", { module: "constraints", title: "agent core", content: "do not promote", tags: ["  CoRe  "], projectRoot: fx.projDir }, 8000);
+      const corePayload = JSON.parse(core.result.content[0].text);
+      assert.equal(corePayload.ok, false);
+      assert.match(corePayload.error, /human-only/);
+      await r.callTool("memory_consolidate", { projectRoot: fx.projDir }, 8000);
+      await r.callTool("memory_rollback", { id: "mem-1", projectRoot: fx.projDir }, 8000);
+      const after = fs.readFileSync(fx.recordPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      assert.equal(after.filter((x) => x.kind === "write").length, 1, "reserved core tag is refused before vault write");
+      assert.equal(after.find((x) => x.kind === "consolidate").obj.excludeProtected, true);
+      assert.equal(after.find((x) => x.kind === "rollback").obj.rejectProtectedRollback, true);
     } finally {
       r.kill();
       setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);

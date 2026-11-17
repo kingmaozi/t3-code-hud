@@ -151,6 +151,34 @@ describe("CRUD across modules", () => {
     assert.equal(r2.deduplicated, true);
     assert.equal(r2.item.id, r1.item.id);
   });
+  it("does not auto-evolve a pinned/core memory but still evolves ordinary memories", () => {
+    const v = makeVault();
+    const key = "protected-evolve-" + crypto.randomUUID();
+    const pinned = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} cache guard`, content: `${key} cache throughput guard uses a strict threshold of sixty tokens`, tags: [" Pinned "], autoEvolve: false });
+    assert.equal(pinned.ok, true);
+    const pinnedUpdate = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} cache guard`, content: `${key} cache throughput guard uses a strict threshold of sixty tokens and records the request source` });
+    assert.equal(pinnedUpdate.ok, true);
+    assert.notEqual(pinnedUpdate.item.id, pinned.item.id, "automatic similarity matching must not write the protected record");
+    const pinnedCurrent = v.listMemories({ projectRoot: projA, id: pinned.item.id, limit: 500 }).items.find((item) => item.id === pinned.item.id);
+    assert.equal(pinnedCurrent.content, pinned.item.content);
+    assert.equal(pinnedCurrent.version, pinned.item.version);
+
+    const core = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} core cache guard`, content: `${key} core cache throughput guard uses a strict threshold of sixty tokens`, tags: ["CORE"], autoEvolve: false });
+    const coreUpdate = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} core cache guard`, content: `${key} core cache throughput guard uses a strict threshold of sixty tokens and records the request source` });
+    assert.notEqual(coreUpdate.item.id, core.item.id, "core-tagged memories must stay out of automatic similarity writes");
+    assert.equal(v.listMemories({ projectRoot: projA, limit: 500 }).items.find((item) => item.id === core.item.id).content, core.item.content);
+
+    const ordinary = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} ordinary cache guard`, content: `${key} ordinary cache throughput guard uses a strict threshold of sixty tokens`, autoEvolve: false });
+    const ordinaryUpdate = v.saveMemory({ projectRoot: projA, module: "topics", kind: "topic", title: `${key} ordinary cache guard`, content: `${key} ordinary cache throughput guard uses a strict threshold of sixty tokens and records the request source` });
+    assert.equal(ordinaryUpdate.ok, true);
+    assert.ok(["merged", "evolved"].includes(ordinaryUpdate.action));
+    assert.ok(ordinaryUpdate.item.version > ordinary.item.version, "ordinary same-scope memories can still evolve");
+
+    const isolated = v.saveMemory({ projectRoot: projB, module: "topics", kind: "topic", title: `${key} cache guard`, content: `${key} cache throughput guard uses a strict threshold of sixty tokens and records the request source` });
+    assert.equal(isolated.ok, true);
+    assert.notEqual(isolated.item.id, pinned.item.id, "auto-evolve must not cross project scope");
+    assert.ok(v.listMemories({ projectRoot: projB, query: key }).items.every((item) => item.projectSlug === path.basename(projB)));
+  });
   it("derives module from kind when module omitted", () => {
     const v = makeVault();
     const r = v.saveMemory({ projectRoot: projA, kind: "decision", title: "kind-only", content: "由 kind 推导模块的内容唯一性标记" + Date.now() });
