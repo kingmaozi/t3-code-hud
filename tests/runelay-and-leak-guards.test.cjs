@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
 
 const REPO = path.resolve(__dirname, "..");
 const EMBED_SERVER = path.join(REPO, "src", "embed-server.py");
@@ -29,17 +30,20 @@ function expectedCeiling(est) {
 // ---------------------------------------------------------------------------
 // Router integration harness (spawns bin/t3-mcp-router as stdio MCP server)
 // ---------------------------------------------------------------------------
-function startRouter({ homeDir, hubDir, vaultPath, recordPath, cwd }) {
+function startRouter({ homeDir, hubDir, vaultPath, recordPath, cwd, userDataDir, threadId }) {
   const env = {
     ...process.env,
     HOME: homeDir,
     T3_HUB_DIR: hubDir,
     T3_MEMORY_VAULT: vaultPath,
+    T3CODE_HOME: userDataDir || path.join(homeDir, ".t3", "userdata"),
     T3_MCP_ROUTER: "",
     STUB_RECORD_PATH: recordPath || "",
   };
   delete env.T3_PROJECT_ROOT;
   delete env.T3_MCP_ROUTER;
+  if (threadId == null) delete env.T3CODE_THREAD_ID;
+  else env.T3CODE_THREAD_ID = String(threadId);
   const proc = spawn(process.execPath, [ROUTER_PATH], { env, stdio: ["pipe", "pipe", "pipe"], cwd: cwd || homeDir });
   let buffer = "";
   let nextId = 1;
@@ -135,9 +139,22 @@ function setupRouterFixture() {
   const homeDir = path.join(tmp, "home");
   const hubDir = path.join(tmp, "hub");
   const projDir = path.join(tmp, "proj");
+  const userDataDir = path.join(homeDir, ".t3", "userdata");
   fs.mkdirSync(homeDir, { recursive: true });
   fs.mkdirSync(hubDir, { recursive: true });
   fs.mkdirSync(path.join(projDir, ".git"), { recursive: true });
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const stateDbPath = path.join(userDataDir, "statev2.sqlite");
+  const db = new DatabaseSync(stateDbPath);
+  db.exec("CREATE TABLE projection_projects(project_id TEXT, workspace_root TEXT, deleted_at TEXT); CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, project_id TEXT, payload_json TEXT, deleted_at TEXT)");
+  db.prepare("INSERT INTO projection_projects VALUES(?,?,NULL)").run("project-default", fs.realpathSync(projDir));
+  db.close();
+  const updateStateDb = (sql, values) => {
+    const stateDb = new DatabaseSync(stateDbPath);
+    try { stateDb.prepare(sql).run(...values); } finally { stateDb.close(); }
+  };
+  const addProject = (id, root, deletedAt = null) => updateStateDb("INSERT INTO projection_projects VALUES(?,?,?)", [id, fs.realpathSync(root), deletedAt]);
+  const addThread = (id, projectId, worktreePath = null, deletedAt = null) => updateStateDb("INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?)", [id, projectId, JSON.stringify({ worktreePath }), deletedAt]);
   fs.writeFileSync(path.join(hubDir, "state.json"), JSON.stringify({ mcpModes: { global: {}, projects: {} } }), "utf8");
   // demo skill under HOME/.agents/skills
   const skillDir = path.join(homeDir, ".agents", "skills", "demo-skill");
@@ -151,7 +168,7 @@ function setupRouterFixture() {
   makeStubVault(vaultPath);
   const recordPath = path.join(tmp, "records.jsonl");
   fs.writeFileSync(recordPath, "", "utf8");
-  return { tmp, homeDir, hubDir, projDir, skillDir, vaultPath, recordPath };
+  return { tmp, homeDir, hubDir, projDir, userDataDir, stateDbPath, updateStateDb, addProject, addThread, skillDir, vaultPath, recordPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +644,10 @@ describe("project-only Agent memory", () => {
       const search = tools.find((tool) => tool.name === "memory_search");
       const read = tools.find((tool) => tool.name === "memory_read");
       const write = tools.find((tool) => tool.name === "memory_write");
+      assert.match(tools.find((tool) => tool.name === "memory_status").description, /projectBound.*projectRoot/s);
+      for (const name of ["memory_search", "memory_read", "memory_write", "memory_consolidate", "memory_rollback", "context_search"]) {
+        assert.match(tools.find((tool) => tool.name === name).description, /memory_status first.*exact path automatically/i, `${name} guides the Agent to read the bound path`);
+      }
       assert.equal(search.inputSchema.properties.includeGlobal, undefined);
       assert.deepEqual(search.inputSchema.properties.scope.enum, ["shared", "worktree"]);
       assert.deepEqual(search.inputSchema.properties.scopeFilter.enum, ["auto", "shared", "worktree", "all"]);
@@ -721,35 +742,51 @@ describe("project-only Agent memory", () => {
     }
   });
 
-  it("accepts a linked-worktree alias only for the same project-relative path and never switches active worktree", async () => {
+  it("binds a linked-worktree T3 project and rejects ambiguous or mismatched roots", async () => {
     const fx = setupRouterFixture();
-    const gitDir = path.join(fx.projDir, ".git", "worktrees", "linked");
-    fs.mkdirSync(gitDir, { recursive: true });
-    fs.writeFileSync(path.join(gitDir, "commondir"), "../..\n");
+    const repo = path.join(fx.tmp, "git-repo");
     const linkedRoot = path.join(fx.tmp, "linked-worktree");
-    fs.mkdirSync(linkedRoot, { recursive: true });
-    fs.writeFileSync(path.join(linkedRoot, ".git"), `gitdir: ${gitDir}\n`);
-    const project = path.join(fx.projDir, "service-a");
-    const linkedProject = path.join(linkedRoot, "service-a");
-    fs.mkdirSync(project, { recursive: true });
-    fs.mkdirSync(linkedProject, { recursive: true });
-    fs.writeFileSync(path.join(project, "package.json"), "{}\n");
-    fs.writeFileSync(path.join(linkedProject, "package.json"), "{}\n");
-    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: project });
+    fs.mkdirSync(path.join(repo, "service-a"), { recursive: true });
+    fs.mkdirSync(path.join(repo, "service-b"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "service-a", "tracked.txt"), "a\n");
+    fs.writeFileSync(path.join(repo, "service-b", "tracked.txt"), "b\n");
+    const git = (...args) => {
+      const result = spawnSync("git", args, { encoding: "utf8", timeout: 15000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+      assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+    };
+    git("-C", repo, "init", "-b", "main");
+    git("-C", repo, "add", ".");
+    git("-C", repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "fixture");
+    git("-C", repo, "worktree", "add", "-b", "linked", linkedRoot);
+    const projectA = path.join(repo, "service-a"), projectB = path.join(repo, "service-b");
+    const linkedProjectA = path.join(linkedRoot, "service-a"), linkedProjectB = path.join(linkedRoot, "service-b");
+    fx.addProject("service-a", projectA);
+    fx.addProject("service-b", projectB);
+    fx.addThread("thread-a", "service-a", linkedRoot);
+    fx.addThread("thread-b", "service-b", linkedRoot);
+    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: linkedRoot, threadId: "thread-a" });
     try {
-      const allowed = await r.callTool("memory_search", { query: "deploy", projectRoot: linkedProject });
+      const status = await r.callTool("memory_status", {});
+      const binding = JSON.parse(status.result.content[0].text);
+      assert.equal(binding.projectBound, true);
+      assert.equal(binding.projectRoot, fs.realpathSync(linkedProjectA));
+      assert.equal(binding.projectBindingSource, "t3-thread");
+      const allowed = await r.callTool("memory_search", { query: "deploy", projectRoot: linkedProjectA });
       assert.ok(allowed.result, JSON.stringify(allowed));
       const call = JSON.parse(fs.readFileSync(fx.recordPath, "utf8").trim());
-      assert.equal(call.obj.projectRoot, fs.realpathSync(project), "an alias never switches the active worktree root");
-      const wrongSubproject = await r.callTool("memory_search", { query: "deploy", projectRoot: path.join(linkedRoot, "service-b") });
-      assert.ok(wrongSubproject.error, "same Git repo but a different project subdirectory is rejected");
+      assert.equal(call.obj.projectRoot, fs.realpathSync(linkedProjectA));
+      const wrongSubproject = await r.callTool("memory_search", { query: "deploy", projectRoot: linkedProjectB });
+      assert.ok(wrongSubproject.error, "same Git repository but a different T3 project subdirectory is rejected");
+      const wrongWorktreeAlias = await r.callTool("memory_search", { query: "deploy", projectRoot: projectA });
+      assert.ok(wrongWorktreeAlias.error, "explicit projectRoot must exactly match the current worktree binding");
       const ambiguousWorktreeRoot = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: path.join(fx.tmp, "linked-records.jsonl"), cwd: linkedRoot });
       try {
-        const status = await ambiguousWorktreeRoot.callTool("memory_status", {});
-        const payload = JSON.parse(status.result.content[0].text);
-        assert.equal(payload.projectBound, false, "an unbound linked checkout root is ambiguous");
-        const response = await ambiguousWorktreeRoot.callTool("memory_search", { query: "deploy", projectRoot: linkedRoot });
-        assert.ok(response.error, "a worktree checkout root cannot bootstrap the selected T3 subproject");
+        const ambiguousStatus = await ambiguousWorktreeRoot.callTool("memory_status", {});
+        const payload = JSON.parse(ambiguousStatus.result.content[0].text);
+        assert.equal(payload.projectBound, false, "worktree root mapping to two project subdirectories is ambiguous");
+        assert.equal(payload.projectBindingReason, "ambiguous");
+        const response = await ambiguousWorktreeRoot.callTool("memory_search", { query: "deploy", projectRoot: linkedProjectA });
+        assert.ok(response.error, "a caller root cannot resolve an ambiguous worktree context");
       } finally { ambiguousWorktreeRoot.kill(); }
     } finally {
       r.kill();
@@ -769,7 +806,7 @@ describe("project-only Agent memory", () => {
       const statusPayload = JSON.parse(status.result.content[0].text);
       assert.equal(statusPayload.projectBound, false);
       assert.equal(statusPayload.projectRoot, null);
-      assert.equal(statusPayload.projectBindingReason, "context_required");
+      assert.equal(statusPayload.projectBindingReason, "invalid_context");
       assert.equal(fs.readFileSync(fx.recordPath, "utf8").trim(), "", "unbound calls never reach the vault");
     } finally {
       r.kill();
@@ -780,7 +817,8 @@ describe("project-only Agent memory", () => {
   it("allows a real Documents project beneath HOME without treating HOME itself as the project", async () => {
     const fx = setupRouterFixture();
     const project = path.join(fx.homeDir, "Documents", "project");
-    fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    fx.addProject("documents-project", project);
     const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: project });
     try {
       const response = await r.callTool("memory_search", { query: "deploy", projectRoot: project });
@@ -793,11 +831,65 @@ describe("project-only Agent memory", () => {
     }
   });
 
+  it("resolves a non-Git T3 workspace from the read-only project projection", async () => {
+    const fx = setupRouterFixture();
+    const project = path.join(fx.tmp, "registered-without-git");
+    fs.mkdirSync(project, { recursive: true });
+    fx.addProject("non-git-project", project);
+    fx.addThread("non-git-thread", "non-git-project");
+    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: project, threadId: "non-git-thread" });
+    try {
+      const status = await r.callTool("memory_status", {});
+      const binding = JSON.parse(status.result.content[0].text);
+      assert.equal(binding.projectBound, true);
+      assert.equal(binding.projectRoot, fs.realpathSync(project));
+      assert.equal(binding.projectBindingSource, "t3-thread");
+      const response = await r.callTool("memory_search", { query: "deploy", projectRoot: project });
+      assert.ok(response.result, JSON.stringify(response));
+      const call = JSON.parse(fs.readFileSync(fx.recordPath, "utf8").trim());
+      assert.equal(call.obj.projectRoot, fs.realpathSync(project));
+    } finally {
+      r.kill();
+      setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);
+    }
+  });
+
+  it("retries an unbound status until projection appears, then pins the first verified project", async () => {
+    const fx = setupRouterFixture();
+    const projectB = path.join(fx.tmp, "other-registered-project");
+    fs.mkdirSync(projectB, { recursive: true });
+    fx.addProject("project-b", projectB);
+    const r = startRouter({ homeDir: fx.homeDir, hubDir: fx.hubDir, vaultPath: fx.vaultPath, recordPath: fx.recordPath, cwd: fx.projDir, threadId: "late-thread" });
+    try {
+      const early = await r.callTool("memory_status", {});
+      assert.equal(JSON.parse(early.result.content[0].text).projectBindingReason, "thread_not_found");
+      fx.addThread("late-thread", "project-default");
+      const bound = await r.callTool("memory_status", {});
+      assert.equal(JSON.parse(bound.result.content[0].text).projectRoot, fs.realpathSync(fx.projDir));
+      fx.updateStateDb("UPDATE orchestration_v2_projection_threads SET project_id=? WHERE thread_id=?", ["project-b", "late-thread"]);
+      const correct = await r.callTool("memory_search", { query: "deploy", projectRoot: fx.projDir });
+      assert.ok(correct.result, JSON.stringify(correct));
+      const wrong = await r.callTool("memory_search", { query: "deploy", projectRoot: projectB });
+      assert.ok(wrong.error, "a successfully bound router process cannot switch to another project");
+      const finalStatus = await r.callTool("memory_status", {});
+      assert.equal(JSON.parse(finalStatus.result.content[0].text).projectRoot, fs.realpathSync(fx.projDir));
+    } finally {
+      r.kill();
+      setTimeout(() => { try { fs.rmSync(fx.tmp, { recursive: true, force: true }); } catch {} }, 300);
+    }
+  });
+
   it("pc-lite recall is project-bound, defaults to six and truncates long content; smart writes stay project-scoped", async () => {
     const { main } = await import("../scripts/pc-lite.mjs");
     const tmp = mkTmp("pc-lite-project-scope-");
     const project = path.join(tmp, "project");
-    fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    const userDataDir = path.join(tmp, "t3-userdata");
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const stateDb = new DatabaseSync(path.join(userDataDir, "statev2.sqlite"));
+    stateDb.exec("CREATE TABLE projection_projects(project_id TEXT, workspace_root TEXT, deleted_at TEXT); CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, project_id TEXT, payload_json TEXT, deleted_at TEXT)");
+    stateDb.prepare("INSERT INTO projection_projects VALUES(?,?,NULL)").run("cli-project", fs.realpathSync(project));
+    stateDb.close();
     const calls = [];
     const vault = {
       listMemories(args) {
@@ -811,6 +903,9 @@ describe("project-only Agent memory", () => {
     };
     const output = [];
     const common = { cwd: project, vault, accessManager: { isAccessEnabled: () => true }, stdout: (s) => output.push(s), stderr: (s) => output.push(s) };
+    const previousEnv = { HOME: process.env.HOME, T3CODE_HOME: process.env.T3CODE_HOME, T3CODE_THREAD_ID: process.env.T3CODE_THREAD_ID };
+    process.env.T3CODE_HOME = userDataDir;
+    delete process.env.T3CODE_THREAD_ID;
     try {
       const defaultRecallCode = await main({ ...common, argv: ["recall"] });
       assert.equal(defaultRecallCode, 0);
@@ -846,6 +941,9 @@ describe("project-only Agent memory", () => {
       assert.equal(unboundCode, 1, "an explicit --root cannot bootstrap unknown Agent context");
       assert.equal(calls.length, beforeRejectedCalls);
     } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

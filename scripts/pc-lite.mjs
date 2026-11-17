@@ -46,6 +46,24 @@ function defaultAccessManager() {
   return null;
 }
 
+let projectContextResolver = null;
+function getProjectContextResolver() {
+  if (projectContextResolver) return projectContextResolver;
+  for (const cand of [
+    process.env.T3_HUB_MEMORY_PROJECT_CONTEXT ? path.resolve(process.env.T3_HUB_MEMORY_PROJECT_CONTEXT) : null,
+    "../src/hub-memory-project-context.cjs",
+    "../hub-memory-project-context.cjs",
+    "../hud-plugin/hub-memory-project-context.cjs",
+    path.join(process.env.HOME || os.homedir(), ".t3", "hud-plugin", "hub-memory-project-context.cjs"),
+  ].filter(Boolean)) {
+    try {
+      const mod = require(cand);
+      if (typeof mod.resolveMemoryProjectContext === "function") { projectContextResolver = mod.resolveMemoryProjectContext; break; }
+    } catch (error) { if (error?.code !== "MODULE_NOT_FOUND") throw error; }
+  }
+  return projectContextResolver;
+}
+
 function parseCliArgs(argv) {
   const [subcommand, ...rest] = argv;
   const flags = {};
@@ -86,80 +104,23 @@ function agentWriteTags(raw) {
   return tags;
 }
 
-function canonicalRoot(root) {
-  try { return fs.realpathSync(root); } catch { return path.resolve(root); }
-}
-function insidePath(base, candidate) {
-  const relative = path.relative(base, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-function forbiddenProjectRoot(root) {
-  const home = canonicalRoot(process.env.HOME || os.homedir());
-  if (root === home) return true;
-  const denied = [
-    path.join(home, ".t3"), path.join(home, ".codex"), path.join(home, ".agents"),
-    path.join(home, ".config"), path.join(home, "Applications"),
-    "/Applications", "/System/Applications", "/System/Library", process.env.T3CODE_HOME,
-  ].filter(Boolean).map(canonicalRoot);
-  return denied.some((base) => insidePath(base, root));
-}
-function gitRepositoryContext(root) {
-  let current = canonicalRoot(root);
-  while (true) {
-    const dotGit = path.join(current, ".git");
-    try {
-      const stat = fs.lstatSync(dotGit);
-      let common = dotGit;
-      if (stat.isFile()) {
-        const match = fs.readFileSync(dotGit, "utf8").trim().match(/^gitdir:\s*(.+)$/i);
-        if (!match) return null;
-        const gitDir = path.resolve(current, match[1]);
-        if (!fs.statSync(gitDir).isDirectory()) return null;
-        try { common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim()); }
-        catch { common = gitDir; }
-      } else if (!stat.isDirectory()) return null;
-      return { repositoryId: canonicalRoot(common), repositoryRoot: current, relativePath: path.relative(current, canonicalRoot(root)) };
-    } catch (error) {
-      if (error?.code !== "ENOENT") return null;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-function hasProjectMarker(root) {
-  for (const name of [".git", "AGENTS.md", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "Gemfile", "composer.json", "requirements.txt", ".project"]) {
-    try {
-      const stat = fs.lstatSync(path.join(root, name));
-      if (name === ".git" || stat.isFile() || stat.isDirectory()) return true;
-    } catch {}
-  }
-  return false;
-}
-function projectContext(root, { requireMarker = false } = {}) {
-  const canonical = canonicalRoot(root);
-  try { if (!fs.statSync(canonical).isDirectory()) return null; } catch { return null; }
-  if (forbiddenProjectRoot(canonical)) return null;
-  if (requireMarker && !hasProjectMarker(canonical)) return null;
-  // A linked checkout root is ambiguous without T3's thread/project mapping:
-  // its path may be a worktree for a different subproject in the same repo.
-  if (requireMarker) {
-    try { if (fs.lstatSync(path.join(canonical, ".git")).isFile()) return null; } catch {}
-  }
-  const git = gitRepositoryContext(canonical);
-  return { root: canonical, ...(git || {}) };
-}
 function resolveCliProjectRoot(requestedRoot, cwd) {
-  const current = projectContext(cwd, { requireMarker: true });
-  if (!current) throw new Error("project context required: run this command from the selected project");
-  if (requestedRoot == null || requestedRoot === "") return current.root;
+  const resolver = getProjectContextResolver();
+  if (!resolver) throw new Error("project context resolver unavailable");
+  let current;
+  try {
+    current = resolver({ cwd, homeDir: process.env.HOME || os.homedir(), ...(process.env.T3CODE_HOME ? { t3Home: process.env.T3CODE_HOME } : {}) });
+  } catch { current = null; }
+  if (current?.projectBound !== true || typeof current.projectRoot !== "string") {
+    throw new Error(`project context required: ${current?.reason || "context_required"}`);
+  }
+  if (requestedRoot == null || requestedRoot === "") return current.projectRoot;
   const requested = path.isAbsolute(requestedRoot) ? requestedRoot : path.resolve(cwd, requestedRoot);
-  const selected = projectContext(requested);
-  if (!selected) throw new Error("--root is not a valid project directory");
-  const samePath = current.root === selected.root;
-  const sameLinkedProject = Boolean(current.repositoryId && selected.repositoryId && current.repositoryId === selected.repositoryId && current.relativePath === selected.relativePath);
-  if (!samePath && !sameLinkedProject) throw new Error("--root does not match the selected project context");
-  return current.root;
+  let canonicalRequested;
+  try { canonicalRequested = fs.realpathSync(requested); }
+  catch { throw new Error("--root must be the bound T3 project directory"); }
+  if (canonicalRequested !== current.projectRoot) throw new Error("--root does not match the bound T3 project");
+  return current.projectRoot;
 }
 function scopedAgentWrite(kind, tags, requestedScope) {
   const scope = requestedScope == null || requestedScope === "" ? "" : String(requestedScope).toLowerCase();

@@ -980,6 +980,12 @@ for hs in pc-lite.mjs memory-setup.mjs memory-stop-hook.mjs subagent-route-guard
   fi
 done
 
+# Install only a new skill or the exact known legacy template; preserve custom
+# instructions and symlinks. This does not start a host, model, or MCP process.
+if [[ -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
+  node "$SCRIPT_DIR/scripts/install-memory-skill.cjs"
+fi
+
 if [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
   ln -sf "$BIN_DIR/t3-hud" "/opt/homebrew/bin/t3-hud"
 elif [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then

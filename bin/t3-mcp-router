@@ -80,116 +80,68 @@ function hasSymlinkComponent(root) {
   }
   return false;
 }
-function isPathInside(base, candidate) {
-  const relative = path.relative(base, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-function isForbiddenMemoryRoot(root) {
-  const canonical = canonicalProjectRoot(root);
-  if (!canonical) return true;
-  const home = canonicalProjectRoot(HOME_DIR) || path.resolve(HOME_DIR);
-  const denied = [
-    path.join(home, ".t3"),
-    path.join(home, ".codex"),
-    path.join(home, ".agents"),
-    path.join(home, ".config"),
-    path.join(home, "Applications"),
-    "/Applications",
-    "/System/Applications",
-    "/System/Library",
-    process.env.T3CODE_HOME,
-  ].filter(Boolean).map((item) => canonicalProjectRoot(item) || path.resolve(item));
-  return canonical === home || denied.some((base) => isPathInside(base, canonical));
-}
-function gitProjectContext(start) {
-  let cur = canonicalProjectRoot(start);
-  if (!cur) return null;
-  try { if (!fs.statSync(cur).isDirectory()) return null; } catch { return null; }
-  while (true) {
-    const gitEntry = path.join(cur, ".git");
+let memoryProjectContextResolver = null;
+function loadMemoryProjectContextResolver() {
+  if (memoryProjectContextResolver) return memoryProjectContextResolver;
+  for (const cand of [
+    process.env.T3_HUB_MEMORY_PROJECT_CONTEXT ? path.resolve(process.env.T3_HUB_MEMORY_PROJECT_CONTEXT) : null,
+    path.join(__dirname, "..", "src", "hub-memory-project-context.cjs"),
+    path.join(__dirname, "..", "hud-plugin", "hub-memory-project-context.cjs"),
+    path.join(HOME_DIR, ".t3", "hud-plugin", "hub-memory-project-context.cjs"),
+  ].filter(Boolean)) {
     try {
-      const st = fs.lstatSync(gitEntry);
-      let commonDir = gitEntry;
-      if (st.isFile()) {
-        const match = fs.readFileSync(gitEntry, "utf8").trim().match(/^gitdir:\s*(.+)$/i);
-        if (!match) return null;
-        const gitDir = path.resolve(cur, match[1]);
-        if (!fs.statSync(gitDir).isDirectory()) return null;
-        const commonFile = path.join(gitDir, "commondir");
-        try { commonDir = path.resolve(gitDir, fs.readFileSync(commonFile, "utf8").trim()); }
-        catch { commonDir = gitDir; }
-      } else if (!st.isDirectory()) return null;
-      const canonicalRoot = canonicalProjectRoot(cur) || cur;
-      const canonicalCommon = canonicalProjectRoot(commonDir) || path.resolve(commonDir);
-      if (isForbiddenMemoryRoot(canonicalRoot)) return null;
-      return { root: canonicalRoot, repositoryId: canonicalCommon };
-    } catch (error) {
-      if (error?.code !== "ENOENT") return null;
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-}
-function registeredProjectContext(start) {
-  const canonicalStart = canonicalProjectRoot(start);
-  if (!canonicalStart) return null;
-  const registered = new Set(Object.keys(readState().mcpModes?.projects || {})
-    .filter((key) => !hasSymlinkComponent(key))
-    .map(canonicalProjectRoot)
-    .filter((root) => root && !isForbiddenMemoryRoot(root)));
-  if (!registered.has(canonicalStart)) return null;
-  const git = gitProjectContext(canonicalStart);
-  return { root: canonicalStart, repositoryId: git?.repositoryId || null, repoRoot: git?.root || null, repoRelativePath: git ? path.relative(git.root, canonicalStart) : null, source: "registered" };
-}
-function hasProjectRootMarker(root) {
-  for (const name of [".git", "AGENTS.md", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "Gemfile", "composer.json", "requirements.txt", ".project"]) {
-    try {
-      const st = fs.lstatSync(path.join(root, name));
-      if (name === ".git" || st.isFile() || st.isDirectory()) return true;
+      const mod = require(cand);
+      if (typeof mod.resolveMemoryProjectContext === "function") { memoryProjectContextResolver = mod.resolveMemoryProjectContext; break; }
     } catch {}
   }
-  return false;
+  return memoryProjectContextResolver;
 }
-function projectContextAtExactRoot(root, { requireMarker = false } = {}) {
-  const canonical = canonicalProjectRoot(root);
-  if (!canonical || isForbiddenMemoryRoot(canonical)) return null;
-  try { if (!fs.statSync(canonical).isDirectory()) return null; } catch { return null; }
-  const registered = registeredProjectContext(canonical);
-  if (requireMarker && !registered && !hasProjectRootMarker(canonical)) return null;
-  if (requireMarker && !registered) {
-    try { if (fs.lstatSync(path.join(canonical, ".git")).isFile()) return null; } catch {}
+let boundMemoryProjectContext = null;
+function currentMemoryProjectContext() {
+  if (boundMemoryProjectContext) return boundMemoryProjectContext;
+  const resolver = loadMemoryProjectContextResolver();
+  if (!resolver) return { projectBound: false, projectRoot: null, source: null, reason: "resolver_unavailable" };
+  let resolved;
+  try {
+    resolved = resolver({ cwd: process.cwd(), homeDir: HOME_DIR, ...(process.env.T3CODE_HOME ? { t3Home: process.env.T3CODE_HOME } : {}) });
+  } catch {
+    resolved = { projectBound: false, projectRoot: null, source: null, reason: "resolver_error" };
   }
-  const git = gitProjectContext(canonical);
+  if (resolved?.projectBound === true && typeof resolved.projectRoot === "string" && path.isAbsolute(resolved.projectRoot)) {
+    boundMemoryProjectContext = Object.freeze({
+      projectBound: true,
+      projectRoot: canonicalProjectRoot(resolved.projectRoot),
+      source: resolved.source || null,
+      reason: resolved.reason || "matched",
+    });
+    return boundMemoryProjectContext;
+  }
   return {
-    root: canonical,
-    repositoryId: git?.repositoryId || registered?.repositoryId || null,
-    repoRoot: git?.root || registered?.repoRoot || null,
-    repoRelativePath: git ? path.relative(git.root, canonical) : registered?.repoRelativePath ?? null,
-    source: registered ? "registered" : git ? "cwd" : "project-marker",
+    projectBound: false,
+    projectRoot: null,
+    source: resolved?.source || null,
+    reason: typeof resolved?.reason === "string" ? resolved.reason : "context_required",
   };
 }
-const STARTUP_MEMORY_PROJECT_CONTEXT = projectContextAtExactRoot(process.cwd(), { requireMarker: true });
-function currentMemoryProjectContext() { return STARTUP_MEMORY_PROJECT_CONTEXT; }
 function memoryProjectBindingStatus() {
   const current = currentMemoryProjectContext();
-  return current
-    ? { projectBound: true, projectRoot: current.root, projectBindingReason: current.source }
-    : { projectBound: false, projectRoot: null, projectBindingReason: "context_required" };
+  return {
+    projectBound: current.projectBound === true,
+    projectRoot: current.projectBound ? current.projectRoot : null,
+    projectBindingSource: current.source || null,
+    projectBindingReason: current.reason || "context_required",
+  };
 }
 function resolveMemoryProjectRoot(requestedRoot) {
   const current = currentMemoryProjectContext();
-  if (!current) throw new Error("project context required: this MCP process has no verified selected project");
-  if (requestedRoot == null || requestedRoot === "") throw new Error("projectRoot required: pass the selected T3 project root");
-  if (typeof requestedRoot !== "string" || !path.isAbsolute(requestedRoot)) throw new Error("projectRoot must be an absolute path matching the selected project");
-  const selected = projectContextAtExactRoot(requestedRoot);
-  if (!selected) throw new Error("projectRoot is not a valid project directory");
-  const sameExactRoot = selected.root === current.root;
-  const sameLinkedProject = Boolean(current.repositoryId && selected.repositoryId && current.repositoryId === selected.repositoryId && current.repoRelativePath === selected.repoRelativePath);
-  if (!sameExactRoot && !sameLinkedProject) throw new Error("projectRoot does not match the selected project context");
-  // A same-project worktree argument is accepted as an identity alias, but
-  // never changes the active worktree scope selected by this MCP process.
-  return current.root;
+  if (!current.projectBound) throw new Error(`project context required: ${current.reason || "context_required"}`);
+  if (requestedRoot == null || requestedRoot === "") throw new Error("projectRoot required: call memory_status, confirm the current T3 project, then pass its projectRoot");
+  if (typeof requestedRoot !== "string" || !path.isAbsolute(requestedRoot)) throw new Error("projectRoot must be an absolute path matching the bound T3 project");
+  const selected = canonicalProjectRoot(requestedRoot);
+  let isDirectory = false;
+  try { isDirectory = fs.statSync(selected).isDirectory(); } catch {}
+  if (!isDirectory || selected !== current.projectRoot) throw new Error("projectRoot does not match the bound T3 project");
+  return current.projectRoot;
 }
 function memoryScopeOptions(args = {}) {
   const scope = args.scope == null || args.scope === "" ? undefined : String(args.scope).toLowerCase();
@@ -551,14 +503,14 @@ function memoizeVault(names) {
 }
 function memoryTools() {
   const tools = [
-    { name: "memory_status", description: "Report whether Agent memory access is enabled and whether a local vault already exists. This does not initialize or create the vault.", inputSchema: { type: "object", properties: {} } },
+    { name: "memory_status", description: "Report Agent memory access and the project bound to this T3 process without creating a vault. Before using memory, call this first and confirm projectBound is true and projectRoot matches the current T3 project; then pass that exact projectRoot automatically on every memory call. If unbound, stop: tool arguments cannot choose a project.", inputSchema: { type: "object", properties: {} } },
   ];
   tools.push(
-      { name: "memory_search", description: "Search only the selected project's shared/worktree memories. projectRoot is required and must be the current T3 selected project. Shared means shared by worktrees of this same project.", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 20, default: 6 }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["query", "projectRoot"] } },
-      { name: "memory_read", description: "Read an item by ID only inside the selected project and requested scope; full content and revision history are returned. projectRoot must match the current T3 project.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["id", "projectRoot"] } },
-      { name: "memory_write", description: "Write or evolve a verified non-obvious pitfall or durable constraint in the selected project. projectRoot must match the current T3 project. Shared means shared by worktrees of this same project. Pinned/core tags and entries are human-only.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" }, pinned: { type: "boolean" }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["module", "title", "content", "projectRoot"] } },
-      { name: "memory_consolidate", description: "Consolidate overlapping unprotected memories of the selected project only. projectRoot is required and must match the current T3 project.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string", description: "Optional identity check; must match projectRoot. _global is rejected." }, dryRun: { type: "boolean" } }, required: ["projectRoot"] } },
-      { name: "memory_rollback", description: "Roll back an unprotected item only within the selected project. projectRoot is required and must match the current T3 project.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string", description: "Optional identity check; must match projectRoot. _global is rejected." } }, required: ["id", "projectRoot"] } },
+      { name: "memory_search", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Search only that project's shared/worktree memories; global memory is never included. Shared means shared by worktrees of this same project.", inputSchema: { type: "object", properties: { query: { type: "string" }, module: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 20, default: 6 }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["query", "projectRoot"] } },
+      { name: "memory_read", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Read an item by ID only inside that project and requested scope; full content and revision history are returned.", inputSchema: { type: "object", properties: { module: { type: "string" }, id: { type: "string" }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["id", "projectRoot"] } },
+      { name: "memory_write", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Write or evolve a verified non-obvious pitfall or durable constraint only in that project. Shared means shared by worktrees of the same project. Pinned/core tags and entries are human-only.", inputSchema: { type: "object", properties: { module: { type: "string" }, title: { type: "string" }, content: { type: "string" }, kind: { type: "string" }, tags: { type: "array" }, agent: { type: "string" }, supersedesId: { type: "string" }, autoEvolve: { type: "boolean" }, pinned: { type: "boolean" }, scope: { type: "string", enum: ["shared", "worktree"] }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] }, projectRoot: { type: "string" } }, required: ["module", "title", "content", "projectRoot"] } },
+      { name: "memory_consolidate", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Consolidate overlapping unprotected memories only in that project.", inputSchema: { type: "object", properties: { projectRoot: { type: "string" }, projectSlug: { type: "string", description: "Optional identity check; must match projectRoot. _global is rejected." }, dryRun: { type: "boolean" } }, required: ["projectRoot"] } },
+      { name: "memory_rollback", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Roll back an unprotected item only inside that project.", inputSchema: { type: "object", properties: { id: { type: "string" }, targetVersion: { type: "number" }, revisionId: { type: "string" }, projectRoot: { type: "string" }, projectSlug: { type: "string", description: "Optional identity check; must match projectRoot. _global is rejected." } }, required: ["id", "projectRoot"] } },
   );
   if (hubSubagentsMod && typeof hubSubagentsMod.resolveSubagentRoute === "function") {
     tools.push({ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } });
@@ -568,7 +520,7 @@ function memoryTools() {
     tools.push({ name: "plan_update", description: "Update or clear the live T3 Hub task progress checklist (计划/进程 N/M) so the user sees real-time step completion across AGY, Pi, Muse, Codex, and Claude", inputSchema: { type: "object", properties: { title: { type: "string" }, background: { type: "string" }, steps: { type: "array", items: { type: "object", properties: { id: { type: "string" }, text: { type: "string" }, status: { type: "string" } }, required: ["text", "status"] } }, clear: { type: "boolean" }, projectRoot: { type: "string" }, threadId: { type: "string" } } } });
   }
   tools.push(
-    { name: "context_search", description: "Search only this project's memories + available skills. projectRoot is required and must match the current T3 project. Shared means shared by worktrees of this same project.", inputSchema: { type: "object", properties: { query: { type: "string" }, projectRoot: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 20, default: 6 }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] } }, required: ["query", "projectRoot"] } },
+    { name: "context_search", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Search only that project's memories and available skills. Shared means shared by worktrees of this same project.", inputSchema: { type: "object", properties: { query: { type: "string" }, projectRoot: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 20, default: 6 }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] } }, required: ["query", "projectRoot"] } },
     { name: "skill_read", description: "Read a skill SKILL.md on demand (Runelay read_skill).", inputSchema: { type: "object", properties: { slug: { type: "string" }, projectRoot: { type: "string" } }, required: ["slug"] } },
     { name: "skill_read_file", description: "Read a file inside a skill dir (Runelay read_skill_file).", inputSchema: { type: "object", properties: { slug: { type: "string" }, relativePath: { type: "string" }, projectRoot: { type: "string" } }, required: ["slug", "relativePath"] } },
   );

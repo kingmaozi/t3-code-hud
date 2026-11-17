@@ -17,9 +17,14 @@ function fixture(embedFn = () => null, vaultOptions = {}) {
   const projectRoot = path.join(base, "project");
   const vaultDir = path.join(base, "vault");
   const homeDir = path.join(base, "home");
+  const userDataDir = path.join(homeDir, ".t3", "userdata");
   fs.mkdirSync(projectRoot, { recursive: true });
   fs.writeFileSync(path.join(projectRoot, ".project"), "fixture");
-  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const stateDb = new DatabaseSync(path.join(userDataDir, "statev2.sqlite"));
+  stateDb.exec("CREATE TABLE projection_projects(project_id TEXT, workspace_root TEXT, deleted_at TEXT); CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, project_id TEXT, payload_json TEXT, deleted_at TEXT)");
+  stateDb.prepare("INSERT INTO projection_projects VALUES(?,?,NULL)").run("fixture-project", fs.realpathSync(projectRoot));
+  stateDb.close();
   const vault = createMemoryVault({ vaultDir, homeDir, _embedFn: embedFn, ...vaultOptions });
   const save = (args) => {
     const result = vault.saveMemory({ projectRoot, module: "constraints", title: "构建流程", content: "构建之前必须先检查依赖环境", ...args });
@@ -33,7 +38,7 @@ function fixture(embedFn = () => null, vaultOptions = {}) {
   };
   const md = (module = "constraints") => path.join(vaultDir, "projects", "project", module + ".md");
   const db = () => new DatabaseSync(path.join(vaultDir, "index.sqlite"));
-  return { base, projectRoot, vaultDir, homeDir, vault, save, list, md, db };
+  return { base, projectRoot, vaultDir, homeDir, userDataDir, vault, save, list, md, db };
 }
 
 test("supersedes replaces in place across modules; history never enters FTS or vector input", () => {
@@ -314,7 +319,7 @@ test("pc-lite write/rule/experience forward --supersedes and support consolidate
   const f = fixture();
   const cli = (args) => execFileSync(process.execPath, [path.join(REPO, "scripts/pc-lite.mjs"), ...args,
     "--root", f.projectRoot, "--vault-dir", f.vaultDir, "--home-dir", f.homeDir, "--embed-url", "http://127.0.0.1:1/v1/embeddings"],
-  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
+  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3CODE_HOME: f.userDataDir, T3CODE_THREAD_ID: "", T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
   const first = f.save({ content: "old CLI body" });
   cli(["write", "--title", "CLI", "--content", "new CLI body", "--supersedes", first.item.id]);
   assert.equal(f.list()[0].version, 2);
@@ -336,7 +341,7 @@ test("pc-lite Agent writes reject reserved tags and cannot supersede protected r
   const f = fixture();
   const cli = (args) => execFileSync(process.execPath, [path.join(REPO, "scripts/pc-lite.mjs"), ...args,
     "--root", f.projectRoot, "--vault-dir", f.vaultDir, "--home-dir", f.homeDir, "--embed-url", "http://127.0.0.1:1/v1/embeddings"],
-  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
+  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3CODE_HOME: f.userDataDir, T3CODE_THREAD_ID: "", T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
   const assertCliRejected = (args, pattern) => {
     assert.throws(() => cli(args), (error) => {
       const output = String(error.stdout || "") + String(error.stderr || "");
@@ -381,7 +386,7 @@ test("MCP router exposes and executes memory_write evolution and memory_consolid
   const f = fixture();
   const child = spawn(process.execPath, [path.join(REPO, "bin/t3-mcp-router")], {
     cwd: f.projectRoot,
-    env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir,
+    env: { ...process.env, HOME: f.homeDir, T3CODE_HOME: f.userDataDir, T3CODE_THREAD_ID: "", T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir,
       T3_EMBED_URL: "http://127.0.0.1:1/v1/embeddings" }, stdio: ["pipe", "pipe", "pipe"],
   });
   t.after(() => child.kill());
@@ -474,7 +479,7 @@ test("MCP memory_read finds old search hits by ID and stays inside selected proj
 
   const child = spawn(process.execPath, [path.join(REPO, "bin/t3-mcp-router")], {
     cwd: f.projectRoot,
-    env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir,
+    env: { ...process.env, HOME: f.homeDir, T3CODE_HOME: f.userDataDir, T3CODE_THREAD_ID: "", T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir,
       T3_EMBED_URL: "http://127.0.0.1:1/v1/embeddings" }, stdio: ["pipe", "pipe", "pipe"],
   });
   t.after(() => child.kill());
