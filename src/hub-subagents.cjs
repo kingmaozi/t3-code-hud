@@ -5,14 +5,24 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 
 // Refuse links at both the leaf and any parent before reading, creating,
-// replacing or deleting. The OS temp root itself may be a system alias.
+// replacing or deleting. No blind stop at os.tmpdir(): every existing
+// ancestor is lstat-checked, with only the two macOS system aliases allowed.
+function isMacSystemAlias(linkPath, realPath) {
+  const link = path.resolve(String(linkPath));
+  const real = path.resolve(String(realPath));
+  if (link === "/tmp" && real === "/private/tmp") return true;
+  if (link === "/var" && real === "/private/var") return true;
+  return false;
+}
 function assertNoSymlinkPath(file) {
   let current = path.resolve(file);
-  const tempRoot = path.resolve(os.tmpdir());
   while (true) {
-    if (current === tempRoot) return;
     const st = lstatSafe(current);
-    if (st && st.isSymbolicLink()) throw new Error("unsafe symlink path: " + current);
+    if (st && st.isSymbolicLink()) {
+      let real = null;
+      try { real = fs.realpathSync(current); } catch { real = null; }
+      if (real === null || !isMacSystemAlias(current, real)) throw new Error("unsafe symlink path: " + current);
+    }
     const parent = path.dirname(current);
     if (parent === current) return;
     current = parent;
@@ -21,7 +31,10 @@ function assertNoSymlinkPath(file) {
 function safeMkdir(dir) { assertNoSymlinkPath(dir); fs.mkdirSync(dir, { recursive: true }); }
 function dirExists(p) { assertNoSymlinkPath(p); try { return fs.statSync(p).isDirectory(); } catch { return false; } }
 function fileExists(p) { assertNoSymlinkPath(p); try { return fs.statSync(p).isFile(); } catch { return false; } }
-function lstatSafe(p) { try { return fs.lstatSync(p); } catch { return null; } }
+function lstatSafe(p) {
+  try { return fs.lstatSync(p); }
+  catch (e) { if (e?.code === "ENOENT") return null; throw e; }
+}
 function readJsonFile(file, fallback) { assertNoSymlinkPath(file); try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } }
 function existingFileMode(file) {
   try {
@@ -121,7 +134,7 @@ function acquireT3HubLock(lockPath) {
 function releaseT3HubLock(lockPath) {
   try { fs.unlinkSync(lockPath); } catch {}
 }
-function writeNewFileExclusive(file, text, mode) {
+function writeNewFileExclusive(file, text, mode, onPublish) {
   assertNoSymlinkPath(file);
   safeMkdir(path.dirname(file));
   const current = lstatSafe(file);
@@ -145,6 +158,7 @@ function writeNewFileExclusive(file, text, mode) {
     fd = null;
     assertNoSymlinkPath(file);
     fs.linkSync(tmp, file);
+    onPublish?.({ dev: newStat.dev, ino: publishedIno });
     try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
     const post = lstatSafe(file);
     if (!post || !post.isFile() || post.ino !== publishedIno) {
@@ -205,19 +219,19 @@ function readUtf8FromFdAtZero(fd) {
 function readRegularSnapshot(file) {
   const st = lstatSafe(file);
   if (!st) return { missing: true };
-  if (!st.isFile() || st.nlink !== 1) return { missing: false, unsafe: true, st };
+  if (!st.isFile() || st.nlink !== 1 || !(st.mode & 0o444)) return { missing: false, unsafe: true, st, dev: st.dev, ino: st.ino };
   let fd = null;
   try {
     const nofollow = fs.constants.O_NOFOLLOW || 0;
     fd = fs.openSync(file, fs.constants.O_RDONLY | nofollow);
     const snap = readUtf8FromFdAtZero(fd);
-    if (!snap.st.isFile() || snap.st.nlink !== 1 || snap.st.ino !== st.ino || snap.raw === null) {
-      return { missing: false, unsafe: true, st: snap.st };
+    if (!snap.st.isFile() || snap.st.nlink !== 1 || snap.st.ino !== st.ino || snap.st.dev !== st.dev || snap.raw === null) {
+      return { missing: false, unsafe: true, st: snap.st, dev: snap.st.dev, ino: snap.st.ino };
     }
-    return { missing: false, unsafe: false, ino: snap.st.ino, text: snap.text, raw: snap.raw };
+    return { missing: false, unsafe: false, dev: snap.st.dev, ino: snap.st.ino, mode: snap.st.mode & 0o777, text: snap.text, raw: snap.raw };
   } catch (e) {
     if (e && e.code === "ENOENT") return { missing: true };
-    return { missing: false, unsafe: true, error: e };
+    return { missing: false, unsafe: true, error: e, dev: st.dev, ino: st.ino };
   } finally {
     try { if (fd !== null) fs.closeSync(fd); } catch {}
   }
@@ -254,7 +268,7 @@ function retireStagedFile(staged, file, retiredDir) {
   }
   return { retiredPath: staged };
 }
-function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
+function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null, onPublish) {
   assertNoSymlinkPath(file);
   safeMkdir(path.dirname(file));
   const updating = text !== undefined;
@@ -276,7 +290,7 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
   let fd = null;
   let stagedFd = null;
   let stagedOrigMode = null;
-  let publishedIno = null;
+  let publishedIno = null, publishedDev = null;
   let ownsTmp = false;
   let stageDirCleaned = false;
   const restoreWithMode = (sourcePath = staged) => {
@@ -288,6 +302,16 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
       stagedFd = null;
     }
     return restoreStagedFile(sourcePath, file);
+  };
+  const ensureRestoredOrThrow = (sourcePath = staged, causeErr = null) => {
+    const recovery = restoreWithMode(sourcePath);
+    if (!lstatSafe(file)) {
+      const failErr = causeErr || new Error("代理文件恢复原路径失败: " + file);
+      failErr.unrestoredPath = file;
+      if (recovery && recovery.preservedPath) failErr.preservedPath = recovery.preservedPath;
+      throw failErr;
+    }
+    return recovery;
   };
   try {
     if (updating) {
@@ -301,7 +325,7 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
       if ((newStat.mode & 0o222) !== 0) {
         throw new Error("failed to strip write bits before stage link: " + file);
       }
-      publishedIno = newStat.ino;
+      publishedIno = newStat.ino; publishedDev = newStat.dev;
       fs.closeSync(fd);
       fd = null;
     }
@@ -313,6 +337,7 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
     }
     let managed = false;
     let stagedSnapRaw = null;
+    let inspectError = null;
     try {
       const stagedLinkStat = fs.lstatSync(staged);
       if (stagedLinkStat.isFile() && stagedLinkStat.nlink === 1 && stagedLinkStat.ino === baselineIno) {
@@ -336,14 +361,15 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
           }
         }
       }
-    } catch {} // Locked, multi-linked, mutated, or unreadable staged inode is restored intact.
-    if (!managed) return { changed: false, skippedUnmanaged: true, ...restoreWithMode(staged) };
+    } catch (err) { inspectError = err; } // Locked, multi-linked, mutated, or unreadable staged inode is restored intact.
+    if (!managed) return { changed: false, skippedUnmanaged: true, ...ensureRestoredOrThrow(staged, inspectError) };
     // Never rename over `file` (which could clobber a concurrent save), and
     // never drop the staged inode nlink to 0 (retire it via hard link first,
     // then re-read stagedFd AFTER stageDir/old is unlinked so any write up
     // through unlink — even one preserving t3_hub_managed: true — is rescued).
     const rescueIfMutated = (sourcePath) => {
       let unchanged = false;
+      let checkError = null;
       try {
         const check = readUtf8FromFdAtZero(stagedFd);
         unchanged =
@@ -351,9 +377,9 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
           check.raw !== null &&
           Buffer.compare(check.raw, stagedSnapRaw) === 0 &&
           isHubManagedContent(check.text);
-      } catch {}
+      } catch (err) { checkError = err; }
       if (unchanged) return null;
-      return { changed: false, skippedUnmanaged: true, ...restoreWithMode(sourcePath) };
+      return { changed: false, skippedUnmanaged: true, ...ensureRestoredOrThrow(sourcePath, checkError) };
     };
     // POSIX note: Hub-managed files are published 0444 read-only so normal editors
     // cannot acquire writable descriptors. If root/chmod+w pre-opened a writable fd
@@ -377,7 +403,7 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
     if (updating) {
       const preLinkRescue = rescueIfMutated(staged);
       if (preLinkRescue) return preLinkRescue;
-      try { fs.linkSync(tmp, file); }
+      try { fs.linkSync(tmp, file); onPublish?.({ dev: publishedDev, ino: publishedIno }); }
       catch (e) {
         if (e && e.code === "EEXIST") {
           const rescued = finalizeRetired();
@@ -385,11 +411,15 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
           return { changed: false, skippedUnmanaged: true };
         }
         const recovery = restoreWithMode(staged);
+        if (!lstatSafe(file)) e.unrestoredPath = file;
         if (recovery.preservedPath) e.preservedPath = recovery.preservedPath;
         throw e;
       }
       try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
     }
+    // Deletion becomes visible during staging. Register it before retirement
+    // or the first readback can fail; rollback recognizes a rescued original.
+    if (!updating) onPublish?.({ deleted: true });
     const rescued = finalizeRetired();
     if (rescued) return rescued;
     const postTarget = lstatSafe(file);
@@ -411,8 +441,8 @@ function stageManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
     }
   }
 }
-function replaceManagedFile(file, text, mode, retiredDir, expectedSnap = null) {
-  const { changed, ...result } = stageManagedFile(file, text, mode, retiredDir, expectedSnap);
+function replaceManagedFile(file, text, mode, retiredDir, expectedSnap = null, onPublish) {
+  const { changed, ...result } = stageManagedFile(file, text, mode, retiredDir, expectedSnap, onPublish);
   return { file, written: changed, ...result };
 }
 function recordUnmanagedConflict(result, id, skippedUnmanaged, conflicts) {
@@ -943,10 +973,12 @@ function buildOrchestrationDirective(cfg) {
   lines.push("");
   if (c.swarmMode === "on") {
     lines.push("当前模式：T3 蜂群总指挥。主会话默认负责决策、拆解、派单、协调与验收，调查、编码和测试交由合适的子代理完成；这不是调用宿主原生蜂群命令。");
+    lines.push("在存在 delegate_task 的 T3 顶层主会话（parentThreadId == null）中，本总指挥设置优先于通用默认提示 \"Ordinary coding tasks need no T3 tools\"：常规调查、编码修改、QA 与独立代码审查默认派发对应子代理执行；仅在触发 <SUBAGENT-STOP> 子代理禁递归、用户当轮明确要求主会话亲做、AGY 改自身规则配置、几行极微改动、或 worker（L1）连续两次 + worker-pro（L2）连续两次均未解决后主会话兜底时，由主会话直接处理。派单时优先调用 subagent_resolve（或读取 ~/.t3/hub/subagents.json 及项目覆盖配置）查询实时路由，并在 title 或 clientRequestId 中标明具体角色 ID。");
+    lines.push("首次派单前先调用一次 orchestrator_capabilities 确认当前能力；若项目有覆盖（项目 AGENTS.md 或 resolveSubagentRoute 结论）以项目覆盖为准。");
     lines.push("对同一实现问题，worker（L1）连续两次仍未解决时升级 worker-pro（L2）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
     lines.push("用户明确要求主会话亲做时遵照用户要求；T3 中 delegate_task 不可用是能力缺口，应说明实际阻点，不得假称子代理已尝试失败；独立非 T3 宿主不因缺少该工具而报错。");
   } else {
-    lines.push("当前模式：常规协作。小任务、短任务可由主会话直接完成；较长或复杂任务按需要分工，独立工作可并行。");
+    lines.push("当前模式：常规协作。小任务、短任务默认由主会话直接完成；较长或复杂任务按需要分工，独立工作可并行。");
     lines.push("对同一实现问题，worker（L1）连续两次仍未解决时可升级 worker-pro（L2）；L2 连续两次仍未解决时由主会话兜底。");
     lines.push("在 T3 中需要派单而 delegate_task 不可用时说明工具缺口，不得假称已经派单；独立非 T3 宿主不因缺少该工具而报错。");
   }
@@ -962,6 +994,118 @@ function buildSlashCommandPrompt(mode) {
   const header = SUBAGENT_STOP_HEADER + "\n";
   if (["swarm", "/swarm", "carbon", "orchestrator-carbon", "[orchestrator carbon 纯主帅模式]", "argon", "orchestrator-argon", "[orchestrator argon 纯主帅模式]", "plan", "/plan"].includes(m)) return header + "遵守当前宿主与项目的统一协作规则，按已配置角色分工；独立任务可按需并行。极小修改或子代理连续两次未解决时，主会话可直接处理。";
   return header + String(mode || "");
+}
+
+const ROUTING_SKILL_NAME = "t3-subagent-routing";
+const ROUTING_SKILL_MARKER = "<!-- t3-hub-managed-skill -->";
+
+function parseFrontmatterMap(content) {
+  if (typeof content !== "string" || !/^---(?:\r?\n|$)/.test(content)) return null;
+  const m = content.match(/^---\r?\n([\s\S]*?)^---(?:\r?\n|$)/m);
+  if (!m) return null;
+  try { return { map: parseOwnershipFrontmatter(m[1]), raw: m[1] }; } catch { return { invalid: true }; }
+}
+function explicitManagedFlag(content) {
+  const parsed = parseFrontmatterMap(content);
+  if (parsed === null) return null;
+  if (parsed.invalid) return "invalid";
+  if (!parsed.map.has("t3_hub_managed")) return null;
+  const v = parsed.map.get("t3_hub_managed");
+  if (v === true) return true;
+  if (v === false) return false;
+  return "invalid";
+}
+// Skill ownership requires a legal, explicit boolean true in frontmatter.
+// Body comments and historical prose confer no destructive authority.
+function isHubManagedSkillContent(content) {
+  return explicitManagedFlag(content) === true;
+}
+
+function buildHostCapabilities() {
+  const summary = "AGY/Codex/Muse/Claude/Pi 均依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示；PreToolUse subagent-route-guard 仅在 delegate_task 已触发后纠偏目标模型/档位，不会凭空触发派单；AGY ACP ExternalPreInvocationHook.injectSteps 被本机 SDK 忽略；Codex UserPromptSubmit 因 session_id 父子继承未证实安全顶层 lineage 暂不启用动态强推，绝不伪造已生效。";
+  return {
+    t3: {
+      staticRules: "T3 顶层主会话依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。",
+      hotInject: "当前运行中会话不会自动热注入新系统提示，仅新会话生效。",
+      preToolUseGuard: "PreToolUse subagent-route-guard 仅在 delegate_task 已触发后纠偏目标模型/档位，不会凭空触发派单。",
+    },
+    antigravity: {
+      staticRules: "AGY 依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。",
+      acpInjectSteps: "AGY ACP ExternalPreInvocationHook.injectSteps 被本机 SDK 忽略，不可用于注入系统提示，绝不伪造已生效。",
+    },
+    codex: {
+      staticRules: "Codex 依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。",
+      userPromptSubmit: "Codex UserPromptSubmit 因 session_id 父子继承未证实安全顶层 lineage 暂不启用动态强推，绝不伪造已生效。",
+    },
+    muse: { staticRules: "Muse 依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。" },
+    claude: { staticRules: "Claude 依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。" },
+    pi: { staticRules: "Pi 依赖新会话读取静态规则/Skill，当前运行中会话不会自动热注入新系统提示。" },
+    summary,
+  };
+}
+
+function renderRoutingSkillMarkdown(effectiveAgents, orchestrationCfg) {
+  const c = normalizeOrchestrationConfig(orchestrationCfg);
+  const isOn = c.swarmMode === "on";
+  const enabled = (Array.isArray(effectiveAgents) ? effectiveAgents : [])
+    .filter((a) => a && typeof a === "object" && a.id && a.enabled !== false)
+    .slice()
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const routeEntries = enabled.map((a) => `${a.id} -> ${a.providerInstanceId} ${a.model} (${a.effort})`);
+  const modeLabel = isOn ? "T3 蜂群总指挥（ON）" : "常规协作（OFF）";
+  const modeDecl = `当前全局默认模式：${modeLabel}`;
+  const description = `T3 子代理路由：${modeDecl}。${enabled.length} 个已启用角色：${routeEntries.join("、")}；派单前以 Hub 路由配置与项目覆盖为准，详见正文。`;
+  const lines = [];
+  lines.push("---");
+  lines.push(`name: ${ROUTING_SKILL_NAME}`);
+  lines.push(`description: ${yamlDoubleQuotedScalar(description)}`);
+  lines.push("t3_hub_managed: true");
+  lines.push("---");
+  lines.push("");
+  lines.push(ROUTING_SKILL_MARKER);
+  lines.push("");
+  lines.push(`# T3 子代理路由（${ROUTING_SKILL_NAME}）`);
+  lines.push("");
+  lines.push(`${modeDecl}。`);
+  lines.push("");
+  lines.push(SUBAGENT_STOP_HEADER);
+  lines.push("");
+  lines.push("被 delegate_task 派出的子代理不得再调用 delegate_task、invoke_subagent 或启动宿主原生蜂群；宿主内置生图和 browser 等专用能力除外。");
+  lines.push("");
+  lines.push("## 已启用角色（实时路由快照）");
+  lines.push("");
+  lines.push("| id | provider | model | effort |");
+  lines.push("|---|---|---|---|");
+  for (const a of enabled) lines.push(`| ${a.id} | ${a.providerInstanceId} | ${a.model} | ${a.effort} |`);
+  lines.push("");
+  lines.push(routeEntries.join("；") + "。");
+  lines.push("");
+  if (isOn) {
+    lines.push("## 协作模式（ON）");
+    lines.push("");
+    lines.push("当前全局默认模式：T3 蜂群总指挥（ON）。");
+    lines.push("");
+    lines.push("在存在 delegate_task 的 T3 顶层主会话（parentThreadId == null）中，本用户开启的总指挥设置优先于通用默认提示 \"Ordinary coding tasks need no T3 tools\"：常规调查、编码修改、QA 与独立代码审查默认派发对应子代理执行（除非触发 <SUBAGENT-STOP> 子代理禁递归、用户当轮明确要求主会话亲做、AGY 改自身规则配置或几行极微改动、或同一问题 worker（L1）连续两次未解决升 worker-pro（L2）、L2 连续两次未解决后由主会话兜底）。");
+    lines.push("");
+    lines.push("顶层主会话默认负责需求拆解、维护计划（plan_update / update_plan）、划清并发文件边界、通过 delegate_task 派单与验收，不亲自做常规调查/编码/测试/审查。同一问题 worker（L1）连续两次未解决时升级 worker-pro（L2）；L2 连续两次仍未解决时，由主会话亲自兜底。不要求无关子代理重复尝试。");
+    lines.push("");
+    lines.push("派单时优先调用 subagent_resolve（或读取 ~/.t3/hub/subagents.json 及项目覆盖配置）查询实时路由，并在 title 或 clientRequestId 中标明具体角色 ID。派单前若项目有覆盖（项目 AGENTS.md 或 subagent_resolve / resolveSubagentRoute）以项目覆盖为准。首次派单前先调用一次 orchestrator_capabilities 确认当前能力。");
+    lines.push("");
+  } else {
+    lines.push("## 协作模式（OFF）");
+    lines.push("");
+    lines.push("当前全局默认模式：常规协作（OFF）。");
+    lines.push("");
+    lines.push("小任务、短任务默认由主会话直接完成；多模块长任务、前端视觉、难测 QA 或独立审查按需通过 delegate_task 分工，独立工作可并行。需要分工时用 update_plan、plan_update 维护计划，派单时在 title 或 clientRequestId 中标明角色 ID。");
+    lines.push("");
+  }
+  lines.push("## AGY 顶层主会话防压缩减负（仅 AGY 顶层主会话；Muse/Codex/Pi 与子代理豁免）");
+  lines.push("");
+  lines.push("AGY 顶层主会话在 ~220K–256K 上下文窗口逼近上限时，仍须稳控 150K 以内，避免触发压缩丢失关键计划与路由上下文。重型技能下沉子代理自读：主会话仅保留路由索引，重型技能正文由子代理按需读取。预计 >8KB 的命令输出先落盘再按需读取，禁止把大输出直接灌入主会话上下文。压缩后重读源码硬锁：压缩后必须重读当前源码与计划状态再继续，不得凭压缩摘要继续修改。以上规则仅约束 AGY 顶层主会话；Muse/Codex/Pi 与全体子代理豁免，不因本节改变原有上下文策略。");
+  lines.push("");
+  lines.push("各宿主（AGY/Codex/Muse/Claude/Pi）均依赖新会话读取静态规则与本 Skill，当前运行中会话不会自动热注入；PreToolUse 路由守卫仅在 delegate_task 已触发后纠偏目标模型/档位，不会凭空触发派单。");
+  lines.push("");
+  return lines.join("\n") + "\n";
 }
 
 function optionsForSubagent(item) {
@@ -981,14 +1125,82 @@ function createSubagentsManager(opts = {}) {
   const globalAgentsMdPath = opts.globalAgentsMdPath || path.join(hubDir, "global-AGENTS.md");
   const claudeAgentsRoot = opts.claudeAgentsRoot || path.join(homeDir, ".claude", "agents");
 
-  function readGlobal() {
-    if (!fileExists(globalPath)) {
-      safeMkdir(path.dirname(globalPath));
-      writeJsonFileAtomic(globalPath, DEFAULT_SUBAGENTS.map((d) => ({ ...d })));
-      return DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
+  function resolveT3UserdataDir() {
+    if (typeof opts.t3UserdataDir === "string" && opts.t3UserdataDir.trim()) {
+      return path.resolve(opts.t3UserdataDir);
+    }
+    const envHome = process.env.HOME || os.homedir();
+    const sameHome = !opts.homeDir || path.resolve(homeDir) === path.resolve(envHome);
+    if (sameHome && typeof process.env.T3CODE_HOME === "string" && process.env.T3CODE_HOME.trim()) {
+      return path.resolve(process.env.T3CODE_HOME);
+    }
+    return path.join(homeDir, ".t3", "userdata");
+  }
+
+  function rawCanonicalPath(projectRoot) {
+    if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be an absolute path");
+    let canonical = path.resolve(projectRoot);
+    const suffix = [];
+    while (true) {
+      try { canonical = path.join(fs.realpathSync(canonical), ...suffix); break; }
+      catch (e) {
+        if (e.code !== "ENOENT") throw e;
+        const parent = path.dirname(canonical);
+        if (parent === canonical) throw e;
+        suffix.unshift(path.basename(canonical)); canonical = parent;
+      }
+    }
+    return canonical;
+  }
+
+  function rawProjectRolePathFor(canonical) {
+    const hash = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 20);
+    const p = path.join(projectDir, slugFromProjectRoot(canonical) + "-" + hash + ".json");
+    assertContained(projectDir, p);
+    return p;
+  }
+
+  function rawProjectOrchestrationFileFor(canonical) {
+    const hash = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 20);
+    const dir = path.join(projectDir, slugFromProjectRoot(canonical) + "-" + hash);
+    const file = path.join(dir, "orchestration.json");
+    assertContained(projectDir, file);
+    return { canonical, dir, file };
+  }
+
+  function resolveCanonicalProjectRoot(projectRoot) {
+    const start = rawCanonicalPath(projectRoot);
+    let realHome = null;
+    try { realHome = rawCanonicalPath(path.resolve(homeDir)); } catch { realHome = path.resolve(homeDir); }
+    let current = start;
+    while (true) {
+      const orchFile = rawProjectOrchestrationFileFor(current).file;
+      assertNoSymlinkPath(orchFile);
+      if (lstatSafe(orchFile)) return current;
+      const roleFile = rawProjectRolePathFor(current);
+      assertNoSymlinkPath(roleFile);
+      if (lstatSafe(roleFile)) return current;
+      const gitPath = path.join(current, ".git");
+      assertNoSymlinkPath(gitPath);
+      if (lstatSafe(gitPath)) return current;
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      if (start !== realHome && parent === realHome) break;
+      current = parent;
+    }
+    return start;
+  }
+
+  function readGlobal(snapshot = policySnapshot(globalPath), seed = true) {
+    if (snapshot.missing) {
+      const defaults = DEFAULT_SUBAGENTS.map((d) => ({ ...d }));
+      if (seed) transformTextFileAtomic(globalPath, () => JSON.stringify(defaults, null, 2) + "\n", {
+        createIfMissing: true, defaultMode: 0o600, expectedSnapshot: snapshot,
+      });
+      return defaults;
     }
     let raw;
-    try { raw = JSON.parse(fs.readFileSync(globalPath, "utf8")); }
+    try { raw = JSON.parse(snapshot.text); }
     catch { throw new Error("全局子代理路由配置无法读取或解析，原文件未改动"); }
     if (Array.isArray(raw)) {
       // Normalize to ensure id/name alignment.
@@ -1016,33 +1228,16 @@ function createSubagentsManager(opts = {}) {
     }
     throw new Error("全局子代理路由配置格式无效，原文件未改动");
   }
-  function writeGlobal(items) {
-    writeJsonFileAtomic(globalPath, items);
-  }
   function projectPathFor(projectRoot) {
-    if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot)) throw new Error("projectRoot must be an absolute path");
-    let canonical = path.resolve(projectRoot);
-    const suffix = [];
-    while (true) {
-      try { canonical = path.join(fs.realpathSync(canonical), ...suffix); break; }
-      catch (e) {
-        if (e.code !== "ENOENT") throw e;
-        const parent = path.dirname(canonical);
-        if (parent === canonical) throw e;
-        suffix.unshift(path.basename(canonical)); canonical = parent;
-      }
-    }
-    const hash = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 20);
-    const p = path.join(projectDir, slugFromProjectRoot(canonical) + "-" + hash + ".json");
-    assertContained(projectDir, p);
-    return p;
+    return rawProjectRolePathFor(resolveCanonicalProjectRoot(projectRoot));
   }
-  function readProject(projectRoot) {
+  function readProject(projectRoot, preloadedSnap) {
     if (!projectRoot) return [];
     const p = projectPathFor(projectRoot);
-    if (!fileExists(p)) return [];
+    const snap = preloadedSnap || policySnapshot(p);
+    if (snap.missing) return [];
     let raw;
-    try { raw = JSON.parse(fs.readFileSync(p, "utf8")); }
+    try { raw = JSON.parse(snap.text); }
     catch { throw new Error("项目子代理路由配置无法读取或解析，原文件未改动"); }
     if (Array.isArray(raw)) {
       const items = raw.map((it) => {
@@ -1060,11 +1255,6 @@ function createSubagentsManager(opts = {}) {
       return items;
     }
     throw new Error("项目子代理路由配置格式无效，原文件未改动");
-  }
-  function writeProject(projectRoot, items) {
-    const p = projectPathFor(projectRoot);
-    safeMkdir(path.dirname(p));
-    writeJsonFileAtomic(p, items);
   }
 
   function validateItem(item, catalog) {
@@ -1144,8 +1334,16 @@ function createSubagentsManager(opts = {}) {
     path.join(hubDir, "global-AGENTS.md"),
   ];
   function inspectOrchestrationTargets(args = {}) {
-    const hosts = Array.isArray(args.hosts) ? args.hosts : [...defaultOrchestrationHosts(), ...(Array.isArray(args.additionalHosts) ? args.additionalHosts : [])];
+    let discoveredRules = [], treeFailed = false;
+    if (!Array.isArray(args.hosts)) {
+      try { discoveredRules = inspectAntigravityProviderTree([]).ruleTargets; }
+      catch { treeFailed = true; }
+    }
+    const hosts = Array.isArray(args.hosts)
+      ? args.hosts
+      : [...defaultOrchestrationHosts(), ...discoveredRules, ...(Array.isArray(args.additionalHosts) ? args.additionalHosts : [])];
     const items = [];
+    if (treeFailed) items.push({ path: "agy-provider-tree", state: "unknown" });
     for (const file of new Set(hosts)) {
       if (typeof file !== "string" || !path.isAbsolute(file)) continue;
       try {
@@ -1177,16 +1375,32 @@ function createSubagentsManager(opts = {}) {
   }
   function getOrchestrationConfig() { return readOrchestrationSnapshot().config; }
   function getOrchestrationState(args = {}) {
+    if (Object.prototype.hasOwnProperty.call(args, "scope") && args.scope !== undefined && args.scope !== "global" && args.scope !== "project") {
+      throw new Error("invalid orchestration scope: " + String(args.scope));
+    }
     const snapshot = readOrchestrationSnapshot(), cfg = snapshot.config;
-    const hosts = Array.isArray(args.hosts) ? args.hosts : [...defaultOrchestrationHosts(), ...(Array.isArray(args.additionalHosts) ? args.additionalHosts : [])];
+    const extraSkillPaths = args.extraSkillPaths || args.skillPaths || [];
+    let discoveredRules = [], skillTargets = [], treeFailed = false;
+    try {
+      const tree = inspectAntigravityProviderTree(extraSkillPaths);
+      discoveredRules = tree.ruleTargets;
+      skillTargets = tree.skillTargets;
+    } catch {
+      treeFailed = true;
+    }
+    const hosts = Array.isArray(args.hosts)
+      ? args.hosts
+      : [...defaultOrchestrationHosts(), ...discoveredRules, ...(Array.isArray(args.additionalHosts) ? args.additionalHosts : [])];
+    const discoveredSet = new Set(discoveredRules);
     const directive = cfg.policyVersion === 2 ? buildOrchestrationDirective(cfg).trimEnd() : null;
     const hostResults = [];
+    if (treeFailed) hostResults.push({ path: "agy-provider-tree", state: "unknown" });
     for (const file of new Set(hosts)) {
       if (typeof file !== "string" || !path.isAbsolute(file)) continue;
       try {
         assertNoSymlinkPath(file);
         const st = lstatSafe(file);
-        if (!st && !Array.isArray(args.hosts) && !dirExists(path.dirname(file))) continue;
+        if (!st && !Array.isArray(args.hosts) && !discoveredSet.has(file) && !dirExists(path.dirname(file))) continue;
         if (!st) { hostResults.push({ path: file, state: "missing" }); continue; }
         if (!st.isFile() || !(st.mode & 0o444) || st.size > 2 * 1024 * 1024) { hostResults.push({ path: file, state: "unknown" }); continue; }
         const text = fs.readFileSync(file, "utf8"), s = text.indexOf(ORCHESTRATOR_START), e = text.indexOf(ORCHESTRATOR_END);
@@ -1196,7 +1410,42 @@ function createSubagentsManager(opts = {}) {
         hostResults.push({ path: file, state: directive && block === directive ? "applied" : "different" });
       } catch { hostResults.push({ path: file, state: "unknown" }); }
     }
-    return { ...cfg, modeRevision: snapshot.revision, hostResults, modeApplied: cfg.policyVersion === 2 && hostResults.length > 0 && hostResults.every(item => item.state === "applied"), legacyStatus: inspectOrchestrationTargets(args) };
+    const skillResults = [];
+    let skillsApplied = false;
+    if (cfg.policyVersion === 2 && !treeFailed) {
+      try {
+        const desiredSkill = renderRoutingSkillMarkdown(effectiveAgentsForSkill(), cfg);
+        for (const sf of skillTargets) {
+          try {
+            const snap = readRegularSnapshot(sf);
+            if (snap.missing) skillResults.push({ path: sf, state: "missing" });
+            else if (snap.unsafe) skillResults.push({ path: sf, state: "unknown" });
+            else if (snap.text === desiredSkill) skillResults.push({ path: sf, state: "applied" });
+            else skillResults.push({ path: sf, state: isHubManagedSkillContent(snap.text) ? "different" : "unmanaged" });
+          } catch {
+            skillResults.push({ path: sf, state: "unknown" });
+          }
+        }
+        skillsApplied = skillResults.length > 0 && skillResults.every((item) => item.state === "applied");
+      } catch {
+        skillResults.push({ path: globalPath, state: "unknown" });
+        skillsApplied = false;
+      }
+    }
+    const globalEffective = cfg.swarmMode === "on" ? "on" : "off";
+    const base = { ...cfg, effectiveSwarmMode: globalEffective, modeRevision: snapshot.revision, hostResults, skillResults, skillsApplied, modeApplied: cfg.policyVersion === 2 && !treeFailed && hostResults.length > 0 && hostResults.every(item => item.state === "applied") && skillsApplied, legacyStatus: inspectOrchestrationTargets(args), hostCapabilities: buildHostCapabilities() };
+    const projectRoot = args.scope === "global" ? null : (args.projectRoot || args.project);
+    if (args.scope === "project" && (typeof projectRoot !== "string" || !projectRoot.trim())) {
+      throw new Error("projectRoot required for project scope");
+    }
+    if (typeof projectRoot === "string" && projectRoot.trim()) {
+      const resolved = resolveProjectOrchestration(projectRoot, cfg);
+      const checkRoot = resolved.canonicalProjectRoot || canonicalProjectRootForOrchestration(projectRoot);
+      const projectRevision = resolved.projectModeRevision || "missing";
+      const synced = isProjectRuleSynced(checkRoot, resolved.swarmMode, resolved.effectiveSwarmMode);
+      return { ...base, effectiveSwarmMode: resolved.effectiveSwarmMode, projectModeRevision: projectRevision, projectOverride: { swarmMode: resolved.swarmMode, overridesGlobal: resolved.overridesGlobal, effectiveSwarmMode: resolved.effectiveSwarmMode, source: resolved.source || "global", projectRuleSynced: synced, revision: projectRevision, projectModeRevision: projectRevision } };
+    }
+    return base;
   }
   function composeOrchestratorBlock(existing, directive) {
       const sIdx = existing.indexOf(ORCHESTRATOR_START);
@@ -1230,17 +1479,21 @@ function createSubagentsManager(opts = {}) {
     assertNoSymlinkPath(file);
     const snap = readRegularSnapshot(file);
     if (snap.missing) return { missing: true, text: "" };
-    if (snap.unsafe || !snap.raw || !Buffer.from(snap.text, "utf8").equals(snap.raw)) throw new Error("规则文件不可安全读取: " + file);
+    if (snap.unsafe || !snap.raw || !Buffer.from(snap.text, "utf8").equals(snap.raw)) {
+      const error = new Error("规则文件不可安全读取: " + file, { cause: snap.error });
+      if (snap.error?.code) error.code = snap.error.code;
+      throw error;
+    }
     const st = lstatSafe(file);
     if (!st || !(st.mode & 0o444)) throw new Error("规则文件不可读取: " + file);
-    return { missing: false, text: snap.text, ino: snap.ino };
+    return { missing: false, text: snap.text, dev: snap.dev, ino: snap.ino, mode: st.mode & 0o777 };
   }
   function policyTargets(syncArgs) {
     const explicit = Array.isArray(syncArgs.hosts) ? syncArgs.hosts : [];
     const paths = [];
     if (explicit.length) {
       for (const item of explicit) if (typeof item === "string") paths.push(path.resolve(item));
-    } else {
+    } else if (!Array.isArray(syncArgs.hosts)) {
       for (const file of defaultOrchestrationHosts()) {
         try { if (fileExists(file) || dirExists(path.dirname(file))) paths.push(file); }
         catch { paths.push(file); }
@@ -1248,6 +1501,51 @@ function createSubagentsManager(opts = {}) {
     }
     for (const file of Array.isArray(syncArgs.additionalHosts) ? syncArgs.additionalHosts : []) if (typeof file === "string" && path.isAbsolute(file)) paths.push(file);
     return [...new Set(paths)];
+  }
+  function writePolicySnapshot(file, before, intended, tx, writeOptions = {}) {
+    let published = false;
+    const result = transformTextFileAtomic(file, () => intended, {
+      ...writeOptions, expectedSnapshot: before,
+      onPublish(meta) {
+        published = true;
+        tx.journal.push({ path: file, before, after: intended, dev: meta.dev, ino: meta.ino });
+      },
+    });
+    const after = policySnapshot(file);
+    const identity = result.changed ? result : before;
+    if (after.missing || after.text !== intended || after.dev !== identity.dev || after.ino !== identity.ino) {
+      // An idempotent missing/empty target is valid only when no creation was requested.
+      if (!result.changed && before.missing && after.missing && intended === "") {
+        tx.validations?.push({ path: file, missing: true, after: "" });
+        return result;
+      }
+      throw new Error("写入后文件被其他操作修改: " + file);
+    }
+    if (result.changed && !published) throw new Error("缺少发布记录: " + file);
+    tx.validations?.push({ path: file, after: intended, dev: after.dev, ino: after.ino });
+    return result;
+  }
+  function transactionError(cause, rollbackFailures) {
+    const error = new Error(rollbackFailures.length
+      ? "同步失败，部分文件回滚失败: " + rollbackFailures.map(x => x.path + ": " + x.error).join("; ") + "; 原因: " + String(cause?.message || cause)
+      : String(cause?.message || cause), { cause });
+    error.rolledBack = rollbackFailures.length === 0;
+    error.rollbackFailures = rollbackFailures;
+    if (cause?.preservedPath) error.preservedPath = cause.preservedPath;
+    return error;
+  }
+  function validatePolicyTransaction(tx) {
+    // Include idempotent targets: an external edit is still a transaction
+    // conflict even though this transaction has no write to undo there.
+    for (const entry of [...tx.journal, ...(tx.validations || [])]) {
+      try {
+        const current = policySnapshot(entry.path);
+        if (entry.deleted || entry.missing ? !current.missing : current.missing || current.dev !== entry.dev || current.ino !== entry.ino || current.text !== entry.after) throw new Error("事务文件已被其他操作修改: " + entry.path);
+      } catch (e) {
+        if (!tx.journal.some(write => write.path === entry.path)) tx.journalConflicts.push({ path: entry.path, error: String(e?.message || e) });
+        throw e;
+      }
+    }
   }
   function recordPolicyWrite(args, file, result) {
     if (!args.journal || !result?.changed) return;
@@ -1261,11 +1559,12 @@ function createSubagentsManager(opts = {}) {
     }
     const before = args.expectedSnapshots.get(file);
     const intended = args.expectedContents?.get(file);
-    if (after.missing || after.ino !== result.ino || typeof intended !== "string" || after.text !== intended) {
+    const afterSt = lstatSafe(file);
+    if (after.missing || after.ino !== result.ino || after.dev !== result.dev || typeof intended !== "string" || after.text !== intended) {
       args.journalConflicts.push({ path: file, error: "写入后文件被其他操作修改，已保留当前内容，请检查" });
       throw new Error("写入后文件被其他操作修改");
     }
-    args.journal.push({ path: file, before, after: after.text, ino: after.ino });
+    args.journal.push({ path: file, before, after: after.text, dev: after.dev, ino: after.ino });
   }
   function rollbackCreatedPolicyFile(entry) {
     const file = entry.path, lockPath = file + ".t3hub.lock";
@@ -1273,13 +1572,13 @@ function createSubagentsManager(opts = {}) {
     let stageDir = null, staged = null, fd = null;
     try {
       const current = policySnapshot(file);
-      if (current.missing || current.ino !== entry.ino || current.text !== entry.after) throw new Error("文件已被其他操作修改");
+      if (current.missing || current.ino !== entry.ino || (entry.dev !== undefined && current.dev !== entry.dev) || current.text !== entry.after) throw new Error("文件已被其他操作修改");
       stageDir = fs.mkdtempSync(file + ".rollback-"); staged = path.join(stageDir, "owned");
       fs.renameSync(file, staged);
       try {
         fd = fs.openSync(staged, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
         const snap = readUtf8FromFdAtZero(fd);
-        if (snap.st.ino !== entry.ino || snap.raw === null || snap.text !== entry.after) throw new Error("文件在回滚中被修改");
+        if (snap.st.ino !== entry.ino || (entry.dev !== undefined && snap.st.dev !== entry.dev) || snap.raw === null || snap.text !== entry.after) throw new Error("文件在回滚中被修改");
       } catch (e) {
         const rescue = restoreStagedFile(staged, file);
         if (rescue.preservedPath) e.preservedPath = rescue.preservedPath;
@@ -1301,26 +1600,548 @@ function createSubagentsManager(opts = {}) {
     const failures = [];
     for (const entry of [...journal].reverse()) {
       try {
-        if (entry.before.missing) rollbackCreatedPolicyFile(entry);
+        if (entry.rollbackBlockedError) throw new Error(entry.rollbackBlockedError);
+        if (entry.deleted) {
+          const now = policySnapshot(entry.path);
+          if (!now.missing && now.dev === entry.before.dev && now.ino === entry.before.ino && now.text === entry.before.text) continue;
+          restoreClaudeDeletion(entry.path, entry.before);
+        }
+        else if (entry.before.missing) rollbackCreatedPolicyFile(entry);
         else {
           const now = policySnapshot(entry.path);
-          if (now.missing || now.ino !== entry.ino || now.text !== entry.after) throw new Error("文件已被其他操作修改");
+          const wantMode = typeof entry.before.mode === "number" ? (entry.before.mode & 0o777) : null;
+          if (!now.missing && now.dev === entry.before.dev && now.ino === entry.before.ino && now.text === entry.before.text && (wantMode === null || now.mode === wantMode)) continue;
+          if (now.missing || now.ino !== entry.ino || (entry.dev !== undefined && now.dev !== entry.dev) || now.text !== entry.after) throw new Error("文件已被其他操作修改");
           const restored = transformTextFileAtomic(entry.path, (existing) => {
             const st = lstatSafe(entry.path);
-            if (!st || st.ino !== entry.ino || existing !== entry.after) throw new Error("文件已被其他操作修改");
+            if (!st || st.ino !== entry.ino || (entry.dev !== undefined && st.dev !== entry.dev) || existing !== entry.after) throw new Error("文件已被其他操作修改");
             return entry.before.text;
-          }, { createIfMissing: false });
+          }, { createIfMissing: false, ...(wantMode !== null ? { forceMode: wantMode } : {}) });
           if (!restored.changed && entry.before.text !== entry.after) throw new Error("文件已被其他操作删除");
+          if (!restored.changed && wantMode !== null) {
+            const st = lstatSafe(entry.path);
+            if (st && st.isFile() && st.ino === entry.ino && (st.mode & 0o777) !== wantMode) fs.chmodSync(entry.path, wantMode);
+          }
         }
       } catch (e) { failures.push({ path: entry.path, error: String(e?.message || e), ...(e?.preservedPath ? { preservedPath: e.preservedPath } : {}) }); }
     }
     return failures;
+  }
+
+  function safeDirExists(p) {
+    assertNoSymlinkPath(p);
+    try {
+      const st = fs.statSync(p);
+      return st.isDirectory();
+    } catch (e) {
+      if (e && e.code === "ENOENT") return false;
+      throw e;
+    }
+  }
+  function inspectAntigravityProviderTree(extraSkillPaths) {
+    const extras = Array.isArray(extraSkillPaths) ? extraSkillPaths : [];
+    const targets = [
+      path.join(hubDir, "skills", "t3-subagent-routing", "SKILL.md"),
+      path.join(homeDir, ".agents", "skills", "t3-subagent-routing", "SKILL.md"),
+    ];
+    const ruleTargets = [];
+    const instanceNames = [];
+    const dirIds = [];
+    const pkgDirs = {};
+    const fileDigests = {};
+    const recordRuleDigest = (rf, rfSt) => {
+      if (rfSt) {
+        if (rfSt.isSymbolicLink() || !rfSt.isFile()) throw new Error("AGY 规则文件不是普通文件: " + rf);
+        const snap = policySnapshot(rf);
+        composeOrchestratorBlock(snap.text, null);
+        fileDigests[rf] = `${snap.dev}:${snap.ino}:${crypto.createHash("sha256").update(snap.text, "utf8").digest("hex")}`;
+      } else {
+        fileDigests[rf] = "missing";
+      }
+    };
+    const geminiAgyDir = path.join(homeDir, ".gemini", "antigravity");
+    assertNoSymlinkPath(geminiAgyDir);
+    let gemSt = null;
+    try { gemSt = fs.lstatSync(geminiAgyDir); }
+    catch (e) {
+      if (!e || e.code !== "ENOENT") throw new Error("AGY 全局目录不可读取: " + String((e && e.message) || e));
+    }
+    if (gemSt) {
+      if (gemSt.isSymbolicLink() || !gemSt.isDirectory()) throw new Error("AGY 全局目录不是普通目录: " + geminiAgyDir);
+      try { fs.readdirSync(geminiAgyDir); }
+      catch (e) { throw new Error("AGY 全局目录不可枚举: " + geminiAgyDir + ": " + String((e && e.message) || e)); }
+      dirIds.push(`gem:${gemSt.dev}:${gemSt.ino}`);
+      const gemRulesDir = path.join(geminiAgyDir, "rules");
+      let grSt = null;
+      try { grSt = fs.lstatSync(gemRulesDir); }
+      catch (e) {
+        if (!e || e.code !== "ENOENT") throw new Error("AGY 全局规则目录不可读取: " + String((e && e.message) || e));
+      }
+      const gemRulesFile = path.join(gemRulesDir, "AGENTS.md");
+      if (grSt) {
+        if (grSt.isSymbolicLink() || !grSt.isDirectory()) throw new Error("AGY 全局规则目录不是普通目录: " + gemRulesDir);
+        pkgDirs[gemRulesDir] = `${grSt.dev}:${grSt.ino}`;
+        try { fs.readdirSync(gemRulesDir); }
+        catch (e) { throw new Error("AGY 全局规则目录不可枚举: " + gemRulesDir + ": " + String((e && e.message) || e)); }
+        let gfSt = null;
+        try { gfSt = fs.lstatSync(gemRulesFile); }
+        catch (e) {
+          if (!e || e.code !== "ENOENT") throw new Error("AGY 全局规则文件不可读取: " + String((e && e.message) || e));
+        }
+        recordRuleDigest(gemRulesFile, gfSt);
+      } else {
+        pkgDirs[gemRulesDir] = null;
+        recordRuleDigest(gemRulesFile, null);
+      }
+      ruleTargets.push(gemRulesFile);
+    }
+    const agyRoot = path.join(resolveT3UserdataDir(), "providers", "antigravity");
+    // AGY enumeration errors must abort the transaction, not silently truncate.
+    // Missing root is a legitimate first-install state; anything else (symlinks,
+    // regular files, EACCES/EIO) is fatal.
+    assertNoSymlinkPath(agyRoot);
+    let rootSt = null;
+    try { rootSt = fs.lstatSync(agyRoot); }
+    catch (e) {
+      if (!e || e.code !== "ENOENT") throw new Error("AGY 技能目录不可读取: " + String((e && e.message) || e));
+    }
+    if (rootSt) {
+      if (rootSt.isSymbolicLink()) throw new Error("AGY 技能目录是符号链接: " + agyRoot);
+      if (!rootSt.isDirectory()) throw new Error("AGY 技能目录不是目录: " + agyRoot);
+      dirIds.push(`agyRoot:${rootSt.dev}:${rootSt.ino}`);
+      let entries;
+      try { entries = fs.readdirSync(agyRoot, { withFileTypes: true }); }
+      catch (e) { throw new Error("AGY 技能目录枚举失败: " + String((e && e.message) || e)); }
+      for (const ent of entries) {
+        const instDir = path.join(agyRoot, ent.name);
+        let instSt = null;
+        try { instSt = fs.lstatSync(instDir); }
+        catch (e) {
+          if (e && e.code === "ENOENT") continue;
+          throw new Error("AGY 实例目录不可读取: " + instDir + ": " + String((e && e.message) || e));
+        }
+        if (ent.name === ".DS_Store" || ent.name === ".localized") {
+          if (instSt.isSymbolicLink() || !instSt.isFile()) throw new Error("AGY 根目录存在非法元数据项: " + instDir);
+          continue;
+        }
+        if (ent.name.startsWith("skills-archived")) {
+          if (instSt.isSymbolicLink()) throw new Error("AGY 归档目录是符号链接: " + instDir);
+          if (!instSt.isDirectory()) throw new Error("AGY 归档项不是普通目录: " + instDir);
+          continue;
+        }
+        if (instSt.isSymbolicLink()) throw new Error("AGY 实例目录是符号链接: " + instDir);
+        if (!instSt.isDirectory()) throw new Error("AGY 实例目录不是普通目录: " + instDir);
+        try { fs.readdirSync(instDir); }
+        catch (e) { throw new Error("AGY 实例目录不可枚举: " + instDir + ": " + String((e && e.message) || e)); }
+        instanceNames.push(ent.name);
+        dirIds.push(`inst:${ent.name}:${instSt.dev}:${instSt.ino}`);
+        const cfgDir = path.join(instDir, "config");
+        let cfgSt = null;
+        try { cfgSt = fs.lstatSync(cfgDir); }
+        catch (e) {
+          if (e && e.code === "ENOENT") continue;
+          throw new Error("AGY 配置目录不可读取: " + cfgDir + ": " + String((e && e.message) || e));
+        }
+        if (cfgSt.isSymbolicLink() || !cfgSt.isDirectory()) throw new Error("AGY 配置目录不是普通目录: " + cfgDir);
+        try { fs.readdirSync(cfgDir); }
+        catch (e) { throw new Error("AGY 配置目录不可枚举: " + cfgDir + ": " + String((e && e.message) || e)); }
+        dirIds.push(`cfg:${ent.name}:${cfgSt.dev}:${cfgSt.ino}`);
+        const rulesDir = path.join(cfgDir, "rules");
+        let rulesSt = null;
+        try { rulesSt = fs.lstatSync(rulesDir); }
+        catch (e) {
+          if (!e || e.code !== "ENOENT") throw new Error("AGY 规则子目录不可读取: " + rulesDir + ": " + String((e && e.message) || e));
+        }
+        if (rulesSt) {
+          if (rulesSt.isSymbolicLink() || !rulesSt.isDirectory()) throw new Error("AGY 规则子目录不是普通目录: " + rulesDir);
+          try { fs.readdirSync(rulesDir); }
+          catch (e) { throw new Error("AGY 规则子目录不可枚举: " + rulesDir + ": " + String((e && e.message) || e)); }
+          dirIds.push(`rules:${ent.name}:${rulesSt.dev}:${rulesSt.ino}`);
+          const rulesFile = path.join(rulesDir, "AGENTS.md");
+          let rfSt = null;
+          try { rfSt = fs.lstatSync(rulesFile); }
+          catch (e) {
+            if (!e || e.code !== "ENOENT") throw new Error("AGY 规则文件不可读取: " + rulesFile + ": " + String((e && e.message) || e));
+          }
+          recordRuleDigest(rulesFile, rfSt);
+          ruleTargets.push(rulesFile);
+        }
+        const skillsDir = path.join(cfgDir, "skills");
+        let skillsSt = null;
+        try { skillsSt = fs.lstatSync(skillsDir); }
+        catch (e) {
+          if (e && e.code === "ENOENT") continue;
+          throw new Error("AGY 技能子目录不可读取: " + skillsDir + ": " + String((e && e.message) || e));
+        }
+        if (skillsSt.isSymbolicLink() || !skillsSt.isDirectory()) throw new Error("AGY 技能子目录不是普通目录: " + skillsDir);
+        try { fs.readdirSync(skillsDir); }
+        catch (e) { throw new Error("AGY 技能子目录不可枚举: " + skillsDir + ": " + String((e && e.message) || e)); }
+        dirIds.push(`skills:${ent.name}:${skillsSt.dev}:${skillsSt.ino}`);
+        const pkgDir = path.join(skillsDir, "t3-subagent-routing");
+        let pkgSt = null;
+        try { pkgSt = fs.lstatSync(pkgDir); }
+        catch (e) {
+          if (!e || e.code !== "ENOENT") throw new Error("AGY 路由技能包目录不可读取: " + pkgDir + ": " + String((e && e.message) || e));
+        }
+        if (pkgSt) {
+          if (pkgSt.isSymbolicLink() || !pkgSt.isDirectory()) throw new Error("AGY 路由技能包目录不是普通目录: " + pkgDir);
+          try { fs.readdirSync(pkgDir); }
+          catch (e) { throw new Error("AGY 路由技能包目录不可枚举: " + pkgDir + ": " + String((e && e.message) || e)); }
+          pkgDirs[pkgDir] = `${pkgSt.dev}:${pkgSt.ino}`;
+        } else {
+          pkgDirs[pkgDir] = null;
+        }
+        targets.push(path.join(skillsDir, "t3-subagent-routing", "SKILL.md"));
+      }
+    }
+    for (const p of extras) {
+      if (typeof p !== "string" || !p.trim()) continue;
+      targets.push(path.isAbsolute(p) ? path.resolve(p) : path.resolve(p));
+    }
+    const skillTargets = [...new Set(targets)].sort();
+    const sortedRuleTargets = [...new Set(ruleTargets)].sort();
+    for (const sk of skillTargets) {
+      const skSnap = readRegularSnapshot(sk);
+      if (skSnap.missing) fileDigests[sk] = "missing";
+      else if (skSnap.unsafe || !skSnap.raw) fileDigests[sk] = "unsafe";
+      else fileDigests[sk] = `${skSnap.dev}:${skSnap.ino}:${crypto.createHash("sha256").update(skSnap.raw).digest("hex")}`;
+    }
+    return {
+      skillTargets,
+      ruleTargets: sortedRuleTargets,
+      pkgDirs,
+      fileDigests,
+      instanceSignature: JSON.stringify({
+        instances: instanceNames.slice().sort(),
+        rules: sortedRuleTargets,
+        skills: skillTargets,
+        dirs: dirIds.slice().sort(),
+      }),
+    };
+  }
+  function assertPostAntigravityTreeUnchanged(preflightTree, postTree, tx) {
+    if (!preflightTree || !postTree || postTree.instanceSignature !== preflightTree.instanceSignature) {
+      throw new Error("事务期间宿主实例发生变化，请重新读取后再保存");
+    }
+    const txWrites = [...(tx?.journal || []), ...(tx?.validations || [])];
+    for (const [pkgDir, preId] of Object.entries(preflightTree.pkgDirs || {})) {
+      if (preId !== null && postTree.pkgDirs?.[pkgDir] !== preId) {
+        throw new Error("事务期间宿主路由技能目录被替换，请重新读取后再保存");
+      }
+      if (preId === null && postTree.pkgDirs?.[pkgDir] != null && !txWrites.some((w) => path.dirname(w.path) === pkgDir)) {
+        throw new Error("事务期间宿主实例发生变化，请重新读取后再保存");
+      }
+    }
+    for (const target of [...postTree.ruleTargets, ...postTree.skillTargets]) {
+      let txEntry = null;
+      for (let i = txWrites.length - 1; i >= 0; i--) {
+        if (txWrites[i].path === target) { txEntry = txWrites[i]; break; }
+      }
+      if (txEntry) {
+        const cur = policySnapshot(target);
+        const matches = (txEntry.deleted || txEntry.missing)
+          ? cur.missing
+          : (!cur.missing && cur.dev === txEntry.dev && cur.ino === txEntry.ino && cur.text === txEntry.after);
+        if (!matches) throw new Error("事务期间宿主实例文件被替换: " + target);
+      } else if (Object.hasOwn(preflightTree.fileDigests || {}, target)) {
+        if (postTree.fileDigests?.[target] !== preflightTree.fileDigests[target]) {
+          throw new Error("事务期间未纳入写入的宿主实例文件发生变化: " + target);
+        }
+      }
+    }
+  }
+  function defaultRoutingSkillTargets(extraSkillPaths) {
+    return inspectAntigravityProviderTree(extraSkillPaths).skillTargets;
+  }
+  function classifyRoutingSkillFile(file, adoptUnmanagedSkillHashes = {}) {
+    // Only a readable regular file confirmed as the user's custom unmanaged
+    // skill may be skipped. I/O errors, symlinks, special files and unsafe
+    // snapshots abort the whole transaction.
+    assertNoSymlinkPath(file);
+    const st = lstatSafe(file);
+    if (!st) return { file, action: "create", snap: { missing: true, text: "" } };
+    if (st.isSymbolicLink()) throw new Error("unsafe symlink skill: " + file);
+    if (!st.isFile()) throw new Error("non-regular skill file: " + file);
+    const snap = readRegularSnapshot(file);
+    if (snap.missing) return { file, action: "create", snap: { missing: true, text: "" } };
+    if (snap.unsafe) throw new Error("unsafe skill snapshot: " + file + (snap.error ? " (" + String(snap.error.message || snap.error) + ")" : ""));
+    if ((isHubManagedSkillContent(snap.text) || Object.hasOwn(adoptUnmanagedSkillHashes, file)) && !Buffer.from(snap.text, "utf8").equals(snap.raw)) throw new Error("Skill 不是可安全回滚的 UTF-8 文件: " + file);
+    if (isHubManagedSkillContent(snap.text)) return { file, action: "update", snap: { missing: false, text: snap.text, dev: snap.dev, ino: snap.ino } };
+    const expectedHash = Object.hasOwn(adoptUnmanagedSkillHashes, file) ? adoptUnmanagedSkillHashes[file] : null;
+    if (typeof expectedHash === "string" && /^[a-f0-9]{64}$/.test(expectedHash) && crypto.createHash("sha256").update(snap.raw).digest("hex") === expectedHash) {
+      return { file, action: "adopt", snap: { missing: false, text: snap.text, dev: snap.dev, ino: snap.ino } };
+    }
+    return { file, action: "skip", reason: "unmanaged-user-file", skippedUnmanaged: true };
+  }
+  function planRoutingSkillSync(effectiveAgents, orchestrationCfg, extraSkillPaths, adoptUnmanagedSkillHashes) {
+    const desired = renderRoutingSkillMarkdown(effectiveAgents, orchestrationCfg);
+    const paths = defaultRoutingSkillTargets(extraSkillPaths);
+    const plans = paths.map((p) => classifyRoutingSkillFile(p, adoptUnmanagedSkillHashes));
+    return { desired, paths, plans };
+  }
+  function applyRoutingSkillSync(planned, syncArgs = {}) {
+    const { desired, plans } = planned;
+    const updated = [], skippedUnmanaged = [], errors = [], results = [];
+    for (const plan of plans) {
+      const file = plan.file;
+      if (plan.action === "skip") {
+        skippedUnmanaged.push(file);
+        results.push({ path: file, ok: false, skippedUnmanaged: true, error: plan.reason || "unmanaged-user-file" });
+        continue;
+      }
+      try {
+        const expected = syncArgs.expectedSnapshots ? syncArgs.expectedSnapshots.get(file) : plan.snap;
+        if (syncArgs.expectedSnapshots && !expected) throw new Error("缺少事务快照");
+        // Strict CAS: bind to the preflight snapshot {dev, ino, content}.
+        const cur = readRegularSnapshot(file);
+        if (expected.missing !== cur.missing) throw new Error("规则文件已变更，请重新读取: " + file);
+        if (!expected.missing) {
+          if (cur.unsafe) throw new Error("规则文件不可安全读取: " + file);
+          if ((expected.dev !== undefined && cur.dev !== expected.dev) || (expected.ino !== undefined && cur.ino !== expected.ino) || cur.text !== expected.text) {
+            throw new Error("规则文件已变更，请重新读取: " + file);
+          }
+        }
+        if (plan.action === "adopt") {
+          backupOnceWithJournal(file, expected, syncArgs.backupJournal);
+          // After backup, re-verify the skill itself did not change under us.
+          const cur2 = readRegularSnapshot(file);
+          if (cur2.missing !== expected.missing || (!expected.missing && (cur2.unsafe || cur2.dev !== expected.dev || cur2.ino !== expected.ino || cur2.text !== expected.text))) throw new Error("规则文件已变更，请重新读取: " + file);
+        }
+        const changed = writePolicySnapshot(file, expected, desired, syncArgs, { createIfMissing: true, backup: false });
+        if (changed && changed.changed) updated.push(file);
+        results.push({ path: file, ok: true, changed: Boolean(changed && changed.changed) });
+      } catch (e) {
+        errors.push({ path: file, error: String((e && e.message) || e) });
+        results.push({ path: file, ok: false, error: String((e && e.message) || e) });
+      }
+    }
+    return { ok: errors.length === 0, updated, skippedUnmanaged, errors, results };
+  }
+  function backupOnceWithJournal(file, expected, backupJournal) {
+    const bak = file + ".bak-t3hub";
+    const before = policySnapshot(bak);
+    if (!before.missing && before.text === expected.text) return;
+    // Record published inodes before readback. If a prior unmanaged backup already
+    // exists with different content, rotate it into a timestamped archive so neither
+    // the original nor the newly adopted unmanaged skill is ever lost.
+    const tx = { journal: [] };
+    try {
+      if (!before.missing) {
+        let archivePath = null, archiveBefore = null;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const candidate = `${bak}.${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+          const snap = policySnapshot(candidate);
+          if (snap.missing) { archivePath = candidate; archiveBefore = snap; break; }
+        }
+        if (!archivePath) throw new Error("无法分配旧备份归档路径: " + bak);
+        writePolicySnapshot(archivePath, archiveBefore, before.text, tx, { createIfMissing: true, defaultMode: 0o600 });
+      }
+      writePolicySnapshot(bak, before, expected.text, tx, { createIfMissing: true, defaultMode: 0o600 });
+    } finally {
+      if (Array.isArray(backupJournal)) {
+        for (const entry of tx.journal) backupJournal.push(entry);
+      }
+    }
+  }
+  function cleanupCreatedBackups(backupJournal) {
+    return rollbackPolicyWrites(backupJournal || []);
+  }
+  function effectiveAgentsForSkill(projectRoot) {
+    const globals = withReviewTierDefaults(readGlobal(policySnapshot(globalPath), false));
+    return buildEffective(globals, projectRoot ? readProject(projectRoot) : []);
+  }
+  function orchestrationCfgForSkill() {
+    return readOrchestrationSnapshot().config;
+  }
+  function syncRoutingSkillTargets(args = {}) {
+    const planned = args._skillPlanned || planRoutingSkillSync(
+      args.effectiveAgents || effectiveAgentsForSkill(args.projectRoot),
+      args.orchestrationCfg ? normalizeOrchestrationConfig(args.orchestrationCfg) : orchestrationCfgForSkill(),
+      args.extraSkillPaths || args.extraSyncPaths || args.skillPaths || opts.extraSkillPaths || [],
+      args.adoptUnmanagedSkillHashes,
+    );
+    // A parent transaction owns its journal; direct synchronization gets the
+    // same rollback guarantees instead of leaving partial files/backups behind.
+    const ownTransaction = !args.journal;
+    const tx = { ...args, journal: args.journal || [], backupJournal: args.backupJournal || [], journalConflicts: args.journalConflicts || [], validations: args.validations || [] };
+    const result = applyRoutingSkillSync(planned, tx);
+    if (result.ok && ownTransaction) {
+      try {
+        for (const entry of tx.validations) {
+          const current = policySnapshot(entry.path);
+          if (current.missing || current.dev !== entry.dev || current.ino !== entry.ino || current.text !== entry.after) throw new Error("Skill 同步后被并发修改: " + entry.path);
+        }
+      } catch (e) { result.ok = false; result.errors.push({ path: null, error: String(e?.message || e) }); }
+    }
+    if (!result.ok && ownTransaction) {
+      const rollbackFailures = [...tx.journalConflicts, ...rollbackPolicyWrites(tx.journal), ...cleanupCreatedBackups(tx.backupJournal)];
+      return { ...result, rolledBack: rollbackFailures.length === 0, rollbackFailures };
+    }
+    return result;
+  }
+  function canonicalProjectRootForOrchestration(projectRoot) {
+    return resolveCanonicalProjectRoot(projectRoot);
+  }
+  function projectOrchestrationFileFor(projectRoot) {
+    return rawProjectOrchestrationFileFor(resolveCanonicalProjectRoot(projectRoot));
+  }
+  function readProjectOrchestration(projectRoot) {
+    const snap = readProjectOrchestrationSnapshot(projectRoot);
+    return { swarmMode: snap.swarmMode, raw: snap.raw, revision: snap.revision };
+  }
+  function readProjectOrchestrationSnapshot(projectRoot) {
+    const { canonical, file } = projectOrchestrationFileFor(projectRoot);
+    const snap = policySnapshot(file);
+    if (snap.missing) return { canonical, file, swarmMode: "inherit", raw: "", revision: "missing" };
+    let raw, parsed;
+    try { raw = snap.text; parsed = JSON.parse(raw); }
+    catch { throw new Error("项目编排配置无法读取，原文件未改动"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("项目编排配置损坏，原文件未改动");
+    const m = String(parsed.swarmMode ?? "inherit").toLowerCase();
+    if (!["inherit", "on", "off"].includes(m)) throw new Error("项目总指挥覆盖配置无效，原文件未改动");
+    return { canonical, file, swarmMode: m, raw, revision: crypto.createHash("sha256").update(raw).digest("hex") };
+  }
+  function resolveProjectOrchestration(projectRoot, globalCfg) {
+    const g = normalizeOrchestrationConfig(globalCfg);
+    const globalEffective = g.swarmMode === "on" ? "on" : "off";
+    if (!projectRoot || typeof projectRoot !== "string" || !path.isAbsolute(projectRoot)) {
+      return { swarmMode: "inherit", overridesGlobal: false, effectiveSwarmMode: globalEffective, source: "global" };
+    }
+    const current = resolveCanonicalProjectRoot(projectRoot);
+    const { file } = rawProjectOrchestrationFileFor(current);
+    assertNoSymlinkPath(file);
+    if (lstatSafe(file)) {
+      const p = readProjectOrchestration(current);
+      if (p.swarmMode !== "inherit") return { swarmMode: p.swarmMode, overridesGlobal: true, effectiveSwarmMode: p.swarmMode, source: "project", canonicalProjectRoot: current, projectModeRevision: p.revision || "missing" };
+      return { swarmMode: "inherit", overridesGlobal: false, effectiveSwarmMode: globalEffective, source: "global", canonicalProjectRoot: current, projectModeRevision: p.revision || "missing" };
+    }
+    const projectModeRevision = readProjectOrchestrationSnapshot(current).revision;
+    return { swarmMode: "inherit", overridesGlobal: false, effectiveSwarmMode: globalEffective, source: "global", canonicalProjectRoot: current, projectModeRevision };
+  }
+  function buildProjectOrchestrationDirective(effectiveSwarmMode) {
+    const base = buildOrchestrationDirective({ policyVersion: 2, orchestratorMode: "off", swarmMode: effectiveSwarmMode, strictCommanderOnly: effectiveSwarmMode === "on" });
+    const note = "项目级覆盖：本项目总指挥模式为 " + effectiveSwarmMode + "（项目 AGENTS.md 托管块）。\n";
+    return base.replace(ORCHESTRATOR_END, note + ORCHESTRATOR_END);
+  }
+  function isProjectRuleSynced(projectRoot, swarmMode, effectiveSwarmMode) {
+    try {
+      const canonical = canonicalProjectRootForOrchestration(projectRoot);
+      const agentsMd = path.join(canonical, "AGENTS.md");
+      const st = lstatSafe(agentsMd);
+      if (!st) return swarmMode === "inherit";
+      if (!st.isFile()) return false;
+      const text = fs.readFileSync(agentsMd, "utf8");
+      const s = text.indexOf(ORCHESTRATOR_START), e = text.indexOf(ORCHESTRATOR_END);
+      if (swarmMode === "inherit") return s < 0 && e < 0;
+      if (s < 0 || e < s || text.indexOf(ORCHESTRATOR_START, s + 1) >= 0 || text.indexOf(ORCHESTRATOR_END, e + 1) >= 0) return false;
+      const block = text.slice(s, e + ORCHESTRATOR_END.length);
+      return block === buildProjectOrchestrationDirective(effectiveSwarmMode).trimEnd();
+    } catch { return false; }
   }
   function syncOrchestrationDirectiveToHostsRaw(args = {}) {
     const cfg = args.configOverride ? normalizeOrchestrationConfig(args.configOverride) : getOrchestrationConfig();
     if (cfg.policyVersion !== 2 || cfg.orchestratorMode !== "off" || !["on", "off"].includes(cfg.swarmMode)) throw new Error("旧编排指引已退役，请先明确选择统一协作模式");
     const active = cfg.swarmMode === "on";
     const directive = buildOrchestrationDirective(cfg);
+    if (!args.journal) {
+      const hasExplicitHosts = Array.isArray(args.hosts) || Array.isArray(args.hostRulePaths) || Array.isArray(args.extraSyncPaths) || Array.isArray(args.host);
+      const rawHosts = Array.isArray(args.hosts) ? args.hosts
+        : Array.isArray(args.hostRulePaths) ? args.hostRulePaths
+        : Array.isArray(args.extraSyncPaths) ? args.extraSyncPaths
+        : Array.isArray(args.host) ? args.host : undefined;
+      const extraSkills = args.extraSkillPaths || args.skillPaths || [];
+      const pfile = orchestrationConfigPath();
+      const activePath = activeOrchestrationPath();
+      const snapshots = new Map(), expectedContents = new Map();
+      const journal = [], journalConflicts = [], backupJournal = [], validations = [];
+      let preflightPath = null, preflightTree = null, effAgents = null, skillPlanned = null;
+      let effectiveAdditionalHosts = Array.isArray(args.additionalHosts) ? [...args.additionalHosts] : [];
+      try {
+        effAgents = args.effectiveAgents || effectiveAgentsForSkill();
+        preflightPath = "agy-provider-tree";
+        preflightTree = inspectAntigravityProviderTree(extraSkills);
+        if (!hasExplicitHosts) {
+          effectiveAdditionalHosts = [...new Set([...effectiveAdditionalHosts, ...preflightTree.ruleTargets])];
+        }
+        const targets = policyTargets({
+          ...(hasExplicitHosts ? { hosts: rawHosts } : {}),
+          additionalHosts: effectiveAdditionalHosts,
+        });
+        for (const file of targets) {
+          preflightPath = file;
+          if (file === pfile || file === activePath || isSubagentPolicyTarget(file)) throw new Error("不允许将此文件作为宿主规则目标: " + file);
+          const before = policySnapshot(file);
+          const planned = composeOrchestratorBlock(before.text, directive);
+          expectedContents.set(file, planned === null ? before.text : planned);
+          snapshots.set(file, before);
+        }
+        preflightPath = activePath;
+        snapshots.set(activePath, policySnapshot(activePath));
+        expectedContents.set(activePath, "# T3 Hub 协作分工\n\n" + directive);
+        preflightPath = "routing-skill";
+        skillPlanned = args._skillPlanned || planRoutingSkillSync(effAgents, cfg, extraSkills, args.adoptUnmanagedSkillHashes);
+        for (const p of skillPlanned.plans) {
+          if (p.action === "skip") continue;
+          snapshots.set(p.file, p.snap);
+          expectedContents.set(p.file, skillPlanned.desired);
+        }
+      } catch (e) {
+        const msg = String(e?.message || e);
+        return {
+          ok: false,
+          error: msg,
+          config: cfg,
+          active,
+          directive,
+          hostResults: preflightPath ? [{ path: preflightPath, ok: false, error: msg }] : [],
+          skillSync: { ok: false, updated: [], skippedUnmanaged: [], errors: [{ path: preflightPath || "routing-skill", error: msg }], results: [] },
+          rolledBack: true,
+          rollbackFailures: [],
+        };
+      }
+      const txArgs = {
+        ...args,
+        configOverride: cfg,
+        additionalHosts: effectiveAdditionalHosts,
+        effectiveAgents: effAgents,
+        _skillPlanned: skillPlanned,
+        expectedSnapshots: snapshots,
+        expectedContents,
+        journal,
+        journalConflicts,
+        backupJournal,
+        validations,
+      };
+      if (hasExplicitHosts) txArgs.hosts = rawHosts;
+      else {
+        delete txArgs.hosts;
+        delete txArgs.hostRulePaths;
+        delete txArgs.extraSyncPaths;
+        delete txArgs.host;
+      }
+      let innerRes = null;
+      try {
+        innerRes = syncOrchestrationDirectiveToHostsRaw(txArgs);
+        if (!innerRes.ok) throw new Error("部分宿主规则同步失败");
+        validatePolicyTransaction(txArgs);
+        const postTree = inspectAntigravityProviderTree(extraSkills);
+        assertPostAntigravityTreeUnchanged(preflightTree, postTree, txArgs);
+        return innerRes;
+      } catch (e) {
+        const rollbackFailures = [...journalConflicts, ...rollbackPolicyWrites(journal), ...cleanupCreatedBackups(backupJournal)];
+        return {
+          ok: false,
+          error: rollbackFailures.length ? "同步失败，部分文件未能自动恢复，请检查标出的文件" : String(e?.message || e),
+          config: cfg,
+          active,
+          directive,
+          hostResults: innerRes?.hostResults || [],
+          skillSync: innerRes?.skillSync || { ok: false, updated: [], skippedUnmanaged: [], errors: [], results: [] },
+          rolledBack: rollbackFailures.length === 0,
+          rollbackFailures,
+        };
+      }
+    }
     // Always update hub managed file ACTIVE_ORCHESTRATION_MODE.md
     const results = [];
     try {
@@ -1328,11 +2149,11 @@ function createSubagentsManager(opts = {}) {
       const content = "# T3 Hub 协作分工\n\n" + directive;
       const activePath = activeOrchestrationPath(), expected = args.expectedSnapshots?.get(activePath);
       if (args.expectedSnapshots && !expected) throw new Error("缺少事务快照");
-      const changed = transformTextFileAtomic(activePath, (existing) => {
+      if (args.journal) writePolicySnapshot(activePath, expected, content, args, { createIfMissing: true });
+      else transformTextFileAtomic(activePath, (existing) => {
         if (expected && (Boolean(lstatSafe(activePath)) === expected.missing || existing !== expected.text)) throw new Error("规则文件已变更，请重新读取");
         return content;
       }, { createIfMissing: true });
-      recordPolicyWrite(args, activePath, changed);
     } catch (e) { results.push({ path: activeOrchestrationPath(), ok: false, error: String(e?.message || e) }); }
     // Hosts: allow args.hosts or args.hostRulePaths or args.extraSyncPaths
     let hosts = null;
@@ -1360,23 +2181,29 @@ function createSubagentsManager(opts = {}) {
       try {
         const expected = args.expectedSnapshots?.get(fp);
         if (args.expectedSnapshots && !expected) throw new Error("缺少事务快照");
-        const changed = writeOrchestratorBlock(fp, directive, expected);
-        recordPolicyWrite(args, fp, changed);
+        const changed = args.journal
+          ? writePolicySnapshot(fp, expected, args.expectedContents.get(fp), args, { createIfMissing: true, backup: true })
+          : writeOrchestratorBlock(fp, directive, expected);
         results.push({ path: fp, ok: true, changed: Boolean(changed?.changed) });
-      } catch (e) { results.push({ path: fp, ok: false, error: String(e?.message || e) }); }
+      } catch (e) {
+        // Preserve the existing host permission boundary: once a host denies
+        // readback, do not try another write to that protected host in this
+        // operation. Its publication remains journaled and explicitly failed.
+        if (["EACCES", "EPERM"].includes(e?.code)) {
+          const entry = args.journal?.find(write => write.path === fp);
+          if (entry) entry.rollbackBlockedError = "宿主规则写入后拒绝读取，需手动检查: " + String(e.message || e);
+        }
+        results.push({ path: fp, ok: false, error: String(e?.message || e) });
+      }
     };
     for (const h of hosts) {
       if (typeof h !== "string") continue;
       const fp = path.isAbsolute(h) ? h : path.resolve(String(h));
       applyToHost(fp);
     }
-    // If no explicit hosts provided, sync to default CLI global files inside homeDir/hubDir if they exist or hub dir already exists, but only when not isolating via test hostRulePaths.
-    // To avoid polluting real HOME in unit tests, we only sync defaults when hosts length ===0 and no isolated flag? Tests that pass hostRulePaths will have hosts non-empty, so this branch not taken.
-    // When hosts empty (production update via updateOrchestrationConfig without explicit hosts), sync to default CLI targets if they exist or are already present in tmp home/hub.
-    if (hosts.length === 0) {
+    if (hosts.length === 0 && !Array.isArray(args.hosts) && !Array.isArray(args.hostRulePaths) && !Array.isArray(args.extraSyncPaths) && !Array.isArray(args.host)) {
       const defaults = defaultOrchestrationHosts();
       for (const t of defaults) {
-        // Only sync if file already exists or parent dir exists (avoid stray creation)
         try { if (fileExists(t) || dirExists(path.dirname(t))) applyToHost(t); }
         catch (e) { results.push({ path: t, ok: false, error: String(e?.message || e) }); }
       }
@@ -1384,15 +2211,146 @@ function createSubagentsManager(opts = {}) {
     for (const fp of Array.isArray(args.additionalHosts) ? args.additionalHosts : []) {
       if (typeof fp === "string" && path.isAbsolute(fp)) applyToHost(fp);
     }
-    return { ok: results.every((item) => item.ok), config: cfg, active, directive, hostResults: results };
+    let skillSync = { ok: true, updated: [], skippedUnmanaged: [], errors: [], results: [] };
+    try {
+      const effAgents = args.effectiveAgents || effectiveAgentsForSkill();
+      const extraSkills = args.extraSkillPaths || args.skillPaths || [];
+      // Strictly bind to the preflight plan when present; never re-plan over it.
+      let planned = args._skillPlanned || null;
+      if (!planned) {
+        planned = planRoutingSkillSync(effAgents, cfg, extraSkills, args.adoptUnmanagedSkillHashes);
+        if (args.expectedSnapshots) {
+          for (const p of planned.plans) {
+            if (p.action !== "skip" && !args.expectedSnapshots.has(p.file)) {
+              args.expectedSnapshots.set(p.file, p.snap);
+              if (args.expectedContents) args.expectedContents.set(p.file, planned.desired);
+            }
+          }
+        }
+      } else {
+        // Verify re-read skills still match the preflight snapshots (CAS).
+        if (args.expectedSnapshots) {
+          for (const p of planned.plans) {
+            if (p.action === "skip") continue;
+            const exp = args.expectedSnapshots.get(p.file);
+            if (!exp) throw new Error("缺少事务快照: " + p.file);
+            const cur = readRegularSnapshot(p.file);
+            if (exp.missing !== cur.missing) throw new Error("规则文件已变更，请重新读取: " + p.file);
+            if (!exp.missing) {
+              if (cur.unsafe) throw new Error("规则文件不可安全读取: " + p.file);
+              if ((exp.dev !== undefined && cur.dev !== exp.dev) || (exp.ino !== undefined && cur.ino !== exp.ino) || cur.text !== exp.text) {
+                throw new Error("规则文件已变更，请重新读取: " + p.file);
+              }
+            }
+          }
+        }
+      }
+      skillSync = syncRoutingSkillTargets({ ...args, _skillPlanned: planned });
+      if (!skillSync.ok) {
+        for (const r of skillSync.results) {
+          if (!r.ok && !r.skippedUnmanaged) results.push({ path: r.path, ok: false, error: r.error });
+        }
+      }
+    } catch (e) {
+      skillSync = { ok: false, updated: [], skippedUnmanaged: [], errors: [{ path: null, error: String((e && e.message) || e) }], results: [{ path: null, ok: false, error: String((e && e.message) || e) }] };
+      results.push({ path: "routing-skill", ok: false, error: String((e && e.message) || e) });
+    }
+    return { ok: results.every((item) => item.ok), config: cfg, active, directive, hostResults: results, skillSync };
   }
   function updateOrchestrationConfig(patch = {}, opts = {}) {
     const pfile = orchestrationConfigPath();
     const transactionLock = path.join(hubDir, ".orchestration-mode.lock");
     acquireT3HubLock(transactionLock);
     try {
+    // Project orchestration override branch (does not touch global config).
+    const hasPatchScope = Boolean(patch && Object.prototype.hasOwnProperty.call(patch, "scope") && patch.scope !== undefined);
+    const hasOptsScope = Boolean(opts && Object.prototype.hasOwnProperty.call(opts, "scope") && opts.scope !== undefined);
+    const patchScope = hasPatchScope ? patch.scope : undefined;
+    const optsScope = hasOptsScope ? opts.scope : undefined;
+    if (hasPatchScope && patchScope !== "global" && patchScope !== "project") {
+      throw new Error("invalid orchestration scope: " + String(patchScope));
+    }
+    if (hasOptsScope && optsScope !== "global" && optsScope !== "project") {
+      throw new Error("invalid orchestration scope: " + String(optsScope));
+    }
+    if (hasPatchScope && hasOptsScope && patchScope !== optsScope) {
+      throw new Error("conflicting orchestration scope");
+    }
+    const hasPatchProjectRoot = Boolean(patch && Object.prototype.hasOwnProperty.call(patch, "projectRoot") && patch.projectRoot !== undefined);
+    const hasOptsProjectRoot = Boolean(opts && Object.prototype.hasOwnProperty.call(opts, "projectRoot") && opts.projectRoot !== undefined);
+    if (hasPatchProjectRoot && hasOptsProjectRoot && patch.projectRoot !== opts.projectRoot) {
+      throw new Error("conflicting orchestration projectRoot");
+    }
+    const hasPatchRev = Boolean(patch && Object.prototype.hasOwnProperty.call(patch, "expectedRevision") && patch.expectedRevision !== undefined);
+    const hasOptsRev = Boolean(opts && Object.prototype.hasOwnProperty.call(opts, "expectedRevision") && opts.expectedRevision !== undefined);
+    if (hasPatchRev && hasOptsRev && patch.expectedRevision !== opts.expectedRevision) {
+      throw new Error("conflicting orchestration expectedRevision");
+    }
+    let isProjectIntent = false;
+    if (patchScope === "project" || optsScope === "project") isProjectIntent = true;
+    else if (hasPatchProjectRoot || hasOptsProjectRoot) {
+      if (patchScope === "global" || optsScope === "global") isProjectIntent = false;
+      else isProjectIntent = true;
+    }
+    let projectRoot = null;
+    if (isProjectIntent) {
+      const candidate = hasOptsProjectRoot ? opts.projectRoot : patch.projectRoot;
+      if (typeof candidate !== "string" || !candidate.trim()) throw new Error("projectRoot required for project scope and must be a non-empty absolute path");
+      if (!path.isAbsolute(candidate)) throw new Error("projectRoot must be an absolute path and an existing directory");
+      const abs = candidate.trim();
+      assertNoSymlinkPath(abs);
+      let st = null;
+      try { st = fs.statSync(abs); }
+      catch (e) { throw new Error("projectRoot must be an existing directory: " + String((e && e.message) || e)); }
+      if (!st.isDirectory()) throw new Error("projectRoot must be an existing directory: " + abs);
+      // lstat chain already enforced by assertNoSymlinkPath; symlink itself is rejected above.
+      projectRoot = abs;
+    }
+    if (isProjectIntent) {
+      const snapshot0 = readOrchestrationSnapshot(), globalCfg0 = snapshot0.config;
+      const targetMode = String(patch.swarmMode || "").toLowerCase();
+      if (!["inherit", "on", "off"].includes(targetMode)) throw new Error("项目总指挥覆盖请选择 inherit、常规协作或总指挥模式");
+      const { canonical, dir, file: projFile } = projectOrchestrationFileFor(projectRoot);
+      // Independent project revision CAS (symmetric with global expectedRevision).
+      const projBefore = readProjectOrchestrationSnapshot(canonical);
+      const expectedRev = hasPatchRev ? patch.expectedRevision : opts?.expectedRevision;
+      if (typeof expectedRev !== "string" || !expectedRev || expectedRev !== projBefore.revision) {
+        return { ok: false, error: "项目协作模式已变更，请重新读取后再保存", config: globalCfg0, projectRoot: canonical, rolledBack: true, rollbackFailures: [] };
+      }
+      const agentsMd = path.join(canonical, "AGENTS.md");
+      const beforeSnap = policySnapshot(agentsMd);
+      const directive = targetMode === "inherit" ? null : buildProjectOrchestrationDirective(targetMode);
+      const plannedComposed = composeOrchestratorBlock(beforeSnap.text, directive);
+      const plannedText = plannedComposed === null ? beforeSnap.text : plannedComposed;
+      const tx = { journal: [], journalConflicts: [], backupJournal: [], validations: [] };
+      const projBeforeSnap = policySnapshot(projFile);
+      if ((projBeforeSnap.missing ? "missing" : crypto.createHash("sha256").update(projBeforeSnap.text).digest("hex")) !== projBefore.revision) throw new Error("项目协作模式已变更，请重新读取后再保存");
+      const newProjText = JSON.stringify({ swarmMode: targetMode }, null, 2) + "\n";
+      const expectedAfterRev = crypto.createHash("sha256").update(newProjText).digest("hex");
+      try {
+        if (plannedText !== beforeSnap.text) writePolicySnapshot(agentsMd, beforeSnap, plannedText, tx, { backup: true, createIfMissing: Boolean(directive) });
+        writePolicySnapshot(projFile, projBeforeSnap, newProjText, tx, { createIfMissing: true, defaultMode: 0o600 });
+        // Verify after publication AND lock release. Never discard afterRev or
+        // report success for a configuration whose mode disagrees with rules.
+        const after = readProjectOrchestrationSnapshot(canonical);
+        if (after.revision !== expectedAfterRev || after.raw !== newProjText || after.swarmMode !== targetMode) throw new Error("项目编排配置写入后已变更，请重新读取");
+        const effectiveMode = targetMode === "inherit" ? (globalCfg0.swarmMode === "on" ? "on" : "off") : targetMode;
+        const synced = isProjectRuleSynced(canonical, targetMode, effectiveMode);
+        if (!synced) throw new Error("项目规则与编排配置不一致，请重新读取");
+        for (const entry of [...tx.journal, ...tx.validations]) {
+          const current = policySnapshot(entry.path);
+          if (current.missing || current.dev !== entry.dev || current.ino !== entry.ino || current.text !== entry.after) throw new Error("项目事务文件写入后已变更: " + entry.path);
+        }
+        const projectOverride = { swarmMode: targetMode, overridesGlobal: targetMode !== "inherit", effectiveSwarmMode: effectiveMode, source: targetMode === "inherit" ? "global" : "project", projectRuleSynced: true, revision: after.revision, projectModeRevision: after.revision };
+        return { ok: true, config: globalCfg0, projectRoot: canonical, projectModeRevision: after.revision, projectOverride, projectRuleSynced: true, skillSync: { ok: true, updated: [], skippedUnmanaged: [], errors: [], results: [] } };
+      } catch (e) {
+        const error = transactionError(e, [...tx.journalConflicts, ...rollbackPolicyWrites(tx.journal)]);
+        return { ok: false, error: error.message, config: globalCfg0, projectRoot: canonical, rolledBack: error.rolledBack, rollbackFailures: error.rollbackFailures };
+      }
+    }
     const snapshot = readOrchestrationSnapshot(), current = snapshot.config;
-    if (typeof patch.expectedRevision !== "string" || patch.expectedRevision !== snapshot.revision) throw new Error("协作模式已变更，请重新读取后再保存");
+    const globalExpectedRev = hasPatchRev ? patch.expectedRevision : opts?.expectedRevision;
+    if (typeof globalExpectedRev !== "string" || globalExpectedRev !== snapshot.revision) throw new Error("协作模式已变更，请重新读取后再保存");
     if (!["on", "off"].includes(patch.swarmMode) || patch.orchestratorMode && patch.orchestratorMode !== "off") throw new Error("请选择常规协作或总指挥模式");
     const merged = { ...current, ...(patch || {}) };
     // Remove hostRulePaths/hosts from merged before persisting
@@ -1401,6 +2359,7 @@ function createSubagentsManager(opts = {}) {
     delete merged.hosts;
     delete merged.host;
     delete merged.expectedRevision;
+    delete merged.scope;
     merged.policyVersion = 2;
     merged.orchestratorMode = "off";
     merged.strictCommanderOnly = merged.swarmMode === "on";
@@ -1413,9 +2372,35 @@ function createSubagentsManager(opts = {}) {
     if (Array.isArray(hostRulePaths)) syncArgs.hosts = hostRulePaths;
     else if (Array.isArray(patch?.hostRulePaths)) syncArgs.hosts = patch.hostRulePaths;
     else if (Array.isArray(opts.hosts)) syncArgs.hosts = opts.hosts;
-    const directive = buildOrchestrationDirective(normalized), paths = policyTargets(syncArgs), snapshots = new Map(), expectedContents = new Map(), journal = [], journalConflicts = [];
+    const skillExtraPaths = opts.extraSkillPaths || opts.skillPaths || patch.extraSkillPaths || patch.skillPaths || [];
+    if (Array.isArray(skillExtraPaths)) syncArgs.extraSkillPaths = skillExtraPaths;
+    // Corrupted subagents.json must abort preflight, never fall back to defaults.
+    try { syncArgs.effectiveAgents = effectiveAgentsForSkill(); }
+    catch (e) {
+      return { ok: false, error: String((e && e.message) || e), config: current, desiredConfig: normalized, hostResults: [{ path: globalPath, ok: false, error: String((e && e.message) || e) }], rolledBack: true, rollbackFailures: [], skillSync: { ok: false, updated: [], skippedUnmanaged: [], errors: [{ path: globalPath, error: String((e && e.message) || e) }], results: [] } };
+    }
+    syncArgs._skillPlanned = null;
+    const directive = buildOrchestrationDirective(normalized), snapshots = new Map(), expectedContents = new Map(), journal = [], journalConflicts = [], backupJournal = [], validations = [];
+    syncArgs.backupJournal = backupJournal;
+    syncArgs.validations = validations;
     let preflightPath = null;
+    let pfileSnap;
+    let preflightTree = null;
     try {
+      preflightPath = "agy-provider-tree";
+      preflightTree = inspectAntigravityProviderTree(skillExtraPaths);
+      if (!Array.isArray(syncArgs.hosts)) {
+        syncArgs.additionalHosts = [
+          ...new Set([
+            ...(Array.isArray(syncArgs.additionalHosts) ? syncArgs.additionalHosts : []),
+            ...preflightTree.ruleTargets,
+          ]),
+        ];
+      }
+      const paths = policyTargets(syncArgs);
+      preflightPath = pfile;
+      pfileSnap = policySnapshot(pfile);
+      if ((pfileSnap.missing ? "missing" : crypto.createHash("sha256").update(pfileSnap.text).digest("hex")) !== snapshot.revision) throw new Error("协作模式已变更，请重新读取后再保存");
       for (const file of paths) {
         preflightPath = file;
         if (file === pfile || file === activeOrchestrationPath() || isSubagentPolicyTarget(file)) throw new Error("不允许将此文件作为宿主规则目标: " + file);
@@ -1427,24 +2412,40 @@ function createSubagentsManager(opts = {}) {
       preflightPath = activeOrchestrationPath();
       snapshots.set(activeOrchestrationPath(), policySnapshot(activeOrchestrationPath()));
       expectedContents.set(activeOrchestrationPath(), "# T3 Hub 协作分工\n\n" + directive);
+      preflightPath = "routing-skill";
+      const skillPlanned = planRoutingSkillSync(syncArgs.effectiveAgents, normalized, skillExtraPaths, opts.adoptUnmanagedSkillHashes || patch.adoptUnmanagedSkillHashes);
+      syncArgs._skillPlanned = skillPlanned;
+      for (const p of skillPlanned.plans) {
+        if (p.action === "skip") continue;
+        snapshots.set(p.file, p.snap);
+        expectedContents.set(p.file, skillPlanned.desired);
+      }
       if (readOrchestrationSnapshot().revision !== snapshot.revision) throw new Error("协作模式已变更，请重新读取后再保存");
     } catch (e) {
-      return { ok: false, error: String(e?.message || e), config: current, desiredConfig: normalized, hostResults: preflightPath ? [{ path: preflightPath, ok: false, error: String(e?.message || e) }] : [], rolledBack: true, rollbackFailures: [] };
+      return { ok: false, error: String(e?.message || e), config: current, desiredConfig: normalized, hostResults: preflightPath ? [{ path: preflightPath, ok: false, error: String(e?.message || e) }] : [], rolledBack: true, rollbackFailures: [], skillSync: { ok: false, updated: [], skippedUnmanaged: [], errors: [{ path: preflightPath || "routing-skill", error: String(e?.message || e) }], results: [] } };
     }
     syncArgs.expectedSnapshots = snapshots; syncArgs.expectedContents = expectedContents; syncArgs.journal = journal; syncArgs.journalConflicts = journalConflicts;
     let syncResult = null;
     try {
       syncResult = syncOrchestrationDirectiveToHostsRaw(syncArgs);
       if (!syncResult.ok) throw new Error("部分宿主规则同步失败");
-      transformTextFileAtomic(pfile, (existing) => {
-        const revision = lstatSafe(pfile) ? crypto.createHash("sha256").update(existing).digest("hex") : "missing";
-        if (revision !== snapshot.revision) throw new Error("协作模式已变更，请重新读取后再保存");
-        return JSON.stringify(normalized, null, 2) + "\n";
-      }, { createIfMissing: true, defaultMode: 0o600 });
-      return { ...syncResult, config: normalized };
+      writePolicySnapshot(pfile, pfileSnap, JSON.stringify(normalized, null, 2) + "\n", syncArgs, { createIfMissing: true, defaultMode: 0o600 });
+      validatePolicyTransaction(syncArgs);
+      const postTree = inspectAntigravityProviderTree(skillExtraPaths);
+      assertPostAntigravityTreeUnchanged(preflightTree, postTree, syncArgs);
+      // A successful transaction may deliberately preserve an unmanaged Skill.
+      // Only targets written and verified by this transaction count as applied.
+      const skillResults = postTree.skillTargets.map((file) => {
+        const result = syncResult.skillSync.results.find((item) => item.path === file);
+        return { path: file, state: result?.ok ? "applied" : result?.skippedUnmanaged ? "unmanaged" : "unknown" };
+      });
+      const skillsApplied = skillResults.length > 0 && skillResults.every((item) => item.state === "applied");
+      const modeApplied = skillsApplied && syncResult.hostResults.length > 0 && syncResult.hostResults.every((item) => item.ok);
+      return { ...syncResult, config: normalized, skillResults, skillsApplied, modeApplied };
     } catch (e) {
       const rollbackFailures = [...journalConflicts, ...rollbackPolicyWrites(journal)];
-      return { ok: false, error: rollbackFailures.length ? "同步失败，部分文件未能自动恢复，请检查标出的文件" : String(e?.message || e), config: current, desiredConfig: normalized, hostResults: syncResult?.hostResults || [], rolledBack: rollbackFailures.length === 0, rollbackFailures };
+      rollbackFailures.push(...cleanupCreatedBackups(backupJournal));
+      return { ok: false, error: rollbackFailures.length ? "同步失败，部分文件未能自动恢复，请检查标出的文件" : String(e?.message || e), config: current, desiredConfig: normalized, hostResults: syncResult?.hostResults || [], rolledBack: rollbackFailures.length === 0, rollbackFailures, skillSync: syncResult?.skillSync || { ok: false, updated: [], skippedUnmanaged: [], errors: [], results: [] } };
     }
     } finally { releaseT3HubLock(transactionLock); }
   }
@@ -1452,7 +2453,8 @@ function createSubagentsManager(opts = {}) {
     const state = getOrchestrationState();
     if (state.policyVersion !== 2) throw new Error("旧编排指引已退役，请先明确选择统一协作模式");
     const hosts = args.hosts || args.hostRulePaths || args.extraSyncPaths || args.host;
-    return updateOrchestrationConfig({ swarmMode: state.swarmMode, expectedRevision: state.modeRevision }, { ...(Array.isArray(hosts) ? { hostRulePaths: hosts } : {}), ...(Array.isArray(args.additionalHosts) ? { additionalHosts: args.additionalHosts } : {}) });
+    const extraSkills = args.extraSkillPaths || args.skillPaths || [];
+    return updateOrchestrationConfig({ swarmMode: state.swarmMode, expectedRevision: state.modeRevision }, { adoptUnmanagedSkillHashes: args.adoptUnmanagedSkillHashes, ...(Array.isArray(hosts) ? { hostRulePaths: hosts } : {}), ...(Array.isArray(args.additionalHosts) ? { additionalHosts: args.additionalHosts } : {}), ...(Array.isArray(extraSkills) ? { extraSkillPaths: extraSkills } : {}) });
   }
 
   function renderBlock(items, isProject) {
@@ -1529,6 +2531,8 @@ function createSubagentsManager(opts = {}) {
       try {
         assertNoSymlinkPath(filePath);
         const st = lstatSafe(filePath);
+        const expected = tOpts.expectedSnapshot;
+        if (expected && (Boolean(st) === expected.missing || (st && (st.dev !== expected.dev || st.ino !== expected.ino)))) throw new Error("文件已变更，请重新读取: " + filePath);
         if (!st) {
           if (!createIfMissing) return { changed: false };
           const next = transformFn("");
@@ -1536,18 +2540,22 @@ function createSubagentsManager(opts = {}) {
           const tmp = filePath + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
           let fd = null;
           let ownsTmp = false;
-          let publishedIno = null;
+          let publishedIno = null, publishedDev = null;
           try {
             fd = fs.openSync(tmp, "wx", 0o600);
             ownsTmp = true;
             fs.writeSync(fd, next, 0, "utf8");
             try { fs.fsyncSync(fd); } catch {}
-            try { fs.fchmodSync(fd, typeof tOpts.defaultMode === "number" ? tOpts.defaultMode : 0o644); } catch {}
-            publishedIno = fs.fstatSync(fd).ino;
+            const targetMode = typeof tOpts.defaultMode === "number" ? (tOpts.defaultMode & 0o777) : 0o644;
+            fs.fchmodSync(fd, targetMode);
+            const published = fs.fstatSync(fd);
+            if ((published.mode & 0o777) !== targetMode) throw new Error("failed to apply file mode on: " + filePath);
+            publishedIno = published.ino; publishedDev = published.dev;
             fs.closeSync(fd);
             fd = null;
             assertNoSymlinkPath(filePath);
             fs.linkSync(tmp, filePath);
+            tOpts.onPublish?.({ changed: true, dev: publishedDev, ino: publishedIno });
             try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
           } catch (e) {
             try { if (fd !== null) fs.closeSync(fd); } catch {}
@@ -1557,7 +2565,7 @@ function createSubagentsManager(opts = {}) {
           }
           const post = lstatSafe(filePath);
           if (!post || !post.isFile() || post.ino !== publishedIno) continue;
-          return { changed: true, ino: publishedIno };
+          return { changed: true, dev: post.dev, ino: publishedIno };
         }
         if (!st.isFile()) throw new Error("unsafe non-regular file: " + filePath);
         if (st.nlink !== 1) throw new Error("refusing to clobber multi-linked file: " + filePath);
@@ -1578,8 +2586,9 @@ function createSubagentsManager(opts = {}) {
         } finally {
           try { if (rfd !== null) fs.closeSync(rfd); } catch {}
         }
-        if (doBackup) backupOnce(filePath);
         const existing = rawPre.toString("utf8");
+        if (expected && (!Buffer.from(expected.text, "utf8").equals(rawPre))) throw new Error("文件已变更，请重新读取: " + filePath);
+        if (doBackup) backupOnce(filePath);
         const next = transformFn(existing);
         if (next === null || next === existing) return { changed: false };
         const stageDir = fs.mkdtempSync(filePath + ".stage-");
@@ -1588,15 +2597,16 @@ function createSubagentsManager(opts = {}) {
         let fd = null;
         let stagedFd = null;
         let ownsTmp = false;
-        let publishedIno = null;
+        let publishedIno = null, publishedDev = null;
         let retryCas = false;
         try {
           fd = fs.openSync(tmp, "wx", 0o600);
           ownsTmp = true;
           fs.writeSync(fd, next, 0, "utf8");
           try { fs.fsyncSync(fd); } catch {}
-          try { fs.fchmodSync(fd, origMode); } catch {}
-          publishedIno = fs.fstatSync(fd).ino;
+          const targetMode = typeof tOpts.forceMode === "number" ? (tOpts.forceMode & 0o777) : origMode;
+          try { fs.fchmodSync(fd, targetMode); } catch {}
+          const published = fs.fstatSync(fd); publishedIno = published.ino; publishedDev = published.dev;
           fs.closeSync(fd);
           fd = null;
           assertNoSymlinkPath(filePath);
@@ -1631,6 +2641,7 @@ function createSubagentsManager(opts = {}) {
               try {
                 assertNoSymlinkPath(filePath);
                 fs.linkSync(tmp, filePath);
+                tOpts.onPublish?.({ changed: true, dev: publishedDev, ino: publishedIno });
                 try { fs.unlinkSync(tmp); ownsTmp = false; } catch {}
               } catch (e) {
                 if (e && e.code === "EEXIST") {
@@ -1693,6 +2704,8 @@ function createSubagentsManager(opts = {}) {
                 const postTarget = lstatSafe(filePath);
                 if (!postTarget || !postTarget.isFile() || postTarget.ino !== publishedIno) {
                   retryCas = true;
+                } else {
+                  var postTargetDev = postTarget.dev;
                 }
               }
             }
@@ -1704,7 +2717,7 @@ function createSubagentsManager(opts = {}) {
           try { fs.rmdirSync(stageDir); } catch {}
         }
         if (retryCas) continue;
-        return { changed: true, ino: publishedIno };
+        return { changed: true, dev: (typeof postTargetDev !== "undefined" ? postTargetDev : lstatSafe(filePath)?.dev), ino: publishedIno };
       } finally {
         releaseT3HubLock(lockPath);
       }
@@ -1719,25 +2732,28 @@ function createSubagentsManager(opts = {}) {
     }
   }
 
+  function composeRoleBlockText(existing, block, startMarker, endMarker) {
+    validateRoleMarkers(existing, startMarker, endMarker);
+    const sIdx = existing.indexOf(startMarker);
+    const eIdx = existing.indexOf(endMarker);
+    let next = "";
+    if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
+      const before = existing.slice(0, sIdx);
+      let after = existing.slice(eIdx + endMarker.length);
+      if (after.startsWith("\r\n")) after = after.slice(2);
+      else if (after.startsWith("\n")) after = after.slice(1);
+      next = before + block + after;
+    } else {
+      next = (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + block;
+    }
+    return next === existing ? null : next;
+  }
   function injectIntoFile(filePath, block, startMarker, endMarker) {
-    return transformTextFileAtomic(filePath, (existing) => {
-      validateRoleMarkers(existing, startMarker, endMarker);
-      const sIdx = existing.indexOf(startMarker);
-      const eIdx = existing.indexOf(endMarker);
-      let next = "";
-      if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
-        const before = existing.slice(0, sIdx);
-        let after = existing.slice(eIdx + endMarker.length);
-        // The block already ends with a trailing "\n"; consume the one
-        // newline it contributed so repeated saves stay byte-identical.
-        if (after.startsWith("\r\n")) after = after.slice(2);
-        else if (after.startsWith("\n")) after = after.slice(1);
-        next = before + block + after;
-      } else {
-        next = (existing.trim() ? existing.replace(/\s+$/, "") + "\n\n" : "") + block;
-      }
-      return next === existing ? null : next;
-    }, { backup: true, createIfMissing: true });
+    return transformTextFileAtomic(filePath, (existing) => composeRoleBlockText(existing, block, startMarker, endMarker), { backup: true, createIfMissing: true });
+  }
+  function generateClaudeAgentContent(item) {
+    const modelLine = item.model ? `\nmodel: ${yamlDoubleQuotedScalar(item.model)}` : "";
+    return `---\nname: ${yamlDoubleQuotedScalar(item.id)}\ndescription: ${yamlDoubleQuotedScalar(item.description || item.id)}${modelLine}\n${HUB_AGENT_MARKER}\n---\n\n${item.systemPrompt || ""}\n\n${memoryInstruction(item)}\n`;
   }
 
   // Shared global rules are a bounded block inside each host's own file. The
@@ -1816,23 +2832,29 @@ function createSubagentsManager(opts = {}) {
     }, { createIfMissing: false });
   }
 
-  function writeClaudeAgentFile(dir, item) {
+  function writeClaudeAgentFile(dir, item, txOptions = {}) {
     assertSafeSubagentId(String(item.id));
     const file = path.join(dir, item.id + ".md");
     assertContained(dir, file);
     safeMkdir(dir);
     assertNoSymlinkPath(file);
     const st = lstatSafe(file);
+    if (txOptions.before) {
+      const current = lenientClaudeSnapshot(file), expected = txOptions.before;
+      if (current.missing !== expected.missing || (!current.missing && (current.unsafe || current.dev !== expected.dev || current.ino !== expected.ino || current.text !== expected.text))) {
+        if (txOptions.strictExpected) throw new Error("项目代理文件已变更: " + file);
+        return { file, written: false, skippedUnmanaged: true };
+      }
+    }
     if (st && !st.isFile()) return { file, written: false, skippedUnmanaged: true };
-    const modelLine = item.model ? `\nmodel: ${yamlDoubleQuotedScalar(item.model)}` : "";
-    const fm = `---\nname: ${yamlDoubleQuotedScalar(item.id)}\ndescription: ${yamlDoubleQuotedScalar(item.description || item.id)}${modelLine}\n${HUB_AGENT_MARKER}\n---\n\n${item.systemPrompt || ""}\n\n${memoryInstruction(item)}\n`;
+    const fm = generateClaudeAgentContent(item);
     if (!isHubManagedContent(fm)) throw new Error("generated frontmatter failed ownership check: " + file);
     const baseMode = existingFileMode(file) ?? 0o644;
     const mode = (baseMode & 0o555) || 0o444;
     const existsNow = fileExists(file);
     if (!existsNow) {
       try {
-        const pub = writeNewFileExclusive(file, fm, mode);
+        const pub = writeNewFileExclusive(file, fm, mode, txOptions.onPublish);
         if (pub && pub.replacedConcurrently) return { file, written: false, skippedUnmanaged: true };
         return { file, written: true, skippedUnmanaged: false };
       } catch (e) {
@@ -1849,9 +2871,13 @@ function createSubagentsManager(opts = {}) {
     try {
       assertNoSymlinkPath(file);
       const lockSnap = readRegularSnapshot(file);
+      if (txOptions.strictExpected) {
+        const expected = txOptions.before;
+        if (lockSnap.missing !== expected.missing || (!lockSnap.missing && (lockSnap.unsafe || lockSnap.dev !== expected.dev || lockSnap.ino !== expected.ino || lockSnap.text !== expected.text))) throw new Error("项目代理文件已变更: " + file);
+      }
       if (lockSnap.missing) {
         try {
-          const pub = writeNewFileExclusive(file, fm, mode);
+          const pub = writeNewFileExclusive(file, fm, mode, txOptions.onPublish);
           if (pub && pub.replacedConcurrently) return { file, written: false, skippedUnmanaged: true };
           return { file, written: true, skippedUnmanaged: false };
         }
@@ -1866,17 +2892,19 @@ function createSubagentsManager(opts = {}) {
       if (lockSnap.ino !== preSnap.ino || Buffer.compare(lockSnap.raw, preSnap.raw) !== 0) {
         return { file, written: false, skippedUnmanaged: true };
       }
-      return replaceManagedFile(file, fm, mode, path.join(hubDir, "retired-agents"), lockSnap);
+      return replaceManagedFile(file, fm, mode, path.join(hubDir, "retired-agents"), lockSnap, txOptions.onPublish);
     } finally {
       releaseT3HubLock(lockPath);
     }
   }
-  function removeClaudeAgentFile(dir, id) {
+  function removeClaudeAgentFile(dir, id, txOptions = {}) {
     assertSafeSubagentId(String(id));
     const file = path.join(dir, id + ".md");
     assertContained(dir, file);
     assertNoSymlinkPath(file);
     const preSnap = readRegularSnapshot(file);
+    const expected = txOptions.before;
+    if (expected && (preSnap.missing !== expected.missing || (!preSnap.missing && (preSnap.unsafe || preSnap.dev !== expected.dev || preSnap.ino !== expected.ino || preSnap.text !== expected.text)))) throw new Error("项目代理文件已变更: " + file);
     if (preSnap.missing) return { file, removed: false, skippedUnmanaged: false };
     if (preSnap.unsafe || !isHubManagedContent(preSnap.text)) return { file, removed: false, skippedUnmanaged: true };
     const lockPath = file + ".t3hub.lock";
@@ -1889,7 +2917,7 @@ function createSubagentsManager(opts = {}) {
       if (lockSnap.ino !== preSnap.ino || Buffer.compare(lockSnap.raw, preSnap.raw) !== 0) {
         return { file, removed: false, skippedUnmanaged: true };
       }
-      const { changed, ...result } = stageManagedFile(file, undefined, undefined, path.join(hubDir, "retired-agents"), lockSnap);
+      const { changed, ...result } = stageManagedFile(file, undefined, undefined, path.join(hubDir, "retired-agents"), lockSnap, txOptions.onPublish);
       return { file, removed: changed, ...result };
     } finally {
       releaseT3HubLock(lockPath);
@@ -1913,39 +2941,31 @@ function createSubagentsManager(opts = {}) {
     const start = scope === "project" ? PROJECT_START : GLOBAL_START, end = scope === "project" ? PROJECT_END : GLOBAL_END;
     for (const target of targets) validateRoleMarkers(policySnapshot(target).text, start, end);
   }
-
-  function injectGlobal(allGlobal, extraSyncPaths = opts.extraSyncPaths || []) {
-    const block = renderBlock(allGlobal, false);
-    for (const t of globalRoleTargets(extraSyncPaths)) {
-      // Sync only when parent dir exists (like hub-skills), to avoid creating stray dirs on fresh systems.
-      // But still sync if file already exists regardless.
-      injectIntoFile(t, block, GLOBAL_START, GLOBAL_END);
+  function lenientClaudeSnapshot(file) {
+    try {
+      const snap = readRegularSnapshot(file);
+      if (snap.missing) return { missing: true, text: "" };
+      if (snap.unsafe) return { missing: false, unsafe: true, text: null, dev: snap.dev, ino: snap.ino, mode: snap.mode };
+      return { missing: false, text: snap.text, dev: snap.dev, ino: snap.ino, mode: snap.mode };
+    } catch (e) {
+      return { missing: false, unsafe: true, text: null, error: e };
     }
-    // Also sync to .claude/agents for enabled globals
-    const enabled = allGlobal.filter((i) => i.enabled !== false);
-    safeMkdir(claudeAgentsRoot);
-    const skippedUnmanaged = [];
-    const conflicts = [];
-    for (const it of enabled) {
-      const res = writeClaudeAgentFile(claudeAgentsRoot, it);
-      recordUnmanagedConflict(res, it.id, skippedUnmanaged, conflicts);
+  }
+  function restoreClaudeDeletion(file, beforeSnap) {
+    // before exists, after missing: recreate with CAS (still missing) and original file mode.
+    const cur = lenientClaudeSnapshot(file);
+    if (!cur.missing) throw new Error("文件已被其他操作修改");
+    safeMkdir(path.dirname(file));
+    const restoreMode = typeof beforeSnap?.mode === "number" ? ((beforeSnap.mode & 0o777) || 0o444) : 0o444;
+    const res = transformTextFileAtomic(file, () => {
+      if (lstatSafe(file)) throw new Error("文件已被其他操作修改");
+      return beforeSnap.text;
+    }, { createIfMissing: true, defaultMode: restoreMode });
+    if (!res.changed) throw new Error("文件已被其他操作删除");
+    const restoredSt = lstatSafe(file);
+    if (!restoredSt || !restoredSt.isFile() || (restoredSt.mode & 0o777) !== restoreMode) {
+      throw new Error("恢复文件权限核验失败: " + file);
     }
-    // Clean up disabled/removed agents that had files but now disabled.
-    // Hard guard: only Hub-managed files may be deleted; user files always preserved.
-    let existingGlobalFiles = [];
-    try { existingGlobalFiles = fs.readdirSync(claudeAgentsRoot).filter((f) => f.endsWith(".md")); }
-    catch (e) { if (!e || e.code !== "ENOENT") throw e; }
-    const enabledGlobalIds = new Set(enabled.map((i) => i.id));
-    for (const f of existingGlobalFiles) {
-      const id = f.slice(0, -3);
-      if (!enabledGlobalIds.has(id)) {
-        const full = path.join(claudeAgentsRoot, f);
-        if (isHubManagedAgentFile(full)) {
-          recordUnmanagedConflict(removeClaudeAgentFile(claudeAgentsRoot, id), id, skippedUnmanaged, conflicts);
-        }
-      }
-    }
-    return { block, skippedUnmanaged, conflicts };
   }
 
   function injectProject(projectRoot, allProjectItems, globalItems, injectOpts = {}) {
@@ -1991,13 +3011,14 @@ function createSubagentsManager(opts = {}) {
   }
 
   function listSubagents(args = {}) {
-    const projectRoot = args.projectRoot || null;
+    const rawProjectRoot = args.projectRoot || null;
+    const projectRoot = rawProjectRoot ? resolveCanonicalProjectRoot(rawProjectRoot) : null;
     const catalog = listModelCatalog(homeDir);
     const globalItems = withReviewTierDefaults(readGlobal());
     const projectItems = projectRoot ? readProject(projectRoot) : [];
     const effectiveItems = buildEffective(globalItems, projectItems);
     const legacyPath = projectRoot ? path.join(projectDir, slugFromProjectRoot(projectRoot) + ".json") : null;
-    const legacyProjectConfig = Boolean(legacyPath && fileExists(legacyPath));
+    const legacyProjectConfig = Boolean(legacyPath && !policySnapshot(legacyPath).missing);
     const sourceById = Object.fromEntries(effectiveItems.map(item => [item.id, projectItems.some(p => p.enabled !== false && p.id === item.id && (p.overridesGlobal || !globalItems.some(g => g.enabled !== false && g.id === item.id))) ? "project" : item.suggestedDefault ? "default" : "global"]));
     const group = (id, role, label, definitions) => ({ id, role, label, levels: definitions.map(([level, itemId, kind, levelLabel, description]) => {
       if (kind === "main") return { level, id: null, kind, label: levelLabel, description, item: null, globalItem: null, projectItem: null, source: "main", configured: false };
@@ -2015,14 +3036,243 @@ function createSubagentsManager(opts = {}) {
     return { ok: true, projectRoot, catalog, globalItems, projectItems, effectiveItems, sourceById, legacyProjectConfig, tierGroups };
   }
 
+  function commitProjectRoleTransaction(projectRoot, items, beforeProjSnap, args = {}) {
+    const json = projectPathFor(projectRoot), lock = json + ".transaction.lock";
+    acquireT3HubLock(lock);
+    try {
+      const block = renderBlock(items, true), host = path.join(projectRoot, "AGENTS.md");
+      const beforeHost = policySnapshot(host);
+      const hostText = composeRoleBlockText(beforeHost.text, block, PROJECT_START, PROJECT_END) ?? beforeHost.text;
+      const dir = path.join(projectRoot, ".claude", "agents");
+      const enabled = items.filter(i => i.enabled !== false), enabledIds = new Set(enabled.map(i => i.id));
+      const names = safeDirExists(dir) ? fs.readdirSync(dir).filter(f => f.endsWith(".md")) : [];
+      const plans = [...new Set([...enabled.map(i => i.id), ...names.map(f => f.slice(0, -3))])].map(id => {
+        assertSafeSubagentId(id);
+        const file = path.join(dir, id + ".md"), before = lenientClaudeSnapshot(file);
+        if (before.error) throw before.error;
+        return { id, file, before, item: enabled.find(i => i.id === id) };
+      });
+      const exclude = resolveExcludePath(projectRoot), beforeExclude = exclude ? policySnapshot(exclude) : null;
+      let excludeText = beforeExclude?.text || "";
+      const skippedUnmanaged = [], conflicts = [];
+      const tx = { journal: [], journalConflicts: [], validations: [] };
+      const recordUnrestored = (err) => {
+        if (err?.unrestoredPath && !tx.journal.some(entry => entry.path === err.unrestoredPath) && !tx.journalConflicts.some(entry => entry.path === err.unrestoredPath)) {
+          tx.journalConflicts.push({
+            path: err.unrestoredPath,
+            error: String(err.message || err),
+            ...(err.preservedPath ? { preservedPath: err.preservedPath } : {}),
+          });
+        }
+      };
+      try {
+        writePolicySnapshot(json, beforeProjSnap, JSON.stringify(items, null, 2) + "\n", tx, { createIfMissing: true, defaultMode: 0o600 });
+        writePolicySnapshot(host, beforeHost, hostText, tx, { createIfMissing: true, backup: true });
+        for (const p of plans) {
+          if (!p.before.missing && (p.before.unsafe || !isHubManagedContent(p.before.text))) {
+            if (p.item || args.deletedId === p.id || items.some(i => i.id === p.id)) recordUnmanagedConflict({ file: p.file, skippedUnmanaged: true }, p.id, skippedUnmanaged, conflicts);
+            continue;
+          }
+          if (p.item) {
+            const text = generateClaudeAgentContent(p.item);
+            let res;
+            try {
+              res = writeClaudeAgentFile(dir, p.item, { before: p.before, strictExpected: true, onPublish(meta) {
+                tx.journal.push({ path: p.file, before: p.before, after: text, ...meta });
+              } });
+            } catch (stepErr) {
+              recordUnrestored(stepErr);
+              throw stepErr;
+            }
+            if (res.skippedUnmanaged) {
+              // Match global-role conflict semantics: the writer rescued the
+              // user's inode and released ownership of this optional file.
+              tx.journal = tx.journal.filter(entry => entry.path !== p.file);
+              recordUnmanagedConflict(res, p.id, skippedUnmanaged, conflicts);
+              continue;
+            }
+            if (!res.written) throw new Error("项目代理文件写入失败: " + p.file);
+            const after = policySnapshot(p.file);
+            if (after.missing || after.text !== text) throw new Error("项目代理文件写入后已变更: " + p.file);
+            tx.validations.push({ path: p.file, after: text, dev: after.dev, ino: after.ino });
+            const entry = `.claude/agents/${p.id}.md`;
+            const lines = excludeText.split(/\r?\n/);
+            if (!lines.includes(entry)) { lines.push(entry); excludeText = lines.join("\n").replace(/\n+$/, "") + "\n"; }
+          } else if (!p.before.missing && !enabledIds.has(p.id)) {
+            let res;
+            try {
+              res = removeClaudeAgentFile(dir, p.id, { before: p.before, onPublish() {
+                tx.journal.push({ path: p.file, before: p.before, deleted: true });
+              } });
+            } catch (stepErr) {
+              recordUnrestored(stepErr);
+              throw stepErr;
+            }
+            if (res.skippedUnmanaged) {
+              tx.journal = tx.journal.filter(entry => entry.path !== p.file);
+              recordUnmanagedConflict(res, p.id, skippedUnmanaged, conflicts);
+              continue;
+            }
+            if (!res.removed) throw new Error("项目代理文件删除时已变更: " + p.file);
+            if (args.deletedId === p.id || items.some(i => i.id === p.id)) {
+              const entry = `.claude/agents/${p.id}.md`;
+              if (excludeText.includes(entry)) excludeText = excludeText.split(/\r?\n/).filter(l => l !== entry).join("\n").replace(/\n+$/, "") + (excludeText.endsWith("\n") ? "\n" : "");
+            }
+          }
+        }
+        if (exclude) writePolicySnapshot(exclude, beforeExclude, excludeText, tx, { createIfMissing: true });
+        validatePolicyTransaction(tx);
+        return { block, skippedUnmanaged, conflicts };
+      } catch (e) {
+        throw transactionError(e, [...tx.journalConflicts, ...rollbackPolicyWrites(tx.journal)]);
+      }
+    } finally { releaseT3HubLock(lock); }
+  }
+
+  function commitGlobalRoleTransaction(items, beforeSub, args) {
+    // Role and mode transactions touch the same Skills/rules. Serialize their
+    // publication windows; per-file CAS still protects non-Hub editors.
+    const transactionLock = path.join(hubDir, ".orchestration-mode.lock");
+    acquireT3HubLock(transactionLock);
+    try {
+    const block = renderBlock(items, false);
+    const hostPlans = globalRoleTargets(args.extraSyncPaths).map(file => {
+      const before = policySnapshot(file);
+      return { file, before, text: composeRoleBlockText(before.text, block, GLOBAL_START, GLOBAL_END) ?? before.text };
+    });
+    const extraSkillsForTx = args.extraSkillPaths || args.skillPaths || opts.extraSkillPaths || [];
+    const preflightRoleTree = inspectAntigravityProviderTree(extraSkillsForTx);
+    const plannedForTx = planRoutingSkillSync(buildEffective(withReviewTierDefaults(items), []), orchestrationCfgForSkill(),
+      extraSkillsForTx, args.adoptUnmanagedSkillHashes);
+    const enabled = items.filter(i => i.enabled !== false), enabledIds = new Set(enabled.map(i => i.id));
+    const claudePlans = enabled.map(item => {
+      const file = path.join(claudeAgentsRoot, item.id + ".md");
+      return { file, item, before: lenientClaudeSnapshot(file), text: generateClaudeAgentContent(item) };
+    });
+    let files = [];
+    if (safeDirExists(claudeAgentsRoot)) files = fs.readdirSync(claudeAgentsRoot).filter(f => f.endsWith(".md"));
+    const deletionPlans = files.filter(f => !enabledIds.has(f.slice(0, -3))).map(f => {
+      const file = path.join(claudeAgentsRoot, f);
+      return { file, id: f.slice(0, -3), before: lenientClaudeSnapshot(file) };
+    });
+    const tx = { journal: [], journalConflicts: [], backupJournal: [], validations: [] };
+    const skippedUnmanaged = [], conflicts = [];
+    const recordUnrestored = (err) => {
+      if (err?.unrestoredPath && !tx.journal.some(entry => entry.path === err.unrestoredPath) && !tx.journalConflicts.some(entry => entry.path === err.unrestoredPath)) {
+        tx.journalConflicts.push({
+          path: err.unrestoredPath,
+          error: String(err.message || err),
+          ...(err.preservedPath ? { preservedPath: err.preservedPath } : {}),
+        });
+      }
+    };
+    try {
+      writePolicySnapshot(globalPath, beforeSub, JSON.stringify(items, null, 2) + "\n", tx, { createIfMissing: true, defaultMode: 0o600 });
+      for (const p of hostPlans) {
+        // Host documents are bounded blocks: merge concurrent changes to user
+        // prose under the primitive's CAS, without rebasing JSON or Skills.
+        let baseline = p.before, intended = p.text;
+        const hostRes = transformTextFileAtomic(p.file, existing => {
+          const st = lstatSafe(p.file);
+          baseline = { missing: !st, text: existing, ...(st ? { dev: st.dev, ino: st.ino } : {}) };
+          intended = composeRoleBlockText(existing, block, GLOBAL_START, GLOBAL_END) ?? existing;
+          return intended;
+        }, { createIfMissing: true, backup: true, onPublish(meta) {
+          tx.journal.push({ path: p.file, before: baseline, after: intended, ...meta });
+        } });
+        if (!hostRes.changed && !baseline.missing) {
+          tx.validations.push({ path: p.file, after: intended, dev: baseline.dev, ino: baseline.ino });
+        }
+      }
+      for (const p of claudePlans) {
+        let res;
+        try {
+          res = writeClaudeAgentFile(claudeAgentsRoot, p.item, { before: p.before, onPublish(meta) {
+            tx.journal.push({ path: p.file, before: p.before, after: p.text, ...meta });
+          } });
+        } catch (stepErr) {
+          recordUnrestored(stepErr);
+          throw stepErr;
+        }
+        if (res.skippedUnmanaged) {
+          // Claude files retain their established conflict/skip contract. The
+          // writer has already rescued an edited inode; it is no longer owned
+          // by this transaction and must never be rolled back over user edits.
+          tx.journal = tx.journal.filter(entry => entry.path !== p.file);
+        }
+        recordUnmanagedConflict(res, p.item.id, skippedUnmanaged, conflicts);
+      }
+      for (const p of deletionPlans) {
+        if (p.before.missing) continue;
+        if (p.before.unsafe) {
+          if (isHubManagedAgentFile(p.file)) recordUnmanagedConflict({ file: p.file, skippedUnmanaged: true }, p.id, skippedUnmanaged, conflicts);
+          continue;
+        }
+        if (!isHubManagedContent(p.before.text)) continue;
+        const current = lenientClaudeSnapshot(p.file);
+        if (current.unsafe || current.dev !== p.before.dev || current.ino !== p.before.ino || current.text !== p.before.text) {
+          recordUnmanagedConflict({ file: p.file, skippedUnmanaged: true }, p.id, skippedUnmanaged, conflicts);
+          continue;
+        }
+        let res;
+        try {
+          res = removeClaudeAgentFile(claudeAgentsRoot, p.id, {
+            onPublish() {
+              tx.journal.push({ path: p.file, before: p.before, deleted: true });
+            },
+          });
+        } catch (stepErr) {
+          recordUnrestored(stepErr);
+          throw stepErr;
+        }
+        if (res.skippedUnmanaged) {
+          tx.journal = tx.journal.filter(entry => entry.path !== p.file);
+        }
+        recordUnmanagedConflict(res, p.id, skippedUnmanaged, conflicts);
+      }
+      const skillSync = syncRoutingSkillTargets({ ...tx, _skillPlanned: plannedForTx });
+      if (!skillSync.ok) throw new Error("路由 Skill 同步失败: " + skillSync.errors.map(x => x.path + ": " + x.error).join("; "));
+      // Validate the candidate as a whole, including changes made during later
+      // file writes. A saved JSON alone is never proof of a committed route.
+      for (const entry of [...tx.journal, ...tx.validations]) {
+        const current = policySnapshot(entry.path);
+        if (entry.deleted ? !current.missing : current.missing || current.dev !== entry.dev || current.ino !== entry.ino || current.text !== entry.after) throw new Error("事务文件已被其他操作修改: " + entry.path);
+      }
+      const postRoleTree = inspectAntigravityProviderTree(extraSkillsForTx);
+      assertPostAntigravityTreeUnchanged(preflightRoleTree, postRoleTree, tx);
+      return { block, skippedUnmanaged, conflicts, skillSync };
+    } catch (e) {
+      const failures = [...tx.journalConflicts, ...rollbackPolicyWrites(tx.journal), ...cleanupCreatedBackups(tx.backupJournal)];
+      throw transactionError(e, failures);
+    }
+    } finally { releaseT3HubLock(transactionLock); }
+  }
+
   function saveSubagent(args = {}) {
-    const scope = args.scope || "global";
-    const projectRoot = args.projectRoot || null;
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("invalid arguments");
+    const hasArgsScope = Object.prototype.hasOwnProperty.call(args, "scope") && args.scope !== undefined;
+    if (hasArgsScope && args.scope !== "global" && args.scope !== "project") throw new Error("invalid scope: " + String(args.scope));
+    if (Object.prototype.hasOwnProperty.call(args, "item") && args.item !== undefined && (!args.item || typeof args.item !== "object" || Array.isArray(args.item))) {
+      throw new Error("invalid item");
+    }
+    const hasItemScope = Boolean(args.item && Object.prototype.hasOwnProperty.call(args.item, "scope") && args.item.scope !== undefined);
+    if (hasItemScope && args.item.scope !== "global" && args.item.scope !== "project") throw new Error("invalid scope: " + String(args.item.scope));
+    if (hasArgsScope && hasItemScope && args.scope !== args.item.scope) throw new Error("conflicting scope");
+    const hasArgsProj = Object.prototype.hasOwnProperty.call(args, "projectRoot") && args.projectRoot !== undefined;
+    const hasItemProj = Boolean(args.item && Object.prototype.hasOwnProperty.call(args.item, "projectRoot") && args.item.projectRoot !== undefined);
+    if (hasArgsProj && hasItemProj && args.projectRoot !== args.item.projectRoot) throw new Error("conflicting projectRoot");
+    const rawProjectRoot = hasArgsProj ? args.projectRoot : (hasItemProj ? args.item.projectRoot : null);
+    const scope = hasArgsScope ? args.scope : (hasItemScope ? args.item.scope : (rawProjectRoot !== null ? "project" : "global"));
     if (!["global", "project"].includes(scope)) throw new Error("invalid scope: " + scope);
-    if (scope === "project" && (!projectRoot || !path.isAbsolute(String(projectRoot)))) throw new Error("projectRoot required for project scope");
+    if (scope === "project" && (!rawProjectRoot || typeof rawProjectRoot !== "string" || !path.isAbsolute(rawProjectRoot))) throw new Error("projectRoot required for project scope");
+    const projectRoot = scope === "project" ? resolveCanonicalProjectRoot(rawProjectRoot) : null;
     preflightRoleTargets(scope, projectRoot, args.extraSyncPaths);
+    const beforeGlobal = scope === "global" ? policySnapshot(globalPath) : null;
+    const beforeProjSnap = scope === "project" ? policySnapshot(projectPathFor(projectRoot)) : null;
+    const projectItemsForSave = beforeProjSnap ? readProject(projectRoot, beforeProjSnap) : null;
+    const globalItemsForSave = beforeGlobal ? readGlobal(beforeGlobal, false) : null;
     const input = args.item || args;
-    const previous = (scope === "project" && projectRoot ? readProject(projectRoot) : readGlobal()).find(i => i.id === (input.id || input.name));
+    const previous = (scope === "project" ? projectItemsForSave : globalItemsForSave).find(i => i.id === (input.id || input.name));
     const item = { ...previous, ...input };
     const catalog = listModelCatalog(homeDir);
     // Support being called as saveSubagent({scope, projectRoot, item}) or flat.
@@ -2049,32 +3299,32 @@ function createSubagentsManager(opts = {}) {
     let renderedMarkdownBlock;
     let syncSkippedUnmanaged = [];
     let syncConflicts = [];
+    let skillSync = null;
     if (scope === "global") {
-      let items = readGlobal();
+      let items = globalItemsForSave;
       const idx = items.findIndex((x) => x.id === normalized.id);
-      // Preserve builtin flag correctly: if id is a default builtin and caller didn't set builtin, mark builtin true.
       const isDefaultId = [...DEFAULT_SUBAGENTS, ...REVIEW_TIER_DEFAULTS].some((d) => d.id === normalized.id);
       if (isDefaultId && !normalized.builtin) {
-        // Keep builtin true if it was builtin before or is a default.
         const prev = items[idx];
         if (prev) normalized.builtin = Boolean(prev.builtin);
         else normalized.builtin = true;
       }
       if (idx >= 0) {
-        // Merge, preserving builtin if was builtin.
         if (items[idx].builtin) normalized.builtin = true;
         items[idx] = { ...items[idx], ...normalized, id: normalized.id, name: normalized.name };
       } else {
         if (isDefaultId) normalized.builtin = true;
         items.push(normalized);
       }
-      writeGlobal(items);
-      const syncRes = injectGlobal(items, args.extraSyncPaths);
-      if (typeof syncRes === "string") { renderedMarkdownBlock = syncRes; } else { renderedMarkdownBlock = syncRes.block; syncSkippedUnmanaged = syncRes.skippedUnmanaged || []; syncConflicts = syncRes.conflicts || []; }
+      const syncRes = commitGlobalRoleTransaction(items, beforeGlobal, args);
+      renderedMarkdownBlock = syncRes.block;
+      syncSkippedUnmanaged = syncRes.skippedUnmanaged;
+      syncConflicts = syncRes.conflicts;
+      skillSync = syncRes.skillSync;
       saved = items.find((x) => x.id === normalized.id);
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
-      let items = readProject(projectRoot);
+      let items = projectItemsForSave;
       const idx = items.findIndex((x) => x.id === normalized.id);
       // If overridesGlobal, ensure global exists with that id? Allow anyway but mark override.
       if (idx >= 0) {
@@ -2082,66 +3332,64 @@ function createSubagentsManager(opts = {}) {
       } else {
         items.push(normalized);
       }
-      writeProject(projectRoot, items);
-      const globalItems = readGlobal();
-      const syncRes = injectProject(projectRoot, items, globalItems);
+      const syncRes = commitProjectRoleTransaction(projectRoot, items, beforeProjSnap);
       if (typeof syncRes === "string") { renderedMarkdownBlock = syncRes; } else { renderedMarkdownBlock = syncRes.block; syncSkippedUnmanaged = syncRes.skippedUnmanaged || []; syncConflicts = syncRes.conflicts || []; }
       saved = items.find((x) => x.id === normalized.id);
     } else {
       throw new Error("invalid scope: " + scope);
     }
     // Also ensure global block is re-injected when project changes? No.
-    return { ok: true, scope, projectRoot: scope === "project" ? projectRoot : null, item: saved, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
+    return { ok: true, scope, projectRoot: scope === "project" ? projectRoot : null, item: saved, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts, skillSync };
   }
 
   function deleteSubagent(args = {}) {
-    const scope = args.scope || "global";
-    const projectRoot = args.projectRoot || null;
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("invalid arguments");
+    const hasArgsScope = Object.prototype.hasOwnProperty.call(args, "scope") && args.scope !== undefined;
+    if (hasArgsScope && args.scope !== "global" && args.scope !== "project") throw new Error("invalid scope: " + String(args.scope));
+    const hasArgsProj = Object.prototype.hasOwnProperty.call(args, "projectRoot") && args.projectRoot !== undefined;
+    const rawProjectRoot = hasArgsProj ? args.projectRoot : null;
+    const scope = hasArgsScope ? args.scope : (rawProjectRoot !== null ? "project" : "global");
     const id = String(args.id || "").trim();
     if (!id) throw new Error("id required");
     assertSafeSubagentId(id);
     if (!["global", "project"].includes(scope)) throw new Error("invalid scope: " + scope);
-    if (scope === "project" && (!projectRoot || !path.isAbsolute(String(projectRoot)))) throw new Error("projectRoot required for project scope");
+    if (scope === "project" && (!rawProjectRoot || typeof rawProjectRoot !== "string" || !path.isAbsolute(rawProjectRoot))) throw new Error("projectRoot required for project scope");
+    const projectRoot = scope === "project" ? resolveCanonicalProjectRoot(rawProjectRoot) : null;
     preflightRoleTargets(scope, projectRoot, args.extraSyncPaths);
     let renderedMarkdownBlock;
     let syncSkippedUnmanaged = [];
     let syncConflicts = [];
+    let skillSync = null;
     function unwrapSync(res) {
-      if (typeof res === "string") { renderedMarkdownBlock = res; } else { renderedMarkdownBlock = res.block; syncSkippedUnmanaged = res.skippedUnmanaged || []; syncConflicts = res.conflicts || []; }
+      if (typeof res === "string") { renderedMarkdownBlock = res; } else { renderedMarkdownBlock = res.block; syncSkippedUnmanaged = res.skippedUnmanaged || []; syncConflicts = res.conflicts || []; skillSync = res.skillSync || null; }
     }
     if (scope === "global") {
-      let items = readGlobal();
+      const beforeGlobal = policySnapshot(globalPath);
+      let items = readGlobal(beforeGlobal, false);
       const idx = items.findIndex((x) => x.id === id);
       if (idx === -1) return { ok: true, scope, id, deleted: false };
       const existing = items[idx];
+      let newItems = null;
+      let isReset = false;
       if (existing.builtin) {
-        // Reset builtin to default seed instead of deleting.
         const def = [...DEFAULT_SUBAGENTS, ...REVIEW_TIER_DEFAULTS].find((d) => d.id === id);
         if (def) {
-          items[idx] = { ...def };
-          writeGlobal(items);
-          unwrapSync(injectGlobal(items, args.extraSyncPaths));
-          return { ok: true, scope, id, deleted: false, reset: true, item: items[idx], renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
+          newItems = items.map((x) => (x.id === id ? { ...def } : x));
+          isReset = true;
         }
       }
-      items = items.filter((x) => x.id !== id);
-      writeGlobal(items);
-      unwrapSync(injectGlobal(items, args.extraSyncPaths));
-      return { ok: true, scope, id, deleted: true, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
+      if (!newItems) newItems = items.filter((x) => x.id !== id);
+      unwrapSync(commitGlobalRoleTransaction(newItems, beforeGlobal, args));
+      if (isReset) return { ok: true, scope, id, deleted: false, reset: true, item: newItems.find((x) => x.id === id), renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts, skillSync };
+      return { ok: true, scope, id, deleted: true, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts, skillSync };
     } else if (scope === "project") {
       if (!projectRoot || !path.isAbsolute(String(projectRoot))) throw new Error("projectRoot required for project scope");
-      let items = readProject(projectRoot);
+      const beforeProjSnap = policySnapshot(projectPathFor(projectRoot));
+      let items = readProject(projectRoot, beforeProjSnap);
       const idx = items.findIndex((x) => x.id === id);
       if (idx === -1) return { ok: true, scope, id, deleted: false, projectRoot };
       items = items.filter((x) => x.id !== id);
-      writeProject(projectRoot, items);
-      // Clean file and exclude (guarded: only managed files removed)
-      const claudeAgentsDir = path.join(projectRoot, ".claude", "agents");
-      const rmRes1 = removeClaudeAgentFile(claudeAgentsDir, id);
-      if (rmRes1 && !rmRes1.skippedUnmanaged) removeExcludeEntry(projectRoot, `.claude/agents/${id}.md`);
-      const globalItems = readGlobal();
-      unwrapSync(injectProject(projectRoot, items, globalItems, { skipRemoveIds: new Set([id]) }));
-      recordUnmanagedConflict(rmRes1, id, syncSkippedUnmanaged, syncConflicts);
+      unwrapSync(commitProjectRoleTransaction(projectRoot, items, beforeProjSnap, { deletedId: id }));
       return { ok: true, scope, id, deleted: true, projectRoot, renderedMarkdownBlock, skippedUnmanaged: syncSkippedUnmanaged, conflicts: syncConflicts };
     }
     throw new Error("invalid scope: " + scope);
@@ -2149,20 +3397,17 @@ function createSubagentsManager(opts = {}) {
 
   // Read on every call and never seed/synchronize configuration from a hook invocation.
   function resolveSubagentRoute({ idOrTitle, role, projectRoot } = {}) {
-    const globals = fileExists(globalPath) ? withReviewTierDefaults(readGlobal()) : [];
+    const globalCfg = readOrchestrationSnapshot().config;
+    const resolvedOrch = resolveProjectOrchestration(projectRoot || null, globalCfg);
+    const orchestration = { swarmMode: resolvedOrch.effectiveSwarmMode, source: resolvedOrch.source || "global" };
+    const globalSnap = policySnapshot(globalPath);
+    const globals = globalSnap.missing ? [] : withReviewTierDefaults(readGlobal(globalSnap, false));
     let projects = [];
     if (projectRoot) {
-      let current = path.resolve(projectRoot);
-      try { current = fs.realpathSync(current); } catch (e) { if (e.code !== "ENOENT") throw e; }
-      // A tool may run below the project root. The closest project config wins.
-      while (true) {
-        const file = projectPathFor(current);
-        if (fileExists(file)) { projects = readProject(current); break; }
-        if (fileExists(path.join(current, ".git")) || dirExists(path.join(current, ".git"))) break;
-        const parent = path.dirname(current);
-        if (parent === current) break;
-        current = parent;
-      }
+      const canonical = resolveCanonicalProjectRoot(projectRoot);
+      const file = rawProjectRolePathFor(canonical);
+      const snap = policySnapshot(file);
+      if (!snap.missing) projects = readProject(canonical, snap);
     }
     const items = buildEffective(globals, projects).map(normalizeMemory);
     const hints = (Array.isArray(idOrTitle) ? idOrTitle : [idOrTitle]).filter(x => typeof x === "string" && x.trim()).map(x => x.trim().toLowerCase());
@@ -2185,7 +3430,7 @@ function createSubagentsManager(opts = {}) {
         const id = String(value || "").toLowerCase();
         return id && (hint === id || hint.startsWith(id) && /^(?:\s*[·:：|/]|\s+-\s)/.test(hint.slice(id.length)));
       })));
-      if (explicitUnavailable) return { ok: true, matched: false, explicitUnavailable: true, item: null, target: null };
+      if (explicitUnavailable) return { ok: true, matched: false, explicitUnavailable: true, item: null, target: null, orchestration };
     }
     const roleDefault = { research: "explorer", implementation: "worker", general: "default", design: "frontend", test: "qa", review: "code-review" };
     if (!item && roleDefault[role] && (!hints.length || hints.length === 1 && hints[0] === String(role).toLowerCase())) item = items.find(i => i.id === roleDefault[role]);
@@ -2194,16 +3439,21 @@ function createSubagentsManager(opts = {}) {
       item = items.find(i => i.id === role || i.name === role);
       if (!item) { const matches = items.filter(i => i.role === role); if (matches.length === 1) item = matches[0]; }
     }
-    if (!item || !item.providerInstanceId || !item.model || !item.effort) return { ok: true, matched: false, item: null, target: null };
-    return { ok: true, matched: true, item, instruction: subagentInstruction(item), target: { providerInstanceId: item.providerInstanceId, model: item.model, options: optionsForSubagent(item) } };
+    if (!item || !item.providerInstanceId || !item.model || !item.effort) return { ok: true, matched: false, item: null, target: null, orchestration };
+    return { ok: true, matched: true, item, instruction: subagentInstruction(item), target: { providerInstanceId: item.providerInstanceId, model: item.model, options: optionsForSubagent(item) }, orchestration };
   }
 
-  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, listSubagents, saveSubagent, deleteSubagent, getOrchestrationConfig, getOrchestrationState, inspectOrchestrationTargets, updateOrchestrationConfig, syncOrchestrationDirectiveToHosts, syncManagedRuleBlock, replaceRuleDocument, transformRuleDocument, buildOrchestrationDirective, buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode), listModelCatalog: () => listModelCatalog(homeDir) };
+  return { homeDir, hubDir, globalPath, projectDir, resolveSubagentRoute, renderMarkdownBlock: renderBlock, renderRoutingSkillMarkdown, syncRoutingSkillTargets, buildHostCapabilities, listSubagents, saveSubagent, deleteSubagent, getOrchestrationConfig, getOrchestrationState, inspectOrchestrationTargets, updateOrchestrationConfig, syncOrchestrationDirectiveToHosts, syncOrchestrationDirectiveToHostsRaw: (args = {}) => syncOrchestrationDirectiveToHostsRaw(args), syncManagedRuleBlock, replaceRuleDocument, transformRuleDocument, buildOrchestrationDirective, buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode), listModelCatalog: () => listModelCatalog(homeDir) };
 }
 
 let _singleton = null;
+let _singletonKey = null;
 function getDefaultSubagentsManager() {
-  if (!_singleton) _singleton = createSubagentsManager();
+  const key = (process.env.HOME || os.homedir()) + "\0" + (process.env.T3_HUB_DIR || "") + "\0" + (process.env.T3CODE_HOME || "");
+  if (!_singleton || _singletonKey !== key) {
+    _singleton = createSubagentsManager();
+    _singletonKey = key;
+  }
   return _singleton;
 }
 function listSubagents(a) { return getDefaultSubagentsManager().listSubagents(a || {}); }
@@ -2230,6 +3480,10 @@ module.exports = {
   syncOrchestrationDirectiveToHosts: syncOrchestrationDirectiveToHostsExport,
   buildSlashCommandPrompt: (mode) => buildSlashCommandPrompt(mode),
   buildOrchestrationDirective: (cfg) => buildOrchestrationDirective(cfg),
+  renderRoutingSkillMarkdown,
+  isHubManagedSkillContent,
+  buildHostCapabilities,
+  SUBAGENT_STOP_HEADER,
   AGY_MODELS,
   ORCHESTRATOR_START,
   ORCHESTRATOR_END,

@@ -223,7 +223,7 @@
   }
 
   function toEpochMs(v) {
-    if (!v) return null;
+    if (v == null || v === "") return null;
     if (typeof v === "number") return v;
     if (typeof v === "object" && typeof v.epochMilliseconds === "number") return v.epochMilliseconds;
     if (typeof v === "string") {
@@ -252,19 +252,110 @@
 
   function buildProjectionPayload(p, stEnvId, uhProps) {
     const ctxList = Array.isArray(p.providerThreads) ? p.providerThreads : [];
-    const activeDriver = String(p.thread?.providerInstanceId || "");
+    const activeDriver = String(
+      p.thread?.modelSelection?.provider ||
+      p.thread?.modelSelection?.instanceId ||
+      p.thread?.providerInstanceId ||
+      ""
+    );
     let lastUsage = null;
     let driverUsage = null;
     for (const pt of ctxList) {
       if (!pt || !pt.contextUsage) continue;
-      lastUsage = pt.contextUsage;
       const drv = String(pt.driver || pt.providerThreadRef?.driver || pt.provider || "");
-      if (activeDriver && drv === activeDriver) driverUsage = pt.contextUsage;
+      if (!drv) lastUsage = pt.contextUsage;
+      if (activeDriver) {
+        if (drv === activeDriver) driverUsage = pt.contextUsage;
+      } else {
+        lastUsage = pt.contextUsage;
+      }
     }
-    const contextUsage = driverUsage ?? lastUsage;
+    const contextUsage = activeDriver ? driverUsage : lastUsage;
+    const isRunningStatus = (st) => st === "running" || st === "starting" || st === "in_progress";
+    const isActiveTurnStatus = (st) => st === "running" || st === "pending" || st === "starting" || st === "in_progress";
+    const sessionDriverOf = (s) => String(s?.driver || s?.provider || s?.providerInstanceId || "").trim();
+    const linkedSessionDriverOf = (pt) => {
+      const sid = pt?.providerSessionId ?? pt?.sessionId ?? null;
+      if (sid == null || String(sid) === "") return "";
+      const sess = (p.providerSessions || []).find((s) => String(s?.id ?? s?.providerSessionId ?? "") === String(sid));
+      return sess ? sessionDriverOf(sess) : "";
+    };
+    const turnDriverOf = (pt) => String(pt?.nativeTurnRef?.driver || pt?.driver || pt?.provider || linkedSessionDriverOf(pt) || "").trim();
+    const itemDriverOf = (it) => {
+      const drivers = new Set();
+      const add = (v) => { if (v != null && String(v).trim() !== "") drivers.add(String(v).trim()); };
+      add(it?.nativeTurnRef?.driver);
+      add(it?.nativeItemRef?.driver);
+      add(it?.payload?.nativeTurnRef?.driver);
+      add(it?.payload?.nativeItemRef?.driver);
+      add(it?.driver);
+      add(it?.provider);
+      add(it?.payload?.driver);
+      add(it?.payload?.provider);
+      if (drivers.size === 0) return "";
+      if (drivers.size > 1) return "__conflicting_driver__";
+      return [...drivers][0];
+    };
+    const recordStampMs = (rec) => {
+      for (const v of [rec?.updatedAt, rec?.completedAt, rec?.completedMs, rec?.startedAt, rec?.startedMs, rec?.createdAt]) {
+        const ms = toEpochMs(v);
+        if (ms != null) return ms;
+      }
+      return null;
+    };
+    const pickLatestRecord = (list, filterFn) => {
+      let best = null;
+      let bestMs = null;
+      for (const item of list || []) {
+        if (!item || (filterFn && !filterFn(item))) continue;
+        const ms = recordStampMs(item);
+        if (!best || (ms != null && (bestMs == null || ms >= bestMs)) || (ms == null && bestMs == null)) {
+          best = item;
+          if (ms != null) bestMs = ms;
+        }
+      }
+      return best;
+    };
+    const latestDriverSession = activeDriver
+      ? pickLatestRecord(p.providerSessions, (s) => sessionDriverOf(s) === activeDriver)
+      : pickLatestRecord(p.providerSessions, Boolean);
+    const latestDriverTurn = activeDriver
+      ? pickLatestRecord(p.providerTurns, (pt) => turnDriverOf(pt) === activeDriver)
+      : pickLatestRecord(p.providerTurns, Boolean);
+    const latestSessionRunning = (() => {
+      if (!latestDriverSession || !isRunningStatus(String(latestDriverSession.status || ""))) return false;
+      if (latestDriverTurn && !isActiveTurnStatus(String(latestDriverTurn.status || ""))) {
+        const sMs = recordStampMs(latestDriverSession);
+        const tDoneMs = toEpochMs(latestDriverTurn.completedAt ?? latestDriverTurn.completedMs) ?? recordStampMs(latestDriverTurn);
+        if (sMs != null && tDoneMs != null && tDoneMs >= sMs) return false;
+      }
+      return true;
+    })();
+    const hasActiveDriverTurn = Boolean(activeDriver) && Boolean(
+      latestDriverTurn && isActiveTurnStatus(String(latestDriverTurn.status || ""))
+    );
+    const hasActiveDriverWork = Boolean(activeDriver) && (latestSessionRunning || hasActiveDriverTurn);
+    const resolveRunDriver = (run) => {
+      let rDrv = String(run?.driver || run?.provider || run?.providerInstanceId || run?.nativeTurnRef?.driver || "").trim();
+      if (!rDrv) {
+        const rTurnId = run?.providerTurnId ?? run?.turnId ?? run?.id ?? null;
+        if (rTurnId != null && String(rTurnId) !== "") {
+          const linked = (p.providerTurns || []).find((pt) => String(pt?.id ?? pt?.providerTurnId ?? "") === String(rTurnId));
+          if (linked) rDrv = turnDriverOf(linked);
+        }
+      }
+      return rDrv;
+    };
+    const latestRelevantRun = activeDriver
+      ? pickLatestRecord(p.runs, (r) => {
+          const d = resolveRunDriver(r);
+          return d ? d === activeDriver : hasActiveDriverWork;
+        })
+      : pickLatestRecord(p.runs, Boolean);
+    const latestRunRunning = Boolean(latestRelevantRun && isRunningStatus(String(latestRelevantRun.status || "")));
     // Everything that is not conversational content counts as tool wait
     // (file_search / web_search / mcp / dynamic tools included).
-    const CONTENT_EXCLUDE = new Set(["root_turn", "assistant_message", "user_message", "checkpoint", "notification"]);
+    const CONTENT_EXCLUDE = new Set(["root_turn", "assistant_message", "reasoning", "user_message", "checkpoint", "notification"]);
     const matchTid = (a, b) => {
       if (!a || !b) return false;
       if (a === b) return true;
@@ -299,19 +390,52 @@
       }
       return Math.round(cjk * 0.88 + ascii * 0.33 + other * 0.75);
     };
+    const sampledAtMs = Number.isFinite(p?.sampledAtMs) ? p.sampledAtMs : Date.now();
+    const threadRunning = latestRunRunning || latestSessionRunning || hasActiveDriverTurn;
+    const toolObservedEnd = (it, turn) => {
+      const completedMs = itemCompletedMs(it);
+      if (completedMs != null) return completedMs;
+      const status = String(it.status || "").toLowerCase();
+      if (status && !["running", "pending", "in_progress", "starting"].includes(status)) return null;
+      if (turn && (toEpochMs(turn.completedAt ?? turn.completedMs) != null ||
+        ["completed", "cancelled", "canceled", "failed", "error", "interrupted"].includes(turn.status))) return null;
+      const running = turn ? ["running", "pending", "starting", "in_progress"].includes(turn.status) || threadRunning : threadRunning;
+      const s = itemStartedMs(it);
+      if (!running || s == null) return null;
+      const updated = toEpochMs(it.updatedAt);
+      const obsMs = updated != null && updated > s ? Math.max(sampledAtMs, updated) : sampledAtMs;
+      return obsMs > s && obsMs - s < 600000 ? obsMs : null;
+    };
+    const rawItems = (Array.isArray(p.turnItems) && p.turnItems) || (Array.isArray(p.items) && p.items) || null;
     const toolIntervals = [];
-    for (const n of p.nodes || []) {
+    for (const n of rawItems || p.nodes || []) {
       if (!n) continue;
+      if (n.threadId != null && !matchTid(String(n.threadId), String(p.thread?.id || ""))) continue;
+      const nTurnId = itemTurnId(n);
+      if (nTurnId == null || String(nTurnId) === "") continue;
+      const itemDriver = itemDriverOf(n);
+      if (itemDriver === "__conflicting_driver__") continue;
+      if (itemDriver && activeDriver && itemDriver !== activeDriver) continue;
       if (!CONTENT_EXCLUDE.has(itemKind(n))) {
+        const owner = (p.providerTurns || []).find(pt => String(pt?.id ?? pt?.providerTurnId ?? "") === String(nTurnId));
+        if (!owner) continue;
+        const ownerDriver = turnDriverOf(owner);
+        if (ownerDriver && activeDriver && ownerDriver !== activeDriver) continue;
+        if (!ownerDriver && activeDriver && p.thread?.modelSelection?.provider) continue;
+        if (itemDriver && ownerDriver && itemDriver !== ownerDriver) continue;
         const s = itemStartedMs(n);
-        const e = itemCompletedMs(n);
-        if (s != null && e != null && e > s) toolIntervals.push([s, e]);
+        const e = toolObservedEnd(n, owner);
+        const ownerId = String(owner?.id ?? owner?.providerTurnId ?? nTurnId);
+        if (s != null && e != null && e > s) toolIntervals.push([s, e, ownerId, ownerDriver || itemDriver || null]);
       }
     }
-    const rawItems = (Array.isArray(p.turnItems) && p.turnItems) || (Array.isArray(p.items) && p.items) || null;
     const turns = (p.providerTurns || []).map((pt) => {
       const ptId = pt?.id ?? pt?.providerTurnId ?? null;
       const turnId = ptId == null ? null : String(ptId);
+      const startedMs = toEpochMs(pt?.startedAt ?? pt?.startedMs);
+      const resolvedTurnDriver = turnDriverOf(pt);
+      const driver = resolvedTurnDriver || (!p.thread?.modelSelection?.provider && !p.thread?.modelSelection?.instanceId ? (activeDriver || null) : null);
+      const effectiveItemGuardDriver = driver || activeDriver || null;
       // Pure streaming decode window: final assistant_message span after last tool end.
       let streamDecode = null;
       if (turnId) {
@@ -326,6 +450,9 @@
           if (pTid && it.threadId != null && !matchTid(String(it.threadId), pTid)) continue;
           const itTurnId = itemTurnId(it);
           if (itTurnId == null || String(itTurnId) !== turnId) continue;
+          const itDriver = itemDriverOf(it);
+          if (itDriver === "__conflicting_driver__") continue;
+          if (itDriver && effectiveItemGuardDriver && itDriver !== effectiveItemGuardDriver) continue;
           const k = itemKind(it);
           if (k === "assistant_message") {
             asstCount++;
@@ -334,7 +461,7 @@
             if (s != null && e != null) assts.push({ s, e, it });
           } else if (!CONTENT_EXCLUDE.has(k)) {
             toolsInTurn++;
-            const e = itemCompletedMs(it);
+            const e = toolObservedEnd(it, pt);
             if (e != null && e > lastToolEndMs) lastToolEndMs = e;
           }
         }
@@ -358,6 +485,9 @@
                   if (pTid && it.threadId != null && !matchTid(String(it.threadId), pTid)) continue;
                   const itTurnId = itemTurnId(it);
                   if (itTurnId == null || String(itTurnId) !== turnId) continue;
+                  const itDriver = itemDriverOf(it);
+                  if (itDriver === "__conflicting_driver__") continue;
+                  if (itDriver && effectiveItemGuardDriver && itDriver !== effectiveItemGuardDriver) continue;
                   if (!CONTENT_EXCLUDE.has(itemKind(it)) && itemKind(it) !== "assistant_message") {
                     toolArgWeight += weightTextTokens(it.input || it.pattern || it.arguments || "") + 18;
                   }
@@ -372,11 +502,58 @@
           }
         }
       }
+      let lastItemMs = null;
+      let itemOutput = 0;
+      const waits = [];
+      for (const it of rawItems || p.nodes || []) {
+        if (!it || !turnId || String(itemTurnId(it) ?? "") !== turnId) continue;
+        if (it.threadId != null && !matchTid(String(it.threadId), String(p.thread?.id || ""))) continue;
+        const itemDriver = itemDriverOf(it);
+        if (itemDriver === "__conflicting_driver__") continue;
+        if (itemDriver && effectiveItemGuardDriver && itemDriver !== effectiveItemGuardDriver) continue;
+        const itemStart = itemStartedMs(it);
+        if (startedMs != null && itemStart != null && itemStart < startedMs) continue;
+        const stamps = [itemCompletedMs(it), toEpochMs(it.updatedAt), itemStart].filter(Number.isFinite);
+        const explicit = Number(it.outputTokens ?? it.usage?.outputTokens ?? it.tokenCount);
+        const contentOutput = explicit > 0 ? explicit : weightTextTokens(it.text || it.content || it.delta || "") || Math.max(0, Number(it.charCount) || 0) * 0.28;
+        if (toEpochMs(pt?.completedAt ?? pt?.completedMs) == null && itemCompletedMs(it) == null &&
+          (contentOutput > 0 || ["running", "in_progress", "starting"].includes(it.status) || itemStart != null)) {
+          const observed = toEpochMs(it.updatedAt) ?? sampledAtMs;
+          if (itemStart == null || observed >= itemStart) stamps.push(observed);
+        }
+        if (stamps.length) lastItemMs = Math.max(lastItemMs ?? -Infinity, ...stamps);
+        if (itemKind(it) === "assistant_message" || itemKind(it) === "reasoning") {
+          itemOutput += contentOutput;
+        } else if (!CONTENT_EXCLUDE.has(itemKind(it))) {
+          const end = toolObservedEnd(it, pt);
+          if (itemStart != null && end != null && end > itemStart) waits.push([itemStart, end]);
+        }
+      }
+      let itemEstimateTps = null;
+      const output = Number(pt?.turnTokenUsage?.outputTokens) > 0 ? Number(pt.turnTokenUsage.outputTokens) : itemOutput;
+      if (Number.isFinite(startedMs) && lastItemMs > startedMs + 50 && output > 0) {
+        let cursor = startedMs;
+        let waitMs = 0;
+        for (const [start, end] of waits.sort((a, b) => a[0] - b[0])) {
+          const left = Math.max(startedMs, cursor, start);
+          const right = Math.min(lastItemMs, end);
+          if (right > left) waitMs += right - left;
+          cursor = Math.max(cursor, right);
+        }
+        const netSec = (lastItemMs - startedMs - waitMs) / 1000;
+        const rate = output / netSec;
+        if (netSec > 0.05 && Number.isFinite(rate) && rate > 0 && rate <= 1500) itemEstimateTps = Math.round(rate * 10) / 10;
+      }
       return {
         id: turnId,
+        providerTurnId: pt?.providerTurnId != null && String(pt.providerTurnId) !== "" ? String(pt.providerTurnId) : null,
+        nativeTurnId: pt?.nativeTurnRef?.nativeId != null && String(pt.nativeTurnRef.nativeId) !== "" ? String(pt.nativeTurnRef.nativeId) : null,
         status: pt?.status || null,
-        driver: pt?.nativeTurnRef?.driver || null,
-        startedMs: toEpochMs(pt?.startedAt),
+        driver,
+        startedMs,
+        lastItemMs,
+        itemEstimateTps,
+        itemOutputTokens: itemOutput,
         completedMs: toEpochMs(pt?.completedAt),
         usage: pt?.turnTokenUsage || null,
         streamDecode,
@@ -385,6 +562,7 @@
     const tid = String(p.thread?.id || "");
     const uhMatches = uhProps && (!tid || !uhProps.threadId || String(uhProps.threadId) === tid);
     return {
+      sampledAtMs,
       environmentId: String(stEnvId || (uhMatches ? uhProps.environmentId : "") || ""),
       threadId: tid || (uhMatches ? String(uhProps.threadId || "") : ""),
       title: String(p.thread?.title || ""),
@@ -393,9 +571,7 @@
       branch: p.thread?.branch || null,
       repoPath: (uhMatches && uhProps.gitCwd) || p.thread?.worktreePath || null,
       isServerThread: uhMatches ? Boolean(uhProps.isServerThread) : true,
-      isRunning:
-        (p.runs || []).some((run) => run && (run.status === "running" || run.status === "starting")) ||
-        (p.providerSessions || []).some((s) => s && s.status === "running"),
+      isRunning: threadRunning,
       subagentCount: Array.isArray(p.subagents) ? p.subagents.length : 0,
       contextUsage,
       toolIntervals,
@@ -553,21 +729,38 @@
     const payload = remotePayload && typeof remotePayload === "object" ? remotePayload : null;
     if (!payload) return { ok: false, error: "Invalid remote payload" };
     const turns = Array.isArray(payload.turns) ? payload.turns : [];
-    const intervals = (Array.isArray(payload.toolIntervals) ? payload.toolIntervals : [])
-      .filter((iv) => Array.isArray(iv) && Number.isFinite(iv[0]) && Number.isFinite(iv[1]) && iv[1] > iv[0])
-      .map(([s, e]) => [s, e])
-      .sort((a, b) => a[0] - b[0]);
-    const merged = [];
-    for (const [s, e] of intervals) {
-      const last = merged[merged.length - 1];
-      if (last && s <= last[1]) {
-        if (e > last[1]) last[1] = e;
-      } else {
-        merged.push([s, e]);
-      }
-    }
-    const subtractWait = (startMs, endMs) => {
+    const rawToolIntervals = Array.isArray(payload.toolIntervals) ? payload.toolIntervals : [];
+    const isLegacySingleFixture = payload.sampledAtMs == null && turns.length === 1 && turns[0] && typeof turns[0] === "object"
+      && !("id" in turns[0]) && !("providerTurnId" in turns[0]) && !("nativeTurnId" in turns[0]);
+    const subtractWait = (startMs, endMs, turnId, turnDriver) => {
       if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+      const hasTid = turnId != null && String(turnId) !== "";
+      const allowLegacySingle = !hasTid && isLegacySingleFixture && turnDriver && turnDriver !== "unknown" && (!payload.provider || String(turnDriver) === String(payload.provider));
+      if (!hasTid && !allowLegacySingle) return Math.max(0, endMs - startMs) / 1000;
+      const intervals = [];
+      for (const iv of rawToolIntervals) {
+        if (!Array.isArray(iv) || !Number.isFinite(iv[0]) || !Number.isFinite(iv[1]) || iv[1] <= iv[0]) continue;
+        if (hasTid) {
+          if (iv.length < 3 || iv[2] == null || String(iv[2]) === "") continue;
+          if (String(iv[2]) !== String(turnId)) continue;
+          if (iv.length >= 4 && iv[3] != null && String(iv[3]) !== "") {
+            if (turnDriver && turnDriver !== "unknown" && String(iv[3]) !== String(turnDriver)) continue;
+          }
+        } else if (iv.length !== 2) {
+          continue;
+        }
+        intervals.push([iv[0], iv[1]]);
+      }
+      intervals.sort((a, b) => a[0] - b[0]);
+      const merged = [];
+      for (const [s, e] of intervals) {
+        const last = merged[merged.length - 1];
+        if (last && s <= last[1]) {
+          if (e > last[1]) last[1] = e;
+        } else {
+          merged.push([s, e]);
+        }
+      }
       let waitMs = 0;
       for (const [s, e] of merged) {
         const os = Math.max(startMs, s);
@@ -600,6 +793,12 @@
     let lastTurnModel = null;
     const byModel = {};
     const decodeByModel = {};
+    const resolveLocalTurnDriver = (t) => {
+      if (t && Object.prototype.hasOwnProperty.call(t, "driver")) {
+        return t.driver ? String(t.driver) : "unknown";
+      }
+      return payload.provider || "unknown";
+    };
     for (const t of turns) {
       const u = t?.usage;
       turnCacheRate = null;
@@ -607,7 +806,7 @@
       lastTurnNetSec = null;
       lastTurnDecodeTps = null;
       lastStreamSec = null;
-      lastTurnDriver = t?.driver || payload.provider || "unknown";
+      lastTurnDriver = resolveLocalTurnDriver(t);
       lastTurnModel = u?.models?.[0] || t?.model || payload.model || null;
       if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") {
         continue;
@@ -616,7 +815,7 @@
       lastTurnNetSec = null;
       lastTurnDecodeTps = null;
       lastStreamSec = null;
-      const driver = t.driver || payload.provider || "unknown";
+      const driver = resolveLocalTurnDriver(t);
       let inp = Math.max(0, u.inputTokens || 0);
       const cr = Math.max(0, u.cachedInputTokens || 0);
       const cw = Math.max(0, u.cacheCreationTokens || 0);
@@ -659,7 +858,7 @@
         }
       }
       if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
-        const netSec = subtractWait(t.startedMs, t.completedMs);
+        const netSec = subtractWait(t.startedMs, t.completedMs, t.id ?? t.providerTurnId ?? null, driver);
         if (netSec > 0.05) {
           netOutSum += out;
           netSecSum += netSec;
@@ -680,18 +879,21 @@
     let totalSavedUsd = sumSavedUsd;
     let estimated = false;
     const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
-    const effDriver = lastTurnDriver || payload.provider || "unknown";
-    const effModel = lastTurnModel || payload.model || null;
-    let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
+    const providerSwitched = Boolean(payload.provider && lastTurnDriver && payload.provider !== lastTurnDriver);
+    const effDriver = providerSwitched ? payload.provider : (lastTurnDriver || payload.provider || "unknown");
+    const effModel = providerSwitched ? (payload.model || null) : (lastTurnModel || payload.model || null);
+    const effectiveLastPrompt = providerSwitched ? null : lastPromptTotal;
+    const effectiveTurnCacheRate = providerSwitched ? null : turnCacheRate;
+    let contextUsed = payload.contextUsage?.usedTokens ?? effectiveLastPrompt;
     if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
-      const agyCacheRatio = turnCacheRate ?? sessionCacheRate ?? 0;
+      const agyCacheRatio = effectiveTurnCacheRate ?? sessionCacheRate ?? 0;
       const deduped =
         agyCacheRatio > 0.01
           ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
           : payload.contextUsage.usedTokens;
       contextUsed = deduped;
-      if (!payload.isRunning && lastPromptTotal != null && deduped > lastPromptTotal * 2.5) {
-        contextUsed = lastPromptTotal;
+      if (!payload.isRunning && effectiveLastPrompt != null && deduped > effectiveLastPrompt * 2.5) {
+        contextUsed = effectiveLastPrompt;
       }
     }
     let contextMax = Number.isFinite(payload.contextUsage?.maxTokens) && payload.contextUsage.maxTokens > 0
@@ -723,8 +925,49 @@
         .filter(([, v]) => v.sec > 0.1)
         .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
     );
-    const lastDecodeTps = lastTurnDecodeTps ?? lastTurnTps;
-    const lastDurationSec = lastStreamSec ?? lastTurnNetSec;
+    const lastDecodeTps = providerSwitched ? null : (lastTurnDecodeTps ?? lastTurnTps);
+    const lastDurationSec = providerSwitched ? null : (lastStreamSec ?? lastTurnNetSec);
+    const isLocalTurnActive = (last, selectedProvider) => {
+      if (!last) return false;
+      const s = String(last.status || "").toLowerCase();
+      if (s === "completed" || s === "interrupted" || s === "failed" || s === "error" || s === "cancelled" || s === "canceled") return false;
+      if (s === "running" || s === "pending" || s === "starting" || s === "in_progress") {
+        const d = last.driver || null;
+        if (d != null && selectedProvider != null && String(d) !== String(selectedProvider)) return false;
+        return true;
+      }
+      const completedMs = last.completedMs ?? last.completedAt ?? null;
+      const startedMs = last.startedMs ?? last.startedAt ?? null;
+      if (completedMs != null && startedMs != null && Number(completedMs) > Number(startedMs)) return false;
+      if (completedMs != null && startedMs == null) return false;
+      return false;
+    };
+    const localLatest = turns[turns.length - 1] || null;
+    const localSelectedProvider = payload.provider || effDriver;
+    const localActive = isLocalTurnActive(localLatest, localSelectedProvider);
+    const localRunningWithoutActive = Boolean(payload.isRunning && !localActive);
+    const localActiveTurnIds = Boolean(payload.isRunning) && !localRunningWithoutActive && localActive && localLatest
+      ? Array.from(new Set([localLatest.id, localLatest.providerTurnId, localLatest.nativeTurnId].filter((v) => v != null && String(v) !== "").map(String)))
+      : [];
+    const localEstimateTps = (() => {
+      // Only expose an estimate for the strictly current running turn when its own sub-step sample exists.
+      if (!payload.isRunning || turns.length === 0) return null;
+      if (localRunningWithoutActive || providerSwitched) return null;
+      const last = turns[turns.length - 1];
+      const drv = last?.driver || payload.provider || null;
+      if (drv && drv !== effDriver) return null;
+      const direct = [lastTurnDecodeTps, last?.itemEstimateTps].find(rate => Number.isFinite(rate) && rate > 0 && rate <= 1500);
+      if (direct != null) return Math.round(direct * 10) / 10;
+      const out = Number(last?.usage?.outputTokens ?? last?.itemOutputTokens);
+      if (!Number.isFinite(out) || out <= 0) return null;
+      const sMs = last?.startedMs;
+      const eMs = last?.completedMs ?? last?.lastItemMs ?? payload.sampledAtMs ?? Date.now();
+      if (!Number.isFinite(sMs) || !Number.isFinite(eMs) || eMs <= sMs + 50) return null;
+      const net = subtractWait(sMs, eMs, last?.id ?? last?.providerTurnId ?? null, drv || effDriver);
+      if (!(net > 0.05)) return null;
+      const raw = out / net;
+      return Number.isFinite(raw) && raw > 0 && raw <= 1500 ? Math.round(raw * 10) / 10 : null;
+    })();
     return {
       ok: true,
       telemetrySource: "remote-projection",
@@ -737,14 +980,16 @@
       repoPath: payload.repoPath || null,
       branch: payload.branch || null,
       isRunning: Boolean(payload.isRunning),
+      activeTurnIds: localActiveTurnIds,
       turnCount: turns.length,
       stepCount: pricedTurns,
       speed: {
         tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
         byModel: byModelSpeed,
-        lastDecodeTps: lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
+        lastDecodeTps: localRunningWithoutActive ? null : lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
+        currentTurnEstimateTps: localEstimateTps,
         e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
-        durationSec: lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
+        durationSec: localRunningWithoutActive ? null : lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
       },
       tokens: {
         input: promptTotal,
@@ -771,10 +1016,10 @@
         sessionRate: sessionCacheRate,
         mainSessionRate: sessionCacheRate,
         withSubagentsSessionRate: sessionCacheRate,
-        turnRate: turnCacheRate,
-        lastTurnRate: turnCacheRate,
+        turnRate: localRunningWithoutActive ? null : effectiveTurnCacheRate,
+        lastTurnRate: localRunningWithoutActive ? null : effectiveTurnCacheRate,
         lastCallRate: null,
-        displayRate: turnCacheRate ?? sessionCacheRate,
+        displayRate: effectiveTurnCacheRate ?? sessionCacheRate,
         savedUsd: totalSavedUsd,
       },
       cost: {
@@ -801,45 +1046,81 @@
 
   // Unified RPC caller: supports live hot-swap override RPC, Electron IPC preload bridge, and loopback HTTP
   async function callBackend(method, ...args) {
-    const overrideCfg = window.__t3HudOverrideRpc;
-    if (overrideCfg && overrideCfg.url && overrideCfg.token) {
-      try {
-        const res = await fetch(`${overrideCfg.url}/rpc`, {
+    const RPC_TIMEOUT_MS = 8000;
+    const READ_ONLY_HUB_ACTIONS = new Set([
+      "hub:getContext", "slash:list", "skills:list",
+      "agentsMd:get", "mcp:list", "mcp:matrix", "plugins:list", "plugins:catalog",
+      "hooks:list", "memory:overview", "memory:list", "memory:search",
+      "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
+      "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
+      "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+    ]);
+    const isHubTunnel = method === "getGitGraph" && args[0] === "__HUB_RPC__";
+    const hubAction = isHubTunnel ? String(args[1] || "") : "";
+    const isMutatingBackendMethod = /^(?:set|save|update|delete|clear|write|reset|toggle)[A-Z]/.test(String(method || ""));
+    const useReadDeadline = isHubTunnel
+      ? (
+        READ_ONLY_HUB_ACTIONS.has(hubAction) ||
+        /^(?:[^:]+:)+(?:get|read|list|search|status|context|resolve|check|overview|health|stats|vectorStats|worktreeInfo|catalog|matrix|slashPrompt)(?:[A-Z:]|$)/.test(hubAction)
+      )
+      : !isMutatingBackendMethod;
+    const scheduleBackendTimer = typeof setTimeout === "function" ? setTimeout : null;
+    const cancelBackendTimer = typeof clearTimeout === "function" ? clearTimeout : null;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    let timer;
+    const transport = async () => {
+      const post = async (cfg) => {
+        const res = await fetch(`${cfg.url}/rpc`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-T3-Hud-Token": overrideCfg.token,
-          },
+          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": cfg.token },
           body: JSON.stringify({ method, args }),
+          ...(controller ? { signal: controller.signal } : {}),
         });
-        return await res.json();
-      } catch {
-        // Fall through to native IPC bridge if override server exited
+        return res.json();
+      };
+      const overrideCfg = window.__t3HudOverrideRpc;
+      if (overrideCfg?.url && overrideCfg.token) {
+        try { return await post(overrideCfg); }
+        catch (error) { if (controller?.signal?.aborted) throw error; }
       }
-    }
-    if (window.__t3HudBridge && typeof window.__t3HudBridge[method] === "function") {
-      return window.__t3HudBridge[method](...args);
-    }
-    const httpCfg = window.__t3HudHttpConfig;
-    if (httpCfg && httpCfg.url && httpCfg.token) {
-      const res = await fetch(`${httpCfg.url}/rpc`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-T3-Hud-Token": httpCfg.token,
-        },
-        body: JSON.stringify({ method, args }),
-      });
-      return res.json();
-    }
-    return { ok: false, error: "HUD bridge unavailable" };
+      if (typeof window.__t3HudBridge?.[method] === "function") return window.__t3HudBridge[method](...args);
+      const httpCfg = window.__t3HudHttpConfig;
+      if (httpCfg?.url && httpCfg.token) return post(httpCfg);
+      return { ok: false, error: "HUD bridge unavailable" };
+    };
+    if (!useReadDeadline || !scheduleBackendTimer) return transport();
+    try {
+      return await Promise.race([
+        transport(),
+        new Promise((_, reject) => {
+          timer = scheduleBackendTimer(() => {
+            reject(new Error(`HUD RPC timed out: ${method}`));
+            controller?.abort();
+          }, RPC_TIMEOUT_MS);
+        }),
+      ]);
+    } finally { if (timer !== undefined && cancelBackendTimer) cancelBackendTimer(timer); }
   }
 
   // Keep Sidecar Hub on the same authenticated transport as the resident HUD.
   const callRpc = (method, ...args) => callBackend(method, ...args);
   window.__t3HubRpc = async (action, payload) => {
+    // Keep this dispatcher self-contained for standalone sidecar/VM extraction.
+    const HUB_RPC_TIMEOUT_MS = 8000;
+    const HUB_READ_ONLY_ACTIONS = new Set([
+      "hub:getContext", "slash:list", "skills:list",
+      "agentsMd:get", "mcp:list", "mcp:matrix", "plugins:list", "plugins:catalog",
+      "hooks:list", "memory:overview", "memory:list", "memory:search",
+      "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
+      "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
+      "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+    ]);
     const bridge = window.__t3HubSidecarBridge;
     const normalizedPayload = payload || {};
+    const scheduleTimer = typeof setTimeout === "function" ? setTimeout : null;
+    const cancelTimer = typeof clearTimeout === "function" ? clearTimeout : null;
     if (typeof action === "string" && action.startsWith("memory:dream:")) {
       const english = typeof hudLang !== "undefined" && hudLang === "en";
       const unknownRun = (detail) => ({
@@ -861,12 +1142,43 @@
         };
       }
       let response;
+      let sidecarResult;
+      let jsonReadFailed = false;
+      const isDreamRead = action === "memory:dream:get" && Boolean(scheduleTimer);
+      const dreamController = isDreamRead && typeof AbortController === "function" ? new AbortController() : null;
+      let dreamTimer;
+      let dreamTimedOut = false;
       try {
-        response = await fetch(bridge.url + "/hub-rpc", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
-          body: JSON.stringify({ action, payload: normalizedPayload }),
-        });
+        const doDreamFetchAndParse = async () => {
+          response = await fetch(bridge.url + "/hub-rpc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+            body: JSON.stringify({ action, payload: normalizedPayload }),
+            ...(dreamController ? { signal: dreamController.signal } : {}),
+          });
+          try {
+            sidecarResult = await response.json();
+          } catch (parseErr) {
+            if (dreamTimedOut || dreamController?.signal?.aborted) throw parseErr;
+            jsonReadFailed = true;
+          }
+        };
+        if (isDreamRead) {
+          await Promise.race([
+            doDreamFetchAndParse(),
+            new Promise((_, reject) => {
+              dreamTimer = scheduleTimer(() => {
+                dreamTimedOut = true;
+                const timeoutErr = new Error("HUD RPC timed out: memory:dream:get");
+                timeoutErr.code = "TimeoutError";
+                reject(timeoutErr);
+                dreamController?.abort();
+              }, HUB_RPC_TIMEOUT_MS);
+            }),
+          ]);
+        } else {
+          await doDreamFetchAndParse();
+        }
       } catch (error) {
         const detail = safeErrorKind(error);
         return action === "memory:dream:run"
@@ -876,11 +1188,10 @@
               status: "unavailable",
               error: english ? `Dream service connection failed (${detail}).` : `梦境服务连接失败（${detail}）。`,
             };
+      } finally {
+        if (dreamTimer !== undefined && cancelTimer) cancelTimer(dreamTimer);
       }
-      let sidecarResult;
-      try {
-        sidecarResult = await response.json();
-      } catch {
+      if (jsonReadFailed) {
         const detail = `HTTP ${Number(response?.status) || 0}, invalid JSON`;
         return action === "memory:dream:run"
           ? unknownRun(detail)
@@ -912,17 +1223,60 @@
       }
       return sidecarResult;
     }
+    const actionStr = String(action || "");
+    const isReadOnlyHub = Boolean(scheduleTimer) && (
+      HUB_READ_ONLY_ACTIONS.has(actionStr) ||
+      /^(?:[^:]+:)+(?:get|read|list|search|status|context|resolve|check|overview|health|stats|vectorStats|worktreeInfo|catalog|matrix|slashPrompt)(?:[A-Z:]|$)/.test(actionStr)
+    );
+    const monoNow = () => {
+      const ms = typeof performance === "object" && performance !== null && typeof performance.now === "function"
+        ? performance.now() : NaN;
+      return Number.isFinite(ms) ? ms : Date.now();
+    };
+    const hubRpcStartedAt = monoNow();
+    const hubRpcWallStartedAt = Date.now();
     const res = await callRpc("getGitGraph", "__HUB_RPC__", action, payload || {});
     if (res && (res.ok || !/Git|Unknown method|unknown action:/i.test(String(res.error || "")))) return res;
     if (bridge && bridge.url && bridge.token) {
+      const monoElapsed = monoNow() - hubRpcStartedAt;
+      const wallElapsed = Date.now() - hubRpcWallStartedAt;
+      const remainingMs = HUB_RPC_TIMEOUT_MS - Math.max(0,
+        Number.isFinite(monoElapsed) ? monoElapsed : 0,
+        Number.isFinite(wallElapsed) ? wallElapsed : 0);
+      if (isReadOnlyHub && remainingMs <= 0) {
+        throw new Error(`HUD RPC timed out: ${actionStr}`);
+      }
+      const fbController = isReadOnlyHub && typeof AbortController === "function" ? new AbortController() : null;
+      let fbTimer;
+      let fbTimedOut = false;
       try {
-        const r = await fetch(bridge.url + "/hub-rpc", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
-          body: JSON.stringify({ action, payload: normalizedPayload }),
-        });
-        if (r.ok) return await r.json();
-      } catch {}
+        const doFallback = async () => {
+          const r = await fetch(bridge.url + "/hub-rpc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-T3-Hud-Token": bridge.token },
+            body: JSON.stringify({ action, payload: normalizedPayload }),
+            ...(fbController ? { signal: fbController.signal } : {}),
+          });
+          return r.ok ? await r.json() : null;
+        };
+        const parsed = isReadOnlyHub
+          ? await Promise.race([
+              doFallback(),
+              new Promise((_, reject) => {
+                fbTimer = scheduleTimer(() => {
+                  fbTimedOut = true;
+                  reject(new Error(`HUD RPC timed out: ${actionStr}`));
+                  fbController?.abort();
+                }, remainingMs);
+              }),
+            ])
+          : await doFallback();
+        if (parsed) return parsed;
+      } catch (fbErr) {
+        if (fbTimedOut) throw fbErr;
+      } finally {
+        if (fbTimer !== undefined && cancelTimer) cancelTimer(fbTimer);
+      }
     }
     return res;
   };
@@ -997,6 +1351,10 @@
       lastTurnSpeed: "末轮速度",
       e2eSpeed: "端到端速度 (含首字预填充)",
       turnCacheRate: "本轮缓存命中率",
+      cachePendingShort: "待上报",
+      cachePendingTitle: "等待本轮缓存上报（流式期间上游未提供本轮缓存明细，不回退旧轮）",
+      cachePendingPopover: "等待本轮上报",
+      cachePendingNote: "本轮 / 末次调用 / 会话累计口径不同；流式期间上游未上报时不沿用旧值",
       lastCallCacheRate: "最近模型调用（原生记录）",
       mainSessionCacheRate: "主会话累计",
       inclusiveSessionCacheRate: "含子代理累计",
@@ -1071,6 +1429,10 @@
       lastTurnSpeed: "Last Turn Speed",
       e2eSpeed: "End-to-end (incl. prefill)",
       turnCacheRate: "This-turn cache hit rate",
+      cachePendingShort: "Pending",
+      cachePendingTitle: "Waiting for this turn's cache report (upstream has not provided this turn's cache details during streaming; not falling back to previous turn)",
+      cachePendingPopover: "Waiting for this turn",
+      cachePendingNote: "Turn / last-call / session totals differ; not reusing previous turn's value before this turn reports",
       lastCallCacheRate: "Latest model call (native record)",
       mainSessionCacheRate: "Main session total",
       inclusiveSessionCacheRate: "Total incl. subagents",
@@ -2180,10 +2542,13 @@
       awaitingFreshSample: false,
       baselineStepCount: null,
       lastIdleStepCount: null,
+      baselineMessageId: "",
+      baselineCaptured: false,
+      baselineProvider: "",
     };
   }
 
-  function resolveHudTurnSpeed(state, stats, liveTps, routeKey) {
+  function resolveHudTurnSpeed(state, stats, liveTps, routeKey, liveSample) {
     const route = String(routeKey ?? stats?.threadId ?? stats?.nonThreadRoute ?? "");
     const routeChanged = state.route !== route;
     if (routeChanged) {
@@ -2192,11 +2557,29 @@
       state.awaitingFreshSample = false;
       state.baselineStepCount = null;
       state.lastIdleStepCount = null;
+      state.baselineMessageId = "";
+      state.baselineCaptured = false;
+      state.baselineProvider = "";
     }
+    // Unwrap live sample provenance: messageId + confirmation flag.
+    // liveSample may be { messageId, liveSampleConfirmedNewTurn } /
+    // { messageId, confirmedNewTurn } / { messageId, confirmed } / boolean.
+    let liveMessageId = "";
+    let liveSampleConfirmedNewTurn = null;
+    if (typeof liveSample === "boolean") {
+      liveSampleConfirmedNewTurn = liveSample;
+    } else if (liveSample && typeof liveSample === "object") {
+      liveMessageId = String(liveSample.messageId || "");
+      if (typeof liveSample.liveSampleConfirmedNewTurn === "boolean") liveSampleConfirmedNewTurn = liveSample.liveSampleConfirmedNewTurn;
+      else if (typeof liveSample.confirmedNewTurn === "boolean") liveSampleConfirmedNewTurn = liveSample.confirmedNewTurn;
+      else if (typeof liveSample.confirmed === "boolean") liveSampleConfirmedNewTurn = liveSample.confirmed;
+    }
+    const currentProvider = String(stats?.provider || stats?.driver || "");
 
     const stepCount = Number.isFinite(stats?.stepCount) ? stats.stepCount : null;
     const running = Boolean(stats?.ok && stats.isRunning);
-    const liveRate = !routeChanged && Number.isFinite(liveTps) && liveTps > 0 ? liveTps : null;
+    const providerMatches = !state.baselineProvider || !currentProvider || state.baselineProvider === currentProvider;
+    const liveRate = !routeChanged && providerMatches && Number.isFinite(liveTps) && liveTps > 0 ? liveTps : null;
     let started = false;
 
     if (running && !state.active) {
@@ -2211,9 +2594,24 @@
     }
 
     if (running) {
-      return liveRate != null && !started
-        ? { kind: "estimated", value: liveRate, routeChanged, started }
-        : { kind: "waiting", value: null, routeChanged, started };
+      if (liveRate != null) {
+        const baselineMessageId = state.baselineMessageId ? String(state.baselineMessageId) : "";
+        const baselineProvider = state.baselineProvider ? String(state.baselineProvider) : "";
+        if (started) {
+          // First frame of a new turn: only keep liveRate when it is provably
+          // from a new assistant message of this turn.
+          const confirmed = state.baselineCaptured === true &&
+            liveSampleConfirmedNewTurn === true && liveMessageId !== "" &&
+            liveMessageId !== baselineMessageId &&
+            (!baselineProvider || !currentProvider || baselineProvider === currentProvider);
+          if (confirmed) return { kind: "estimated", value: liveRate, routeChanged, started };
+        } else if (!(state.baselineCaptured === true && baselineMessageId !== "" && liveMessageId !== "" && liveMessageId === baselineMessageId)) {
+          return { kind: "estimated", value: liveRate, routeChanged, started };
+        }
+      }
+      const currentEstimate = Number(stats?.speed?.currentTurnEstimateTps);
+      if (Number.isFinite(currentEstimate) && currentEstimate > 0) return { kind: "estimated", value: currentEstimate, routeChanged, started };
+      return { kind: "waiting", value: null, routeChanged, started };
     }
 
     if (liveRate != null) {
@@ -2250,38 +2648,164 @@
     return requestId === latestRequestId && String(requestedRoute ?? "") === String(currentRoute ?? "");
   }
 
+  function isHiddenStreamNode(el, root) {
+    let cur = el;
+    for (let guard = 0; cur && guard < 128; guard++) {
+      try {
+        if (cur.hidden === true || cur.getAttribute?.("hidden") != null || cur.getAttribute?.("aria-hidden") === "true") return true;
+        const tag = String(cur.tagName || cur.localName || cur.nodeName || "").toLowerCase();
+        if (tag === "details" && cur.open !== true && cur.getAttribute?.("open") == null) return true;
+        const style = cur.style;
+        if (style?.display === "none" || style?.visibility === "hidden" || style?.visibility === "collapse") return true;
+        if (typeof style === "string" && /display\s*:\s*none|visibility\s*:\s*(hidden|collapse)/i.test(style)) return true;
+        const view = cur.ownerDocument?.defaultView;
+        const computed = typeof view?.getComputedStyle === "function" ? view.getComputedStyle(cur)
+          : typeof getComputedStyle === "function" ? getComputedStyle(cur) : null;
+        if (computed?.display === "none" || computed?.visibility === "hidden" || computed?.visibility === "collapse") return true;
+      } catch {}
+      if (cur === root) break;
+      cur = cur.parentElement || cur.parentNode || cur.parent || null;
+    }
+    return false;
+  }
+
+  function visibleStreamText(el, root) {
+    const collect = (node) => {
+      if (!node || isHiddenStreamNode(node, root)) return "";
+      if (node.nodeType === 3) return String(node.textContent || node.nodeValue || "");
+      const kids = node.childNodes?.length ? node.childNodes : node.children;
+      // DOM NodeLists are array-like, not Arrays. Never fall back to container text after filtering.
+      if (kids?.length) return Array.from(kids, collect).join("");
+      try {
+        const lacksInnerText = typeof node.innerText !== "string";
+        return lacksInnerText ? String(node.textContent || "") : node.innerText;
+      } catch { return ""; }
+    };
+    return collect(el);
+  }
+
   function getAssistantStreamSnapshot(chatCol) {
+    function isHiddenStreamNode(el, root) {
+      let cur = el;
+      for (let guard = 0; cur && guard < 128; guard++) {
+        try {
+          if (cur.hidden === true || cur.getAttribute?.("hidden") != null || cur.getAttribute?.("aria-hidden") === "true") return true;
+          const tag = String(cur.tagName || cur.localName || cur.nodeName || "").toLowerCase();
+          if (tag === "details" && cur.open !== true && cur.getAttribute?.("open") == null) return true;
+          const style = cur.style;
+          if (style?.display === "none" || style?.visibility === "hidden" || style?.visibility === "collapse") return true;
+          if (typeof style === "string" && /display\s*:\s*none|visibility\s*:\s*(hidden|collapse)/i.test(style)) return true;
+          const view = cur.ownerDocument?.defaultView;
+          const computed = typeof view?.getComputedStyle === "function" ? view.getComputedStyle(cur)
+            : typeof getComputedStyle === "function" ? getComputedStyle(cur) : null;
+          if (computed?.display === "none" || computed?.visibility === "hidden" || computed?.visibility === "collapse") return true;
+        } catch {}
+        if (cur === root) break;
+        cur = cur.parentElement || cur.parentNode || cur.parent || null;
+      }
+      return false;
+    }
+    function visibleStreamText(el, root) {
+      const collect = (node) => {
+        if (!node || isHiddenStreamNode(node, root)) return "";
+        if (node.nodeType === 3) return String(node.textContent || node.nodeValue || "");
+        const kids = node.childNodes?.length ? node.childNodes : node.children;
+        // DOM NodeLists are array-like, not Arrays. Never fall back to container text after filtering.
+        if (kids?.length) return Array.from(kids, collect).join("");
+        try {
+          const lacksInnerText = typeof node.innerText !== "string";
+          return lacksInnerText ? String(node.textContent || "") : node.innerText;
+        } catch { return ""; }
+      };
+      return collect(el);
+    }
+
     if (!chatCol || typeof chatCol.querySelectorAll !== "function") return null;
     let nodes;
-    try {
-      nodes = chatCol.querySelectorAll('[data-message-role]');
-    } catch {
-      return null;
+    try { nodes = Array.from(chatCol.querySelectorAll('[data-message-role], [data-timeline-row-kind="thinking"]')); }
+    catch { return null; }
+    const attr = (node, name, key) => node?.getAttribute?.(name) || node?.dataset?.[key] || "";
+    const role = (node) => attr(node, "data-message-role", "messageRole");
+    const fiberTurnId = (node) => {
+      try {
+        for (const k of Object.keys(node || {})) {
+          if (!k.startsWith("__reactFiber$") && !k.startsWith("__reactProps$")) continue;
+          let cur = node[k];
+          for (let depth = 0; cur && depth < 5; depth++) {
+            const props = cur.memoizedProps || cur;
+            const tid = props?.turnId || props?.providerTurnId || props?.row?.turnId || props?.row?.providerTurnId || props?.message?.turnId || props?.item?.providerTurnId;
+            if (typeof tid === "string" && tid.trim()) return tid.trim();
+            cur = cur.return || null;
+          }
+        }
+      } catch {}
+      return "";
+    };
+    const nodeTurnId = (node) => attr(node, "data-turn-id", "turnId") || attr(node, "data-provider-turn-id", "providerTurnId") || fiberTurnId(node);
+    let lastUserIdx = -1;
+    for (let i = 0; i < nodes.length; i++) if (role(nodes[i]) === "user") lastUserIdx = i;
+    let turnNodes = nodes.slice(lastUserIdx + 1).filter(node => role(node) === "assistant" ||
+      attr(node, "data-timeline-row-kind", "timelineRowKind") === "thinking");
+    let visible = turnNodes.filter(node => !isHiddenStreamNode(node, chatCol));
+    if (!visible.length) return null;
+    let unboundedNoUser = false;
+    const tail = visible[visible.length - 1];
+    const tailTurnId = nodeTurnId(tail);
+    let lockedTurnId = tailTurnId || null;
+    let start = nodes.indexOf(tail);
+    // Unidentified tail blocks can accompany the current answer. Once an ID
+    // is found, every earlier row must prove the same identity, even hidden rows.
+    while (start > lastUserIdx + 1) {
+      const prev = nodes[start - 1];
+      const rowTurnId = nodeTurnId(prev);
+      if (lockedTurnId && rowTurnId !== lockedTurnId) break;
+      if (!lockedTurnId && rowTurnId) lockedTurnId = rowTurnId;
+      start--;
     }
-    const node = nodes?.[nodes.length - 1];
-    if (!node) return null;
-    const role = node.getAttribute?.("data-message-role") || node.dataset?.messageRole;
-    // Until the current user message is followed by an assistant message, old
-    // assistant expansion/re-rendering is not generation for this turn.
-    if (role !== "assistant") return null;
-    let text = "";
-    try {
-      // innerText excludes hidden controls and only measures what the user sees.
-      text = typeof node.innerText === "string" ? node.innerText : String(node.textContent || "");
-    } catch {}
-    let messageId = "";
-    try {
-      messageId = String(node.getAttribute?.("data-message-id") || node.dataset?.messageId || "");
-    } catch {}
-    return { messageId, text };
+    if (lastUserIdx === -1 && !lockedTurnId) {
+      if (nodes.length !== 1 || visible.length !== 1) return null;
+      unboundedNoUser = true;
+    }
+    turnNodes = turnNodes.filter(node => nodes.indexOf(node) >= start && nodes.indexOf(node) <= nodes.indexOf(tail));
+    visible = turnNodes.filter(node => !isHiddenStreamNode(node, chatCol));
+    // Keep the first turn row as anchor even if its thinking text is later collapsed.
+    const rowId = (node) => attr(node, "data-message-id", "messageId") || attr(node, "data-timeline-row-id", "timelineRowId");
+    const messageId = String(rowId(turnNodes.find(node => rowId(node)) || visible[0]));
+    const snapshotTurnId = lockedTurnId;
+    const texts = [];
+    for (const node of visible) {
+      let text = visibleStreamText(node, chatCol);
+      // Some virtual stream surfaces expose extra children only via selectors.
+      for (const extra of node.querySelectorAll?.('[data-streaming="true"], [data-thinking="true"], [class*="streaming"], [class*="thinking"]') || []) {
+        const extraText = visibleStreamText(extra, chatCol);
+        if (extraText && !text.includes(extraText)) text += extraText;
+      }
+      texts.push(text);
+    }
+    return { messageId, turnId: snapshotTurnId, text: texts.join("\n"), unboundedNoUser, hasUserAnchor: lastUserIdx >= 0 };
   }
 
   function canSampleHudStream(stats, snapshot) {
-    return stats?.ok === true && stats.isRunning === true && Boolean(snapshot);
+    if (!(stats?.ok === true && stats.isRunning === true && Boolean(snapshot))) return false;
+    const hasExplicitList = Array.isArray(stats.activeTurnIds);
+    const activeIds = hasExplicitList
+      ? stats.activeTurnIds.filter(Boolean).map(String)
+      : stats.activeTurnId != null && String(stats.activeTurnId) !== ""
+        ? [String(stats.activeTurnId)]
+        : null;
+    const snapTurnId = String(snapshot.turnId || "");
+    if (hasExplicitList) {
+      if (activeIds.length === 0 || !snapTurnId || !activeIds.includes(snapTurnId)) return false;
+    } else if (activeIds) {
+      if (!snapTurnId || !activeIds.includes(snapTurnId)) return false;
+    } else if (snapTurnId) {
+      return false;
+    }
+    return true;
   }
 
   function createHudStreamSampler() {
-    return { samples: [], messageId: "", lastGrowthAt: 0, liveTps: null };
+    return { samples: [], messageId: "", provider: "", lastGrowthAt: 0, liveTps: null };
   }
 
   function advanceHudStreamSampler(sampler, snapshot, now, enabled, estimateTokens) {
@@ -2290,6 +2814,7 @@
       const changed = sampler.liveTps != null || sampler.samples.length > 0;
       sampler.samples = [];
       sampler.messageId = "";
+      sampler.provider = "";
       sampler.lastGrowthAt = 0;
       sampler.liveTps = null;
       return { liveTps: null, changed, stalled };
@@ -2324,7 +2849,7 @@
       const last = sampler.samples[sampler.samples.length - 1];
       const dt = (last.t - first.t) / 1000;
       const dTok = last.tok - first.tok;
-      if (dt >= 0.22 && dTok >= 3) {
+      if (dt >= 0.22 && dTok >= 1.8) {
         const inst = Math.min(950, dTok / dt);
         sampler.liveTps = sampler.liveTps != null ? sampler.liveTps * 0.55 + inst * 0.45 : inst;
       }
@@ -2622,6 +3147,9 @@
         if (f.sibling) stack.push(f.sibling);
       }
     } catch {}
+    finally {
+      if (typeof refreshStats === "function") refreshStats._observeSelection?.({ selectedProvider, selectedModel });
+    }
     return { usage, contextWindow, selectedModel, selectedProvider };
   }
 
@@ -2649,13 +3177,23 @@
 
   function computeQuotaAndContext(stats) {
     const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider } = readLiveT3State();
-    const liveContext = live?.contextWindow ?? liveCtx ?? null;
+    const rawLiveContext = live?.contextWindow ?? liveCtx ?? null;
     const activeProviderRaw = (
       selectedProvider ||
       live?.providerInstanceId ||
       stats?.provider ||
       ""
     ).toLowerCase();
+    const liveCtxProvider = String(
+      rawLiveContext?.driver ||
+      rawLiveContext?.provider ||
+      rawLiveContext?.providerInstanceId ||
+      (live?.contextWindow ? (live?.providerInstanceId || live?.provider || "") : "") ||
+      ""
+    ).toLowerCase();
+    const liveContext = rawLiveContext && (!activeProviderRaw || (liveCtxProvider ? liveCtxProvider === activeProviderRaw : !selectedProvider))
+      ? rawLiveContext
+      : null;
     // Prefer live composer-selected model so switching Gemini <-> Opus/Sonnet updates 周余 immediately!
     const activeModelRaw = (selectedModel || stats?.model || "").toLowerCase();
 
@@ -2950,15 +3488,18 @@
         : "--";
 
     const cacheText = (rate) => rate != null ? `${(rate * 100).toFixed(1)}%` : "--";
-    const turnCache = cacheText(s.cache.turnRate);
+    const turnCachePending = s.cache.turnRate == null && s.isRunning === true;
+    const turnCache = turnCachePending ? t("cachePendingPopover") : cacheText(s.cache.turnRate);
+    const turnCacheNote = turnCachePending ? `<div style="margin-top:2px;font-size:10px;color:var(--hud-muted)">${escapeHtml(t("cachePendingNote"))}</div>` : "";
     const lastCallCache = cacheText(s.cache.lastCallRate);
     const mainSessionCache = cacheText(s.cache.mainSessionRate);
     const inclusiveSessionCache = cacheText(s.cache.withSubagentsSessionRate ?? s.cache.sessionRate);
     const avgSpeed = resolveModelAvgSpeed(s, qInfo.activeModelRaw);
     const speedColor = (value) => value >= 150 ? "var(--hud-cyan)" : "var(--hud-fg)";
     const formatSpeed = (value) => value != null ? `${value.toFixed(1)} tok/s` : "--";
-    const liveSpeedLine = liveStreamTps != null
-      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span style="color:var(--hud-blue)">≈${formatSpeed(liveStreamTps)}</span></div>`
+    const liveSpeedValue = liveStreamTps != null ? liveStreamTps : (Number.isFinite(Number(s.speed.currentTurnEstimateTps)) && Number(s.speed.currentTurnEstimateTps) > 0 ? Number(s.speed.currentTurnEstimateTps) : null);
+    const liveSpeedLine = liveSpeedValue != null
+      ? `<div class="t3-pop-row"><span>${escapeHtml(t("streamSpeed"))}</span><span style="color:var(--hud-blue)">≈${formatSpeed(liveSpeedValue)}</span></div>`
       : "";
     const e2eLine =
       s.speed.e2eTokPerSec != null
@@ -2983,6 +3524,7 @@
       ${liveSpeedLine}
       ${e2eLine}
       <div class="t3-pop-row"><span>${escapeHtml(t("turnCacheRate"))}</span><span style="color:${cacheColor(s.cache.turnRate)}">${turnCache}</span></div>
+      ${turnCacheNote}
       <div class="t3-pop-row"><span>${escapeHtml(t("lastCallCacheRate"))}</span><span style="color:${cacheColor(s.cache.lastCallRate)}">${lastCallCache}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("mainSessionCacheRate"))}</span><span style="color:${cacheColor(s.cache.mainSessionRate)}">${mainSessionCache}</span></div>
       <div class="t3-pop-row"><span>${escapeHtml(t("inclusiveSessionCacheRate"))}</span><span style="color:${cacheColor(s.cache.withSubagentsSessionRate ?? s.cache.sessionRate)}">${inclusiveSessionCache}</span></div>
@@ -3056,9 +3598,57 @@
   let lastTopbarSig = "";
   function renderTopbarStats(stats) {
     latestStats = stats;
-    const speedView = resolveHudTurnSpeed(turnSpeedState, stats, liveStreamTps, currentPathHint);
-    if (speedView.routeChanged || (speedView.started && stats?.isRunning)) {
+    // Reset route state before taking an idle snapshot, so resolve does not erase the new baseline.
+    if (turnSpeedState.route !== String(currentPathHint || "")) {
+      resolveHudTurnSpeed(turnSpeedState, { ok: false }, null, currentPathHint);
       resetLiveStreamSampler(currentPathHint);
+    }
+    const nextProvider = String(stats?.provider || "");
+    const samplerProvider = String(streamSampler?.provider || "");
+    const providerChanged = Boolean(
+      nextProvider && (
+        (turnSpeedState.baselineProvider && turnSpeedState.baselineProvider !== nextProvider) ||
+        (samplerProvider && samplerProvider !== nextProvider)
+      )
+    );
+    if (!(stats?.ok && stats.isRunning) || providerChanged) {
+      // Capture the final DOM synchronously: a new turn can start before the next sampler tick.
+      if (providerChanged || turnSpeedState.active || liveStreamTps != null || streamSampler.samples.length > 0) clearActiveStreamSamples();
+      const idleSnapshot = getAssistantStreamSnapshot(document.querySelector("[data-chat-column]"));
+      turnSpeedState.baselineMessageId = String(idleSnapshot?.messageId || "");
+      turnSpeedState.baselineCaptured = true;
+      turnSpeedState.baselineProvider = nextProvider;
+      lastIdleMessageId = String(idleSnapshot?.messageId || "");
+      lastIdleTextLen = idleSnapshot?.text.length || 0;
+    } else if (!turnSpeedState.baselineProvider && nextProvider) {
+      turnSpeedState.baselineProvider = nextProvider;
+    }
+    const samplerMessageId = streamSampler?.messageId ? String(streamSampler.messageId) : "";
+    const baselineMessageId = turnSpeedState.baselineMessageId ? String(turnSpeedState.baselineMessageId) : "";
+    const baselineProvider = turnSpeedState.baselineProvider ? String(turnSpeedState.baselineProvider) : "";
+    const statsProvider = nextProvider;
+    const activeSamplerProvider = streamSampler?.provider ? String(streamSampler.provider) : "";
+    const liveSampleConfirmedNewTurn = Boolean(
+      turnSpeedState.baselineCaptured === true && samplerMessageId !== "" &&
+        samplerMessageId !== baselineMessageId &&
+        streamSampler.liveTps != null && streamSampler.messageId === samplerMessageId &&
+        (!baselineProvider || !statsProvider || baselineProvider === statsProvider) &&
+        (!activeSamplerProvider || !statsProvider || activeSamplerProvider === statsProvider)
+    );
+    const speedView = resolveHudTurnSpeed(turnSpeedState, stats, liveStreamTps, currentPathHint, {
+      messageId: samplerMessageId,
+      liveSampleConfirmedNewTurn,
+    });
+    if (speedView.routeChanged) {
+      resetLiveStreamSampler(currentPathHint);
+    } else if (speedView.started && stats?.isRunning) {
+      // First frame of a new turn: keep only a sampler proven to be from a new
+      // assistant message of this turn; otherwise drop any stale live rate.
+      if (liveStreamTps != null && !liveSampleConfirmedNewTurn) {
+        clearActiveStreamSamples();
+      } else if (liveStreamTps == null) {
+        clearActiveStreamSamples();
+      }
     }
     const qInfo = computeQuotaAndContext(stats);
     const wk = qInfo.primaryWeekly;
@@ -3067,6 +3657,7 @@
     let nextDotClass;
     let nextSpeed;
     let nextCache;
+    let nextCacheTitle = "";
     let nextCacheColor = "var(--hud-fg)";
     let nextTokens;
     let nextCost;
@@ -3095,7 +3686,9 @@
         waiting: t("streaming"),
       });
       const rate = stats.cache.turnRate ?? null;
-      nextCache = rate != null ? `${Math.round(rate * 100)}%` : "--%";
+      const cachePending = rate == null && stats.isRunning === true;
+      nextCache = rate != null ? `${Math.round(rate * 100)}%` : cachePending ? t("cachePendingShort") : "--%";
+      nextCacheTitle = cachePending ? t("cachePendingTitle") : "";
       nextCacheColor = cacheColor(rate);
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
       const totalUsd = stats.cost.withSubagentsUsd;
@@ -3103,7 +3696,7 @@
       nextCost = `${formatUsd(totalUsd)}${subSuffix}`;
     }
 
-    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
+    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextCacheTitle}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
     if (sig !== lastTopbarSig) {
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
@@ -3111,6 +3704,8 @@
       speedEl.style.color = "var(--hud-fg)";
       cacheEl.textContent = nextCache;
       cacheEl.style.color = nextCacheColor;
+      cacheEl.title = nextCacheTitle;
+      cacheEl.setAttribute("aria-label", nextCacheTitle || nextCache);
       tokensEl.textContent = nextTokens;
       costEl.innerHTML = nextCost;
       if (nextQuota) {
@@ -3548,10 +4143,35 @@
   let statsInFlight = false;
   let statsRequestSeq = 0;
   async function refreshStats(routeChanged = false) {
-    if (statsInFlight && !routeChanged) return;
+    const readLive = () => (typeof readLiveT3State === "function" ? readLiveT3State() : null);
+    const observeSelection = (live) => {
+      const p = String(live?.selectedProvider || "");
+      const m = String(live?.selectedModel || "");
+      const sig = p || m ? `${p}:${m}` : "";
+      if (refreshStats._selectionSeq == null) refreshStats._selectionSeq = 0;
+      if (refreshStats._lastSelectionSig == null) refreshStats._lastSelectionSig = sig;
+      else if (sig !== refreshStats._lastSelectionSig) {
+        refreshStats._selectionSeq++;
+        refreshStats._lastSelectionSig = sig;
+      }
+      return sig;
+    };
+    refreshStats._observeSelection = observeSelection;
+    const entrySelectionSig = observeSelection(readLive());
+    if (statsInFlight && !routeChanged) {
+      if (refreshStats._activeSelectionSeq !== refreshStats._selectionSeq || refreshStats._activeSelectionSig !== entrySelectionSig) {
+        pendingFastRefresh = true;
+      }
+      return;
+    }
     statsInFlight = true;
     const requestId = ++statsRequestSeq;
     const hint = getRouteHint();
+    const requestedProvider = String(readLive()?.selectedProvider || "");
+    const requestedSelectionSig = observeSelection(readLive());
+    const requestedSelectionSeq = refreshStats._selectionSeq;
+    refreshStats._activeSelectionSig = requestedSelectionSig;
+    refreshStats._activeSelectionSeq = requestedSelectionSeq;
     if (routeChanged) {
       resetLiveStreamSampler(hint);
       resolveHudTurnSpeed(turnSpeedState, { ok: false }, null, hint);
@@ -3561,7 +4181,10 @@
       renderTopbarStats({ ok: false });
     }
     try {
-      let stats = await callBackend("getThreadStats", hint);
+      let stats = null;
+      try { stats = await callBackend("getThreadStats", hint); }
+      catch (err) { stats = { ok: false, error: String(err?.message || err || "rpc_failed") }; }
+      if (!isCurrentStatsSnapshot(requestId, statsRequestSeq, hint, getRouteHint())) return;
       let remotePayloadCandidate = null;
       if (!stats?.ok && !stats?.nonThreadRoute) {
         try {
@@ -3581,6 +4204,43 @@
         }
       }
       if (!isCurrentStatsSnapshot(requestId, statsRequestSeq, hint, getRouteHint())) return;
+      const liveAfter = readLive();
+      const afterSelectionSig = observeSelection(liveAfter);
+      const currentSelectedProvider = String(liveAfter?.selectedProvider || "");
+      if (
+        refreshStats._selectionSeq !== requestedSelectionSeq ||
+        (afterSelectionSig && requestedSelectionSig !== afterSelectionSig) ||
+        (currentSelectedProvider && requestedProvider !== currentSelectedProvider)
+      ) {
+        pendingFastRefresh = true;
+        return;
+      }
+      if (currentSelectedProvider && stats?.ok && stats?.provider && String(stats.provider) !== currentSelectedProvider) {
+        const mismatchKey = `${hint}:${currentSelectedProvider}`;
+        if (refreshStats._mismatchKey !== mismatchKey) {
+          refreshStats._mismatchKey = mismatchKey;
+          pendingFastRefresh = true;
+          return;
+        }
+        const selModel = liveAfter?.selectedModel || null;
+        const estMax = currentSelectedProvider === "antigravity"
+          ? (/opus|sonnet|haiku|claude/i.test(String(selModel || "")) ? 1000000 : 1048576)
+          : currentSelectedProvider === "muse"
+            ? 1007997
+            : null;
+        stats = {
+          ...stats,
+          provider: currentSelectedProvider,
+          model: selModel,
+          isRunning: false,
+          activeTurnIds: [],
+          speed: { ...(stats.speed || {}), lastDecodeTps: null, currentTurnEstimateTps: null, durationSec: null },
+          cache: { ...(stats.cache || {}), turnRate: null, lastTurnRate: null, lastCallRate: null, displayRate: stats.cache?.sessionRate ?? null },
+          tokens: { ...(stats.tokens || {}), contextUsed: null, contextMax: estMax, contextMaxSource: estMax != null ? "estimated" : null },
+        };
+      } else {
+        refreshStats._mismatchKey = "";
+      }
       lastRemotePayload = remotePayloadCandidate;
       renderTopbarStats(stats);
 
@@ -3596,8 +4256,28 @@
     } catch {
       // Ignore transient query errors
     } finally {
-      if (requestId === statsRequestSeq) statsInFlight = false;
+      if (requestId === statsRequestSeq) {
+        statsInFlight = false;
+        if (pendingFastRefresh && !disposed && !document.hidden && typeof scheduleTrailingFastRefresh === "function") scheduleTrailingFastRefresh();
+      }
     }
+  }
+
+  function installHudSelectionObservers() {
+    const events = ["click", "keydown", "input", "change"];
+    const observe = () => {
+      if (disposed) return;
+      refreshStats._observeSelection?.(readLiveT3State());
+    };
+    const onSelectionEvent = () => {
+      observe();
+      // Capture runs before React's handlers; observe again after their commit.
+      if (typeof queueMicrotask === "function") queueMicrotask(observe);
+    };
+    for (const event of events) document.addEventListener(event, onSelectionEvent, true);
+    return () => {
+      for (const event of events) document.removeEventListener(event, onSelectionEvent, true);
+    };
   }
 
   function toggleDrawer(forceState) {
@@ -3677,6 +4357,8 @@
   window.addEventListener("resize", scheduleLayoutSync);
 
   let lastPickerSig = "";
+  let lastPickerModelSig = "";
+  const stopSelectionObservers = installHudSelectionObservers();
   const routeWatchTimer = setInterval(() => {
     if (document.hidden) return;
     if (!unsubscribeRouter) ensureRouterSubscription();
@@ -3688,10 +4370,30 @@
     }
     // Instant sync when user switches model in composer dropdown (e.g., Gemini <-> Opus/Sonnet)
     const live = readLiveT3State();
-    const pSig = `${live.selectedProvider || ""}:${live.selectedModel || ""}:${live.usage?.contextWindow?.usedTokens ?? ""}`;
+    refreshStats._observeSelection?.(live);
+    const mSig = `${live.selectedProvider || ""}:${live.selectedModel || ""}`;
+    const pSig = `${mSig}:${live.usage?.contextWindow?.usedTokens ?? ""}`;
     if (pSig !== lastPickerSig) {
+      const pickerChanged = mSig !== lastPickerModelSig;
       lastPickerSig = pSig;
-      if (latestStats) renderTopbarStats(latestStats);
+      lastPickerModelSig = mSig;
+      if (latestStats) {
+        if (pickerChanged && live.selectedProvider && latestStats.provider && String(latestStats.provider) !== String(live.selectedProvider)) {
+          latestStats = {
+            ...latestStats,
+            provider: String(live.selectedProvider),
+            model: live.selectedModel || null,
+            isRunning: false,
+            speed: { ...(latestStats.speed || {}), lastDecodeTps: null, currentTurnEstimateTps: null, durationSec: null },
+            cache: { ...(latestStats.cache || {}), turnRate: null, lastTurnRate: null, lastCallRate: null, displayRate: latestStats.cache?.sessionRate ?? null },
+            tokens: { ...(latestStats.tokens || {}), contextUsed: null, contextMax: null, contextMaxSource: null },
+          };
+        } else if (pickerChanged && live.selectedModel && (!live.selectedProvider || String(latestStats.provider || "") === String(live.selectedProvider))) {
+          latestStats = { ...latestStats, model: live.selectedModel };
+        }
+        renderTopbarStats(latestStats);
+      }
+      if (pickerChanged) refreshStats(false);
     }
   }, 600);
 
@@ -3705,6 +4407,7 @@
   // Observe structural mounts without attribute storms on every streaming token
   const domObserver = new MutationObserver((records) => {
     if (disposed || document.hidden) return;
+    refreshStats._observeSelection?.(readLiveT3State());
     let relevant = false;
     for (let i = 0; i < records.length; i++) {
       if (!isHudOwnNode(records[i].target)) {
@@ -3728,11 +4431,55 @@
   // Real-time streaming speed sampler (ticks live every 260ms while text/thinking streams into chat!)
   let streamSampler = createHudStreamSampler();
   let streamRouteSnap = currentPathHint;
+  let lastIdleMessageId = "";
+  let lastIdleTextLen = 0;
+  let lastFastRefreshAt = 0;
+  let pendingFastRefresh = false;
+  let trailingFastRefreshTimer = null;
+
+  function clearActiveStreamSamples() {
+    streamSampler = createHudStreamSampler();
+    liveStreamTps = null;
+  }
 
   function resetLiveStreamSampler(route = currentPathHint) {
-    streamSampler = createHudStreamSampler();
+    if (route === streamRouteSnap) return;
+    clearActiveStreamSamples();
     streamRouteSnap = route;
-    liveStreamTps = null;
+    lastIdleMessageId = "";
+    lastIdleTextLen = 0;
+    lastFastRefreshAt = 0;
+    // Full identity/throttle reset is reserved for actual route changes.
+  }
+
+  function scheduleTrailingFastRefresh() {
+    if (typeof setTimeout !== "function") {
+      pendingFastRefresh = true;
+      return;
+    }
+    if (statsInFlight) {
+      pendingFastRefresh = true;
+      return;
+    }
+    if (trailingFastRefreshTimer) return;
+    const now = () => typeof performance === "object" && performance !== null && typeof performance.now === "function" ? performance.now() : Date.now();
+    const elapsed = now() - lastFastRefreshAt;
+    const remaining = Math.max(0, 900 - elapsed);
+    trailingFastRefreshTimer = setTimeout(() => {
+      trailingFastRefreshTimer = null;
+      if (disposed || document.hidden) {
+        pendingFastRefresh = false;
+        return;
+      }
+      if (!pendingFastRefresh) return;
+      if (statsInFlight) {
+        pendingFastRefresh = true;
+        return;
+      }
+      pendingFastRefresh = false;
+      lastFastRefreshAt = now();
+      refreshStats(false);
+    }, remaining + 10);
   }
 
   function estimateRenderedTokens(str) {
@@ -3761,13 +4508,42 @@
     const chatCol = document.querySelector("[data-chat-column]");
     const assistantSnapshot = getAssistantStreamSnapshot(chatCol);
     const now = performance.now();
+    // Capture an idle snapshot even when empty; never confuse "not captured" with an empty turn.
+    if (!(latestStats?.ok && latestStats.isRunning)) {
+      const isNewMessage = String(assistantSnapshot?.messageId || "") !== lastIdleMessageId;
+      const isGrowing = (assistantSnapshot?.text.length || 0) > lastIdleTextLen;
+      if (turnSpeedState.active || liveStreamTps != null || streamSampler.samples.length) clearActiveStreamSamples();
+      turnSpeedState.baselineMessageId = String(assistantSnapshot?.messageId || "");
+      turnSpeedState.baselineCaptured = true;
+      turnSpeedState.baselineProvider = String(latestStats?.provider || "");
+      lastIdleMessageId = String(assistantSnapshot?.messageId || "");
+      lastIdleTextLen = assistantSnapshot?.text.length || 0;
+      if (latestStats && assistantSnapshot && (isNewMessage || isGrowing)) {
+        pendingFastRefresh = true;
+        scheduleTrailingFastRefresh(); // completion of an in-flight request resumes the pending refresh
+      }
+    }
+    // When running, keep idle baseline in sync so a future idle does not mis-detect the same message.
+    if (latestStats?.isRunning === true && assistantSnapshot) {
+      lastIdleMessageId = assistantSnapshot.messageId;
+      lastIdleTextLen = Math.max(lastIdleTextLen, assistantSnapshot.text.length);
+    }
+    const isUnboundedUntrusted = Boolean(assistantSnapshot?.unboundedNoUser);
+    const isBaselineMessage = Boolean(
+      turnSpeedState.baselineCaptured &&
+        turnSpeedState.baselineMessageId &&
+        assistantSnapshot?.messageId === turnSpeedState.baselineMessageId
+    );
     const sample = advanceHudStreamSampler(
       streamSampler,
       assistantSnapshot,
       now,
-      canSampleHudStream(latestStats, assistantSnapshot),
+      canSampleHudStream(latestStats, assistantSnapshot) && !isUnboundedUntrusted && !isBaselineMessage,
       estimateRenderedTokens
     );
+    if (streamSampler.samples.length > 0 && latestStats?.provider) {
+      streamSampler.provider = String(latestStats.provider);
+    }
     liveStreamTps = sample.liveTps;
     if (sample.changed && latestStats) renderTopbarStats(latestStats);
     if (sample.stalled) refreshStats(false);
@@ -3796,12 +4572,18 @@
     cachedRouter = null;
     clearInterval(routeWatchTimer);
     clearInterval(streamWatchTimer);
-    if (pollTimer) clearTimeout(pollTimer);
-    if (layoutSyncTimer) clearTimeout(layoutSyncTimer);
+    if (pollTimer && typeof clearTimeout === "function") clearTimeout(pollTimer);
+    if (trailingFastRefreshTimer) {
+      if (typeof clearTimeout === "function") clearTimeout(trailingFastRefreshTimer);
+      trailingFastRefreshTimer = null;
+    }
+    pendingFastRefresh = false;
+    if (layoutSyncTimer && typeof clearTimeout === "function") clearTimeout(layoutSyncTimer);
     if (layoutRafId) cancelAnimationFrame(layoutRafId);
     if (cleanupDragListeners) cleanupDragListeners();
     if (layoutResizeObserver) layoutResizeObserver.disconnect();
     domObserver.disconnect();
+    stopSelectionObservers();
     setComposerTopSpacing(null);
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("hashchange", onRouteMaybeChanged);

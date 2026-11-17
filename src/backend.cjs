@@ -35,9 +35,13 @@ function getTaskBoard() {
 }
 function getHostSettingsManager() {
   const curHome = process.env.HOME || os.homedir();
-  if (_hostSettingsInstance && _hostSettingsHome === curHome) return _hostSettingsInstance;
-  _hostSettingsInstance = hubHostSettings.createHostSettingsManager({});
-  _hostSettingsHome = curHome;
+  const curKey = `${curHome}\0${process.env.T3_HUB_DIR || ""}\0${process.env.T3CODE_HOME || ""}`;
+  if (_hostSettingsInstance && _hostSettingsHome === curKey) return _hostSettingsInstance;
+  _hostSettingsInstance = hubHostSettings.createHostSettingsManager({
+    homeDir: curHome,
+    ...(process.env.T3_HUB_DIR ? { hubDir: process.env.T3_HUB_DIR } : {}),
+  });
+  _hostSettingsHome = curKey;
   return _hostSettingsInstance;
 }
 function isTestEnv() {
@@ -537,15 +541,17 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
   let lastDecodeSec = null;
   let lastStepCacheRate = null;
   let lastContextPrompt = null;
+  let lastEventMs = null;
+  let lastUsageEventMs = null;
+  let lastSpeedEventMs = null;
+  let hasPendingUnfinishedCallAfterLastUsage = false;
   let latestModel = fallbackModel || null;
   let stepCount = 0;
 
   let pendingResponseCreatedUs = null;
 
   forEachJsonlLineSync(jsonlPath, (line) => {
-    if (!line || (!line.includes("model_response_created") && !line.includes("model_completed"))) {
-      return;
-    }
+    if (!line) return;
     let rec;
     try {
       rec = JSON.parse(line);
@@ -554,15 +560,24 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     }
     const evt = rec?.payload?.event;
     if (!evt) return;
+    const eventMs = Number.isFinite(rec.recorded_at) && rec.recorded_at / 1e3 >= 946684800000
+      ? rec.recorded_at / 1e3 : null;
+    if (eventMs != null) lastEventMs = eventMs;
 
     if (evt.kind === "model_response_created") {
+      hasPendingUnfinishedCallAfterLastUsage = true;
       pendingResponseCreatedUs = typeof rec.recorded_at === "number" ? rec.recorded_at : null;
+    } else if (evt.kind === "turn_started" || evt.kind === "turn_start" || evt.kind === "request_started") {
+      hasPendingUnfinishedCallAfterLastUsage = true;
     } else if (evt.kind === "model_completed") {
       // A completed response supersedes the previous turn even when it did not
       // yield enough visible output for a valid decode-rate sample.
       lastDecodeTps = null;
       lastDecodeSec = null;
       lastStepCacheRate = null;
+      lastSpeedEventMs = null;
+      lastUsageEventMs = null;
+      hasPendingUnfinishedCallAfterLastUsage = false;
       if (!evt.usage) {
         pendingResponseCreatedUs = null;
         return;
@@ -584,8 +599,12 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
         (typeof evt.model === "string" ? evt.model : evt.model?.model_id) || latestModel;
       if (model) latestModel = model;
 
-      if (inputTotal + output === 0) return;
+      if (inputTotal + output === 0) {
+        pendingResponseCreatedUs = null;
+        return;
+      }
       stepCount++;
+      lastUsageEventMs = eventMs;
 
       sumUncached += uncached;
       sumCached += cacheRead;
@@ -611,6 +630,7 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
           if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += output; bm.sec += decSec; }
           lastDecodeTps = output / decSec;
           lastDecodeSec = decSec;
+          lastSpeedEventMs = eventMs;
         }
       }
       if (evt.duration_ms > 50 && output > 0) {
@@ -645,6 +665,10 @@ function readMuseSessionFile(jsonlPath, fallbackModel) {
     byModelDecode,
     e2eTokPerSec: avgE2eTps,
     durationSec: lastDecodeSec,
+    lastEventMs,
+    lastUsageEventMs,
+    lastSpeedEventMs,
+    hasPendingUnfinishedCallAfterLastUsage,
   };
 
   lruSet(fileParseCache, jsonlPath, { sig, data });
@@ -787,23 +811,35 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
     let lastStreamSec = null;
     let lastStepCacheRate = null;
     let lastContextPrompt = null;
+    let lastEventMs = null;
+    let lastUsageEventMs = null;
+    let lastSpeedEventMs = null;
+    let hasPendingUnfinishedCallAfterLastUsage = false;
     let latestModel = fallbackModel || null;
     let stepCount = 0;
 
     for (const r of rows) {
-      if (!r.metadata) continue;
+      if (!r.metadata) {
+        if (Number(r.step_type) === 15) hasPendingUnfinishedCallAfterLastUsage = true;
+        continue;
+      }
+      const f = parseProtoSimple(Buffer.from(r.metadata));
+      const t1 = f[1]?.[0] ? protoTimestampSec(f[1][0]) : null;
+      const t6 = f[6]?.[0] ? protoTimestampSec(f[6][0]) : null;
+      const t7 = f[7]?.[0] ? protoTimestampSec(f[7][0]) : f[8]?.[0] ? protoTimestampSec(f[8][0]) : null;
+      const evSec = t7 ?? t6 ?? t1;
+      const eventMs = Number.isFinite(evSec) && evSec * 1000 >= 946684800000 ? evSec * 1000 : null;
+      if (eventMs != null) lastEventMs = eventMs;
       // step_type === 15 marks inference/token-usage steps; when the column exists, prefer it.
       // We still accept any step with f[9] usage metadata for backward compatibility.
       if (r.step_type != null && Number(r.step_type) !== 15) {
-        const probe = parseProtoSimple(Buffer.from(r.metadata));
-        if (!probe[9]?.[0]) continue;
-        const uProbe = parseProtoSimple(probe[9][0]);
+        if (!f[9]?.[0]) continue;
+        const uProbe = parseProtoSimple(f[9][0]);
         const probeTotal =
           (Number(uProbe[2]?.[0]) || 0) + (Number(uProbe[5]?.[0]) || 0) + (Number(uProbe[4]?.[0]) || 0) +
           Math.max(Number(uProbe[3]?.[0]) || 0, (Number(uProbe[9]?.[0]) || 0) + (Number(uProbe[10]?.[0]) || 0));
         if (probeTotal === 0) continue;
       }
-      const f = parseProtoSimple(Buffer.from(r.metadata));
       if (!f[9]?.[0]) {
         // With the typed schema, a new inference row is a new model call even
         // if its usage submessage is absent. Do not label the previous call's
@@ -812,6 +848,8 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
           lastStreamTps = null;
           lastStreamSec = null;
           lastStepCacheRate = null;
+          lastSpeedEventMs = null;
+          hasPendingUnfinishedCallAfterLastUsage = true;
         }
         continue;
       }
@@ -821,6 +859,8 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       // the newest step has no valid visible-output/decode window.
       lastStreamTps = null;
       lastStreamSec = null;
+      lastSpeedEventMs = null;
+      lastStepCacheRate = null;
       const uncached = Math.max(0, Number(u[2]?.[0]) || 0);
       const cacheRead = Math.max(0, Number(u[5]?.[0]) || 0);
       const cacheWrite = Math.max(0, Number(u[4]?.[0]) || 0);
@@ -829,8 +869,13 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       const output = Math.max(Number(u[3]?.[0]) || 0, reasoning + visOut);
 
       const promptTotal = uncached + cacheRead + cacheWrite;
-      if (promptTotal + output === 0) continue;
+      if (promptTotal + output === 0) {
+        if (Number(r.step_type) === 15) hasPendingUnfinishedCallAfterLastUsage = true;
+        continue;
+      }
       stepCount++;
+      lastUsageEventMs = eventMs;
+      hasPendingUnfinishedCallAfterLastUsage = false;
 
       // Model extraction from step field 24
       if (f[24]?.[0]) {
@@ -860,10 +905,6 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
         lastContextPrompt = promptTotal + output;
       }
 
-      const t1 = f[1]?.[0] ? protoTimestampSec(f[1][0]) : null;
-      const t6 = f[6]?.[0] ? protoTimestampSec(f[6][0]) : null;
-      const t7 = f[7]?.[0] ? protoTimestampSec(f[7][0]) : f[8]?.[0] ? protoTimestampSec(f[8][0]) : null;
-
       // Pure API E2E duration (excludes all bash/tool execution wait time!)
       if (t1 && t7 && t7 > t1 + 0.05 && output > 0) {
         e2eTokensSum += output;
@@ -881,6 +922,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
           if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += streamTok; bm.sec += sDur; }
           lastStreamTps = sTps;
           lastStreamSec = sDur;
+          lastSpeedEventMs = eventMs;
         }
       }
     }
@@ -909,6 +951,10 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       byModelDecode,
       e2eTokPerSec: avgE2eTps,
       durationSec: lastStreamSec,
+      lastEventMs,
+      lastUsageEventMs,
+      lastSpeedEventMs,
+      hasPendingUnfinishedCallAfterLastUsage,
     };
 
     lruSet(fileParseCache, dbFile, { sig, data });
@@ -989,6 +1035,10 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
   let lastE2eSec = null;
   let lastStepCacheRate = null;
   let lastContextPrompt = null;
+  let lastEventMs = null;
+  let lastUsageEventMs = null;
+  let lastSpeedEventMs = null;
+  let hasPendingUnfinishedCallAfterLastUsage = false;
   let codexContextMax = null;
   let latestModel = fallbackModel || null;
   let stepCount = 0;
@@ -1005,7 +1055,16 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       return;
     }
     const tsMs = rec.timestamp ? Date.parse(rec.timestamp) : null;
+    const eventMs = Number.isFinite(tsMs) && tsMs >= 946684800000 ? tsMs : null;
+    if (eventMs != null) lastEventMs = eventMs;
     const p = rec.payload;
+    if (rec.type === "model_response_created" ||
+      (rec.type === "event_msg" && ["model_response_created", "task_started", "turn_started", "turn_start", "request_started"].includes(p?.type)) ||
+      (rec.type === "response_item" && p?.type === "message" && p?.role === "user")) {
+      hasPendingUnfinishedCallAfterLastUsage = true;
+      stepInputReadyMs = tsMs;
+      reasoningDoneMs = null;
+    }
 
     if (p?.thread_settings?.model) {
       latestModel = p.thread_settings.model;
@@ -1023,6 +1082,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     ) {
       stepInputReadyMs = tsMs;
       reasoningDoneMs = null;
+      hasPendingUnfinishedCallAfterLastUsage = true;
     } else if (rec.type === "response_item" && p?.type === "reasoning") {
       reasoningDoneMs = tsMs;
     } else if (rec.type === "token_usage_record") {
@@ -1032,6 +1092,9 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       lastDecodeSec = null;
       lastE2eSec = null;
       lastStepCacheRate = null;
+      lastUsageEventMs = null;
+      lastSpeedEventMs = null;
+      hasPendingUnfinishedCallAfterLastUsage = false;
       if (!p?.usage) {
         stepCount++;
         stepInputReadyMs = tsMs;
@@ -1053,6 +1116,8 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
         return;
       }
       stepCount++;
+
+      lastUsageEventMs = eventMs;
 
       sumUncached += uncached;
       sumCached += cr;
@@ -1083,6 +1148,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
           lastDecodeSec = dSec;
           if (latestModel) { const bm = (byModelDecode[latestModel] ||= { tok: 0, sec: 0 }); bm.tok += visOut; bm.sec += dSec; }
           lastDecodeTps = visOut / dSec;
+          lastSpeedEventMs = eventMs;
         }
       }
       stepInputReadyMs = tsMs;
@@ -1114,6 +1180,10 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     decodeSecSum,
     e2eTokPerSec: avgE2eTps,
     durationSec: lastDecodeSec ?? lastE2eSec,
+    lastEventMs,
+    lastUsageEventMs,
+    lastSpeedEventMs,
+    hasPendingUnfinishedCallAfterLastUsage,
   };
 
   lruSet(fileParseCache, jsonlPath, { sig, data });
@@ -1149,6 +1219,235 @@ function latestProviderTurnCacheRate(turnRows, fallbackDriver) {
   if (!latest) return null;
   const payload = safeJsonParse(latest.payload_json);
   return cacheRateForTurnUsage(payload?.turnTokenUsage, payload?.nativeTurnRef?.driver || payload?.driver || fallbackDriver);
+}
+
+function estimateTextTokens(str) {
+  if (!str) return 0;
+  let cjk = 0;
+  const len = str.length;
+  for (let i = 0; i < len; i++) {
+    if (str.charCodeAt(i) > 0x2e80) cjk++;
+  }
+  return cjk * 0.72 + (len - cjk) * 0.27;
+}
+
+function latestTurnIdentityIds(latestTurn) {
+  const ids = new Set();
+  const push = (v) => { if (v != null && String(v) !== "") ids.add(String(v)); };
+  if (!latestTurn) return ids;
+  try { push(latestTurn.row?.provider_turn_id); } catch {}
+  try { push(latestTurn.row?.turn_id); } catch {}
+  try { push(latestTurn.row?.id); } catch {}
+  const p = latestTurn.payload || {};
+  push(p.id);
+  push(p.turnId);
+  push(p.providerTurnId);
+  push(p.providerTurn?.id);
+  push(p.turn?.id);
+  push(p.nativeTurnRef?.nativeId);
+  return ids;
+}
+
+function itemTurnIdentityIds(p, row) {
+  const ids = new Set();
+  const push = (v) => { if (v != null && String(v) !== "") ids.add(String(v)); };
+  if (p) {
+    push(p.turnId);
+    push(p.providerTurnId);
+    push(p.providerTurn?.id);
+    push(p.turn?.id);
+    push(p.turn_id);
+    push(p.nativeTurnRef?.nativeId);
+  }
+  if (row) {
+    push(row.turn_id);
+    push(row.provider_turn_id);
+  }
+  return ids;
+}
+
+function itemDriverOf(p, row) {
+  const drivers = new Set();
+  const add = (v) => {
+    if (v != null && String(v).trim() !== "") drivers.add(String(v).trim());
+  };
+  if (p) {
+    add(p.driver);
+    add(p.provider);
+    add(p.nativeTurnRef?.driver);
+    add(p.nativeItemRef?.driver);
+    add(p.payload?.driver);
+    add(p.payload?.provider);
+    add(p.payload?.nativeTurnRef?.driver);
+    add(p.payload?.nativeItemRef?.driver);
+  }
+  if (row) {
+    add(row.driver);
+    add(row.provider);
+  }
+  if (drivers.size === 0) return null;
+  if (drivers.size > 1) return "__conflicting_driver__";
+  return [...drivers][0];
+}
+
+function itemBelongsToCurrentTurn(p, row, latestTurnIds, effDriver) {
+  const itemIds = itemTurnIdentityIds(p, row);
+  const itemDriver = itemDriverOf(p, row);
+  if (itemDriver === "__conflicting_driver__") return false;
+  if (itemDriver != null && effDriver != null && itemDriver !== effDriver) return false;
+  if (itemIds.size === 0 || !latestTurnIds || latestTurnIds.size === 0) return false;
+  for (const id of itemIds) {
+    if (latestTurnIds.has(id)) return true;
+  }
+  return false;
+}
+
+function safeTurnItemRows(db, threadId) {
+  try {
+    const colsRows = db.prepare('PRAGMA table_info("orchestration_v2_projection_turn_items")').all();
+    const cols = new Set((colsRows || []).map((r) => r.name));
+    if (cols.size === 0) throw new Error("no cols");
+    const sel = ["payload_json"];
+    for (const c of ["turn_id", "provider_turn_id", "driver", "provider", "ordinal", "type", "updated_at"]) {
+      if (cols.has(c)) sel.push(c);
+    }
+    const sql = `SELECT ${sel.map((s) => `"${s}"`).join(", ")} FROM orchestration_v2_projection_turn_items WHERE thread_id = ?`;
+    return db.prepare(sql).all(threadId);
+  } catch {
+    return db.prepare("SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE thread_id = ?").all(threadId);
+  }
+}
+
+function isDbTurnStaticallyActive(latestTurn, effDriver) {
+  if (!latestTurn) return false;
+  const row = latestTurn.row || {};
+  const payload = latestTurn.payload || {};
+  const st = String(row.status || payload.status || "").toLowerCase();
+  if (st === "completed" || st === "interrupted" || st === "failed" || st === "error" || st === "cancelled" || st === "canceled") return false;
+  if (st !== "running" && st !== "pending" && st !== "starting" && st !== "in_progress") return false;
+  const completedAt = row.completed_at || payload.completedAt || payload.completed_at || null;
+  if (completedAt != null && completedAt !== "") {
+    const ms = typeof completedAt === "number" ? completedAt : Date.parse(completedAt);
+    if (Number.isFinite(ms)) return false;
+    if (typeof completedAt === "string" && completedAt.trim() !== "") return false;
+  }
+  const d = payload?.nativeTurnRef?.driver || payload?.driver || row?.driver || null;
+  if (d != null && effDriver != null && String(d) !== String(effDriver)) return false;
+  return true;
+}
+
+function isRemoteTurnActive(last, selectedProvider) {
+  if (!last) return false;
+  const st = String(last.status || "").toLowerCase();
+  if (st === "completed" || st === "interrupted" || st === "failed" || st === "error" || st === "cancelled" || st === "canceled") return false;
+  if (st === "running" || st === "pending" || st === "starting" || st === "in_progress") {
+    const d = last.driver || null;
+    if (d != null && selectedProvider != null && String(d) !== String(selectedProvider)) return false;
+    return true;
+  }
+  const completedMs = last.completedMs ?? last.completedAt ?? null;
+  const startedMs = last.startedMs ?? last.startedAt ?? null;
+  if (completedMs != null && startedMs != null && Number(completedMs) > Number(startedMs)) return false;
+  if (completedMs != null && startedMs == null) return false;
+  return false;
+}
+
+// Strictly attributed estimate for the current running turn only.
+// Returns null unless a sub-step sample is provably part of latestTurn (turn identity + driver + timestamp >= latestTurn.stamp, positive output, valid duration).
+function computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver, isRunning, nowMs = Date.now() }) {
+  if (!isRunning) return null;
+  if (!latestTurn || !Number.isFinite(latestTurn.stamp) || !isDbTurnStaticallyActive(latestTurn, effDriver)) return null;
+  if (latestTurnDriver && latestTurnDriver !== effDriver) return null;
+  const latestTurnIds = latestTurnIdentityIds(latestTurn);
+  let toolIntervals = [];
+  let items = [];
+  try {
+    const rows = safeTurnItemRows(db, threadId);
+    for (const row of rows) {
+      const p = safeJsonParse(row.payload_json);
+      if (!p) continue;
+      items.push({ p, row });
+      if (!["root_turn", "assistant_message", "reasoning", "user_message", "checkpoint", "notification"].includes(p.type)) {
+        if (!itemBelongsToCurrentTurn(p, row, latestTurnIds, effDriver)) continue;
+        const s = Date.parse(p.startedAt);
+        let e = Date.parse(p.completedAt);
+        const status = String(p.status || "").toLowerCase();
+        if (p.completedAt == null && (!status || ["running", "pending", "in_progress", "starting"].includes(status)) && s >= latestTurn.stamp) {
+          const updatedMs = Date.parse(p.updatedAt || row.updated_at || "");
+          e = Number.isFinite(updatedMs) && updatedMs > s ? Math.max(nowMs, updatedMs) : nowMs;
+        }
+        if (Number.isFinite(s) && Number.isFinite(e) && e > s && e - s < 600000) toolIntervals.push([s, e]);
+      }
+    }
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const { p, row } of items) {
+    if (p.type !== "assistant_message" && p.type !== "reasoning") continue;
+    if (!itemBelongsToCurrentTurn(p, row, latestTurnIds, effDriver)) continue;
+    const s = Date.parse(p.startedAt);
+    const e = p.completedAt ? Date.parse(p.completedAt) : Date.parse(p.updatedAt || row.updated_at || "") || nowMs;
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s + 50) continue;
+    if (s < latestTurn.stamp) continue;
+    const explicitOut = p.outputTokens ?? p.output_tokens ?? p.output ?? p.usage?.outputTokens ?? p.usage?.output_tokens ?? p.tokenCount ?? p.estimatedTokens;
+    let out = Number(explicitOut);
+    if (!Number.isFinite(out) || out <= 0) {
+      // No explicit token count: estimate from real text with CJK weighting.
+      let text = "";
+      for (const c of [p.text, p.delta, p.content]) {
+        if (typeof c === "string" && c.length > 0) text += c;
+        else if (Array.isArray(c)) {
+          for (const part of c) {
+            if (typeof part === "string") text += part;
+            else if (part && typeof part.text === "string") text += part.text;
+          }
+        }
+      }
+      if (text.length > 0) {
+        out = estimateTextTokens(text);
+      } else if (Number.isFinite(Number(p.charCount)) && Number(p.charCount) > 0) {
+        // Bare charCount without text is never a token count; use a conservative factor.
+        out = Number(p.charCount) * 0.28;
+      } else {
+        continue;
+      }
+    }
+    if (!Number.isFinite(out) || out <= 0) continue;
+    const netSec = subtractToolWait(s, e, toolIntervals);
+    if (!(netSec > 0.05)) continue;
+    const tps = out / netSec;
+    if (!Number.isFinite(tps) || tps <= 0 || tps > 1500) continue;
+    candidates.push({ out, netSec });
+  }
+  if (candidates.length > 0) {
+    const sumOut = candidates.reduce((a, c) => a + c.out, 0);
+    const sumSec = candidates.reduce((a, c) => a + c.netSec, 0);
+    if (!(sumSec > 0.05)) return null;
+    const agg = sumOut / sumSec;
+    return Number.isFinite(agg) && agg > 0 && agg <= 1500 ? Math.round(agg * 10) / 10 : null;
+  }
+  // Fallback: interim usage on the running turn itself (if upstream already reported partial usage while still running)
+  try {
+    const u = latestTurn.payload?.turnTokenUsage;
+    const out = Number(u?.outputTokens);
+    if (Number.isFinite(out) && out > 0) {
+      const sMs = latestTurn.stamp;
+      const completed = latestTurn.row.completed_at || latestTurn.payload?.completedAt;
+      const itemStamps = items.filter(({ p, row }) => itemBelongsToCurrentTurn(p, row, latestTurnIds, effDriver))
+        .flatMap(({ p, row }) => [p.completedAt, p.updatedAt, row.updated_at, p.startedAt].map(value => Date.parse(value || "")))
+        .filter(value => Number.isFinite(value) && value >= sMs);
+      const eMs = completed ? Date.parse(completed) : itemStamps.length ? Math.max(...itemStamps) : nowMs;
+      if (Number.isFinite(eMs) && eMs > sMs + 50) {
+        const netSec = subtractToolWait(sMs, eMs, toolIntervals);
+        if (netSec > 0.05) {
+          const tps = out / netSec;
+          if (Number.isFinite(tps) && tps > 0 && tps <= 1500) return Math.round(tps * 10) / 10;
+        }
+      }
+    }
+  } catch {}
+  return null;
 }
 
 function extractThreadId(hint) {
@@ -1195,11 +1494,20 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     )
     .all(threadId);
 
-  const rawTurnRows = db
-    .prepare(
-      "SELECT rowid AS row_order, ordinal, status, started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC"
-    )
-    .all(threadId);
+  let rawTurnRows;
+  try {
+    const colsRows = db.prepare('PRAGMA table_info("orchestration_v2_projection_provider_turns")').all();
+    const cols = new Set((colsRows || []).map((r) => r.name));
+    if (cols.size === 0) throw new Error("no cols");
+    const sel = ["rowid AS row_order"];
+    for (const c of ["provider_turn_id", "ordinal", "status", "started_at", "completed_at", "payload_json"]) {
+      if (cols.has(c)) sel.push(c);
+    }
+    if (!cols.has("payload_json")) sel.push("payload_json");
+    rawTurnRows = db.prepare(`SELECT ${sel.join(", ")} FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC`).all(threadId);
+  } catch {
+    rawTurnRows = db.prepare("SELECT rowid AS row_order, ordinal, status, started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC").all(threadId);
+  }
   // Provider ordinals reset across resumed sessions. Use event time, with the
   // stable insertion order for ties and for a newly inserted undated turn.
   const turnEvidence = rawTurnRows.map((row, index) => {
@@ -1234,13 +1542,25 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     contextMax = current.max;
     contextMaxSource = current.max != null ? "reported" : null;
   }
-  if (latestTurnDriver) {
-    latestDriver = latestTurnDriver;
-    const current = contextsByDriver.get(latestTurnDriver);
+  const providerChanged = Boolean(fallbackProvider && (latestTurnDriver || latestDriver) && fallbackProvider !== (latestTurnDriver || latestDriver));
+  isRunning = !providerChanged && isDbTurnStaticallyActive(latestTurn, fallbackProvider || latestTurnDriver);
+  if (fallbackProvider || latestTurnDriver) {
+    // Historical accumulation keeps its driver; only the returned current-provider fields are replaced below.
+    latestDriver = latestTurnDriver || fallbackProvider;
+    const current = contextsByDriver.get(fallbackProvider || latestDriver);
     contextUsed = current?.used ?? null;
     contextMax = current?.max ?? null;
     contextMaxSource = contextMax != null ? "reported" : null;
   }
+  const currentProviderTelemetry = (telemetry) => {
+    if (!providerChanged && (!fallbackProvider || telemetry.provider === fallbackProvider)) return telemetry;
+    return { ...telemetry, provider: fallbackProvider, model: fallbackModel || null,
+      isRunning: false, turnCacheRate: null, lastTurnCacheRate: null, lastCallCacheRate: null,
+      contextCacheRate: null, lastDecodeTps: null, currentTurnEstimateTps: null, durationSec: null,
+      contextUsed: contextsByDriver.get(fallbackProvider)?.used ?? null,
+      contextMax: contextsByDriver.get(fallbackProvider)?.max ?? null,
+      contextMaxSource: contextsByDriver.get(fallbackProvider)?.max != null ? "reported" : null };
+  };
 
   const agyConvIds = new Set();
   const museNativeIds = new Set();
@@ -1258,7 +1578,6 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   }
 
   for (const tr of turnRows) {
-    if (tr.status === "running" || tr.status === "pending") isRunning = true;
     const p = safeJsonParse(tr.payload_json);
     const turnNid = p?.nativeTurnRef?.nativeId;
     if (p?.nativeTurnRef?.driver === "antigravity" && typeof turnNid === "string") {
@@ -1286,7 +1605,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     if (fp) {
       const d = readMuseSessionFile(fp, latestModel);
       if (d && d.stepCount > 0) {
-        nativeParts.push({ ...d, driver: "muse", mtimeMs: getLatestMtimeMs(fp) });
+        nativeParts.push({ ...d, driver: "muse", nativeId: mid, mtimeMs: getLatestMtimeMs(fp) });
       }
     }
   }
@@ -1295,7 +1614,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     if (fp) {
       const d = readAntigravityConvDb(fp, latestModel);
       if (d && d.stepCount > 0) {
-        nativeParts.push({ ...d, driver: "antigravity", mtimeMs: getLatestMtimeMs(fp) });
+        nativeParts.push({ ...d, driver: "antigravity", nativeId: cid, mtimeMs: getLatestMtimeMs(fp) });
       }
     }
   }
@@ -1304,7 +1623,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     if (fp) {
       const d = readCodexSessionFile(fp, latestModel);
       if (d && d.stepCount > 0) {
-        nativeParts.push({ ...d, driver: "codex", mtimeMs: getLatestMtimeMs(fp) });
+        nativeParts.push({ ...d, driver: "codex", nativeId: xid, mtimeMs: getLatestMtimeMs(fp) });
       }
     }
   }
@@ -1337,6 +1656,22 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     let latestUncoveredOutput = 0;
     let latestUncoveredStartMs = null;
     let latestUncoveredEndMs = null;
+    let latestUncoveredTurnIds = null;
+    let cachedTurnItemRows = null;
+    const getParsedTurnItems = () => {
+      if (cachedTurnItemRows) return cachedTurnItemRows;
+      try {
+        cachedTurnItemRows = safeTurnItemRows(db, threadId).map((row) => ({ row, item: safeJsonParse(row.payload_json) }));
+      } catch {
+        cachedTurnItemRows = [];
+      }
+      return cachedTurnItemRows;
+    };
+    const buildTurnToolIntervals = (turnIds, turnDriver) =>
+      getParsedTurnItems()
+        .filter(({ row, item }) => item && item.startedAt && item.completedAt && item.type !== "assistant_message" && item.type !== "reasoning" && itemBelongsToCurrentTurn(item, row, turnIds, turnDriver))
+        .map(({ item }) => [Date.parse(item.startedAt), Date.parse(item.completedAt)])
+        .filter(([startMs, endMs]) => Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs && endMs - startMs < 600000);
 
     for (const part of nativeParts) {
       uncached += part.uncached;
@@ -1370,6 +1705,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       const completed = tr.status === "completed" || Boolean(tr.completed_at || p?.completedAt);
       const uS = Date.parse(tr.started_at || p?.startedAt || "");
       const uE = Date.parse(tr.completed_at || p?.completedAt || "");
+      const trIds = latestTurnIdentityIds({ row: tr, payload: p });
       if (completed) stepCount++;
       const turnMs = Number.isFinite(uE) ? uE : Number.isFinite(uS) ? uS : NaN;
       // Each uncovered provider row supersedes the prior candidate, including
@@ -1380,6 +1716,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       latestUncoveredOutput = completed && typeof u?.outputTokens === "number" ? Math.max(0, u.outputTokens) : 0;
       latestUncoveredStartMs = completed && Number.isFinite(uS) ? uS : null;
       latestUncoveredEndMs = completed && Number.isFinite(uE) ? uE : null;
+      latestUncoveredTurnIds = trIds;
       latestUncoveredModel =
         (Array.isArray(u?.models) && typeof u.models[0] === "string" && u.models[0]) ||
         (typeof p?.model === "string" && p.model) ||
@@ -1402,7 +1739,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       savedUsd += priced.savedUsd;
       if (Number.isFinite(uE) && Number.isFinite(uS) && uE > uS + 50 && out > 0) {
         uncoveredOut += out;
-        uncoveredNetSec += (uE - uS) / 1000;
+        uncoveredNetSec += subtractToolWait(uS, uE, buildTurnToolIntervals(trIds, d));
       }
     }
 
@@ -1416,6 +1753,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 
     const matchingParts = latestTurnDriver ? nativeParts.filter((part) => part.driver === latestTurnDriver) : nativeParts;
     const lastPart = matchingParts[matchingParts.length - 1] || nativeParts[nativeParts.length - 1];
+    const matchingStepsSum = matchingParts.reduce((sum, part) => sum + (part.stepCount || 0), 0);
 
     // Mixed-provider freshness: if an uncovered provider ran after the newest
     // native part, its statev2 metadata wins over stale native metadata.
@@ -1449,7 +1787,79 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     const useOverride = Boolean(overrideDriver) && ((overrideDriver === latestTurnDriver && !Number.isFinite(latestTurn?.stamp)) || overrideMs > (lastPart.mtimeMs || 0));
     const effDriver = useOverride ? overrideDriver : lastPart.driver || latestDriver;
     const effModel = useOverride ? overrideModel || statev2Model : lastPart.model || latestModel;
-    const latestCallCacheRate = useOverride
+    const completedDriverTurns = turnRows.reduce((cnt, tr) => {
+      const p = safeJsonParse(tr.payload_json);
+      if (p?.nativeTurnRef?.driver !== effDriver) return cnt;
+      return (tr.status === "completed" || Boolean(tr.completed_at || p?.completedAt)) ? cnt + 1 : cnt;
+    }, 0);
+    const latestTurnCompleted = latestTurn && (String(latestTurn.row.status || latestTurn.payload?.status) === "completed" || Boolean(latestTurn.row.completed_at || latestTurn.payload?.completedAt));
+    const latestTurnStartMs = latestTurn ? Date.parse(latestTurn.row.started_at || latestTurn.payload?.startedAt || "") : NaN;
+    const latestTurnEndMs = latestTurn ? Date.parse(latestTurn.row.completed_at || latestTurn.payload?.completedAt || "") : NaN;
+    const latestTurnOut = Math.max(0, Number(latestTurn?.payload?.turnTokenUsage?.outputTokens) || 0);
+    const epochFloorMs = 946684800000;
+    // A request/start event can make both mtime and lastEventMs fresh without
+    // producing any new usage. Attribute samples by their own completion time.
+    const hasLatestTurnStart = Number.isFinite(latestTurnStartMs) && latestTurnStartMs >= epochFloorMs;
+    const staleByUsageTime = hasLatestTurnStart && Number.isFinite(lastPart.lastUsageEventMs) &&
+      lastPart.lastUsageEventMs < latestTurnStartMs - 50;
+    const staleBySpeedTime = hasLatestTurnStart && Number.isFinite(lastPart.lastSpeedEventMs) &&
+      lastPart.lastSpeedEventMs < latestTurnStartMs - 50;
+    const pendingNativeCall = !latestTurnCompleted && lastPart.hasPendingUnfinishedCallAfterLastUsage === true;
+    const staleByEventTime =
+      Number.isFinite(lastPart.lastEventMs) &&
+      lastPart.lastEventMs >= epochFloorMs &&
+      Number.isFinite(latestTurnStartMs) &&
+      latestTurnStartMs >= epochFloorMs &&
+      lastPart.lastEventMs < latestTurnStartMs - 1000;
+    const staleByMtime =
+      Number.isFinite(latestTurnStartMs) &&
+      latestTurnStartMs >= epochFloorMs &&
+      (lastPart.mtimeMs || 0) > 0 &&
+      lastPart.mtimeMs < latestTurnStartMs - 1000;
+    const latestSameDriverPThread = [...pThreadRows].reverse().find((pt) => pt.driver === effDriver);
+    const latestSameDriverNativeId = (() => {
+      const turnNid = latestTurnDriver === effDriver && typeof latestTurn?.payload?.nativeTurnRef?.nativeId === "string"
+        ? (effDriver === "antigravity" ? latestTurn.payload.nativeTurnRef.nativeId.split(":")[0] : null)
+        : null;
+      if (turnNid) return turnNid;
+      const ptNid = safeJsonParse(latestSameDriverPThread?.payload_json)?.nativeThreadRef?.nativeId;
+      if (!ptNid || String(ptNid).startsWith("pending:")) return null;
+      return effDriver === "antigravity" ? String(ptNid).split(":")[0] : String(ptNid);
+    })();
+    const missingExpectedLatestNativePart = Boolean(
+      latestSameDriverNativeId && !matchingParts.some((part) => part.nativeId === latestSameDriverNativeId)
+    );
+    const lastPartCoversLatestTurn =
+      !staleByUsageTime && !pendingNativeCall && (
+        !latestTurn ||
+        !latestTurnCompleted ||
+        (latestTurnDriver && latestTurnDriver !== effDriver) ||
+        (lastPart.driver === effDriver &&
+          !missingExpectedLatestNativePart &&
+          matchingStepsSum >= Math.max(1, completedDriverTurns) &&
+          !staleByEventTime &&
+          !staleByMtime)
+      );
+    let latestSameDriverFallbackTps = null;
+    let latestSameDriverFallbackDurationSec = null;
+    if (
+      !lastPartCoversLatestTurn &&
+      latestTurnCompleted &&
+      latestTurnDriver === effDriver &&
+      latestTurnOut >= 15 &&
+      Number.isFinite(latestTurnStartMs) &&
+      Number.isFinite(latestTurnEndMs) &&
+      latestTurnEndMs > latestTurnStartMs
+    ) {
+      const toolIntervals = buildTurnToolIntervals(latestTurnIdentityIds(latestTurn), effDriver);
+      const netSec = subtractToolWait(latestTurnStartMs, latestTurnEndMs, toolIntervals);
+      const tps = latestTurnOut / netSec;
+      if (netSec > 0.05 && Number.isFinite(tps) && tps <= 1500) {
+        latestSameDriverFallbackTps = tps;
+        latestSameDriverFallbackDurationSec = netSec;
+      }
+    }
+    const latestCallCacheRate = useOverride || !lastPartCoversLatestTurn
       ? null
       : lastPart.lastStepCacheRate ?? null;
     let latestUncoveredTps = null;
@@ -1463,16 +1873,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       Number.isFinite(latestUncoveredEndMs) &&
       latestUncoveredEndMs > latestUncoveredStartMs
     ) {
-      let toolIntervals = [];
-      try {
-        toolIntervals = db
-          .prepare("SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE thread_id = ?")
-          .all(threadId)
-          .map((row) => safeJsonParse(row.payload_json))
-          .filter((item) => item && item.startedAt && item.completedAt && item.type !== "assistant_message" && item.type !== "reasoning")
-          .map((item) => [Date.parse(item.startedAt), Date.parse(item.completedAt)])
-          .filter(([startMs, endMs]) => Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs && endMs - startMs < 600000);
-      } catch {}
+      const toolIntervals = buildTurnToolIntervals(latestUncoveredTurnIds, overrideDriver);
       const netSec = subtractToolWait(latestUncoveredStartMs, latestUncoveredEndMs, toolIntervals);
       const tps = latestUncoveredOutput / netSec;
       if (netSec > 0.05 && Number.isFinite(tps) && tps <= 1500) {
@@ -1482,9 +1883,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     }
     const promptTotal = uncached + cached + cacheWrite;
     const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
-    const latestTurnCompleted = latestTurn && (String(latestTurn.row.status || latestTurn.payload?.status) === "completed" || Boolean(latestTurn.row.completed_at || latestTurn.payload?.completedAt));
+    const currentTurnEstimateTpsNative = computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver, isRunning });
     const latestTurnHasOutput = Number.isFinite(latestTurn?.payload?.turnTokenUsage?.outputTokens) && latestTurn.payload.turnTokenUsage.outputTokens > 0;
     const currentTurnSpeedKnown = !latestTurn || (latestTurnCompleted && latestTurnHasOutput && (!latestTurnDriver || latestTurnDriver === effDriver));
+    const latestTurnActive = isDbTurnStaticallyActive(latestTurn, effDriver);
+    const runningWithoutActiveTurn = Boolean(isRunning && !latestTurnActive);
+
+    // Current active turn estimate is a separate channel; never pollute lastDecodeTps.
+    const currentTurnEstimateTps = isRunning ? currentTurnEstimateTpsNative : null;
 
     // Prefer host/T3 reported values, then the local model catalog, then an
     // explicit model-family estimate. The HUD does not infer product compaction.
@@ -1532,7 +1938,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       }
     }
 
-    return {
+    return currentProviderTelemetry({
       source: "native",
       provider: effDriver,
       model: effModel,
@@ -1548,43 +1954,29 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       usd,
       savedUsd,
       sessionCacheRate,
-      turnCacheRate: latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
-      lastTurnCacheRate: latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
+      turnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
+      lastTurnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
       lastCallCacheRate: latestCallCacheRate,
       contextCacheRate: turnCacheRate ?? latestCallCacheRate ?? sessionCacheRate,
       tokPerSec: sessionAvgTps ?? lastPart.tokPerSec,
       byModelSpeed: Object.fromEntries(Object.entries(mergedByModel).filter(([, v]) => v.sec > 0.1).map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])),
       // Use the latest uncovered turn's own effective duration when it wins the
-      // mixed-provider freshness check; never reuse the previous provider's rate.
-      lastDecodeTps: !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredTps : lastPart.lastDecodeTps,
+      // mixed-provider freshness check; never reuse a prior turn's native rate.
+      lastDecodeTps: runningWithoutActiveTurn ? null : !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredTps : !lastPartCoversLatestTurn || staleBySpeedTime ? latestSameDriverFallbackTps : lastPart.lastDecodeTps,
+      currentTurnEstimateTps: runningWithoutActiveTurn ? null : currentTurnEstimateTps,
       e2eTokPerSec: lastPart.e2eTokPerSec,
-      durationSec: !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredDurationSec : lastPart.durationSec,
-      contextUsed: useOverride ? contextUsed : preferCurrentReport ? contextUsed ?? lastPart.lastContextPrompt : lastPart.lastContextPrompt ?? contextUsed,
+      durationSec: runningWithoutActiveTurn ? null : !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredDurationSec : !lastPartCoversLatestTurn || staleBySpeedTime ? latestSameDriverFallbackDurationSec : lastPart.durationSec,
+      contextUsed: useOverride ? contextUsed : preferCurrentReport || !lastPartCoversLatestTurn ? contextUsed ?? lastPart.lastContextPrompt : lastPart.lastContextPrompt ?? contextUsed,
       contextMax: resolvedContextMax,
       contextMaxSource: resolvedContextMaxSource,
-    };
+    });
   }
 
   // Fallback for other providers (e.g., Claude Code ACP) via statev2.sqlite turns - tool durations
-  const toolRows = db
-    .prepare(
-      "SELECT payload_json FROM orchestration_v2_projection_turn_items WHERE thread_id = ?"
-    )
-    .all(threadId);
-  let totalToolWaitSec = 0;
-  const toolIntervals = [];
-  for (const it of toolRows) {
-    const p = safeJsonParse(it.payload_json);
-    if (p && p.startedAt && p.completedAt && p.type !== "assistant_message" && p.type !== "reasoning") {
-      const startMs = Date.parse(p.startedAt);
-      const endMs = Date.parse(p.completedAt);
-      const dt = (endMs - startMs) / 1000;
-      if (dt > 0 && dt < 600) {
-        totalToolWaitSec += dt;
-        toolIntervals.push([startMs, endMs]);
-      }
-    }
-  }
+  const rawToolRows = safeTurnItemRows(db, threadId).map((row) => ({
+    row,
+    payload: safeJsonParse(row.payload_json),
+  }));
 
   let uncached = 0;
   let cached = 0;
@@ -1594,6 +1986,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   let usd = 0;
   let savedUsd = 0;
   let turnDurSum = 0;
+  let netGenSecSum = 0;
   let lastTurnTps = null;
   let lastTurnNetSec = null;
   let lastTurnCacheRate = null;
@@ -1636,7 +2029,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 
     if (Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs) {
       turnDurSum += (eMs - sMs) / 1000;
-      const netSec = subtractToolWait(sMs, eMs, toolIntervals);
+      const trIds = latestTurnIdentityIds({ row: tr, payload: p });
+      const trDriver = p?.nativeTurnRef?.driver || p?.driver || tr.driver || latestDriver || null;
+      const trToolIntervals = rawToolRows
+        .filter(({ row, payload }) => payload && payload.startedAt && payload.completedAt && payload.type !== "assistant_message" && payload.type !== "reasoning" && itemBelongsToCurrentTurn(payload, row, trIds, trDriver))
+        .map(({ payload }) => [Date.parse(payload.startedAt), Date.parse(payload.completedAt)])
+        .filter(([startMs, endMs]) => Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs && endMs - startMs < 600000);
+      const netSec = subtractToolWait(sMs, eMs, trToolIntervals);
+      netGenSecSum += netSec;
       if (completed && out >= 15 && netSec > 0.05 && out / netSec <= 1500) {
         lastTurnTps = out / netSec;
         lastTurnNetSec = netSec;
@@ -1644,9 +2044,12 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     }
   }
 
-  const netGenSec = Math.max(0.2, turnDurSum - totalToolWaitSec);
+  const netGenSec = Math.max(0.2, netGenSecSum);
   const promptTotal = uncached + cached + cacheWrite;
   const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
+  const currentTurnEstimateTpsFallback = computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver: latestDriver, isRunning });
+  const fallbackLatestActive = isDbTurnStaticallyActive(latestTurn, latestDriver);
+  const fallbackRunningWithoutActive = Boolean(isRunning && !fallbackLatestActive);
   let effectiveMax = contextMax ?? null;
   let effectiveMaxSource = effectiveMax != null ? contextMaxSource || "reported" : null;
   if (effectiveMax == null) {
@@ -1664,7 +2067,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     effectiveMaxSource = "estimated";
   }
 
-  return {
+  return currentProviderTelemetry({
     source: "sqlite-fallback",
     provider: latestDriver,
     model: latestModel,
@@ -1680,18 +2083,19 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     usd,
     savedUsd,
     sessionCacheRate,
-    turnCacheRate,
-    lastTurnCacheRate: turnCacheRate,
+    turnCacheRate: fallbackRunningWithoutActive ? null : turnCacheRate,
+    lastTurnCacheRate: fallbackRunningWithoutActive ? null : turnCacheRate,
     lastCallCacheRate: null,
     contextCacheRate: turnCacheRate ?? lastTurnCacheRate ?? sessionCacheRate,
     tokPerSec: turnDurSum > 0.2 && output > 0 ? output / netGenSec : null,
-    lastDecodeTps: lastTurnTps,
+    lastDecodeTps: fallbackRunningWithoutActive ? null : lastTurnTps,
+    currentTurnEstimateTps: fallbackRunningWithoutActive ? null : currentTurnEstimateTpsFallback,
     e2eTokPerSec: turnDurSum > 0.2 && output > 0 ? output / netGenSec : null,
-    durationSec: lastTurnNetSec,
+    durationSec: fallbackRunningWithoutActive ? null : lastTurnNetSec,
     contextUsed,
     contextMax: effectiveMax,
     contextMaxSource: effectiveMaxSource,
-  };
+  });
 }
 
 // Memoize completed subagent telemetry keyed by childThreadId + updated_at so 400+ subagents run in < 2ms
@@ -1778,20 +2182,85 @@ function getThreadStats(threadHint) {
 
     const psRow = db
       .prepare(
-        "SELECT provider, driver, model, status FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ? ORDER BY updated_at DESC LIMIT 1"
+        "SELECT provider, driver, model, status, updated_at FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1"
       )
       .get(threadId);
 
-    const baseModel =
-      psRow?.model ||
-      threadPayload?.modelSelection?.model ||
-      null;
-    const baseProvider =
-      psRow?.driver ||
-      psRow?.provider ||
-      threadPayload?.modelSelection?.provider ||
-      threadRow.default_provider ||
-      null;
+    const selectedProvider = threadPayload?.modelSelection?.provider || threadPayload?.modelSelection?.instanceId || null;
+    const selectedModel = threadPayload?.modelSelection?.model || null;
+    const threadUpdatedMs = Date.parse(threadRow?.updated_at || "");
+    const psProvider = psRow?.driver || psRow?.provider || null;
+    const psUpdatedMs = Date.parse(psRow?.updated_at || "");
+    const turnEvidenceAfterSelection = (tr, tp) => {
+      let startedMs = NaN;
+      for (const raw of [tr?.started_at, tp?.startedAt]) {
+        const ms = Date.parse(raw || "");
+        if (Number.isFinite(ms) && (!Number.isFinite(startedMs) || ms > startedMs)) startedMs = ms;
+      }
+      if (Number.isFinite(startedMs)) return startedMs > threadUpdatedMs;
+      let completedMs = NaN;
+      for (const raw of [tr?.completed_at, tp?.completedAt]) {
+        const ms = Date.parse(raw || "");
+        if (Number.isFinite(ms) && (!Number.isFinite(completedMs) || ms > completedMs)) completedMs = ms;
+      }
+      return Number.isFinite(completedMs) && completedMs > threadUpdatedMs;
+    };
+    const hasTurnAfterSelection = (targetDriver) => {
+      if (!Number.isFinite(threadUpdatedMs)) return false;
+      try {
+        const tRows = db
+          .prepare("SELECT started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?")
+          .all(threadId);
+        return (tRows || []).some((tr) => {
+          const tp = safeJsonParse(tr.payload_json);
+          const drv = tp?.nativeTurnRef?.driver || tp?.driver || null;
+          if (!drv) return false;
+          if (targetDriver ? drv !== targetDriver : drv === selectedProvider) return false;
+          return turnEvidenceAfterSelection(tr, tp);
+        });
+      } catch {
+        return false;
+      }
+    };
+    const hasSupersededDefaultWithoutSession = () => {
+      if (psRow || !selectedProvider || selectedProvider !== threadRow.default_provider) return false;
+      try {
+        const ptRows = db
+          .prepare("SELECT driver, updated_at FROM orchestration_v2_projection_provider_threads WHERE thread_id = ?")
+          .all(threadId);
+        let selMax = NaN;
+        let otherMax = NaN;
+        for (const r of ptRows || []) {
+          const ms = Date.parse(r?.updated_at || "");
+          if (!Number.isFinite(ms) || !r?.driver) continue;
+          if (r.driver === selectedProvider) {
+            if (!Number.isFinite(selMax) || ms > selMax) selMax = ms;
+          } else if (!Number.isFinite(otherMax) || ms > otherMax) {
+            otherMax = ms;
+          }
+        }
+        return Number.isFinite(selMax) && Number.isFinite(otherMax) && otherMax > selMax;
+      } catch {
+        return false;
+      }
+    };
+    // A cross-driver session can supersede selection only when an actual turn on that driver ran after selection.
+    const selectionWins = Boolean(
+      selectedProvider &&
+      psProvider !== selectedProvider &&
+      !(psProvider ? hasTurnAfterSelection(psProvider) : (hasTurnAfterSelection(null) || hasSupersededDefaultWithoutSession()))
+    );
+    const modelSelectionWins = Boolean(
+      selectedProvider &&
+      selectedModel &&
+      psProvider === selectedProvider &&
+      Number.isFinite(threadUpdatedMs) &&
+      (!Number.isFinite(psUpdatedMs) || threadUpdatedMs > psUpdatedMs) &&
+      !hasTurnAfterSelection(selectedProvider)
+    );
+    const effectivePsRow = selectionWins ? null : psRow;
+    const baseModel = selectionWins || modelSelectionWins ? selectedModel : effectivePsRow?.model || selectedModel;
+    const baseProvider = selectionWins ? selectedProvider : psProvider || null;
 
     const mainTel = aggregateSingleThreadTelemetry(db, threadId, baseModel, baseProvider);
 
@@ -1865,8 +2334,57 @@ function getThreadStats(threadHint) {
     const combinedSessionCacheRate =
       combinedInput > 0 ? combinedCached / combinedInput : mainTel.sessionCacheRate;
 
-    const resolvedProvider = mainTel.provider || baseProvider;
-    const resolvedModel = mainTel.model || baseModel;
+    const resolvedProvider = baseProvider || mainTel.provider || selectedProvider || threadRow.default_provider || null;
+    const resolvedModel = (baseProvider && mainTel.provider !== baseProvider) || modelSelectionWins ? baseModel : mainTel.model || baseModel;
+    let sessionRunning = Boolean(effectivePsRow?.status === "running" && psProvider === resolvedProvider);
+    let effectiveIsRunning = Boolean(mainTel.isRunning || sessionRunning);
+    let runningWithoutActiveTurn = false;
+    let activeTurnIds = [];
+    if (effectiveIsRunning) {
+      try {
+        let rows;
+        try {
+          const colsRows = db.prepare('PRAGMA table_info("orchestration_v2_projection_provider_turns")').all();
+          const cols = new Set((colsRows || []).map((r) => r.name));
+          if (cols.size === 0) throw new Error("no cols");
+          const sel = ["rowid AS row_order"];
+          for (const c of ["provider_turn_id", "ordinal", "status", "started_at", "completed_at", "payload_json"]) {
+            if (cols.has(c)) sel.push(c);
+          }
+          if (!cols.has("payload_json")) sel.push("payload_json");
+          rows = db.prepare(`SELECT ${sel.join(", ")} FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC`).all(threadId);
+        } catch {
+          rows = db.prepare("SELECT rowid AS row_order, ordinal, status, started_at, completed_at, payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ? ORDER BY rowid ASC").all(threadId);
+        }
+        const evidence = (rows || []).map((row, index) => {
+          const payload = safeJsonParse(row.payload_json);
+          const stamp = Date.parse(row.started_at || payload?.startedAt || row.completed_at || payload?.completedAt || "");
+          return { row, payload, stamp, order: Number.isFinite(row.row_order) ? row.row_order : index };
+        });
+        const dated = evidence.filter((e) => Number.isFinite(e.stamp)).sort((a, b) => a.stamp - b.stamp || a.order - b.order);
+        let latest = dated[dated.length - 1] || null;
+        for (const e of evidence) {
+          if (!Number.isFinite(e.stamp) && (!latest || e.order > latest.order)) latest = e;
+        }
+        // A completed current-provider turn at/after the session observation wins
+        // over a stale session 'running' flag, even when another driver is older.
+        const sameProvider = evidence.filter(e => (e.payload?.nativeTurnRef?.driver || e.payload?.driver || null) === resolvedProvider);
+        const currentDated = sameProvider.filter(e => Number.isFinite(e.stamp)).sort((a, b) => a.stamp - b.stamp || a.order - b.order);
+        let currentLatest = currentDated[currentDated.length - 1] || null;
+        for (const e of sameProvider) {
+          if (!Number.isFinite(e.stamp) && (!currentLatest || e.order > currentLatest.order)) currentLatest = e;
+        }
+        const completedMs = Date.parse(currentLatest?.row.completed_at || currentLatest?.payload?.completedAt || "");
+        if (sessionRunning && Number.isFinite(completedMs) && (!Number.isFinite(psUpdatedMs) || completedMs >= psUpdatedMs)) sessionRunning = false;
+        effectiveIsRunning = Boolean(mainTel.isRunning || sessionRunning);
+        runningWithoutActiveTurn = effectiveIsRunning && !isDbTurnStaticallyActive(latest, resolvedProvider);
+        if (effectiveIsRunning && !runningWithoutActiveTurn && latest) {
+          activeTurnIds = Array.from(latestTurnIdentityIds(latest));
+        }
+      } catch {
+        runningWithoutActiveTurn = !mainTel.isRunning;
+      }
+    }
     let resolvedContextMax = mainTel.contextMax ?? null;
     let resolvedContextMaxSource = mainTel.contextMaxSource ?? null;
     if (resolvedContextMax == null) {
@@ -1894,7 +2412,8 @@ function getThreadStats(threadHint) {
       provider: resolvedProvider,
       model: resolvedModel,
       telemetrySource: mainTel.source,
-      isRunning: mainTel.isRunning || psRow?.status === "running",
+      isRunning: effectiveIsRunning,
+      activeTurnIds,
       turnCount: mainTel.turnCount,
       stepCount: mainTel.stepCount,
       tokens: {
@@ -1917,22 +2436,28 @@ function getThreadStats(threadHint) {
         // displayRate is retained for Antigravity context dedupe only; the HUD
         // cache metric uses turnRate and never falls back to a cumulative rate.
         displayRate: mainTel.contextCacheRate ?? mainTel.sessionCacheRate,
-        turnRate: mainTel.turnCacheRate ?? null,
+        turnRate: runningWithoutActiveTurn ? null : mainTel.turnCacheRate ?? null,
         sessionRate: combinedSessionCacheRate,
         mainSessionRate: mainTel.sessionCacheRate,
         withSubagentsSessionRate: combinedSessionCacheRate,
-        lastTurnRate: mainTel.turnCacheRate ?? null,
+        lastTurnRate: runningWithoutActiveTurn ? null : mainTel.turnCacheRate ?? null,
         lastCallRate: mainTel.lastCallCacheRate ?? null,
         savedUsd: mainTel.savedUsd + subagentSavedUsd,
       },
       speed: {
         tokPerSec: mainTel.tokPerSec != null ? Math.round(mainTel.tokPerSec * 10) / 10 : null,
         byModel: mainTel.byModelSpeed || {},
-        lastDecodeTps:
-          mainTel.lastDecodeTps != null ? Math.round(mainTel.lastDecodeTps * 10) / 10 : null,
+        lastDecodeTps: runningWithoutActiveTurn
+          ? null
+          : mainTel.lastDecodeTps != null ? Math.round(mainTel.lastDecodeTps * 10) / 10 : null,
+        currentTurnEstimateTps: runningWithoutActiveTurn
+          ? null
+          : mainTel.currentTurnEstimateTps != null ? Math.round(mainTel.currentTurnEstimateTps * 10) / 10 : null,
         e2eTokPerSec:
           mainTel.e2eTokPerSec != null ? Math.round(mainTel.e2eTokPerSec * 10) / 10 : null,
-        durationSec: mainTel.durationSec != null ? Math.round(mainTel.durationSec * 10) / 10 : null,
+        durationSec: runningWithoutActiveTurn
+          ? null
+          : mainTel.durationSec != null ? Math.round(mainTel.durationSec * 10) / 10 : null,
       },
       cost: {
         sessionUsd: mainTel.usd,
@@ -1961,7 +2486,29 @@ function priceRemoteProjection(payload) {
     return { ok: false, error: "Invalid remote payload" };
   }
   const turns = Array.isArray(payload.turns) ? payload.turns : [];
-  const mergedToolIntervals = mergeToolIntervals(payload.toolIntervals);
+  const rawToolIntervals = Array.isArray(payload.toolIntervals) ? payload.toolIntervals : [];
+  const isLegacySingleFixture = payload.sampledAtMs == null && turns.length === 1 && turns[0] && typeof turns[0] === "object"
+    && !("id" in turns[0]) && !("providerTurnId" in turns[0]) && !("nativeTurnId" in turns[0]);
+  const turnToolIntervals = (turnId, turnDriver) => {
+    const hasTid = turnId != null && String(turnId) !== "";
+    const allowLegacySingle = !hasTid && isLegacySingleFixture && turnDriver && turnDriver !== "unknown" && (!payload.provider || String(turnDriver) === String(payload.provider));
+    if (!hasTid && !allowLegacySingle) return [];
+    const filtered = [];
+    for (const iv of rawToolIntervals) {
+      if (!Array.isArray(iv) || !Number.isFinite(iv[0]) || !Number.isFinite(iv[1]) || iv[1] <= iv[0]) continue;
+      if (hasTid) {
+        if (iv.length < 3 || iv[2] == null || String(iv[2]) === "") continue;
+        if (String(iv[2]) !== String(turnId)) continue;
+        if (iv.length >= 4 && iv[3] != null && String(iv[3]) !== "") {
+          if (turnDriver && turnDriver !== "unknown" && String(iv[3]) !== String(turnDriver)) continue;
+        }
+      } else if (iv.length !== 2) {
+        continue;
+      }
+      filtered.push([iv[0], iv[1]]);
+    }
+    return mergeToolIntervals(filtered);
+  };
   let sumUncached = 0;
   let sumCached = 0;
   let sumCacheWrite = 0;
@@ -1987,6 +2534,12 @@ function priceRemoteProjection(payload) {
   let lastTurnDriver = null;
   let lastTurnModel = null;
   const byModel = {};
+  const resolveTurnDriverForPricing = (t) => {
+    if (t && Object.prototype.hasOwnProperty.call(t, "driver")) {
+      return t.driver ? String(t.driver) : "unknown";
+    }
+    return payload.provider || "unknown";
+  };
   for (const t of turns) {
     const u = t?.usage;
     turnCacheRate = null;
@@ -1994,7 +2547,7 @@ function priceRemoteProjection(payload) {
     lastTurnNetSec = null;
     lastTurnDecodeTps = null;
     lastStreamSec = null;
-    lastTurnDriver = t?.driver || payload.provider || "unknown";
+    lastTurnDriver = resolveTurnDriverForPricing(t);
     lastTurnModel = u?.models?.[0] || t?.model || payload.model || null;
     if (!u || typeof u.inputTokens !== "number" || u.usageStatus === "unavailable") {
       continue;
@@ -2005,7 +2558,7 @@ function priceRemoteProjection(payload) {
     lastTurnNetSec = null;
     lastTurnDecodeTps = null;
     lastStreamSec = null;
-    const driver = t.driver || payload.provider || "unknown";
+    const driver = resolveTurnDriverForPricing(t);
     let inp = Math.max(0, u.inputTokens || 0);
     const cr = Math.max(0, u.cachedInputTokens || 0);
     const cw = Math.max(0, u.cacheCreationTokens || 0);
@@ -2052,7 +2605,7 @@ function priceRemoteProjection(payload) {
       }
     }
     if (Number.isFinite(t.startedMs) && Number.isFinite(t.completedMs) && t.completedMs > t.startedMs + 50 && out >= 15) {
-      const netSec = subtractToolWait(t.startedMs, t.completedMs, mergedToolIntervals);
+      const netSec = subtractToolWait(t.startedMs, t.completedMs, turnToolIntervals(t.id ?? t.providerTurnId ?? null, driver));
       if (netSec > 0.05) {
         netOutSum += out;
         netSecSum += netSec;
@@ -2073,20 +2626,23 @@ function priceRemoteProjection(payload) {
   let totalSavedUsd = sumSavedUsd;
   let estimated = false;
   const sessionCacheRate = promptTotal > 0 ? sumCached / promptTotal : null;
-  const effDriver = lastTurnDriver || payload.provider || "unknown";
-  const effModel = lastTurnModel || payload.model || null;
-  let contextUsed = payload.contextUsage?.usedTokens ?? lastPromptTotal;
+  const providerSwitched = Boolean(payload.provider && lastTurnDriver && payload.provider !== lastTurnDriver);
+  const effDriver = providerSwitched ? payload.provider : (lastTurnDriver || payload.provider || "unknown");
+  const effModel = providerSwitched ? (payload.model || null) : (lastTurnModel || payload.model || null);
+  const effectiveLastPrompt = providerSwitched ? null : lastPromptTotal;
+  const effectiveTurnCacheRate = providerSwitched ? null : turnCacheRate;
+  let contextUsed = payload.contextUsage?.usedTokens ?? effectiveLastPrompt;
   if (effDriver === "antigravity" && payload.contextUsage?.usedTokens > 0) {
     // T3's acpPerTurnPromptUsage counts promptTokenCount + cachedContentTokenCount,
     // but Gemini's promptTokenCount already includes cachedContentTokenCount.
-    const agyCacheRatio = turnCacheRate ?? sessionCacheRate ?? 0;
+    const agyCacheRatio = effectiveTurnCacheRate ?? sessionCacheRate ?? 0;
     const deduped =
       agyCacheRatio > 0.01
         ? Math.round(payload.contextUsage.usedTokens / (1 + Math.min(1, agyCacheRatio)))
         : payload.contextUsage.usedTokens;
     contextUsed = deduped;
-    if (!payload.isRunning && lastPromptTotal != null && deduped > lastPromptTotal * 2.5) {
-      contextUsed = lastPromptTotal;
+    if (!payload.isRunning && effectiveLastPrompt != null && deduped > effectiveLastPrompt * 2.5) {
+      contextUsed = effectiveLastPrompt;
     }
   }
   let contextMax = Number.isFinite(payload.contextUsage?.maxTokens) && payload.contextUsage.maxTokens > 0
@@ -2125,8 +2681,34 @@ function priceRemoteProjection(payload) {
       .filter(([, v]) => v.sec > 0.1)
       .map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])
   );
-  const lastDecodeTps = lastTurnDecodeTps ?? lastTurnTps;
-  const lastDurationSec = lastStreamSec ?? lastTurnNetSec;
+  const lastDecodeTps = providerSwitched ? null : (lastTurnDecodeTps ?? lastTurnTps);
+  const lastDurationSec = providerSwitched ? null : (lastStreamSec ?? lastTurnNetSec);
+  const remoteLatest = turns[turns.length - 1] || null;
+  const remoteSelectedProvider = payload.provider || effDriver;
+  const remoteActive = isRemoteTurnActive(remoteLatest, remoteSelectedProvider);
+  const remoteRunningWithoutActive = Boolean(payload.isRunning && !remoteActive);
+  const remoteActiveTurnIds = Boolean(payload.isRunning) && !remoteRunningWithoutActive && remoteActive && remoteLatest
+    ? Array.from(new Set([remoteLatest.id, remoteLatest.providerTurnId, remoteLatest.nativeTurnId].filter((v) => v != null && String(v) !== "").map(String)))
+    : [];
+  let currentTurnEstimateTpsRemote = null;
+  if (payload.isRunning && turns.length > 0 && !remoteRunningWithoutActive && !providerSwitched) {
+    const last = turns[turns.length - 1];
+    const drv = last?.driver || payload.provider || null;
+    if (!drv || drv === effDriver) {
+      const direct = [lastTurnDecodeTps, last?.itemEstimateTps].find(rate => Number.isFinite(rate) && rate > 0 && rate <= 1500);
+      if (direct != null) currentTurnEstimateTpsRemote = Math.round(direct * 10) / 10;
+      else {
+        const out = Number(last?.usage?.outputTokens ?? last?.itemOutputTokens);
+        const sMs = last?.startedMs;
+        const eMs = last?.completedMs ?? last?.lastItemMs ?? payload.sampledAtMs ?? Date.now();
+        if (out > 0 && Number.isFinite(out) && Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs + 50) {
+          const net = subtractToolWait(sMs, eMs, turnToolIntervals(last?.id ?? last?.providerTurnId ?? null, drv || effDriver));
+          const tps = out / net;
+          if (net > 0.05 && Number.isFinite(tps) && tps > 0 && tps <= 1500) currentTurnEstimateTpsRemote = Math.round(tps * 10) / 10;
+        }
+      }
+    }
+  }
   const subagentCount = Math.max(0, Number(payload.subagentCount) || 0);
   return {
     ok: true,
@@ -2140,14 +2722,16 @@ function priceRemoteProjection(payload) {
     repoPath: payload.repoPath || null,
     branch: payload.branch || null,
     isRunning: Boolean(payload.isRunning),
+    activeTurnIds: remoteActiveTurnIds,
     turnCount: turns.length,
     stepCount: pricedTurns,
     speed: {
       tokPerSec: tokPerSec != null ? Math.round(tokPerSec * 10) / 10 : null,
       byModel: byModelSpeed,
-      lastDecodeTps: lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
+      lastDecodeTps: remoteRunningWithoutActive ? null : lastDecodeTps != null ? Math.round(lastDecodeTps * 10) / 10 : null,
+      currentTurnEstimateTps: remoteRunningWithoutActive ? null : currentTurnEstimateTpsRemote != null ? Math.round(currentTurnEstimateTpsRemote * 10) / 10 : null,
       e2eTokPerSec: e2eTokPerSec != null ? Math.round(e2eTokPerSec * 10) / 10 : null,
-      durationSec: lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
+      durationSec: remoteRunningWithoutActive ? null : lastDurationSec != null ? Math.round(lastDurationSec * 10) / 10 : null,
     },
     tokens: {
       input: promptTotal,
@@ -2174,10 +2758,10 @@ function priceRemoteProjection(payload) {
       sessionRate: sessionCacheRate,
         mainSessionRate: sessionCacheRate,
         withSubagentsSessionRate: sessionCacheRate,
-        turnRate: turnCacheRate,
-        lastTurnRate: turnCacheRate,
+        turnRate: remoteRunningWithoutActive ? null : effectiveTurnCacheRate,
+        lastTurnRate: remoteRunningWithoutActive ? null : effectiveTurnCacheRate,
         lastCallRate: null,
-        displayRate: turnCacheRate ?? sessionCacheRate,
+        displayRate: effectiveTurnCacheRate ?? sessionCacheRate,
       savedUsd: totalSavedUsd,
     },
     cost: {
@@ -2304,16 +2888,102 @@ function parseRefs(decorateStr) {
 let didAutoSyncHosts = false;
 function discoverAntigravityRulesPaths(extra = []) {
   const out = new Set(Array.isArray(extra) ? extra.filter(Boolean) : []);
-  try {
-    if (fs.existsSync(AGY_PROVIDERS_ROOT)) {
-      for (const entry of fs.readdirSync(AGY_PROVIDERS_ROOT, { withFileTypes: true })) {
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-        const rulesDir = path.join(AGY_PROVIDERS_ROOT, entry.name, "config", "rules");
-        const rulesFile = path.join(rulesDir, "AGENTS.md");
-        if (fs.existsSync(rulesFile) || fs.existsSync(rulesDir)) out.add(rulesFile);
+  const homeDir = process.env.HOME || os.homedir();
+  const t3Userdata = process.env.T3CODE_HOME
+    ? path.resolve(process.env.T3CODE_HOME)
+    : path.join(homeDir, ".t3", "userdata");
+  const geminiAgyDir = path.join(homeDir, ".gemini", "antigravity");
+  const agyRoot = path.join(t3Userdata, "providers", "antigravity");
+  const isMacAlias = (linkPath, realPath) => {
+    const link = path.resolve(String(linkPath)), real = path.resolve(String(realPath));
+    return (link === "/tmp" && real === "/private/tmp") || (link === "/var" && real === "/private/var");
+  };
+  const lstatIfExists = (p) => {
+    try { return fs.lstatSync(p); }
+    catch (e) { if (e && e.code === "ENOENT") return null; throw e; }
+  };
+  const assertSafeAncestors = (targetPath) => {
+    let cur = path.resolve(targetPath);
+    while (true) {
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+      const pst = lstatIfExists(cur);
+      if (pst && pst.isSymbolicLink()) {
+        let real = null;
+        try { real = fs.realpathSync(cur); } catch { real = null; }
+        if (!real || !isMacAlias(cur, real)) throw new Error("unsafe symlink ancestor in AGY rules path: " + cur);
       }
     }
-  } catch {}
+  };
+  const validateExistingRuleFile = (rulesFile) => {
+    const fileSt = lstatIfExists(rulesFile);
+    if (!fileSt) return;
+    if (fileSt.isSymbolicLink() || !fileSt.isFile()) throw new Error("AGY 规则文件不是普通文件: " + rulesFile);
+    if (fileSt.nlink !== 1) throw new Error("AGY 规则文件存在多重硬链接: " + rulesFile);
+    if (!(fileSt.mode & 0o444)) throw new Error("AGY 规则文件不可读取: " + rulesFile);
+    let fd = null;
+    try {
+      fd = fs.openSync(rulesFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const fst = fs.fstatSync(fd);
+      if (!fst.isFile() || fst.ino !== fileSt.ino || fst.nlink !== 1) {
+        throw new Error("AGY 规则文件句柄校验失败: " + rulesFile);
+      }
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+    }
+  };
+  assertSafeAncestors(geminiAgyDir);
+  const gemSt = lstatIfExists(geminiAgyDir);
+  if (gemSt) {
+    if (gemSt.isSymbolicLink() || !gemSt.isDirectory()) throw new Error("AGY 全局目录不是普通目录: " + geminiAgyDir);
+    fs.readdirSync(geminiAgyDir);
+    const gemRulesDir = path.join(geminiAgyDir, "rules");
+    const gemRulesSt = lstatIfExists(gemRulesDir);
+    if (gemRulesSt) {
+      if (gemRulesSt.isSymbolicLink() || !gemRulesSt.isDirectory()) throw new Error("AGY 全局规则目录不是普通目录: " + gemRulesDir);
+      fs.readdirSync(gemRulesDir);
+    }
+    const gemRulesFile = path.join(gemRulesDir, "AGENTS.md");
+    validateExistingRuleFile(gemRulesFile);
+    out.add(gemRulesFile);
+  }
+  assertSafeAncestors(agyRoot);
+  const rootSt = lstatIfExists(agyRoot);
+  if (!rootSt) return [...out];
+  if (rootSt.isSymbolicLink() || !rootSt.isDirectory()) {
+    throw new Error("AGY 规则根目录不是普通目录: " + agyRoot);
+  }
+  for (const entry of fs.readdirSync(agyRoot, { withFileTypes: true })) {
+    const instDir = path.join(agyRoot, entry.name);
+    const instSt = lstatIfExists(instDir);
+    if (!instSt) continue;
+    if (entry.name === ".DS_Store" || entry.name === ".localized") {
+      if (instSt.isSymbolicLink() || !instSt.isFile()) throw new Error("AGY 规则根目录存在非法元数据项: " + instDir);
+      continue;
+    }
+    if (entry.name.startsWith("skills-archived")) {
+      if (instSt.isSymbolicLink()) throw new Error("AGY 归档目录是符号链接: " + instDir);
+      if (!instSt.isDirectory()) throw new Error("AGY 归档项不是普通目录: " + instDir);
+      continue;
+    }
+    if (instSt.isSymbolicLink()) throw new Error("AGY 实例目录是符号链接: " + instDir);
+    if (!instSt.isDirectory()) throw new Error("AGY 实例目录不是普通目录: " + instDir);
+    fs.readdirSync(instDir);
+    const configDir = path.join(instDir, "config");
+    const cfgSt = lstatIfExists(configDir);
+    if (!cfgSt) continue;
+    if (cfgSt.isSymbolicLink() || !cfgSt.isDirectory()) throw new Error("AGY 配置目录不是普通目录: " + configDir);
+    fs.readdirSync(configDir);
+    const rulesDir = path.join(configDir, "rules");
+    const rulesSt = lstatIfExists(rulesDir);
+    if (!rulesSt) continue;
+    if (rulesSt.isSymbolicLink() || !rulesSt.isDirectory()) throw new Error("AGY 规则子目录不是普通目录: " + rulesDir);
+    fs.readdirSync(rulesDir);
+    const rulesFile = path.join(rulesDir, "AGENTS.md");
+    validateExistingRuleFile(rulesFile);
+    out.add(rulesFile);
+  }
   return [...out];
 }
 
@@ -2742,16 +3412,45 @@ async function hubCall(action, payload = {}) {
       case "subagents:list": return hubSubagents.listSubagents(payload);
       case "subagents:resolveRoute":
       case "subagents:resolve": return hubSubagents.resolveSubagentRoute(payload);
-      case "subagents:save": return hubSubagents.saveSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
+      case "subagents:save": {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("invalid subagent payload");
+        const p = payload;
+        const hasScope = Object.prototype.hasOwnProperty.call(p, "scope") && p.scope !== undefined;
+        if (hasScope && p.scope !== "global" && p.scope !== "project") throw new Error("invalid scope: " + String(p.scope));
+        if (Object.prototype.hasOwnProperty.call(p, "item") && p.item !== undefined && (!p.item || typeof p.item !== "object" || Array.isArray(p.item))) throw new Error("invalid item payload");
+        const hasItemScope = Boolean(p.item && Object.prototype.hasOwnProperty.call(p.item, "scope") && p.item.scope !== undefined);
+        if (hasItemScope && p.item.scope !== "global" && p.item.scope !== "project") throw new Error("invalid scope: " + String(p.item.scope));
+        if (hasScope && hasItemScope && p.scope !== p.item.scope) throw new Error("conflicting scope");
+        const saveScope = hasScope ? p.scope : (hasItemScope ? p.item.scope : ((Object.prototype.hasOwnProperty.call(p, "projectRoot") && p.projectRoot !== undefined && p.projectRoot !== null) ? "project" : "global"));
+        return hubSubagents.saveSubagent({
+          ...p,
+          scope: saveScope,
+          extraSyncPaths: saveScope === "project" ? (Array.isArray(p.extraSyncPaths) ? p.extraSyncPaths : []) : discoverAntigravityRulesPaths(p.extraSyncPaths),
+        });
+      }
       case "subagents:update": {
-        const p = payload || {};
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("invalid subagent payload");
+        const p = payload;
+        const hasScope = Object.prototype.hasOwnProperty.call(p, "scope") && p.scope !== undefined;
+        if (hasScope && p.scope !== "global" && p.scope !== "project") throw new Error("invalid scope: " + String(p.scope));
+        if (Object.prototype.hasOwnProperty.call(p, "item") && p.item !== undefined && (!p.item || typeof p.item !== "object" || Array.isArray(p.item))) throw new Error("invalid item payload");
+        const hasItemScope = Boolean(p.item && Object.prototype.hasOwnProperty.call(p.item, "scope") && p.item.scope !== undefined);
+        if (hasItemScope && p.item.scope !== "global" && p.item.scope !== "project") throw new Error("invalid scope: " + String(p.item.scope));
+        if (hasScope && hasItemScope && p.scope !== p.item.scope) throw new Error("conflicting scope");
+        const hasProj = Object.prototype.hasOwnProperty.call(p, "projectRoot") && p.projectRoot !== undefined;
+        const hasItemProj = Boolean(p.item && Object.prototype.hasOwnProperty.call(p.item, "projectRoot") && p.item.projectRoot !== undefined);
+        if (hasProj && hasItemProj && p.projectRoot !== p.item.projectRoot) throw new Error("conflicting projectRoot");
+        const targetScope = hasScope ? p.scope : (hasItemScope ? p.item.scope : ((hasProj && p.projectRoot !== null) || (hasItemProj && p.item.projectRoot !== null) ? "project" : "global"));
         if (p.item && typeof p.item === "object") {
-          return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+          return hubSubagents.saveSubagent({
+            ...p,
+            scope: targetScope,
+            extraSyncPaths: targetScope === "project" ? (Array.isArray(p.extraSyncPaths) ? p.extraSyncPaths : []) : discoverAntigravityRulesPaths(p.extraSyncPaths),
+          });
         }
         if (p.id || p.name) {
-          const { id, item: _item, scope, projectRoot, extraSyncPaths, ...patch } = p;
+          const { id, item: _item, scope: _scope, projectRoot, extraSyncPaths, ...patch } = p;
           const targetId = id || patch.name;
-          const targetScope = scope || (projectRoot ? "project" : "global");
           let existing;
           try {
             const listed = hubSubagents.listSubagents({ projectRoot: targetScope === "project" ? (projectRoot || null) : null });
@@ -2770,33 +3469,120 @@ async function hubCall(action, payload = {}) {
             ...p,
             scope: targetScope,
             projectRoot: targetScope === "project" ? projectRoot : null,
-            extraSyncPaths: discoverAntigravityRulesPaths(extraSyncPaths),
+            extraSyncPaths: targetScope === "project" ? (Array.isArray(extraSyncPaths) ? extraSyncPaths : []) : discoverAntigravityRulesPaths(extraSyncPaths),
             item: mergedItem,
           });
         }
-        return hubSubagents.saveSubagent({ ...p, extraSyncPaths: discoverAntigravityRulesPaths(p.extraSyncPaths) });
+        return hubSubagents.saveSubagent({
+          ...p,
+          scope: targetScope,
+          extraSyncPaths: targetScope === "project" ? (Array.isArray(p.extraSyncPaths) ? p.extraSyncPaths : []) : discoverAntigravityRulesPaths(p.extraSyncPaths),
+        });
       }
-      case "subagents:delete": return hubSubagents.deleteSubagent({ ...(payload || {}), extraSyncPaths: discoverAntigravityRulesPaths(payload?.extraSyncPaths) });
-      case "subagents:orchestration:get": return hubSubagents.getOrchestrationState({ additionalHosts: discoverAntigravityRulesPaths() });
+      case "subagents:delete": {
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("invalid subagent payload");
+        const dp = payload;
+        const hasDelScope = Object.prototype.hasOwnProperty.call(dp, "scope") && dp.scope !== undefined;
+        if (hasDelScope && dp.scope !== "global" && dp.scope !== "project") throw new Error("invalid scope: " + String(dp.scope));
+        const delScope = hasDelScope ? dp.scope : ((Object.prototype.hasOwnProperty.call(dp, "projectRoot") && dp.projectRoot !== undefined && dp.projectRoot !== null) ? "project" : "global");
+        return hubSubagents.deleteSubagent({
+          ...dp,
+          scope: delScope,
+          extraSyncPaths: delScope === "project" ? (Array.isArray(dp.extraSyncPaths) ? dp.extraSyncPaths : []) : discoverAntigravityRulesPaths(dp.extraSyncPaths),
+        });
+      }
+      case "subagents:orchestration:get": {
+        const p = payload && typeof payload === "object" ? payload : {};
+        if (Object.prototype.hasOwnProperty.call(p, "scope") && p.scope !== undefined && p.scope !== "global" && p.scope !== "project") {
+          return { ok: false, error: "invalid orchestration scope" };
+        }
+        const effectiveProjectRoot = p.scope === "global" ? undefined : (p.projectRoot || p.project || undefined);
+        if (p.scope === "project" && (!effectiveProjectRoot || typeof effectiveProjectRoot !== "string" || !effectiveProjectRoot.trim())) {
+          return { ok: false, error: "projectRoot required for project scope" };
+        }
+        try {
+          return hubSubagents.getOrchestrationState({
+            ...p,
+            projectRoot: effectiveProjectRoot,
+            ...(Array.isArray(p.hosts) ? { hosts: p.hosts } : { additionalHosts: discoverAntigravityRulesPaths(p.additionalHosts) }),
+          });
+        } catch (e) {
+          return { ok: false, error: e?.message || String(e) };
+        }
+      }
       case "subagents:orchestration:update": {
-        const p = payload || {};
-        const patch = p.config || p.patch || p;
+        const p = payload && typeof payload === "object" ? payload : {};
+        if (Object.prototype.hasOwnProperty.call(p, "config") && p.config !== undefined && (!p.config || typeof p.config !== "object" || Array.isArray(p.config))) {
+          return { ok: false, error: "invalid orchestration config payload" };
+        }
+        if (Object.prototype.hasOwnProperty.call(p, "patch") && p.patch !== undefined && (!p.patch || typeof p.patch !== "object" || Array.isArray(p.patch))) {
+          return { ok: false, error: "invalid orchestration patch payload" };
+        }
+        const cfgObj = p.config && typeof p.config === "object" && !Array.isArray(p.config) ? p.config : null;
+        const patchObj = p.patch && typeof p.patch === "object" && !Array.isArray(p.patch) ? p.patch : null;
+        const seenScopes = [];
+        for (const obj of [p, cfgObj, patchObj]) {
+          if (!obj || !Object.prototype.hasOwnProperty.call(obj, "scope") || obj.scope === undefined) continue;
+          if (obj.scope !== "global" && obj.scope !== "project") {
+            return { ok: false, error: "invalid orchestration scope" };
+          }
+          seenScopes.push(obj.scope);
+        }
+        if (new Set(seenScopes).size > 1) {
+          return { ok: false, error: "conflicting orchestration scope" };
+        }
+        for (const key of ["swarmMode", "orchestratorMode", "expectedRevision", "projectRoot"]) {
+          const seenVals = [];
+          for (const obj of [p, cfgObj, patchObj]) {
+            if (!obj || !Object.prototype.hasOwnProperty.call(obj, key) || obj[key] === undefined) continue;
+            seenVals.push(obj[key]);
+          }
+          if (new Set(seenVals).size > 1) {
+            return { ok: false, error: `conflicting orchestration ${key}` };
+          }
+        }
+        const hasNestedPatch = Boolean(cfgObj || patchObj);
+        const patch = hasNestedPatch ? { ...(cfgObj || {}), ...(patchObj || {}) } : p;
+        const explicitScope = seenScopes.length ? seenScopes[0] : undefined;
+        const isProject = explicitScope === "project";
         // Extract host hints for sync
         const hostHints = p.hostRulePaths || p.hosts || p.host || p.extraSyncPaths;
         let res;
         // Prefer updateOrchestrationConfig which already syncs, passing host hints via opts
         try {
           if (typeof hubSubagents.updateOrchestrationConfig === "function") {
-            res = hubSubagents.updateOrchestrationConfig(patch, hostHints ? { hostRulePaths: hostHints, hosts: hostHints } : { additionalHosts: discoverAntigravityRulesPaths() });
+            if (isProject) {
+              res = hubSubagents.updateOrchestrationConfig(patch, {
+                scope: "project",
+                projectRoot: p.projectRoot ?? patch?.projectRoot,
+                expectedRevision: p.expectedRevision ?? patch?.expectedRevision,
+              });
+            } else {
+              const discoveredAgyRules = discoverAntigravityRulesPaths(p.additionalHosts);
+              const { projectRoot: _ambientProjectRoot, scope: _ambientScope, ...globalPatch } = (patch && typeof patch === "object") ? patch : {};
+              res = hubSubagents.updateOrchestrationConfig(globalPatch, {
+                scope: "global",
+                ...(hostHints ? { hostRulePaths: hostHints, hosts: hostHints } : { additionalHosts: discoveredAgyRules }),
+                ...(Array.isArray(p.extraSkillPaths || patch?.extraSkillPaths) ? { extraSkillPaths: p.extraSkillPaths || patch?.extraSkillPaths } : {}),
+                ...((p.adoptUnmanagedSkillHashes || patch?.adoptUnmanagedSkillHashes) ? { adoptUnmanagedSkillHashes: p.adoptUnmanagedSkillHashes || patch?.adoptUnmanagedSkillHashes } : {}),
+                ...(p.expectedRevision !== undefined ? { expectedRevision: p.expectedRevision } : {}),
+              });
+            }
           } else {
             throw new Error("updateOrchestrationConfig unavailable");
           }
         } catch (e) {
-          return { ok: false, error: e?.message || String(e) };
+          return {
+            ok: false,
+            error: e?.message || String(e),
+            ...(typeof e?.rolledBack === "boolean" ? { rolledBack: e.rolledBack } : {}),
+            ...(Array.isArray(e?.rollbackFailures) ? { rollbackFailures: e.rollbackFailures } : {}),
+            ...(typeof e?.preservedPath === "string" && e.preservedPath ? { preservedPath: e.preservedPath } : {}),
+          };
         }
         // Return latest config per spec (prefer res.config)
         const latest = res?.config || hubSubagents.getOrchestrationConfig();
-        return { ok: true, config: latest, ...(res || {}) };
+        return { ok: res?.ok !== false, config: latest, ...(res || {}) };
       }
       case "subagents:slashPrompt": return { prompt: hubSubagents.buildSlashCommandPrompt(payload?.mode) };
       case "board:get": return getTaskBoard().getBoardSnapshot(payload || {});
@@ -2810,7 +3596,8 @@ async function hubCall(action, payload = {}) {
       case "settings:get": {
         let t3EnvironmentId = null;
         try {
-          const id = fs.readFileSync(path.join(T3_USERDATA, "environment-id"), "utf8").trim();
+          const activeUserdata = process.env.T3CODE_HOME ? path.resolve(process.env.T3CODE_HOME) : T3_USERDATA;
+          const id = fs.readFileSync(path.join(activeUserdata, "environment-id"), "utf8").trim();
           if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) t3EnvironmentId = id;
         } catch {}
         return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId };
@@ -2821,7 +3608,13 @@ async function hubCall(action, payload = {}) {
       default: return { ok: false, error: "unknown action: " + action };
     }
   } catch (err) {
-    return { ok: false, error: err?.message || String(err) };
+    return {
+      ok: false,
+      error: err?.message || String(err),
+      ...(typeof err?.rolledBack === "boolean" ? { rolledBack: err.rolledBack } : {}),
+      ...(Array.isArray(err?.rollbackFailures) ? { rollbackFailures: err.rollbackFailures } : {}),
+      ...(typeof err?.preservedPath === "string" && err.preservedPath ? { preservedPath: err.preservedPath } : {}),
+    };
   }
 }
 

@@ -4,6 +4,8 @@
 
 **English** | [简体中文](docs/README.zh-CN.md) | [日本語](docs/README.ja.md) | [한국어](docs/README.ko.md)
 
+Project handoff: [engineering notes](docs/HANDOFF.md) · [development setup](docs/DEVELOPMENT.zh-CN.md) · [requirements and experiments (Chinese)](docs/REQUIREMENTS-AND-EXPERIMENTS.zh-CN.md) · [T3 takeover prompt (Chinese)](docs/T3-HUB-TAKEOVER-PROMPT.zh-CN.md) · [T3 self-test prompt (Chinese)](docs/T3-HUB-SELFTEST-PROMPT.zh-CN.md)
+
 Non-invasive real-time telemetry HUD, billion-token subagent & cost tracker, true context ring, quota monitor, and interactive Git Graph floating window for **T3 Code / T3 Code (Beta)**.
 
 > Zero modification to `app.asar`, no signature breakage, survives T3 auto-updates. Precise fixes for stock T3 telemetry bugs across **Antigravity / Muse / Codex / Claude** engines: speed misreporting, cache double-counting, context-capacity inflation, and billion-token subagent undercounting.

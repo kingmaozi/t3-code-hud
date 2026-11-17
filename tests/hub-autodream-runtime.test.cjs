@@ -37,6 +37,91 @@ function seedGray(f) {
   return ids;
 }
 
+test('review-8 defect-1: production CLI and cleanup failures both persist without raw errors', async t => {
+  const f = fixture(t), close = fs.closeSync, fstat = fs.fstatSync;
+  fakeCli(f, 'muse', "printf '%s\\n' 'HTTP 429 api_key=EXAMPLE_SECRET_VALUE' >&2\nexit 1");
+  seedGray(f);
+  f.vault.updateDreamConfig({dreamMode:'agent', providerInstanceId:'muse', model:'muse-ember-1.0', minDeltaMemories:1});
+  let promptFd, injected = false;
+  fs.fstatSync = function(fd, ...args) {
+    const stat = fstat.call(this, fd, ...args);
+    if (args[0] && args[0].bigint && stat.isFile()) promptFd = fd;
+    return stat;
+  };
+  fs.closeSync = function(fd) {
+    const result = close.call(this, fd);
+    if (fd === promptFd && !injected) { injected = true; throw new Error('cleanup path /synthetic/private EXAMPLE_SECRET_VALUE'); }
+    return result;
+  };
+  let result;
+  try { result = await f.vault.runDreamCycle({force:true, projectRoot:f.projectRoot}); }
+  finally { fs.fstatSync = fstat; fs.closeSync = close; }
+  assert.equal(injected, true);
+  assert.equal(result.ok, false);
+  const state = f.vault.getDreamOverview();
+  const journal = JSON.parse(fs.readFileSync(path.join(f.hubDir, 'dream-journal.json'), 'utf8'));
+  for (const agent of [result.report.agent, state.config.lastReport.agent, journal.entries.at(-1).agent]) {
+    assert.equal(agent.error, 'cli-exit-1');
+    assert.deepEqual(agent.diagnostic, {category:'http', httpStatus:429});
+    assert.equal(agent.cleanupError, 'cli-temp-cleanup-failed');
+  }
+  assert.doesNotMatch(JSON.stringify({result, state, journal}), /EXAMPLE_SECRET_VALUE|\/synthetic\/private/);
+});
+
+for (const marker of ['cli-temp-cleanup-failed', 'cli-temp-cleanup-failed:/synthetic/private EXAMPLE_SECRET_VALUE', {path:'/synthetic/private EXAMPLE_SECRET_VALUE'}, undefined]) {
+  test(`review-8 defect-1: runner cleanup marker accepts only the exact whitelist (${typeof marker === 'object' ? 'object' : marker === undefined ? 'absent' : marker.includes(':') ? 'raw' : 'fixed'})`, async t => {
+    const f = fixture(t); seedGray(f);
+    f.vault.updateDreamConfig({dreamMode:'agent', providerInstanceId:'muse', model:'muse-ember-1.0', minDeltaMemories:1});
+    const result = await f.vault.runDreamCycle({force:true, projectRoot:f.projectRoot, agentRunner:() => {
+      const err = new Error('cli-timeout');
+      err.diagnostic = {category:'tls', stderr:'EXAMPLE_SECRET_VALUE'};
+      err.cleanupError = marker;
+      throw err;
+    }});
+    const state = f.vault.getDreamOverview();
+    const journal = JSON.parse(fs.readFileSync(path.join(f.hubDir, 'dream-journal.json'), 'utf8'));
+    for (const agent of [result.report.agent, state.config.lastReport.agent, journal.entries.at(-1).agent]) {
+      assert.equal(agent.error, 'cli-timeout');
+      assert.deepEqual(agent.diagnostic, {category:'tls'});
+      assert.equal(Object.hasOwn(agent, 'cleanupError'), marker === 'cli-temp-cleanup-failed');
+      if (marker === 'cli-temp-cleanup-failed') assert.equal(agent.cleanupError, marker);
+    }
+    assert.doesNotMatch(JSON.stringify({result, state, journal}), /EXAMPLE_SECRET_VALUE|\/synthetic\/private/);
+  });
+}
+
+for (const mode of ['timeout','overflow']) {
+  test(`review-1: ${mode} reaps a SIGTERM-ignoring CLI before prompt cleanup`, async t => {
+    const f = fixture(t), pidFile = path.join(f.base,'pid'), termFile = path.join(f.base,'term');
+    const vault = createMemoryVault({homeDir:f.homeDir,hubDir:f.hubDir,vaultDir:f.vaultDir,
+      _dreamPromptTempRoot:f.base,_embedFn:()=>null,_healthFn:()=>({modelId:'test',dim:2})});
+    const code = `
+      const fs=require('node:fs');
+      const input=process.argv[process.argv.indexOf('--prompt-file')+1];
+      process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(termFile)},fs.readFileSync(input,'utf8'));});
+      fs.writeFileSync(${JSON.stringify(pidFile)},JSON.stringify({pid:process.pid,input}));
+      ${mode==='overflow' ? "process.stdout.write('X'.repeat(5000));" : ''}
+      setInterval(()=>{},1000);
+    `;
+    let seen;
+    t.after(() => {
+      if (!seen && fs.existsSync(pidFile)) seen=JSON.parse(fs.readFileSync(pidFile,'utf8'));
+      if (seen) { try {process.kill(seen.pid,'SIGKILL');} catch {} }
+    });
+    const error = await vault.runDreamAgentCli({cmd:process.execPath,
+      args:['-e',code,'--','--prompt-file','placeholder'],prompt:'synthetic private prompt',
+      promptFile:true,timeoutMs:500,maxOutputBytes:32}).catch(e=>e);
+    assert.equal(error.message,mode==='timeout'?'cli-timeout':'cli-output-overflow');
+    seen=JSON.parse(fs.readFileSync(pidFile,'utf8'));
+    let alive=true;
+    try {process.kill(seen.pid,0);} catch(e) {if(e.code==='ESRCH')alive=false;else throw e;}
+    assert.equal(alive,false,'owned child must be reaped before the promise settles');
+    assert.equal(fs.readFileSync(termFile,'utf8'),'synthetic private prompt','SIGTERM must precede SIGKILL and cleanup');
+    assert.equal(fs.existsSync(seen.input),false);
+    assert.equal(fs.readdirSync(f.base).some(name=>name.startsWith('t3-dream-prompt-')),false);
+  });
+}
+
 test("capability and schedule status use static checks without launching a CLI", t => {
   const f = fixture(t), touched = path.join(f.base, "started");
   fakeCli(f, "muse", `: > ${JSON.stringify(touched)}\nexit 1`);
@@ -70,7 +155,7 @@ test("existing AGY setting stays visible but fails before any runner call", asyn
 
 test("Muse receives the selected model and effort through noninteractive stub CLI", async t => {
   const f = fixture(t), argsFile = path.join(f.base, "args"), promptFile = path.join(f.base, "prompt");
-  fakeCli(f, "muse", `printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\ncat > ${JSON.stringify(promptFile)}\nprintf '%s\\n' '{"merges":[]}'`);
+  fakeCli(f, "muse", `printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\nwhile [ "$#" -gt 0 ]; do if [ "$1" = '--prompt-file' ]; then shift; cat "$1" > ${JSON.stringify(promptFile)}; break; fi; shift; done\nprintf '%s\\n' '{"merges":[]}'`);
   seedGray(f);
   const up = f.vault.updateDreamConfig({ dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", reasoningEffort: "max", minDeltaMemories: 1 });
   assert.equal(up.ok, true);

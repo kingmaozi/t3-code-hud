@@ -54,6 +54,8 @@ try {
   let resolved = manager.resolveSubagentRoute({ idOrTitle: hints, role: input.role, projectRoot: payload.cwd || process.cwd() });
   if (!resolved.matched && !resolved.explicitUnavailable && input.role) resolved = manager.resolveSubagentRoute({ idOrTitle: input.role, role: input.role, projectRoot: payload.cwd || process.cwd() });
   if (!resolved.matched || (input.role && resolved.item?.role && input.role !== resolved.item.role)) process.exit(0);
+  const orch = resolved.orchestration && typeof resolved.orchestration === 'object' ? resolved.orchestration : { swarmMode: 'off', source: 'global' };
+  const orchNote = ` 生效模式：${orch.swarmMode}（来源：${orch.source}）。`;
   const updated = { ...input };
   const oldTarget = input.target && typeof input.target === 'object' && !Array.isArray(input.target) ? input.target : {};
   const rawOptions = oldTarget.options;
@@ -61,7 +63,7 @@ try {
   const validArray = optionsArray && rawOptions.every(entry => entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.id === 'string' && Object.keys(entry).every(key => key === 'id' || key === 'value')) && new Set(rawOptions.map(entry => entry.id)).size === rawOptions.length;
   const validObject = rawOptions === undefined || (rawOptions && typeof rawOptions === 'object' && !optionsArray);
   if (!validArray && !validObject) {
-    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: '目标选项格式无法安全合并，已保留原派单；请确认后手动选择角色。', updatedInput: input } }));
+    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: '目标选项格式无法安全合并，已保留原派单；请确认后手动选择角色。' + orchNote, updatedInput: input } }));
     process.exit(0);
   }
   const oldOptions = optionsArray ? Object.fromEntries(rawOptions.map(entry => [entry.id, entry.value])) : { ...(rawOptions || {}) };
@@ -69,7 +71,7 @@ try {
   const changedModel = Boolean(oldTarget.model && oldTarget.model !== resolved.target.model);
   const unknownOptions = Object.keys(oldOptions).filter(key => !['reasoningEffort', 'thinking', 'thinking_level', 'effort'].includes(key));
   if ((oldTarget.driverKind && oldTarget.providerInstanceId !== resolved.target.providerInstanceId) || ((changedProvider || changedModel) && unknownOptions.length)) {
-    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: '目标含无法确认兼容性的 driver 或选项，已保留原派单；请确认后手动选择角色。', updatedInput: input } }));
+    console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: '目标含无法确认兼容性的 driver 或选项，已保留原派单；请确认后手动选择角色。' + orchNote, updatedInput: input } }));
     process.exit(0);
   }
   for (const key of ['reasoningEffort', 'thinking', 'thinking_level', 'effort']) delete oldOptions[key];
@@ -102,7 +104,7 @@ try {
   if (isDeepStrictEqual(updated, input) && !warning) process.exit(0);
   console.log(JSON.stringify({ hookSpecificOutput: {
     hookEventName: 'PreToolUse',
-    additionalContext: warning || 'T3 已按可识别的角色配置更新派单内容；权限判断仍由宿主执行。',
+    additionalContext: (warning || 'T3 已按可识别的角色配置更新派单内容；权限判断仍由宿主执行。') + orchNote,
     updatedInput: wrapped ? { ...outer, Arguments: updated } : updated,
   } }));
 } catch {

@@ -305,7 +305,7 @@ test("installer fallback includes the new artifact access module", (t) => {
   assert.deepEqual(fs.readFileSync(path.join(dest,"hub-artifact-access.cjs")),fs.readFileSync(modulePath));
 });
 
-test("default macOS command reveals directories and application bundles without launching them", async (t) => {
+test("default macOS command reveals directories and application bundles via inode-pinned fileReferenceURL without launching them", async (t) => {
   const vm = require("node:vm");
   const home=fs.mkdtempSync(path.join(os.tmpdir(),"t3-artifact-finder-"));
   t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
@@ -314,8 +314,9 @@ test("default macOS command reveals directories and application bundles without 
   fs.mkdirSync(path.join(bundle,"Contents"),{recursive:true});fs.mkdirSync(folder);fs.writeFileSync(document,"# Preview\n");
   const calls=[];
   const source=fs.readFileSync(path.join(__dirname,"../src/hub-artifact-access.cjs"),"utf8");
+  const realChildProcess = require("node:child_process");
   const sandbox={module:{exports:{}},Buffer,process:{platform:"darwin"},require(name){
-    if(name==="node:child_process") return {execFile(executable,args,callback){calls.push({executable,args:Array.from(args)});callback(null)}};
+    if(name==="node:child_process") return {...realChildProcess,execFile(executable,args,callback){calls.push({executable,args:Array.from(args)});callback(null)}};
     return require(name);
   }};
   vm.runInNewContext(source,sandbox,{filename:"hub-artifact-access.cjs"});
@@ -327,5 +328,138 @@ test("default macOS command reveals directories and application bundles without 
   assert.equal((await access({...base,path:document})).kind,"markdown");
   assert.equal((await access({...base,path:document,operation:"folder"})).kind,"revealed");
   assert.deepEqual(calls.map(x=>x.executable),["/usr/bin/open","/usr/bin/open","/usr/bin/open"]);
-  assert.deepEqual(calls.map(x=>x.args),[["-R",fs.realpathSync(bundle)],["-R",fs.realpathSync(folder)],["-R",fs.realpathSync(document)]]);
+  const inodes=[`${fs.lstatSync(bundle).ino}/`,`${fs.lstatSync(folder).ino}/`,`${fs.lstatSync(document).ino}`];
+  calls.forEach((call,i)=>{
+    assert.equal(call.args.length,3);
+    assert.equal(call.args[0],"-R");
+    assert.equal(call.args[1],"-u");
+    assert.match(call.args[2],/^file:\/\/\/\.file\/id=\d+\.\d+\/?$/);
+    assert.ok(call.args[2].endsWith(`.${inodes[i]}`),`expected ${call.args[2]} to end with .${inodes[i]}`);
+  });
+});
+
+test("Issue #8 recheck5 [4]: Finder reveal passes inode-pinned fileReferenceURL that resolves to original inode even after ancestor swap", async (t) => {
+  if (process.platform !== "darwin") return;
+  const vm = require("node:vm");
+  const realChildProcess = require("node:child_process");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "t3-artifact-fileref-swap-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const session = path.join(home, ".gemini", "antigravity", "brain", "thread-1");
+  const outside = path.join(home, "outside");
+  fs.mkdirSync(session, { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+  const doc = path.join(session, "readme.md");
+  const decoy = path.join(outside, "readme.md");
+  fs.writeFileSync(doc, "# Trusted\n");
+  fs.writeFileSync(decoy, "# Decoy\n");
+  const origIno = String(fs.lstatSync(doc).ino);
+  let capturedArgs = null;
+  const source = fs.readFileSync(path.join(__dirname, "../src/hub-artifact-access.cjs"), "utf8");
+  const sandbox = {
+    module: { exports: {} }, Buffer, process: { platform: "darwin" },
+    require(name) {
+      if (name === "node:child_process") {
+        return {
+          ...realChildProcess,
+          execFile(_exec, args, callback) {
+            capturedArgs = Array.from(args);
+            callback(null);
+          },
+        };
+      }
+      return require(name);
+    },
+  };
+  vm.runInNewContext(source, sandbox, { filename: "hub-artifact-access.cjs" });
+  const board = { verifyArtifactScope: () => ({ ok: true }), getBoardSnapshot: () => ({ artifacts: [{ path: doc }] }) };
+  const access = sandbox.module.exports.createArtifactAccess({ homeDir: home, board });
+  await access({ projectRoot: path.join(home, "project"), threadId: "thread-1", path: doc, operation: "reveal" });
+  assert.ok(Array.isArray(capturedArgs));
+  assert.equal(capturedArgs[0], "-R");
+  assert.equal(capturedArgs[1], "-u");
+  assert.ok(capturedArgs[2].endsWith(`.${origIno}`));
+  // Swap ancestor directory AFTER open was invoked with the fileReferenceURL:
+  const movedSession = path.join(home, ".gemini", "antigravity", "brain", "session-moved");
+  fs.renameSync(session, movedSession);
+  fs.symlinkSync(outside, session, "dir");
+  const resolvePy = [
+    "import ctypes, sys, urllib.parse",
+    "cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')",
+    "cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]",
+    "cf.CFStringCreateWithCString.restype = ctypes.c_void_p",
+    "cf.CFURLCreateWithString.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
+    "cf.CFURLCreateWithString.restype = ctypes.c_void_p",
+    "cf.CFURLCreateFilePathURL.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
+    "cf.CFURLCreateFilePathURL.restype = ctypes.c_void_p",
+    "cf.CFURLGetString.argtypes = [ctypes.c_void_p]",
+    "cf.CFURLGetString.restype = ctypes.c_void_p",
+    "cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]",
+    "cf.CFStringGetCString.restype = ctypes.c_ubyte",
+    "s = cf.CFStringCreateWithCString(None, sys.argv[1].encode(), 0x08000100)",
+    "u = cf.CFURLCreateWithString(None, s, None)",
+    "p = cf.CFURLCreateFilePathURL(None, u, None)",
+    "b = ctypes.create_string_buffer(4096)",
+    "cf.CFStringGetCString(cf.CFURLGetString(p), b, 4096, 0x08000100)",
+    "sys.stdout.write(urllib.parse.unquote(urllib.parse.urlparse(b.value.decode()).path))",
+  ].join("\n");
+  const resolved = realChildProcess.spawnSync("/usr/bin/python3", ["-I", "-c", resolvePy, capturedArgs[2]], { encoding: "utf8" });
+  assert.equal(resolved.status, 0);
+  assert.equal(fs.realpathSync(resolved.stdout.trim()), fs.realpathSync(path.join(movedSession, "readme.md")));
+});
+
+test("Issue #8 recheck6 [3]: Darwin fileReferenceURL resolution falls back to next executable Python interpreter when /usr/bin/python3 fails", async (t) => {
+  if (process.platform !== "darwin") return;
+  const vm = require("node:vm");
+  const realChildProcess = require("node:child_process");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "t3-artifact-py-fallback-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const session = path.join(home, ".gemini", "antigravity", "brain", "session-py-fallback");
+  fs.mkdirSync(session, { recursive: true });
+  const doc = path.join(session, "plan.md");
+  fs.writeFileSync(doc, "# Fallback test\n");
+  const docIno = String(fs.lstatSync(doc).ino);
+
+  const triedPythons = [];
+  let capturedOpenArgs = null;
+  const source = fs.readFileSync(path.join(__dirname, "../src/hub-artifact-access.cjs"), "utf8");
+  const fakeStatSync = (target, ...rest) => {
+    if (target === "/usr/bin/python3" || target === "/opt/homebrew/bin/python3") {
+      return { isFile: () => true, mode: 0o100755 };
+    }
+    if (target === "/bin/python3") {
+      const e = new Error("ENOENT"); e.code = "ENOENT"; throw e;
+    }
+    return fs.statSync(target, ...rest);
+  };
+  const sandbox = {
+    module: { exports: {} }, Buffer, process: { platform: "darwin" },
+    require(name) {
+      if (name === "node:fs") return { ...fs, statSync: fakeStatSync };
+      if (name === "node:child_process") {
+        return {
+          ...realChildProcess,
+          spawnSync(cmd, args, opts) {
+            triedPythons.push(cmd);
+            if (cmd === "/usr/bin/python3") return { status: 1, stdout: "", stderr: "xcrun stub error" };
+            if (cmd === "/opt/homebrew/bin/python3") return realChildProcess.spawnSync("/usr/bin/python3", args, opts);
+            return { status: 1, stdout: "", stderr: "unexpected" };
+          },
+          execFile(_exec, args, callback) {
+            capturedOpenArgs = Array.from(args);
+            callback(null);
+          },
+        };
+      }
+      return require(name);
+    },
+  };
+  vm.runInNewContext(source, sandbox, { filename: "hub-artifact-access.cjs" });
+  const board = { verifyArtifactScope: () => ({ ok: true }), getBoardSnapshot: () => ({ artifacts: [{ path: doc }] }) };
+  const access = sandbox.module.exports.createArtifactAccess({ homeDir: home, board });
+  await access({ projectRoot: path.join(home, "project"), threadId: "thread-1", path: doc, operation: "reveal" });
+  assert.deepEqual(triedPythons, ["/usr/bin/python3", "/opt/homebrew/bin/python3"]);
+  assert.ok(Array.isArray(capturedOpenArgs));
+  assert.equal(capturedOpenArgs[0], "-R");
+  assert.equal(capturedOpenArgs[1], "-u");
+  assert.ok(capturedOpenArgs[2].endsWith(`.${docIno}`));
 });

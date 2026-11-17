@@ -155,3 +155,274 @@ test('stale host rule draft and changed symlink target never overwrite managed c
  assert.throws(()=>mgr.saveRuleContent('codex','# edited\n',initial.content,initial.targetPath),/变更|重新读取/);assert.match(fs.readFileSync(dest1,'utf8'),/route/);
  fs.writeFileSync(dest1,'# before\n');fs.unlinkSync(file);fs.symlinkSync(dest2,file);assert.throws(()=>mgr.saveRuleContent('codex','# edited\n',initial.content,initial.targetPath),/变更|重新读取/);assert.equal(fs.readFileSync(dest2,'utf8'),'# before\n');
 });
+
+test('R-6-1 global role deletion journals .claude/agents/<id>.md via onPublish so mid-retire EIO rolls back or reports rollbackFailures', t => {
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.writeFileSync(host, '# host\n');
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub, extraSyncPaths: [host] });
+  mgr.saveSubagent({
+    scope: 'global',
+    extraSyncPaths: [host],
+    item: {
+      id: 'temp-role',
+      name: 'temp-role',
+      role: 'general',
+      providerInstanceId: 'muse',
+      model: 'muse-ember-1.0',
+      effort: 'max',
+      description: 'temp role',
+      systemPrompt: 'temp prompt',
+      enabled: true,
+    },
+  });
+  const claudeFile = path.join(home, '.claude/agents/temp-role.md');
+  assert.equal(fs.existsSync(claudeFile), true);
+  const beforeClaude = fs.readFileSync(claudeFile, 'utf8');
+
+  const origUnlink = fs.unlinkSync;
+  let injected = false;
+  fs.unlinkSync = function (target) {
+    if (!injected && String(target).includes('temp-role.md.stage-') && String(target).endsWith(path.sep + 'old')) {
+      injected = true;
+      const err = new Error('injected retire EIO');
+      err.code = 'EIO';
+      throw err;
+    }
+    return origUnlink.apply(this, arguments);
+  };
+  let caught = null;
+  try {
+    mgr.deleteSubagent({ scope: 'global', id: 'temp-role', extraSyncPaths: [host] });
+  } catch (e) {
+    caught = e;
+  } finally {
+    fs.unlinkSync = origUnlink;
+  }
+  assert.equal(injected, true);
+  assert.ok(caught, 'deleteSubagent must fail on mid-retire EIO');
+  assert.equal(fs.existsSync(claudeFile), true, 'deleted Claude agent file must be restored on rollback');
+  assert.equal(fs.readFileSync(claudeFile, 'utf8'), beforeClaude);
+});
+
+test('R-6-2 global orchestration update with explicit hosts: [] still fails closed on unsafe AGY rules symlink', async t => {
+  const home = fixture(t), hub = path.join(home, '.t3/hub');
+  const agyInst = path.join(home, '.t3/userdata/providers/antigravity/inst1/config');
+  const outsideRules = path.join(home, 'outside-rules');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.mkdirSync(path.join(agyInst, 'skills'), { recursive: true });
+  fs.mkdirSync(outsideRules, { recursive: true });
+  fs.symlinkSync(outsideRules, path.join(agyInst, 'rules'));
+
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+  const rev = mgr.getOrchestrationState({ hosts: [] }).modeRevision;
+  const direct = mgr.updateOrchestrationConfig({ swarmMode: 'on', expectedRevision: rev }, { hosts: [] });
+  assert.equal(direct.ok, false, 'direct updateOrchestrationConfig with hosts:[] must reject symlink AGY rules');
+
+  const prevHome = process.env.HOME, prevHub = process.env.T3_HUB_DIR, prevT3 = process.env.T3CODE_HOME;
+  process.env.HOME = home;
+  process.env.T3_HUB_DIR = hub;
+  delete process.env.T3CODE_HOME;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevHub === undefined) delete process.env.T3_HUB_DIR; else process.env.T3_HUB_DIR = prevHub;
+    if (prevT3 === undefined) delete process.env.T3CODE_HOME; else process.env.T3CODE_HOME = prevT3;
+  });
+  const { hubCall } = require('../src/backend.cjs');
+  const rpcRes = await hubCall('subagents:orchestration:update', { swarmMode: 'on', expectedRevision: rev, hosts: [] });
+  assert.equal(rpcRes.ok, false, 'hubCall orchestration:update with hosts:[] must reject symlink AGY rules');
+});
+
+test('R-6-3 concurrent AGY instance appearing mid-transaction aborts and rolls back global orchestration update', t => {
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  const agyRoot = path.join(home, '.t3/userdata/providers/antigravity');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.mkdirSync(path.join(agyRoot, 'inst1/config/skills'), { recursive: true });
+  fs.writeFileSync(host, '# clean host\n');
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+  const rev0 = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+  assert.equal(mgr.updateOrchestrationConfig({ swarmMode: 'off', expectedRevision: rev0 }, { hostRulePaths: [host] }).ok, true);
+
+  const beforeHost = fs.readFileSync(host, 'utf8');
+  const beforeCfg = fs.readFileSync(path.join(hub, 'orchestration-config.json'), 'utf8');
+  const rev1 = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+  const origLink = fs.linkSync;
+  let spawned = false;
+  fs.linkSync = function (src, dest) {
+    const out = origLink.apply(this, arguments);
+    if (!spawned && String(dest).endsWith('orchestration-config.json')) {
+      spawned = true;
+      fs.mkdirSync(path.join(agyRoot, 'inst2/config/skills'), { recursive: true });
+    }
+    return out;
+  };
+  let res;
+  try {
+    res = mgr.updateOrchestrationConfig({ swarmMode: 'on', expectedRevision: rev1 }, { hostRulePaths: [host] });
+  } finally {
+    fs.linkSync = origLink;
+  }
+  assert.equal(spawned, true);
+  assert.equal(res.ok, false, 'new AGY instance mid-transaction must abort commit');
+  assert.equal(res.rolledBack, true);
+  assert.equal(fs.readFileSync(host, 'utf8'), beforeHost);
+  assert.equal(fs.readFileSync(path.join(hub, 'orchestration-config.json'), 'utf8'), beforeCfg);
+});
+
+test('R-6-4 orchestration get/update strictly reject null, empty, invalid, or conflicting scope without ?? fallback', async t => {
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.writeFileSync(host, '# host\n');
+  const prevHome = process.env.HOME, prevHub = process.env.T3_HUB_DIR;
+  process.env.HOME = home;
+  process.env.T3_HUB_DIR = hub;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevHub === undefined) delete process.env.T3_HUB_DIR; else process.env.T3_HUB_DIR = prevHub;
+  });
+  const { hubCall } = require('../src/backend.cjs');
+  const st = await hubCall('subagents:orchestration:get', { hosts: [host] });
+
+  const rNullGet = await hubCall('subagents:orchestration:get', { scope: null, hosts: [host] });
+  assert.equal(rNullGet.ok, false, 'scope:null in get must fail');
+
+  const rNullUpd = await hubCall('subagents:orchestration:update', {
+    scope: null,
+    patch: { swarmMode: 'on', expectedRevision: st.modeRevision },
+    hosts: [host],
+  });
+  assert.equal(rNullUpd.ok, false, 'scope:null in update must not ?? fallback to global');
+
+  const rConflict = await hubCall('subagents:orchestration:update', {
+    scope: 'global',
+    patch: { scope: 'project', swarmMode: 'on', expectedRevision: st.modeRevision },
+    hosts: [host],
+  });
+  assert.equal(rConflict.ok, false, 'conflicting outer/inner scope must fail');
+
+  const rBadInner = await hubCall('subagents:orchestration:update', {
+    scope: 'global',
+    patch: { scope: 'bogus', swarmMode: 'on', expectedRevision: st.modeRevision },
+    hosts: [host],
+  });
+  assert.equal(rBadInner.ok, false, 'invalid inner patch.scope must fail');
+});
+
+test('R-6-5 execute-only (0100) AGY instance or config directory fails closed across subagents, backend, and host settings', async t => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+  const { createHostSettingsManager } = require('../src/hub-host-settings.cjs');
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  const instDir = path.join(home, '.t3/userdata/providers/antigravity/instExecOnly');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.mkdirSync(instDir, { recursive: true });
+  fs.writeFileSync(host, '# host\n');
+  const prevHome = process.env.HOME, prevHub = process.env.T3_HUB_DIR, prevT3 = process.env.T3CODE_HOME;
+  fs.chmodSync(instDir, 0o100);
+  try {
+    const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+    const rev = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+    const res = mgr.updateOrchestrationConfig({ swarmMode: 'on', expectedRevision: rev }, { hostRulePaths: [host] });
+    assert.equal(res.ok, false, '0100 AGY instance dir must fail closed in updateOrchestrationConfig');
+
+    const snap = createHostSettingsManager({ homeDir: home, hubDir: hub }).getAntigravitySnapshot();
+    assert.equal(snap.routingSkillsComplete, false, '0100 AGY instance dir must mark routingSkillsComplete=false');
+
+    process.env.HOME = home;
+    process.env.T3_HUB_DIR = hub;
+    delete process.env.T3CODE_HOME;
+    const { hubCall } = require('../src/backend.cjs');
+    const rpcRes = await hubCall('subagents:orchestration:update', { swarmMode: 'on', expectedRevision: rev });
+    assert.equal(rpcRes.ok, false, '0100 AGY instance dir must fail closed in backend discoverAntigravityRulesPaths');
+  } finally {
+    try { fs.chmodSync(instDir, 0o755); } catch {}
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevHub === undefined) delete process.env.T3_HUB_DIR; else process.env.T3_HUB_DIR = prevHub;
+    if (prevT3 === undefined) delete process.env.T3CODE_HOME; else process.env.T3CODE_HOME = prevT3;
+  }
+});
+
+test('R-6-6 getAntigravitySnapshot rejects symlinked SKILL.md without following target and sets routingSkillsComplete=false on any skill error', t => {
+  const { createHostSettingsManager } = require('../src/hub-host-settings.cjs');
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.writeFileSync(host, '# host\n');
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+  const rev = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+  assert.equal(mgr.updateOrchestrationConfig({ swarmMode: 'on', expectedRevision: rev }, { hostRulePaths: [host] }).ok, true);
+
+  const agentsSkill = path.join(home, '.agents/skills/t3-subagent-routing/SKILL.md');
+  const realTarget = path.join(home, 'real-managed-skill.md');
+  fs.writeFileSync(realTarget, fs.readFileSync(agentsSkill, 'utf8'));
+  fs.unlinkSync(agentsSkill);
+  fs.symlinkSync(realTarget, agentsSkill);
+
+  const snap = createHostSettingsManager({ homeDir: home, hubDir: hub }).getAntigravitySnapshot();
+  const entry = snap.routingSkills.find(x => x.path === agentsSkill);
+  assert.ok(entry);
+  assert.equal(entry.error, 'symlink', 'symlinked SKILL.md must be flagged as symlink rather than followed');
+  assert.equal(entry.managed, false);
+  assert.equal(entry.sha256, null);
+  assert.equal(snap.routingSkillsComplete, false, 'symlinked SKILL.md must set routingSkillsComplete=false');
+  assert.ok(snap.error, 'antigravity snapshot must surface error when a routing skill is unsafe');
+});
+
+test('R-6-7 standalone syncOrchestrationDirectiveToHostsRaw preflights and rolls back all writes when any target fails', t => {
+  const home = fixture(t), hub = path.join(home, '.t3/hub');
+  const goodHost = path.join(home, 'good-AGENTS.md');
+  const badHost = path.join(home, 'bad-AGENTS.md');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.writeFileSync(goodHost, '# good before\n');
+  fs.writeFileSync(badHost, '# bad\n<!-- T3_HUB_ORCHESTRATOR_START -->\nunterminated\n');
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+
+  const res = mgr.syncOrchestrationDirectiveToHostsRaw({
+    configOverride: { policyVersion: 2, orchestratorMode: 'off', swarmMode: 'on', strictCommanderOnly: true },
+    hosts: [goodHost, badHost],
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.rolledBack, true);
+  assert.equal(fs.readFileSync(goodHost, 'utf8'), '# good before\n', 'goodHost must remain untouched/rolled back');
+  assert.equal(fs.existsSync(path.join(hub, 'ACTIVE_ORCHESTRATION_MODE.md')), false, 'ACTIVE_ORCHESTRATION_MODE.md must not be left behind');
+});
+
+test('R-6-8 benign .DS_Store/.localized regular files are ignored across all 3 modules while symlinks or stray files fail closed', async t => {
+  const { createHostSettingsManager } = require('../src/hub-host-settings.cjs');
+  const home = fixture(t), hub = path.join(home, '.t3/hub'), host = path.join(home, 'AGENTS.md');
+  const agyRoot = path.join(home, '.t3/userdata/providers/antigravity');
+  fs.mkdirSync(hub, { recursive: true });
+  fs.mkdirSync(path.join(agyRoot, 'inst1/config/skills'), { recursive: true });
+  fs.mkdirSync(path.join(agyRoot, 'inst1/config/rules'), { recursive: true });
+  fs.writeFileSync(path.join(agyRoot, 'inst1/config/rules/AGENTS.md'), '# agy\n');
+  fs.writeFileSync(path.join(agyRoot, '.DS_Store'), '');
+  fs.writeFileSync(path.join(agyRoot, '.localized'), '');
+  fs.writeFileSync(host, '# host\n');
+
+  const mgr = createSubagentsManager({ homeDir: home, hubDir: hub });
+  const rev0 = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+  assert.equal(mgr.updateOrchestrationConfig({ swarmMode: 'on', expectedRevision: rev0 }, { hostRulePaths: [host] }).ok, true);
+  const hsm = createHostSettingsManager({ homeDir: home, hubDir: hub });
+  assert.equal(hsm.getAntigravitySnapshot().routingSkillsComplete, true, 'benign .DS_Store/.localized must not break routingSkillsComplete');
+
+  // Replace .DS_Store with a symlink -> all 3 modules must fail closed
+  fs.unlinkSync(path.join(agyRoot, '.DS_Store'));
+  fs.symlinkSync(host, path.join(agyRoot, '.DS_Store'));
+  const rev1 = mgr.getOrchestrationState({ hosts: [host] }).modeRevision;
+  assert.equal(mgr.updateOrchestrationConfig({ swarmMode: 'off', expectedRevision: rev1 }, { hostRulePaths: [host] }).ok, false, 'symlink .DS_Store must fail closed in subagents');
+  assert.equal(hsm.getAntigravitySnapshot().routingSkillsComplete, false, 'symlink .DS_Store must fail closed in host settings');
+
+  // Restore .DS_Store and add a stray regular file -> backend discoverAntigravityRulesPaths must also fail closed
+  fs.unlinkSync(path.join(agyRoot, '.DS_Store'));
+  fs.writeFileSync(path.join(agyRoot, 'stray.txt'), 'rogue');
+  const prevHome = process.env.HOME, prevHub = process.env.T3_HUB_DIR, prevT3 = process.env.T3CODE_HOME;
+  process.env.HOME = home;
+  process.env.T3_HUB_DIR = hub;
+  delete process.env.T3CODE_HOME;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevHub === undefined) delete process.env.T3_HUB_DIR; else process.env.T3_HUB_DIR = prevHub;
+    if (prevT3 === undefined) delete process.env.T3CODE_HOME; else process.env.T3CODE_HOME = prevT3;
+  });
+  const { hubCall } = require('../src/backend.cjs');
+  const rpcRes = await hubCall('subagents:orchestration:update', { swarmMode: 'off', expectedRevision: rev1 });
+  assert.equal(rpcRes.ok, false, 'stray non-directory in agyRoot must fail closed in backend');
+});
