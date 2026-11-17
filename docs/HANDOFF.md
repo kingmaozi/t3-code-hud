@@ -1,6 +1,18 @@
 # T3 Hub engineering handoff
 
-Last updated: 2026-11-17 (Asia/Singapore)
+Last updated: 2026-11-18 (Asia/Singapore)
+
+## Active follow-up: project-only memory and embedding probe
+
+Release `1.0.5` builds on `2291cc7` / package `1.0.4`. Memory must read and write only the selected T3 project, including subagents. Global memory is retained on disk but excluded from all normal reads, writes and statistics. Unknown project context must fail closed. Project-shared records remain shared across corresponding worktrees; worktree-private records stay local to that worktree. Different projects under the same repository must not collapse into one memory identity. Markdown synchronization, ID mutations and vector reindexing obey the same boundary.
+
+Ownership: `memory-vault.cjs` and its isolation regressions; MCP router/CLI recall and hook prompt; Memory drawer and UI contract tests; embedding manager and probe tests; backend RPC integration and documentation. The real embedding probe uses a fixed non-sensitive string and reports model, vector dimensions and measured latency without reading or writing memory or changing the model. Dedicated QA owns real service/desktop validation; independent review covers scope and mutation boundaries. T3 restart, AGY calls/configuration changes and Dream execution remain prohibited. Desktop layout must stay unchanged.
+
+The backend, vault, embedding manager and drawer have received a backed-up hot update, with matching source/installed hashes and no T3 process restart. QA clicked the actual desktop test button and observed a successful 2560-dimensional result; no model or account configuration changed. The interface shows project-shared/current-worktree scopes and no global memory option. Concurrent first-use project identity claims are now atomic; established project searches do not hold that global lock during embedding. Existing rows with unprovable or mixed project ownership cause a clear error and remain unchanged.
+
+Host binding limits: third-party MCP initialization does not provide a universally trusted T3 thread identity. The Agent router requires an explicit projectRoot matching its confirmed startup binding; unknown contexts and unregistered ambiguous linked-checkout roots fail closed. Matching worktree aliases do not switch private scope. Old running MCP processes must naturally reconnect to load new code. This release does not claim that all existing or future provider sessions have been behaviorally verified. Worktree-private IDs now use stable v2 identities; old records without provable ownership stay on disk and are not reassigned. Project-shared records remain usable.
+
+Final validation: the eight-file memory/RPC/router/CLI/Hook/access matrix passed 135 tests in a clean temporary environment; the independent UI contract suite passed 240, embedding-manager/probe/lifecycle suites passed 177, and the focused worktree cases passed 4. These are targeted regressions, not a full historical Dream-suite run. The final vault and Agent command files were backed up and hot-installed with matching hashes. Real installed router/vault processes passed an isolated A/B/global/ID/default-limit fixture without touching actual memories. The loaded sidecar reports the local embedding service running and omits memory statistics without a project. Desktop layout and actual probe-button success were verified; prior running MCP processes were not forcibly disconnected.
 
 ## Active delivery: compact Hub and trustworthy status (2026-11-17)
 

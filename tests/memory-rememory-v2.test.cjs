@@ -18,6 +18,7 @@ function fixture(embedFn = () => null, vaultOptions = {}) {
   const vaultDir = path.join(base, "vault");
   const homeDir = path.join(base, "home");
   fs.mkdirSync(projectRoot, { recursive: true });
+  fs.writeFileSync(path.join(projectRoot, ".project"), "fixture");
   fs.mkdirSync(homeDir, { recursive: true });
   const vault = createMemoryVault({ vaultDir, homeDir, _embedFn: embedFn, ...vaultOptions });
   const save = (args) => {
@@ -127,23 +128,23 @@ test("Markdown manual round trips, adjacent deletes, and index rebuild preserve 
   const second = f.save({ id: first.item.id, content: "current manual body" });
   const history = second.item.history;
   const neighbour = f.save({ title: "Unrelated", content: "other independent material", autoEvolve: false });
-  assert.equal(f.vault.deleteMemory({ id: neighbour.item.id }).ok, true);
+  assert.equal(f.vault.deleteMemory({ projectRoot: f.projectRoot, id: neighbour.item.id }).ok, true);
   let text = fs.readFileSync(f.md(), "utf8");
   assert.ok(text.includes("<!-- meta:"));
   text = text.replace("current manual body", "edited manual body");
   fs.writeFileSync(f.md(), text);
-  assert.equal(f.vault.syncFromMarkdownIfChanged("project").ok, true);
+  assert.equal(f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot }).ok, true);
   assert.equal(f.list()[0].version, 2);
   assert.deepEqual(f.list()[0].history, history);
   // An editor that strips only the v2 comment must not reset the DB history.
   fs.writeFileSync(f.md(), fs.readFileSync(f.md(), "utf8").replace(/^<!-- meta:.*-->\n/gm, "").replace("edited manual body", "edited twice body"));
-  f.vault.syncFromMarkdownIfChanged("project");
+  f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   assert.deepEqual(f.list()[0].history, history);
   assert.equal(f.list()[0].content, "edited twice body");
   await new Promise((resolve) => setImmediate(resolve));
   fs.rmSync(path.join(f.vaultDir, "index.sqlite"));
   const restored = createMemoryVault({ vaultDir: f.vaultDir, _embedFn: () => null });
-  restored.syncFromMarkdownIfChanged("project");
+  restored.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   const item = restored.listMemories({ projectRoot: f.projectRoot }).items[0];
   assert.equal(item.version, 2);
   assert.deepEqual(item.history, history);
@@ -153,7 +154,8 @@ test("consolidation dry run is read-only; execution archives duplicates and leav
   const f = fixture();
   const a = f.save({ autoEvolve: false, content: "alpha beta gamma delta epsilon zeta eta theta" });
   f.save({ autoEvolve: false, content: "alpha beta gamma delta epsilon zeta eta theta iota" });
-  f.save({ projectSlug: "other", content: "alpha beta gamma delta epsilon zeta eta theta kappa", autoEvolve: false });
+  const otherRoot = path.join(f.base, "other"); fs.mkdirSync(otherRoot);
+  f.save({ projectRoot: otherRoot, content: "alpha beta gamma delta epsilon zeta eta theta kappa", autoEvolve: false });
   const before = fs.readFileSync(f.md(), "utf8");
   const preview = f.vault.consolidateMemories({ projectRoot: f.projectRoot, dryRun: true });
   assert.equal(preview.ok, true);
@@ -167,7 +169,7 @@ test("consolidation dry run is read-only; execution archives duplicates and leav
   assert.equal(result.items[0].version, result.items[0].history.length + 1);
   assert.ok(result.items[0].history.some((h) => h.reason === "consolidated"));
   assert.equal(f.list().length, 1);
-  assert.equal(f.list({ projectSlug: "other" }).length, 1);
+  assert.equal(f.list({ projectRoot: otherRoot }).length, 1);
   assert.equal(f.vault.consolidateMemories({ projectRoot: f.projectRoot }).mergedCount, 0);
 });
 
@@ -220,7 +222,7 @@ test("late Markdown embedding responses cannot restore superseded or deleted vec
   });
   const first = f.save({ title: "Async", content: "initial body" });
   fs.writeFileSync(f.md(), fs.readFileSync(f.md(), "utf8").replace("initial body", "delayedquartz body"));
-  f.vault.syncFromMarkdownIfChanged("project");
+  f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(deferred.length, 1);
   f.save({ supersedesId: first.item.id, title: "Async", content: "freshwillow body" });
@@ -233,10 +235,10 @@ test("late Markdown embedding responses cannot restore superseded or deleted vec
   // Edit only active content; the history comment remains unchanged.
   const lines = fs.readFileSync(f.md(), "utf8").split("\n");
   fs.writeFileSync(f.md(), lines.map((line) => line === "freshwillow body" ? "delayedquartz again" : line).join("\n"));
-  f.vault.syncFromMarkdownIfChanged("project");
+  f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(deferred.length, 1);
-  f.vault.deleteMemory({ id: first.item.id });
+  f.vault.deleteMemory({ projectRoot: f.projectRoot, id: first.item.id });
   deferred.shift()([[1, 0]]);
   await new Promise((resolve) => setImmediate(resolve));
   db = f.db();
@@ -244,15 +246,13 @@ test("late Markdown embedding responses cannot restore superseded or deleted vec
   db.close();
 });
 
-test("explicit supersedes stays inside its project or global vault", () => {
+test("explicit supersedes stays inside its project and rejects global memory", () => {
   const f = fixture();
   const first = f.save();
-  assert.equal(f.vault.saveMemory({ projectSlug: "other", supersedesId: first.item.id, title: "Wrong", content: "wrong scope" }).ok, false);
+  const otherRoot = path.join(f.base, "other"); fs.mkdirSync(otherRoot);
+  assert.equal(f.vault.saveMemory({ projectRoot: otherRoot, supersedesId: first.item.id, title: "Wrong", content: "wrong scope" }).ok, false);
   assert.equal(f.vault.saveMemory({ projectRoot: f.projectRoot, supersedesId: "missing", title: "Missing", content: "no target" }).ok, false);
-  const global = f.save({ projectSlug: "_global", title: "Global", content: "old global" });
-  const replacement = f.save({ projectSlug: "_global", supersedesId: global.item.id, title: "Global", content: "new global" });
-  assert.equal(replacement.action, "superseded");
-  assert.equal(replacement.item.id, global.item.id);
+  assert.equal(f.vault.saveMemory({ projectRoot: f.projectRoot, scope: "global", title: "Global", content: "unavailable" }).ok, false);
   assert.equal(f.list()[0].id, first.item.id);
 });
 
@@ -288,7 +288,7 @@ test("recall counters survive Markdown sync and mildly boost RRF; empty query an
   assert.ok(hot.score > hits[0].score);
   assert.equal(next[0].id, hot.id);
   fs.writeFileSync(f.md(), fs.readFileSync(f.md(), "utf8") + "\n");
-  f.vault.syncFromMarkdownIfChanged("project");
+  f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   assert.equal(f.list().find((i) => i.id === hot.id).hitCount, 1);
 });
 
@@ -299,6 +299,10 @@ test("v1 SQLite projection is migrated without losing old cards", () => {
   db.exec("CREATE TABLE memories(id TEXT PRIMARY KEY, project_slug TEXT NOT NULL, project_root TEXT, module TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, agent TEXT NOT NULL, tags_json TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
   db.prepare("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run("legacy", "project", f.projectRoot, "topics", "topic", "Legacy", "old body", "user", "[]", "hash", "2026-01-01", "2026-01-01");
   db.close();
+  // An older project needs a proven ownership record; unbound database rows
+  // remain preserved but cannot be attributed to an arbitrary same name.
+  const legacyDir = path.join(f.vaultDir, "projects", "project"); fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "_meta.json"), JSON.stringify({ slug: "project", projectRoot: f.projectRoot }));
   const item = f.list()[0];
   assert.equal(item.id, "legacy");
   assert.equal(item.version, 1);
@@ -310,7 +314,7 @@ test("pc-lite write/rule/experience forward --supersedes and support consolidate
   const f = fixture();
   const cli = (args) => execFileSync(process.execPath, [path.join(REPO, "scripts/pc-lite.mjs"), ...args,
     "--root", f.projectRoot, "--vault-dir", f.vaultDir, "--home-dir", f.homeDir, "--embed-url", "http://127.0.0.1:1/v1/embeddings"],
-  { env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
+  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
   const first = f.save({ content: "old CLI body" });
   cli(["write", "--title", "CLI", "--content", "new CLI body", "--supersedes", first.item.id]);
   assert.equal(f.list()[0].version, 2);
@@ -332,7 +336,7 @@ test("pc-lite Agent writes reject reserved tags and cannot supersede protected r
   const f = fixture();
   const cli = (args) => execFileSync(process.execPath, [path.join(REPO, "scripts/pc-lite.mjs"), ...args,
     "--root", f.projectRoot, "--vault-dir", f.vaultDir, "--home-dir", f.homeDir, "--embed-url", "http://127.0.0.1:1/v1/embeddings"],
-  { env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
+  { cwd: f.projectRoot, env: { ...process.env, HOME: f.homeDir, T3_HUB_DIR: path.join(f.base, "hub"), T3_MEMORY_VAULT_DIR: f.vaultDir }, encoding: "utf8" });
   const assertCliRejected = (args, pattern) => {
     assert.throws(() => cli(args), (error) => {
       const output = String(error.stdout || "") + String(error.stderr || "");
@@ -448,10 +452,15 @@ test("MCP memory_read finds old search hits by ID and stays inside selected proj
   const old = f.save({ title: "Ancient readable rule", content: "ancient-read-token original rule body", autoEvolve: false, autoConsolidateThreshold: 0 }).item;
   const edited = f.vault.saveMemory({ projectRoot: f.projectRoot, id: old.id, title: old.title, content: "ancient-read-token current rule body", autoEvolve: false, autoConsolidateThreshold: 0 });
   assert.equal(edited.ok, true);
-  const otherWorktree = f.vault.saveMemory({ projectRoot: f.projectRoot, module: "constraints", title: "Other worktree only", content: "worktree-only-read-token", scope: "worktree", worktreeId: "different-worktree", autoEvolve: false, autoConsolidateThreshold: 0 });
-  assert.equal(otherWorktree.ok, true);
-  const global = f.vault.saveMemory({ projectSlug: "_global", module: "constraints", title: "Global readable rule", content: "global-readable-token", autoEvolve: false, autoConsolidateThreshold: 0 });
-  assert.equal(global.ok, true);
+  // Seed historical foreign scopes directly: current APIs cannot create them.
+  const otherWorktree = { item: { id: "foreign-worktree-fixture" } };
+  const global = { item: { id: "legacy-global-fixture" } };
+  const seed = f.db();
+  try {
+    const insert = seed.prepare("INSERT INTO memories(id,project_slug,project_root,module,kind,title,content,agent,tags_json,content_hash,created_at,updated_at,memory_scope,worktree_id) VALUES(?, ?, ?, 'constraints','constraint',? ,?,'legacy','[]',?,'2026-01-01','2026-01-01',?,?)");
+    insert.run(otherWorktree.item.id, old.projectSlug, f.projectRoot, "Other worktree only", "worktree-only-read-token", "foreign-wt", "worktree", "different-worktree");
+    insert.run(global.item.id, "_global", null, "Global readable rule", "global-readable-token", "global-old", "global", "");
+  } finally { seed.close(); }
   const projectB = path.join(f.base, "project-b");
   fs.mkdirSync(projectB, { recursive: true });
   const foreign = f.vault.saveMemory({ projectRoot: projectB, module: "constraints", title: "Project B only", content: "project-b-read-token", autoEvolve: false, autoConsolidateThreshold: 0 });
@@ -509,12 +518,11 @@ test("MCP memory_read finds old search hits by ID and stays inside selected proj
   const otherWorktreeAtMain = await call("memory_read", { projectRoot: f.projectRoot, id: otherWorktree.item.id });
   assert.equal(otherWorktreeAtMain.ok, false, "other worktree memories are outside the current auto scope");
   const globalRead = await call("memory_read", { projectRoot: f.projectRoot, id: global.item.id });
-  assert.equal(globalRead.ok, true, "global scope remains readable from a project context");
-  const searchB = await call("memory_search", { projectRoot: projectB, query: "project-b-read-token" });
-  assert.ok(searchB.items.some((item) => item.id === foreign.item.id), "explicit projectRoot continues to select project B consistently");
-  const readB = await call("memory_read", { projectRoot: projectB, id: foreign.item.id });
-  assert.equal(readB.ok, true);
-  assert.equal(readB.item.content, "project-b-read-token");
+  assert.equal(globalRead.ok, false, "global scope is unavailable from a project context");
+  const searchB = await request("tools/call", { name: "memory_search", arguments: { projectRoot: projectB, query: "project-b-read-token" } });
+  assert.ok(searchB.error, "a process bound to project A cannot select project B");
+  const readB = await request("tools/call", { name: "memory_read", arguments: { projectRoot: projectB, id: foreign.item.id } });
+  assert.ok(readB.error, "a process bound to project A cannot read project B by ID");
 });
 
 test("listMemories keeps an exact ID filter through semantic query candidates", () => {
@@ -546,7 +554,7 @@ test("consolidated histories have unique stable revisions and unambiguous rollba
   const bh = item.history.find(h => h.revisionId === be.history[0].revisionId);
   assert.equal(ah.sourceVersion, 1); assert.equal(bh.sourceVersion, 1);
   const restored = createMemoryVault({ homeDir: f.homeDir, vaultDir: f.vaultDir, _embedFn: () => null });
-  restored.syncFromMarkdownIfChanged("project");
+  restored.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   assert.deepEqual(restored.listMemories({ projectRoot: f.projectRoot }).items[0].history, item.history);
   // revisionId takes precedence over a conflicting numeric selector.
   const ra = restored.rollbackMemory({ projectRoot: f.projectRoot, id: item.id, revisionId: ah.revisionId, targetVersion: bh.version });
@@ -565,7 +573,7 @@ test("legacy histories receive stable IDs and duplicate numeric versions require
     { version: 1, title: "second", content: "legacy beta", agent: "user" },
   ] })} -->`);
   fs.writeFileSync(f.md(), md);
-  f.vault.syncFromMarkdownIfChanged("project");
+  f.vault.syncFromMarkdownIfChanged({ projectRoot: f.projectRoot });
   const history = f.list()[0].history;
   assert.equal(new Set(history.map(h => h.revisionId)).size, 2);
   assert.deepEqual(f.list()[0].history, history);

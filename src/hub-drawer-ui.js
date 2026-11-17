@@ -17,7 +17,7 @@
     let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
-    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, settingsVersion = 0, settingsSelectionVersion = 0;
+    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
     let lastRoute = "", lastBoardRoute = "", cachedRouter = null, unsubscribeRouter = null, routerProbeAt = 0;
     let boardDrag = null, contextLoading = true;
     const tabKeys = ["memory"];
@@ -29,11 +29,11 @@
     const errors = {}, drafts = initial?.drafts || {};
     const state = {
  open: initial?.open ?? false, tab: normalizedTab, settingsSubView: restoredSubView === "agents" ? "agents" : "native", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
- resourceFilters: initial?.resourceFilters || {}, memoryScope: initial?.memoryScope || "smart",
+ resourceFilters: initial?.resourceFilters || {}, memoryScope: ["smart", "project", "worktree"].includes(initial?.memoryScope) ? initial.memoryScope : "smart",
  boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
  planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
- memoryImporting: false, embedTrimming: false,
+ memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
  clearedHostFields: new Set(Array.isArray(initial?.clearedHostFields) ? initial.clearedHostFields : []),
@@ -50,6 +50,14 @@
  if (!tabKeys.includes(state.tab)) state.tab = "memory";
  if (storedTab !== state.tab) storageSet("t3-hub-tab", state.tab);
     if (!["global", "project"].includes(state.scope)) state.scope = "global";
+    // Memory is always bound to the current confirmed project. Migrate restored global or
+    // previously selected-project state before rendering so it cannot silently widen scope.
+    const migrateMemoryScope = state.scope !== "project" || state.memoryProject !== "current" || !["smart", "project", "worktree"].includes(state.memoryScope);
+    state.scope = "project";
+    state.memoryProject = "current";
+    if (!["smart", "project", "worktree"].includes(state.memoryScope)) state.memoryScope = "smart";
+    if (drafts.__new?.scope === "global") { drafts.__new.scope = "project"; drafts.__new.migratedFromGlobal = true; }
+    if (migrateMemoryScope) storageSet("t3-hub-scope", "project");
 
     async function hubRpc(action, payload = {}) {
  let result;
@@ -346,7 +354,7 @@
  const model = typeof context.activeModel === "object" ? context.activeModel?.name || context.activeModel?.id : context.activeModel;
  const cliName = [cliNames[String(cli)] || cli, model].filter(Boolean).join(" · ") || tr("本地工作区就绪", "Workspace ready");
  renderMemoryTitleControls();
- root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("工作空间作用域", "Workspace scope"))}"><option value="global" ${state.scope === "global" ? "selected" : ""}>${esc(tr("本机 · 全局", "Local · Global"))}</option><option value="project" ${state.scope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("当前项目", "Project"))} · ${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
+ root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("当前项目", "Current project"))}" disabled><option value="project" selected>${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
  const tabs = [["memory", "memory", tr("记忆", "Memory")]];
  root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, glyph, label]) => {
  const count = tabCount(key);
@@ -380,19 +388,21 @@
  if (key === "board") { const b = boardData(); return b.progress.total ? `${b.progress.completed}/${b.progress.total}` : null; }
  if (key === "subagents") return cache.subagents ? subagentItems().length : counts.subagents ?? null;
  if (key === "memory") {
- const project = items(cache.overview, ["projects", "items"]).find((entry) => state.memoryProject === "global" ? ["global", "_global"].includes(entry.slug) : entry.projectRoot === selectedMemoryRoot());
- return project?.total ?? cache.overview?.total ?? counts.projectMemories ?? (cache.memory ? memoryRecords().length : null);
+ if (!memoryProjectReady()) return null;
+ const projects = items(cache.overview, ["projects", "items"]);
+ const project = projects.find((entry) => entry.slug === cache.overview?.currentProjectSlug) || projects.find((entry) => entry.projectRoot === state.projectRoot || entry.root === state.projectRoot || entry.path === state.projectRoot);
+ return cache.memory?.total ?? project?.total ?? (cache.memory ? memoryRecords().length : null);
  }
  return null;
     }
     function defaultScope() { return state.scope === "project" && state.projectRoot ? "project" : "global"; }
     function setScope(scope) {
- if (scope === "project" && projectDisabled()) return;
+ if (scope !== "project" || projectDisabled()) return;
  state.scope = scope;
  state.importScope = scope;
  state.subagentScope = scope;
  state.agentsTarget = scope;
- state.memoryProject = scope === "project" ? "current" : "global";
+ state.memoryProject = "current";
  state.selectedMemory = null;
  state.supersedeItems = [];
  state.supersedeLoading = false;
@@ -988,19 +998,16 @@
     }
 
     function selectedMemoryProject() {
+ if (!memoryProjectReady()) return null;
  const projects = items(cache.overview, ["projects", "items"]);
- return projects.find((project) => project.slug === state.memoryProject || project.projectRoot === state.memoryProject || project.root === state.memoryProject || project.path === state.memoryProject);
+ return projects.find((project) => project.slug === cache.overview?.currentProjectSlug) || projects.find((project) => project.projectRoot === state.projectRoot || project.root === state.projectRoot || project.path === state.projectRoot);
     }
+    function memoryProjectReady() { return state.memoryProject === "current" && projectContextReady(); }
     function selectedMemoryRoot() {
- if (state.memoryProject === "current") return state.projectRoot;
- if (state.memoryProject === "global") return null;
- const selected = selectedMemoryProject();
- return selected?.projectRoot || selected?.root || selected?.path || (state.memoryProject.startsWith("/") ? state.memoryProject : null);
+ return memoryProjectReady() ? state.projectRoot : null;
     }
     function memoryPayload() {
- const selected = selectedMemoryProject();
- const projectSlug = state.memoryProject === "global" ? "_global" : state.memoryProject === "current" ? cache.overview?.currentProjectSlug : selected?.slug;
- return { projectRoot: selectedMemoryRoot(), projectSlug: projectSlug || undefined, scope: state.memoryProject === "global" ? "global" : "project", scopeFilter: state.memoryScope === "smart" ? "default" : state.memoryScope === "project" ? "shared" : state.memoryScope, module: state.memoryModule === "all" ? undefined : state.memoryModule, query: state.memoryQuery.trim(), limit: 500 };
+ return { projectRoot: selectedMemoryRoot(), scope: "project", scopeFilter: state.memoryScope === "smart" ? "default" : state.memoryScope === "project" ? "shared" : state.memoryScope, module: state.memoryModule === "all" ? undefined : state.memoryModule, query: state.memoryQuery.trim(), limit: 500 };
     }
     function moduleOptions() {
  return [["all", tr("全部", "All"), ""], ["constraints", tr("铁律", "Rules"), ""], ["pitfalls", tr("踩坑", "Pitfalls"), ""], ["architecture", tr("架构", "Architecture"), ""], ["topics", tr("专题", "Topics"), ""]];
@@ -1009,7 +1016,7 @@
  return ({ constraint: "constraints", rule: "constraints", rules: "constraints", pitfall: "pitfalls", experience: "pitfalls", topic: "topics", "topic-memory": "topics", memory: "constraints" })[module] || module || "topics";
     }
  function renderMemory() {
- content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("搜索、整理和维护全局或项目记忆。接入状态显示本机配置证据，不代表当前会话已加载。", "Search and maintain global or project memory. Connection status reflects local configuration evidence, not active session loading."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}"></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
+ content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签。本机接入状态不代表当前会话已加载。", "Read and maintain shared knowledge and worktree notes for the currently confirmed project only. Local access status does not prove the current session loaded it."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
  renderMemoryAgentAccess();
  renderMemoryRuntime();
  renderMemoryConnections();
@@ -1024,6 +1031,7 @@
     ];
     const memorySetupPrompt = [
  "请帮我完成本机 T3 Agent 的记忆首次接入：",
+ "0. 先确认本会话当前选中的 T3 项目与工作树；如果无法确认，停止记忆读取和写入。主 Agent 与子 Agent 每次记忆调用都传当前 T3 项目的绝对 projectRoot；如提示项目未绑定，不改传别的路径绕过，请报告缺口。每次调用都只绑定此项目/工作树，不查找或使用全局通用记忆，也不自行改成其他项目。",
  "1. 运行固定命令 `~/.t3/bin/t3-memory-setup status` 检查当前状态。",
  "2. 运行固定命令 `~/.t3/bin/t3-memory-setup setup` 完成本机接入。",
  "3. 调用可用的 `memory_status` 工具核验记忆状态；如果当前会话没有这个工具，请说明可能需要新会话后再次验证，不要重启 T3。",
@@ -1164,6 +1172,23 @@
     function memoryMcpConfigText() {
  return JSON.stringify({ mcpServers: { t3_hub: { command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'] } } }, null, 2);
     }
+    async function runMemoryVectorTest() {
+ if (disposed || state.memoryVectorTestRunning) return;
+ state.memoryVectorTestRunning = true;
+ state.memoryVectorTest = { status: "running" };
+ renderMemoryRuntime();
+ try {
+  const result = await request("embed:test", {});
+  if (disposed) return;
+  if (result?.ok !== true) throw new Error(result?.message || result?.error || tr("向量模型测试失败", "Vector model test failed"));
+  state.memoryVectorTest = { status: "success", modelId: result.modelId, dimensions: result.dimensions, latencyMs: result.latencyMs };
+ } catch (error) {
+  if (!disposed) state.memoryVectorTest = { status: "error", message: errorText(error) };
+ } finally {
+  state.memoryVectorTestRunning = false;
+  if (!disposed && state.tab === "memory") renderMemoryRuntime();
+ }
+    }
     function renderMemoryRuntime() {
  const node = root.querySelector("#t3-hub-memory-runtime");
  if (!node) return;
@@ -1193,6 +1218,10 @@
  const errorHtml = errors.embed ? `<p class="hub-hint" role="status">${esc(tr("暂时无法读取本机向量服务状态。", "Could not read local vector service status."))} ${button("refresh-memory-runtime", tr("重试", "Retry"), { small: true, icon: "refresh" })}</p>` : "";
  const copyArea = state.memoryMcpConfigVisible ? `<textarea class="hub-input hub-memory-mcp-config" readonly spellcheck="false" aria-label="${esc(tr("MCP 配置 JSON", "MCP config JSON"))}">${esc(memoryMcpConfigText())}</textarea>` : "";
  node.innerHTML = `<section class="hub-card hub-memory-runtime"><div class="hub-section-heading"><span>${esc(tr("本机记忆服务", "Local memory services"))}</span><span class="hub-badge">${esc(tr("仅本机", "Local only"))}</span></div><div class="hub-memory-runtime-grid"><div class="hub-memory-runtime-cell"><span>${esc(tr("向量状态", "Vector status"))}</span><strong>${esc(modelStatus)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("运行中的向量模型", "Active vector model"))}</span><strong>${esc(modelText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("已配置模型", "Configured model"))}</span><strong>${esc(configuredText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("本机服务地址", "Local service address"))}</span><strong>${esc(addressText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("Agent 记忆开关", "Agent memory access"))}</span><strong>${esc(accessLabel)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("Hub MCP 配置（Agent 汇总）", "Hub MCP config (agent summary)"))}</span><strong data-status="${setupKnown ? conflictCount || pendingCount ? "pending" : configuredCount ? "configured" : "unknown" : "unknown"}">${esc(mcpLabel)}</strong><small>${esc(redact(providerSummary || tr("本机配置状态未确认", "Local config status is unknown")))}</small></div><div class="hub-memory-runtime-cell"><span>${esc(tr("当前会话运行时", "Current session runtime"))}</span><strong>${esc(runtimeLabel)}</strong><small>${esc(runtimeDetail)}</small></div></div><div class="hub-memory-mcp"><div><strong>${esc(tr("连接方式：本机 stdio（由宿主启动）", "Connection: local stdio (started by the host)"))}</strong><code>${esc(tr("自动使用当前用户的 T3 路径", "Uses the current user's T3 path"))}</code></div>${button("copy-memory-mcp-config", tr("复制 MCP 配置", "Copy MCP config"), { small: true, icon: "terminal" })}</div><p class="hub-hint">${esc(tr("MCP 由宿主通过本机 stdio 启动，配置会自动使用当前宿主的 HOME 定位 T3 路由器；无需替换路径。它不是 HTTP 地址，也不包含真实 HOME 或令牌。", "The host starts the MCP over local stdio. The config uses the current host's HOME to locate the T3 router automatically, so no path replacement is needed. It is not an HTTP endpoint and contains no real HOME path or token."))}</p>${copyArea}${errorHtml}</section>`;
+ const vectorTest = state.memoryVectorTest;
+ const testOutput = !vectorTest ? "" : vectorTest.status === "running" ? `<p class="hub-hint" role="status">${esc(tr("正在测试向量模型…", "Testing the vector model…"))}</p>` : vectorTest.status === "success" ? `<p class="hub-hint" role="status" data-status="success">${esc(tr("测试成功", "Test passed"))} · ${esc(vectorTest.modelId || tr("模型未知", "Model unknown"))} · ${esc(vectorTest.dimensions ?? tr("维度未知", "dimensions unknown"))} ${esc(tr("维度", "dimensions"))} · ${esc(vectorTest.latencyMs ?? tr("耗时未知", "latency unknown"))} ms</p>` : `<p class="hub-hint" role="alert" data-status="error">${esc(tr("测试失败", "Test failed"))} · ${esc(vectorTest.message || tr("无法确认原因", "Reason unavailable"))}</p>`;
+ const vectorTestMarkup = `<div class="hub-memory-vector-test">${button("test-memory-vector", state.memoryVectorTestRunning ? tr("测试中…", "Testing…") : tr("测试向量模型", "Test vector model"), { small: true, icon: "check", disabled: state.memoryVectorTestRunning })}${testOutput}<p class="hub-hint">${esc(tr("本机独立 MLX 服务，无需打开 oMLX；是否可用以测试结果为准。", "The local MLX service runs independently; oMLX does not need to be open. Use the test result to confirm availability."))}</p></div>`;
+ node.innerHTML = node.innerHTML.replace("</section>", `${vectorTestMarkup}</section>`);
     }
     async function copyMemoryMcpConfig() {
  const config = memoryMcpConfigText();
@@ -1211,23 +1240,25 @@
  const node = root.querySelector("#t3-hub-worktree");
  if (!node) return;
  const info = cache.worktree || {};
- node.innerHTML = `<div class="hub-worktree-bar"><div class="hub-segments" role="group" aria-label="${esc(tr("记忆范围", "Memory scope"))}">${[["smart", tr("智能默认（共享 + 当前工作树）", "Smart · Shared + current tree")], ["project", tr("项目长期共享", "Shared project memory")], ["worktree", tr("当前工作树便签", "Current worktree notes")], ["global", tr("全局通用", "Global")]].map(([scope, label]) => `<button type="button" class="${state.memoryScope === scope ? "is-active" : ""}" data-action="memory-scope-filter" data-scope="${scope}" aria-pressed="${state.memoryScope === scope}">${esc(label)}</button>`).join("")}</div><div class="hub-worktree-caption"><span>${esc(info.branch || info.branchName || info.worktreeName || tr("共享经验，隔离工作树便签", "Shared knowledge, isolated worktree notes"))}</span>${button("open-memory-folder", tr("打开记忆文件夹", "Open memory folder"), { small: true, icon: "folder" })}</div></div>`;
+ const ready = memoryProjectReady();
+ const caption = ready ? info.branch || info.branchName || info.worktreeName || tr("本项目共享经验与工作树便签", "Shared project knowledge and worktree notes") : tr("请先在 T3 中打开并确认一个项目，再读取或维护项目记忆。", "Open and confirm a project in T3 before reading or maintaining project memories.");
+ node.innerHTML = `<div class="hub-worktree-bar"><div class="hub-segments" role="group" aria-label="${esc(tr("项目记忆范围", "Project memory scope"))}">${[["smart", tr("智能默认（本项目共享 + 当前工作树）", "Smart · This project + current tree")], ["project", tr("本项目共享", "Shared in this project")], ["worktree", tr("当前工作树便签", "Current worktree notes")]].map(([scope, label]) => `<button type="button" class="${state.memoryScope === scope ? "is-active" : ""}" data-action="memory-scope-filter" data-scope="${scope}" aria-pressed="${state.memoryScope === scope}" ${ready ? "" : "disabled"}>${esc(label)}</button>`).join("")}</div><div class="hub-worktree-caption"><span>${esc(caption)}</span>${button("open-memory-folder", tr("打开记忆文件夹", "Open memory folder"), { small: true, icon: "folder", disabled: !ready })}</div></div>`;
  if (errors.worktree) node.insertAdjacentHTML("beforeend", `<p class="hub-hint">${esc(errorText(errors.worktree))}</p>`);
     }
     async function setMemoryScope(scope) {
+ if (!["smart", "project", "worktree"].includes(scope)) return;
  state.memoryScope = scope;
- if (scope === "global") state.memoryProject = "global";
- else if (state.memoryProject === "global" && state.projectRoot) state.memoryProject = "current";
+ state.memoryProject = "current";
  state.selectedMemory = null; cache.memory = null; memoryVersion++;
  renderWorktreeScopes(); renderMemoryNav(); renderMemoryList();
- await loadMemories();
+ if (memoryProjectReady()) await loadMemories();
     }
     async function promoteMemory(id, element) {
  if (!memoryWriteReady()) return;
- const version = contextVersion, payload = memoryPayload();
+ const selection = memorySelection(), payload = memoryPayload();
  await busy(`memory-promote:${id}`, element, async () => {
- await request("memory:promote", { ...payload, id, scope: "project" });
- if (disposed || version !== contextVersion) return;
+ await request("memory:promote", { projectRoot: payload.projectRoot, id, scope: "project" });
+ if (disposed || selection !== memorySelection()) return;
  await loadMemories(); toast(tr("已提炼为项目长期共享记忆", "Promoted to shared project memory"));
  });
     }
@@ -1305,26 +1336,6 @@
  const broken = count(data.brokenCount ?? data.brokenLinkCount ?? data.brokenLinks ?? data.danglingLinks ?? data.broken);
  return `<span class="hub-hint hub-memory-health">${esc(tr(`[[链接]]${links == null ? "" : ` ${links}`} · 断链 ${broken ?? "待检测"}`, `[[Links]]${links == null ? "" : ` ${links}`} · Broken ${broken ?? "Not checked"}`))}</span>`;
     }
-    async function importHostMemories(element) {
- if (state.memoryImporting) return;
- const version = contextVersion, projectRoot = state.projectRoot;
- state.memoryImporting = true;
- try {
- await busy("import-host-memories", element, async () => {
- const result = await request("memory:importHostMemories", { projectRoot });
- if (disposed || version !== contextVersion) return;
- const imported = result.importedCount ?? result.imported ?? result.stats?.importedCount ?? result.stats?.imported ?? result.totalImported;
- const count = Array.isArray(imported) ? imported.length : typeof imported === "number" ? imported : null;
- const health = await request("memory:health", { projectRoot }).catch(() => null);
- if (disposed || version !== contextVersion) return;
- if (health) cache.health = health;
- await Promise.all([refreshMemoryOverview(), loadMemories(false), refreshEmbed(false, true)]);
- if (disposed || version !== contextVersion) return;
- if (state.tab === "memory") { renderMemoryNav(); renderMemoryList(); renderEngine(); }
- toast(count == null ? result.message || tr("宿主记忆已汇聚到共享库", "Host memories gathered into the shared vault") : tr(`汇聚完成 · 导入 ${count} 条记忆`, `Import complete · ${count} memories imported`));
- });
- } finally { state.memoryImporting = false; if (!disposed && version === contextVersion && state.tab === "memory") renderMemoryNav(); }
-    }
     async function trimEmbedCache(element) {
  if (state.embedTrimming) return;
  state.embedTrimming = true;
@@ -1338,32 +1349,21 @@
  });
  } finally { state.embedTrimming = false; if (!disposed && state.tab === "memory") renderEngine(); }
     }
-    function renderMemoryGovernance() {
- const node = root.querySelector("#t3-hub-memory-governance");
- if (!node) return;
- node.innerHTML = `<div class="hub-memory-governance"><div class="hub-grow"><span class="hub-hint">${esc(tr("共享记忆治理", "Shared memory care"))}</span>${memoryHealthHint()}</div>${button("import-host-memories", state.memoryImporting ? tr("汇聚中…", "Importing…") : tr("汇聚宿主记忆", "Gather host memories"), { small: true, icon: "download", disabled: state.memoryImporting, attrs: `title="${esc(tr("无损导入本机 Claude、Codex、Gemini 的历史记忆", "Import local Claude, Codex, and Gemini memories without changing the originals"))}"` })}</div>`;
-    }
     function renderMemoryNav() {
  const node = root.querySelector("#t3-hub-memory-nav");
  if (!node) return;
- const projects = items(cache.overview, ["projects", "items"]);
- const seen = new Set([state.projectRoot]);
- const projectOptions = projects.map((project) => {
- const path = typeof project === "string" ? project : project.projectRoot ?? project.root ?? project.path;
- const key = typeof project === "string" ? project : project.slug || path || project.id;
- if (!key || seen.has(path || key) || ["global", "_global", "__global__"].includes(key)) return "";
- seen.add(path || key);
- const name = typeof project === "string" ? project.split(/[\\/]/).filter(Boolean).pop() : project.title || project.name || project.projectName || String(path || key).split(/[\\/]/).filter(Boolean).pop();
- const count = project.count ?? project.total ?? project.memoryCount;
- return `<option value="${esc(key)}" ${state.memoryProject === key ? "selected" : ""}> ${esc(name)}${count == null ? "" : ` · ${count}`}</option>`;
- }).join("");
- node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("记忆所属项目", "Memory project"))}"><option value="current" ${state.memoryProject === "current" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}> ${esc(tr("当前项目", "Current project"))}</option><option value="global" ${state.memoryProject === "global" ? "selected" : ""}> ${esc(tr("全局通用记忆", "Global memories"))}</option>${projectOptions}</select>${button("new-memory", tr("新建 / 演进记忆", "New / evolve memory"), { icon: "plus", small: true })}</div><div class="hub-memory-toolbar">${button("consolidate-memory", tr(" 一键再记忆整理", " Consolidate memories"), { small: true, disabled: !selectedMemoryRoot(), attrs: `title="${esc(!selectedMemoryRoot() ? tr("请选择项目记忆库", "Select a project vault") : tr("合并重复经验，整理过时记忆", "Merge duplicates and outdated memories"))}"` })}<span class="hub-hint">${esc(tr("去重 · 演进 · 保留历史", "Deduplicate · Evolve · Keep history"))}</span></div>`;
+ const ready = memoryProjectReady();
+ const current = ready ? projectTitle() : tr("尚未确认项目", "No confirmed project");
+ const project = ready ? selectedMemoryProject() : null;
+ const total = project?.total ?? cache.memory?.total;
+ const prompt = ready ? "" : `<p class="hub-hint" role="status">${esc(tr("请先在 T3 中打开并确认当前项目；记忆只会读取和写入这个项目。", "Open and confirm the current project in T3 first. Memory reads and writes are limited to that project."))}</p>`;
+ node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("当前记忆项目", "Current memory project"))}" disabled><option value="current" selected>${esc(current)}${total == null ? "" : ` · ${esc(total)}`}</option></select>${button("new-memory", tr("新建 / 演进记忆", "New / evolve memory"), { icon: "plus", small: true, disabled: !ready })}</div><div class="hub-memory-toolbar">${button("consolidate-memory", tr(" 一键再记忆整理", " Consolidate memories"), { small: true, disabled: !ready, attrs: `title="${esc(!ready ? tr("请先确认当前项目", "Confirm the current project first") : tr("合并重复经验，整理过时记忆", "Merge duplicates and outdated memories"))}"` })}<span class="hub-hint">${esc(tr("去重 · 演进 · 保留历史", "Deduplicate · Evolve · Keep history"))}</span></div>${prompt}`;
  if (errors.overview) node.insertAdjacentHTML("beforeend", inlineError(errors.overview));
     }
     function memoryRecords() { return items(cache.memory, ["items", "memories", "results"]); }
     function memoryId(item) { return String(item.id ?? item.key ?? item.path ?? ""); }
     function memoryBody(item) { return item.content ?? item.body ?? item.markdown ?? item.text ?? ""; }
-    function memoryDraftKey(id) { return `${state.memoryProject}\u0000${id}`; }
+    function memoryDraftKey(id) { return `${selectedMemoryRoot() || "unconfirmed"}\u0000${id}`; }
     function formatExactTime(value, seconds = false) {
  if (value == null || value === "") return "";
  const date = new Date(value);
@@ -1376,8 +1376,15 @@
     }
     function renderMemoryList() {
  if (state.tab !== "memory" || disposed) return;
+ const node = root.querySelector("#t3-hub-memory-list");
+ if (!memoryProjectReady()) {
+ root.querySelector("#t3-hub-memory-total").textContent = "";
+ root.querySelector("#t3-hub-memory-filters").innerHTML = "";
+ node.innerHTML = empty(tr("请先确认当前项目", "Confirm the current project first"), tr("为了避免不同项目的记忆混在一起，请在 T3 中打开一个项目并等待连接确认。", "To keep project memories separate, open a project in T3 and wait for its context to be confirmed."), "folder");
+ return;
+ }
  const records = memoryRecords();
- const project = state.memoryProject === "current" ? items(cache.overview, ["projects", "items"]).find((item) => item.slug === cache.overview?.currentProjectSlug || item.projectRoot === state.projectRoot) : state.memoryProject === "global" ? items(cache.overview, ["projects", "items"]).find((item) => ["global", "_global"].includes(item.slug)) : selectedMemoryProject();
+ const project = selectedMemoryProject();
  const moduleCounts = cache.memory?.moduleCounts || cache.memory?.counts || project?.byModule || {};
  const total = cache.memory?.total ?? project?.total ?? records.length;
  root.querySelector("#t3-hub-memory-total").textContent = tr(`${total} 条记忆`, `${total} memories`);
@@ -1385,7 +1392,6 @@
  const count = key === "all" ? total : moduleCounts[key];
  return `<button type="button" class="hub-pill ${state.memoryModule === key ? "is-active" : ""}" data-action="memory-module" data-module="${key}" aria-pressed="${state.memoryModule === key}">${emoji ? `${emoji} ` : ""}${esc(label)}${count == null ? "" : `<span class="hub-pill-count">${count}</span>`}</button>`;
  }).join("");
- const node = root.querySelector("#t3-hub-memory-list");
  node.innerHTML = errors.memory ? inlineError(errors.memory, "refresh-memory") : !cache.memory ? loading() : !records.length ? empty(tr("这里还没有匹配的记忆", "No memories found here"), tr("换一个项目、模块或关键词，也可以新建一条。", "Try another project, module, or search. Or add a memory."), "memory") : records.map((item) => {
  const id = memoryId(item);
  const selected = state.selectedMemory === id;
@@ -1405,8 +1411,13 @@
  }).join("")}</div></div>`;
     }
     async function openNewMemory() {
- const payload = memoryPayload(), selection = JSON.stringify([payload.projectRoot, payload.projectSlug]);
+ if (!memoryWriteReady()) return;
+ const payload = memoryPayload(), selection = memorySelection();
+ if (!payload.projectRoot) return;
  drafts.__new = { ...(drafts.__new || { module: state.memoryModule === "all" ? "topics" : state.memoryModule }), open: true };
+ if (!drafts.__new.projectRoot && drafts.__new.migratedFromGlobal) { drafts.__new.projectRoot = payload.projectRoot; delete drafts.__new.migratedFromGlobal; }
+ if (drafts.__new.projectRoot !== payload.projectRoot) drafts.__new = { open: true, projectRoot: payload.projectRoot, module: state.memoryModule === "all" ? "topics" : state.memoryModule };
+ if (!["project", "worktree"].includes(drafts.__new.scope)) drafts.__new.scope = state.memoryScope === "worktree" ? "worktree" : "project";
  state.supersedeLoading = true;
  state.supersedeItems = [];
  renderNewMemory();
@@ -1414,12 +1425,12 @@
  try {
  const data = await request("memory:list", { ...payload, module: undefined, query: "", limit: 500 });
  const current = memoryPayload();
- if (disposed || selection !== JSON.stringify([current.projectRoot, current.projectSlug])) return;
+ if (disposed || selection !== memorySelection() || current.projectRoot !== payload.projectRoot) return;
  state.supersedeItems = items(data, ["items", "memories", "results"]);
  } catch (error) { if (!disposed) toast(errorText(error), true); }
  finally {
  const current = memoryPayload();
- if (!disposed && selection === JSON.stringify([current.projectRoot, current.projectSlug])) {
+ if (!disposed && selection === memorySelection() && current.projectRoot === payload.projectRoot) {
  state.supersedeLoading = false;
  // Preserve text and focus while the optional choices load.
  const select = content.querySelector('[name="new-memory-supersedes"]');
@@ -1434,8 +1445,14 @@
  const node = root.querySelector("#t3-hub-new-memory");
  if (!node) return;
  const draft = drafts.__new;
- if (!draft?.open) { node.innerHTML = ""; return; }
- node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("保存范围", "Save scope"))}<select class="hub-select" name="new-memory-scope">${[["project", tr("项目长期共享", "Shared project memory")], ["worktree", tr("当前工作树便签", "Current worktree note")], ["global", tr("全局通用", "Global")]].map(([scope, label]) => `<option value="${scope}" ${(draft.scope || (state.memoryScope === "worktree" ? "worktree" : state.memoryProject === "global" ? "global" : "project")) === scope ? "selected" : ""} ${scope !== "global" && !selectedMemoryRoot() ? "disabled" : ""}>${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("覆盖旧记忆 (Supersede) · 可选", "Supersede an existing memory · optional"))}<select class="hub-select" name="new-memory-supersedes" ${state.supersedeLoading ? "disabled" : ""}>${supersedeOptions()}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
+ if (!draft?.open || !memoryProjectReady()) { node.innerHTML = ""; return; }
+ const projectRoot = selectedMemoryRoot();
+ if (draft.projectRoot !== projectRoot) {
+  if (!draft.projectRoot && draft.migratedFromGlobal) { draft.projectRoot = projectRoot; delete draft.migratedFromGlobal; }
+  else { node.innerHTML = ""; return; }
+ }
+ if (!["project", "worktree"].includes(draft.scope)) draft.scope = state.memoryScope === "worktree" ? "worktree" : "project";
+ node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("保存范围", "Save scope"))}<select class="hub-select" name="new-memory-scope">${[["project", tr("本项目共享", "Shared in this project")], ["worktree", tr("当前工作树便签", "Current worktree note")]].map(([scope, label]) => `<option value="${scope}" ${draft.scope === scope ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("覆盖旧记忆 (Supersede) · 可选", "Supersede an existing memory · optional"))}<select class="hub-select" name="new-memory-supersedes" ${state.supersedeLoading ? "disabled" : ""}>${supersedeOptions()}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
     }
 
     function agentKey(target = state.agentsTarget) { return target === "global" ? "global" : `project:${state.projectRoot || ""}`; }
@@ -1637,9 +1654,11 @@
  return false;
     }
     function memoryWriteReady(scope = "project") {
- if (scope === "global") return !(contextLoading && state.memoryScope !== "global") || projectWriteReady("project");
- if (state.memoryProject !== "current" && state.memoryProject !== "global") return true;
- return state.memoryProject === "current" ? projectWriteReady("project") : (projectWriteReady("project"), false);
+ if (!["project", "worktree"].includes(scope)) {
+  toast(tr("记忆只支持当前项目范围", "Memory is limited to the current project"), true);
+  return false;
+ }
+ return memoryProjectReady() || projectWriteReady("project");
     }
     function boardProblem() {
  if (cache.board?.remote === true) {
@@ -2545,13 +2564,15 @@
     function resetProjectData() {
  boardScopeVersion++; requestVersion++; memoryVersion++;
  for (const k of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "connections", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[k] = null; delete errors[k]; }
- if (state.scope === "project" && !state.projectRoot) state.scope = "global";
+ state.scope = "project";
  state.importScope = defaultScope(); state.subagentScope = defaultScope(); state.agentsTarget = defaultScope();
- state.memoryProject = state.projectRoot && state.memoryScope !== "global" ? "current" : "global";
+ state.memoryProject = "current";
+ embedVersion++; embedProjectKey = "";
+ if (cache.embed) { const { vectorStats, vectorStatsError, ...serviceStatus } = cache.embed; cache.embed = serviceStatus; }
  state.artifact = null; state.boardDraft = ""; state.orchestrationDraft = null; state.settingsDirty = false; state.settingsDraft = {}; state.clearedHostFields.clear(); state.settingsRuleDirty = false; state.settingsRule = ""; settingsSelectionVersion++;
  boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = ""; renderLiveBoard();
  state.hookDraft = null; state.supersedeItems = []; state.selectedMemory = null;
- if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
+ if (drafts.__new && !drafts.__new.migratedFromGlobal && drafts.__new.projectRoot !== state.projectRoot) delete drafts.__new;
  if (state.open && state.tab === "memory" && content) renderMemory();
     }
     function checkRoute() {
@@ -2629,8 +2650,8 @@
  if (before !== state.projectRoot) {
  resetProjectData();
  } else if (!state.projectRoot) {
- state.scope = state.subagentScope = state.agentsTarget = state.importScope = "global";
- if (state.memoryProject === "current") state.memoryProject = "global";
+ state.scope = "project"; state.subagentScope = state.agentsTarget = state.importScope = "global";
+ state.memoryProject = "current";
  }
  renderChrome();
  if (force && before === state.projectRoot && state.tab === "board" && content.querySelector('[name="board-step-draft"]')) boardEditorNeedsSync = true;
@@ -2673,8 +2694,15 @@
  }
  };
  if (tab === "memory") {
- await Promise.all([load("connections", "memory:connections", { projectRoot }), refreshMemoryAgentAccess(force), load("overview", "memory:overview", { projectRoot }), load("worktree", "memory:worktreeInfo", { projectRoot }), refreshEmbed(false, force)]);
- if (isCurrent()) await loadMemories(false);
+ const confirmedRoot = memoryProjectReady() ? state.projectRoot : null;
+ const localStatus = [load("connections", "memory:connections", {}), refreshMemoryAgentAccess(force), refreshEmbed(false, force, confirmedRoot)];
+ if (confirmedRoot) {
+  localStatus.push(load("overview", "memory:overview", { projectRoot: confirmedRoot }), load("worktree", "memory:worktreeInfo", { projectRoot: confirmedRoot }));
+ } else {
+  for (const key of ["overview", "memory", "worktree", "health"]) { cache[key] = null; delete errors[key]; }
+ }
+ await Promise.all(localStatus);
+ if (isCurrent() && confirmedRoot && memoryProjectReady() && state.projectRoot === confirmedRoot) await loadMemories(false);
  }
  if (!isCurrent() || state.tab !== tab) return;
  if (tab === "board" && boardEditorActive()) boardTabRenderPending = true;
@@ -2685,14 +2713,21 @@
     async function loadMemories(render = true) {
  const version = ++memoryVersion;
  delete errors.memory;
+ if (!memoryProjectReady()) {
+  cache.memory = null;
+  if (!disposed && render && state.tab === "memory") renderMemoryList();
+  return false;
+ }
  const payload = memoryPayload();
+ const projectRoot = payload.projectRoot, ctxVer = contextVersion, identity = contextIdentityToken();
  try {
- if (!payload.projectRoot && !payload.projectSlug) throw new Error(tr("请重新选择记忆所属项目", "Choose a memory project again"));
+ if (!projectRoot) return false;
  const data = await request(payload.query ? "memory:search" : "memory:list", payload);
- if (disposed || version !== memoryVersion) return;
+ if (disposed || version !== memoryVersion || ctxVer !== contextVersion || projectRoot !== state.projectRoot || !memoryProjectReady() || identity !== contextIdentityToken()) return false;
  cache.memory = data;
- } catch (error) { if (!disposed && version === memoryVersion) errors.memory = error; }
+ } catch (error) { if (!disposed && version === memoryVersion && ctxVer === contextVersion && projectRoot === state.projectRoot && memoryProjectReady()) errors.memory = error; }
  if (!disposed && render && state.tab === "memory") { renderMemoryList(); renderChrome(); }
+ return true;
     }
     function seedAgentDrafts(data, projectRoot) {
  for (const target of ["global", "project"]) {
@@ -2703,12 +2738,18 @@
  if (!old || old.content === old.saved) state.agentDrafts[key] = { content: value || "", saved: value || "", syncedTargets: target === "global" ? data.globalSyncedTargets || data.global?.syncedTargets || [] : data.projectExists ? ["project"] : [] };
  }
     }
-    async function refreshEmbed(render = true, force = false) {
- if (cache.embed && !force && !cache.embed.downloadJob?.active && !cache.embed.vectorStats?.reindexing) return;
+    async function refreshEmbed(render = true, force = false, projectRoot = memoryProjectReady() ? state.projectRoot : null) {
+ const scopedRoot = memoryProjectReady() && projectRoot === state.projectRoot ? projectRoot : null;
+ const projectKey = scopedRoot || "";
+ if (cache.embed && embedProjectKey === projectKey && !force && !cache.embed.downloadJob?.active && !cache.embed.vectorStats?.reindexing) return;
  const version = ++embedVersion;
+ const ctxVer = contextVersion, identity = contextIdentityToken();
  try {
- const data = await request("embed:status", {});
- if (disposed || version !== embedVersion) return;
+ const response = await request("embed:status", scopedRoot ? { projectRoot: scopedRoot } : {});
+ if (disposed || version !== embedVersion || ctxVer !== contextVersion || identity !== contextIdentityToken() || scopedRoot && (state.projectRoot !== scopedRoot || !memoryProjectReady())) return;
+ const data = { ...response };
+ if (!scopedRoot) { delete data.vectorStats; delete data.vectorStatsError; }
+ embedProjectKey = projectKey;
  const wasActive = cache.embed?.downloadJob?.active;
  const prevVs = cache.embed?.vectorStats;
  const prevMemory = [cache.embed?.activeMb, cache.embed?.ceilingMb, cache.embed?.cacheMb, cache.embed?.rssMb, prevVs?.activeMb, prevVs?.ceilingMb, prevVs?.cacheMb].join("/");
@@ -2895,9 +2936,8 @@
  else if (action === "artifact-folder") revealArtifact(target, "folder");
  else if (action === "close-artifact") { artifactVersion++; state.artifact = null; renderBoardTab(); }
  else if (action === "memory-scope-filter") setMemoryScope(target.dataset.scope);
- else if (action === "open-memory-folder") busy("memory-folder", target, () => request("memory:openFolder", memoryPayload()));
+ else if (action === "open-memory-folder" && memoryWriteReady()) busy("memory-folder", target, () => request("memory:openFolder", { projectRoot: selectedMemoryRoot() }));
  else if (action === "promote-memory") promoteMemory(id, target);
- else if (action === "import-host-memories") importHostMemories(target);
  else if (action === "trim-embed") trimEmbedCache(target);
  else if (action === "disable-legacy-orchestration") disableLegacyOrchestration(target);
  else if (action === "toggle-t3-prompt-suggestions") toggleT3PromptSuggestions(target);
@@ -2983,13 +3023,14 @@
  else if (action === "memory-access-copy-prompt") copyMemorySetupPrompt();
  else if (action === "memory-access-refresh") refreshMemoryAgentAccess(true);
  else if (action === "copy-memory-mcp-config") copyMemoryMcpConfig();
+ else if (action === "test-memory-vector") runMemoryVectorTest();
  else if (action === "refresh-memory-runtime") refreshEmbed(true, true);
  else if (action === "open-memory") { state.selectedMemory = state.selectedMemory === id ? null : id; renderMemoryList(); }
  else if (action === "new-memory") openNewMemory();
  else if (action === "cancel-new-memory") { if (drafts.__new) drafts.__new.open = false; renderNewMemory(); }
  else if (action === "create-memory") saveMemory(null, target);
  else if (action === "save-memory") saveMemory(id, target);
- else if (action === "pin-memory" && memoryWriteReady()) busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot: selectedMemoryRoot() }); if (!disposed) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } });
+ else if (action === "pin-memory" && memoryWriteReady()) { const projectRoot = selectedMemoryRoot(), selection = memorySelection(); busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot }); if (!disposed && selection === memorySelection()) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } }); }
  else if (action === "delete-memory") target.closest(".hub-memory-detail").querySelector("[data-delete-confirm]").hidden = false;
  else if (action === "cancel-delete-memory") target.closest("[data-delete-confirm]").hidden = true;
  else if (action === "confirm-delete-memory") deleteMemory(id, target);
@@ -3085,7 +3126,7 @@
  return;
  }
  if (name === "hub-scope") setScope(input.value);
- else if (name === "new-memory-scope") { drafts.__new ||= {}; drafts.__new.scope = input.value; }
+ else if (name === "new-memory-scope") { drafts.__new ||= {}; drafts.__new.scope = ["project", "worktree"].includes(input.value) ? input.value : "project"; }
  else if (name?.startsWith("hook-") && state.hookDraft) state.hookDraft[name.slice(5)] = input.value;
  else if (name === "new-memory-supersedes") { drafts.__new ||= {}; drafts.__new.supersedes = input.value; }
  else if (name === "importScope") state.importScope = input.value;
@@ -3093,7 +3134,7 @@
  else if (name === "embed-model") { state.modelChoice = input.value; renderEngine(); }
  else if (name === "useMirror") state.useMirror = input.checked;
  else if (name === "memoryProject") {
- state.memoryProject = input.value;
+ state.memoryProject = "current";
  if (drafts.__new) drafts.__new.supersedes = "";
  state.supersedeItems = [];
  state.supersedeLoading = false;
@@ -3102,8 +3143,8 @@
  cache.memory = null;
  memoryVersion++;
  renderMemoryList();
- loadMemories();
- if (drafts.__new?.open) openNewMemory();
+ if (memoryProjectReady()) loadMemories();
+ if (drafts.__new?.open && memoryProjectReady()) openNewMemory();
  } else if (name === "new-memory-module") { drafts.__new ||= {}; drafts.__new.module = input.value; }
     }
     function onKeydown(event) {
@@ -3244,7 +3285,7 @@
  toast(tr("自定义 MCP 已移除", "Custom MCP removed"));
  });
     }
-    function memorySelection() { const payload = memoryPayload(); return JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]); }
+    function memorySelection() { return JSON.stringify([state.memoryProject, selectedMemoryRoot(), contextVersion, contextIdentityToken()]); }
     async function consolidateMemory(element) {
  if (!memoryWriteReady()) return;
  const projectRoot = selectedMemoryRoot(), selection = memorySelection();
@@ -3266,6 +3307,7 @@
  if (!Number.isInteger(targetVersion) || targetVersion < 1) return;
  if (typeof memoryWriteReady === "function" && !memoryWriteReady()) return;
  const selection = memorySelection(), projectRoot = selectedMemoryRoot(), key = memoryDraftKey(id);
+ if (!projectRoot) return;
  if (drafts[key]) { toast(tr("请先保存这条记忆的修改，再回滚", "Save your memory edits before restoring a version"), true); return; }
  await busy(`rollback:${id}`, element, async () => {
  await request("memory:rollback", { projectRoot, id, targetVersion, revisionId: revisionId || undefined });
@@ -3350,24 +3392,25 @@
  });
     }
     async function saveMemory(id, element) {
+ if (!memoryWriteReady()) return;
  const payload = memoryPayload();
- const selection = JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]);
+ const selection = memorySelection();
+ if (!payload.projectRoot) return;
  const record = memoryRecords().find((item) => memoryId(item) === id);
  const draft = id == null ? { ...drafts.__new } : { title: record?.title || record?.name || "", content: memoryBody(record || {}), ...drafts[memoryDraftKey(id)] };
  if (!draft.title?.trim() || !draft.content?.trim()) { toast(tr("请填写标题和记忆内容", "Enter a title and memory content"), true); return; }
  const key = id == null ? null : memoryDraftKey(id);
  await busy(`memory-save:${id || "new"}`, element, async () => {
- const saveScope = id == null ? draft.scope || (state.memoryScope === "worktree" ? "worktree" : payload.scope) : record?.scope || payload.scope;
+ const requestedScope = id == null ? draft.scope || (state.memoryScope === "worktree" ? "worktree" : payload.scope) : record?.scope || payload.scope;
+ const saveScope = requestedScope === "worktree" ? "worktree" : "project";
  if (!memoryWriteReady(saveScope)) return;
- const result = await request("memory:save", { ...payload, ...(saveScope === "global" ? { projectRoot: null, projectSlug: "_global" } : {}), scope: saveScope, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
+ const result = await request("memory:save", { ...payload, scope: saveScope, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
  if (disposed) return;
- if (id == null) delete drafts.__new;
+ if (id == null && drafts.__new?.projectRoot === payload.projectRoot) delete drafts.__new;
  else if (drafts[key]?.content === draft.content) delete drafts[key];
- const now = memoryPayload();
- if (selection === JSON.stringify([state.memoryProject, now.projectRoot, now.projectSlug])) {
+ if (selection === memorySelection()) {
  state.selectedMemory = result.item?.id || result.memory?.id || result.id || id;
- if (id == null && saveScope === "global") { state.memoryScope = "global"; state.memoryProject = "global"; }
- else if (id == null && saveScope === "worktree") state.memoryScope = "worktree";
+ if (id == null && saveScope === "worktree") state.memoryScope = "worktree";
  else if (id == null && state.memoryScope === "worktree") state.memoryScope = "project";
  if (state.tab === "memory") { renderMemory(); await refreshMemoryOverview(); await loadMemories(); }
  }
@@ -3377,18 +3420,21 @@
     async function deleteMemory(id, element) {
  if (!memoryWriteReady()) return;
  const payload = memoryPayload();
+ const selection = memorySelection();
+ if (!payload.projectRoot) return;
  const key = memoryDraftKey(id);
  await busy(`memory-delete:${id}`, element, async () => {
  await request("memory:delete", { id, projectRoot: payload.projectRoot, scope: payload.scope });
- if (!disposed) { delete drafts[key]; if (state.selectedMemory === id) state.selectedMemory = null; if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); } toast(tr("记忆已删除", "Memory deleted")); }
+ if (!disposed && selection === memorySelection()) { delete drafts[key]; if (state.selectedMemory === id) state.selectedMemory = null; if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); } toast(tr("记忆已删除", "Memory deleted")); }
  });
     }
     async function refreshMemoryOverview() {
- const projectRoot = state.projectRoot;
+ if (!memoryProjectReady()) { cache.overview = null; return; }
+ const projectRoot = state.projectRoot, ctxVer = contextVersion, identity = contextIdentityToken();
  try {
  const data = await request("memory:overview", { projectRoot });
- if (!disposed && state.projectRoot === projectRoot) { cache.overview = data; delete errors.overview; if (state.tab === "memory") renderMemoryNav(); }
- } catch (error) { if (!disposed && state.projectRoot === projectRoot) { errors.overview = error; if (state.tab === "memory") renderMemoryNav(); } }
+ if (!disposed && ctxVer === contextVersion && identity === contextIdentityToken() && memoryProjectReady() && state.projectRoot === projectRoot) { cache.overview = data; delete errors.overview; if (state.tab === "memory") renderMemoryNav(); }
+ } catch (error) { if (!disposed && ctxVer === contextVersion && identity === contextIdentityToken() && memoryProjectReady() && state.projectRoot === projectRoot) { errors.overview = error; if (state.tab === "memory") renderMemoryNav(); } }
     }
     async function saveAgents(element) {
  const draft = agentDraft();

@@ -24,7 +24,7 @@ function vault(dir) {
   return createMemoryVault({ homeDir: base, hubDir: path.join(dir, "hub"), vaultDir: path.join(dir, "vault"), _embedFn: () => null, _healthFn: () => ({ modelId: "fixture", dim: 2 }) });
 }
 
-test("explicit false excludes global in main and linked worktrees for list and search", () => {
+test("project-only reads exclude legacy global data in main and linked worktrees", () => {
   const dir = path.join(base, "worktrees"), main = path.join(dir, "main"), linked = path.join(dir, "linked");
   fs.mkdirSync(main, { recursive: true });
   const git = (...args) => execFileSync("git", args, { stdio: "ignore", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
@@ -37,40 +37,38 @@ test("explicit false excludes global in main and linked worktrees for list and s
   assert.equal(resolveWorktreeContext(linked).isLinkedWorktree, true);
   const v = vault(dir);
   const project = v.saveMemory({ projectRoot: main, scope: "shared", module: "pitfalls", title: "fixtureword project", content: "fixtureword project only", autoEvolve: false });
-  const global = v.saveMemory({ scope: "global", module: "pitfalls", title: "fixtureword global", content: "fixtureword global original", autoEvolve: false });
-  assert.equal(project.ok, true); assert.equal(global.ok, true);
+  assert.equal(project.ok, true);
+  v._ensureProjectVault("_global", {});
+  const db = new DatabaseSync(path.join(dir, "vault", "index.sqlite"));
+  try {
+    db.prepare("INSERT INTO memories(id,project_slug,project_root,module,kind,title,content,agent,tags_json,content_hash,created_at,updated_at,memory_scope) VALUES('legacy-global','_global',NULL,'pitfalls','pitfall','fixtureword global','fixtureword global original','legacy','[]','fixture','2026-01-01','2026-01-01','global')").run();
+    db.prepare("INSERT INTO memories_fts(id,title,content,tags) VALUES('legacy-global','fixtureword global','fixtureword global original','[]')").run();
+  } finally { db.close(); }
   for (const query of ["", "fixtureword"]) {
-    for (const [root, opts, hasGlobal] of [[main, {}, false], [main, { includeGlobal: false }, false], [main, { includeGlobal: true }, true], [linked, {}, true], [linked, { includeGlobal: false }, false], [linked, { includeGlobal: true }, true], [linked, { scopeFilter: "shared", includeGlobal: true }, false]]) {
+    for (const root of [main, linked]) for (const opts of [{}, { includeGlobal: false }, { includeGlobal: true }, { scopeFilter: "all" }]) {
       const result = v.listMemories({ projectRoot: root, query, trackHits: false, ...opts });
       assert.equal(result.ok, true, JSON.stringify(result));
-      assert.equal(result.items.some((item) => item.id === project.item.id), true);
-      assert.equal(result.items.some((item) => item.id === global.item.id), hasGlobal, JSON.stringify({ root, opts, query }));
+      assert.deepEqual(result.items.map(item => item.id), [project.item.id]);
     }
-    const unscoped = v.listMemories({ includeGlobal: false, query, trackHits: false });
-    assert.ok(unscoped.items.some((item) => item.id === project.item.id));
-    assert.ok(!unscoped.items.some((item) => item.id === global.item.id));
+    assert.equal(v.listMemories({ query }).ok, false);
   }
-  const md = path.join(dir, "vault", "global", "pitfalls.md");
-  fs.writeFileSync(md, fs.readFileSync(md, "utf8").replace("fixtureword global original", "fixtureword global edited"));
-  const readIndex = () => { const db = new DatabaseSync(path.join(dir, "vault", "index.sqlite")); try { return db.prepare("SELECT content FROM memories WHERE id=?").get(global.item.id).content; } finally { db.close(); } };
-  v.listMemories({ projectRoot: linked, includeGlobal: false });
-  assert.match(readIndex(), /original/, "explicit false must not sync global Markdown");
-  v.listMemories({ projectRoot: linked, includeGlobal: true, scopeFilter: "shared" });
-  assert.match(readIndex(), /original/, "shared-only scope must not sync global Markdown");
-  v.listMemories({ projectRoot: linked, includeGlobal: true });
-  assert.match(readIndex(), /edited/, "including global must sync its changed Markdown");
+  assert.equal(v.listMemories({ projectRoot: main, scopeFilter: "global" }).ok, false);
+  assert.equal(v.saveMemory({ projectRoot: main, scope: "global", title: "x", content: "y" }).ok, false);
+  const check = new DatabaseSync(path.join(dir, "vault", "index.sqlite"));
+  try { assert.equal(check.prepare("SELECT content FROM memories WHERE id='legacy-global'").get().content, "fixtureword global original"); } finally { check.close(); }
 });
 
 test("corrupt statistics report a safe failure; a valid empty vault reports zero", () => {
   const dir = path.join(base, "stats"), broken = path.join(dir, "vault");
   fs.mkdirSync(broken, { recursive: true });
   fs.writeFileSync(path.join(broken, "index.sqlite"), "not a database; private example-secret");
-  const failure = vault(dir).getStats();
+  const projectRoot = path.join(dir, "project"); fs.mkdirSync(projectRoot, { recursive: true });
+  const failure = vault(dir).getStats({ projectRoot });
   assert.equal(failure.ok, false);
   assert.match(failure.error, /记忆库|索引/);
   assert.doesNotMatch(failure.error, /example-secret|\/tmp\/|\/Users\//);
   assert.equal(failure.vectorStats, undefined);
-  const empty = vault(path.join(base, "empty")).getStats();
+  const empty = vault(path.join(base, "empty")).getStats({ projectRoot });
   assert.equal(empty.ok, true);
   assert.equal(empty.vectorStats.totalMemories, 0);
   assert.equal(empty.vectorStats.syncedVectors, 0);
@@ -81,7 +79,7 @@ test("embedding status preserves a statistics error instead of reporting zero", 
   const start = source.indexOf('case "embed:status": {'), end = source.indexOf('case "embed:trim":', start);
   assert.ok(start > 0 && end > start);
   const invoke = (stats) => vm.runInNewContext(`(async () => { switch ("embed:status") { ${source.slice(start, end)} } })()`, {
-    embedManager: { getStatus: async () => ({ ready: true, vectorStats: { totalMemories: 999 } }) }, memoryVault: { getStats: () => stats }, enrichWithEmbedMetrics: async () => {},
+    payload: { projectRoot: "/fixture" }, projectMemoryPayload: input => input, embedManager: { getStatus: async () => ({ ready: true, vectorStats: { totalMemories: 999 } }) }, memoryVault: { getStats: () => stats }, enrichWithEmbedMetrics: async () => {},
   });
   const bad = await invoke({ ok: false, error: "记忆统计不可用" });
   assert.equal(bad.vectorStatsError, "记忆统计不可用");
@@ -91,22 +89,17 @@ test("embedding status preserves a statistics error instead of reporting zero", 
   assert.equal(empty.vectorStatsError, undefined);
 });
 
-test("memory summary distinguishes unavailable statistics from an empty vault", () => {
-  const source = fs.readFileSync(path.join(__dirname, "../src/hub-drawer-ui.js"), "utf8");
-  const start = source.indexOf("    function dreamEngineDraft() {"), end = source.indexOf("    async function saveDreamEngine(", start);
-  assert.ok(start > 0 && end > start);
-  function render(embed) {
-    const target = { innerHTML: "" };
-    vm.runInNewContext(`${source.slice(start, end)}; renderDream();`, {
-      root: { querySelector: () => target }, cache: { embed, dream: {} }, state: { lang: "zh" }, errors: {},
-      dreamConfig: () => ({ dreamMode: "local", enabled: false }), dreamPresets: () => [],
-      tr: (zh) => zh, esc: String, icon: () => "", button: () => "", spinner: () => "", exactTimeMarkup: String,
-    });
-    return target.innerHTML;
-  }
-  const bad = render({ vectorStatsError: "记忆统计不可用" });
-  assert.match(bad, /记忆.*统计.*不可用/);
-  assert.doesNotMatch(bad, /0\/0 向量同步/);
-  assert.match(render({ vectorStats: { totalMemories: 0, syncedVectors: 0 } }), /0\/0 向量同步/);
-  assert.match(render({}), /统计读取中/);
+test("embedding status without a project never reports aggregate memory counts", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "../src/backend.cjs"), "utf8");
+  const start = source.indexOf('case "embed:status": {'), end = source.indexOf('case "embed:trim":', start);
+  let reads = 0;
+  const result = await vm.runInNewContext(`(async () => { switch ("embed:status") { ${source.slice(start, end)} } })()`, {
+    payload: {}, projectMemoryPayload: input => input,
+    embedManager: { getStatus: async () => ({ running: true, vectorStats: { totalMemories: 999 }, vectorStatsError: "stale" }) },
+    memoryVault: { getStats: () => { reads++; return { ok: true }; } }, enrichWithEmbedMetrics: async () => {},
+  });
+  assert.equal(reads, 0);
+  assert.equal(result.running, true);
+  assert.equal(result.vectorStats, undefined);
+  assert.equal(result.vectorStatsError, undefined);
 });

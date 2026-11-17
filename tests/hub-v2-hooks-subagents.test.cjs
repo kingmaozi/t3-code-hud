@@ -169,7 +169,7 @@ test("stop: dirty code blocks once; active hook and clean repo pass", t => {
   assert.equal(run(f, "memory-stop-hook.mjs", p), null);
   write(path.join(f.projectRoot, "change.js"), "const x = 1;");
   assert.equal(run(f, "memory-stop-hook.mjs", { ...p, stop_hook_active: true }), null);
-  const first = run(f, "memory-stop-hook.mjs", p); assert.equal(first.decision, "block"); assert.match(first.reason, /T3 自动化记忆提醒/); assert.match(first.reason, /不是用户新请求或授权/); assert.match(first.reason, /当前任务允许.*memory_write/); assert.match(first.reason, /只读.*off.*禁止写入/); assert.match(first.reason, /没有已核实的非平凡结论.*直接结束/); assert.match(first.reason, /不得覆盖.*派单限制/);
+  const first = run(f, "memory-stop-hook.mjs", p); assert.equal(first.decision, "block"); assert.match(first.reason, /T3 自动化记忆提醒/); assert.match(first.reason, /不是用户新请求或授权/); assert.match(first.reason, /当前项目.*不读取或写入全局及其他项目/); assert.match(first.reason, /shared 仅表示本项目 worktree 共享/); assert.match(first.reason, /当前任务允许.*memory_write/); assert.match(first.reason, /只读.*off.*禁止写入/); assert.match(first.reason, /没有已核实的非平凡结论.*直接结束/); assert.match(first.reason, /不得覆盖.*派单限制/);
   assert.equal(run(f, "memory-stop-hook.mjs", p), null);
   const stamp = path.join(f.hubDir, "run", fs.readdirSync(path.join(f.hubDir, "run"))[0]);
   fs.utimesSync(stamp, new Date(0), new Date(0));
@@ -292,17 +292,25 @@ test("subagents: explicit extra sync targets, default no AGY writes, memory inst
 
 test("stop: other project writes cannot suppress current Git root reminder", t => {
   const f = fixture(t);
-  const { slugFromProjectRoot } = require("../src/memory-vault.cjs");
+  const { createMemoryVault } = require("../src/memory-vault.cjs");
   const nested = path.join(f.projectRoot, "src");
   fs.mkdirSync(nested);
   write(path.join(nested, "change.js"), "const changed = true;");
-  write(path.join(f.hubDir, "memory/projects/project-a/constraints.md"), "recent A memory");
-  write(path.join(f.hubDir, "memory/index.sqlite"), "recent shared index");
+  const otherRoot = path.join(f.dir, "other-project");
+  fs.mkdirSync(otherRoot, { recursive: true });
+  spawnSync("git", ["init", "-q", otherRoot]);
+  const vault = createMemoryVault({ vaultDir: path.join(f.hubDir, "memory"), homeDir: f.homeDir, hubDir: f.hubDir, _embedFn: () => null });
+  assert.equal(vault.saveMemory({ projectRoot: otherRoot, title: "Other project", content: "recent memory elsewhere", autoEvolve: false }).ok, true);
   assert.equal(run(f, "memory-stop-hook.mjs", { cwd: nested, session_id: "project-b" }).decision, "block");
-  const slug = slugFromProjectRoot(f.projectRoot);
-  write(path.join(f.hubDir, "memory/projects", slug, "_meta.json"), { projectRoot: f.projectRoot });
-  write(path.join(f.hubDir, "memory/projects", slug, "constraints.md"), "recent B memory");
+  assert.equal(vault.saveMemory({ projectRoot: nested, title: "Current project", content: "recent current memory", autoEvolve: false }).ok, true);
   assert.equal(run(f, "memory-stop-hook.mjs", { cwd: nested, session_id: "project-b-with-memory" }), null);
+});
+
+test("stop: a corrupt isolated memory index fails closed without a nudge", t => {
+  const f = fixture(t);
+  write(path.join(f.projectRoot, "change.js"), "const changed = true;");
+  write(path.join(f.hubDir, "memory", "index.sqlite"), "not a sqlite database");
+  assert.equal(run(f, "memory-stop-hook.mjs", { cwd: f.projectRoot, session_id: "corrupt-memory-index" }), null);
 });
 
 

@@ -3112,12 +3112,7 @@ function resolveHubContext(args = {}) {
         threadRow = db.prepare("SELECT thread_id, project_id, title, default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?").get(parsed);
         if (!threadRow) return { ok: false, error: "无法确认会话所属项目，请检查连接" };
       }
-      if (!threadRow) {
-        // Fall back to most recently updated non-delegated thread.
-        const rows = db.prepare("SELECT thread_id, project_id, title, default_provider, updated_at, payload_json FROM orchestration_v2_projection_threads WHERE archived_at IS NULL AND deleted_at IS NULL ORDER BY updated_at DESC").all();
-        threadRow = rows.find((r) => r.thread_id && !String(r.thread_id).startsWith("delegated:") && !String(r.thread_id).startsWith("thread:delegated")) || rows[0] || null;
-      }
-      if (!threadRow) return { ok: false, error: "No active thread" };
+      if (!threadRow) return { ok: false, error: "无法确认当前会话所属项目，请先选择项目" };
       const threadId = threadRow.thread_id;
       const projectId = threadRow.project_id;
       const payload = (() => { try { return JSON.parse(threadRow.payload_json || "{}"); } catch { return {}; } })();
@@ -3126,7 +3121,8 @@ function resolveHubContext(args = {}) {
         try { projectRow = db.prepare("SELECT * FROM projection_projects WHERE project_id = ?").get(projectId); } catch {}
       }
       if (!projectRow || projectRow.deleted_at || !String(projectRow.workspace_root || "").trim()) return { ok: false, error: "无法确认会话所属项目，请检查连接" };
-      const projectRoot = projectRow.workspace_root;
+      const worktreeRoot = typeof payload.worktreePath === "string" ? payload.worktreePath.trim() : "";
+      const projectRoot = memoryVault.resolveSessionProjectRoot({ projectRoot: projectRow.workspace_root, worktreePath: worktreeRoot || undefined });
       const projectTitle = projectRow?.title || path.basename(projectRoot || "") || threadRow.title || "";
       const projectSlug = (() => {
         if (projectRoot) {
@@ -3303,8 +3299,36 @@ async function fetchEmbedTrimJson() {
   }
 }
 
+const PROJECT_MEMORY_ACTIONS = new Set([
+  "memory:overview", "memory:list", "memory:search", "memory:write", "memory:save",
+  "memory:worktreeInfo", "memory:promote", "memory:ensureLink", "memory:openFolder",
+  "memory:consolidate", "memory:rollback", "memory:delete", "memory:pinToAgentsMd",
+  "memory:migratePowerContext", "memory:importHostMemories", "memory:health",
+  "memory:stats", "memory:vectorStats", "memory:hygiene",
+]);
+function projectMemoryPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("project_memory_context_required");
+  for (const key of ["scope", "scopeFilter", "memory_scope", "memoryScope", "projectSlug"]) {
+    if (["global", "_global"].includes(String(payload[key] || "").trim().toLowerCase())) throw new Error("global_memory_disabled");
+  }
+  const raw = payload.projectRoot;
+  if (typeof raw !== "string" || !raw.trim() || !path.isAbsolute(raw)) throw new Error("project_memory_context_required");
+  let root;
+  try { root = fs.realpathSync(raw); if (!fs.statSync(root).isDirectory()) throw new Error(); }
+  catch { throw new Error("project_memory_context_required"); }
+  const home = process.env.HOME || os.homedir();
+  const canonical = (value) => { try { return fs.realpathSync(value); } catch { return path.resolve(value); } };
+  const homeRoot = canonical(home);
+  const hubRoot = canonical(process.env.T3_HUB_DIR || path.join(home, ".t3", "hub"));
+  const pluginRoot = canonical(path.join(home, ".t3", "hud-plugin"));
+  if (root === path.parse(root).root || root === homeRoot || root === canonical(path.join(home, ".t3")) ||
+      [hubRoot, pluginRoot].some((base) => root === base || root.startsWith(base + path.sep))) throw new Error("project_memory_context_required");
+  return { ...payload, projectRoot: root, includeGlobal: false };
+}
+
 async function hubCall(action, payload = {}) {
   try {
+    if (PROJECT_MEMORY_ACTIONS.has(action)) payload = projectMemoryPayload(payload);
     switch (action) {
       case "hub:getDrawerScript": {
         const code = fs.readFileSync(path.join(__dirname, "hub-drawer-ui.js"), "utf8");
@@ -3392,7 +3416,7 @@ async function hubCall(action, payload = {}) {
       case "memory:search": return await memoryVault.listMemories(payload);
       case "memory:write":
       case "memory:save": return await memoryVault.saveMemory(payload);
-      case "memory:worktreeInfo": return memoryVault.resolveWorktreeContext(payload?.projectRoot || process.cwd());
+      case "memory:worktreeInfo": return memoryVault.resolveWorktreeContext(payload.projectRoot);
       case "memory:promote": return memoryVault.promoteWorktreeMemory(payload);
       case "memory:ensureLink": return memoryVault.ensureProjectMemoryLink(payload?.projectRoot);
       case "memory:openFolder": {
@@ -3425,33 +3449,25 @@ async function hubCall(action, payload = {}) {
       }
       case "memory:hygiene": return memoryVault.runHygiene(payload || {});
       case "memory:dream:get": {
-        const vault = getMemoryVault();
-        const overview = vault.getDreamOverview ? vault.getDreamOverview() : vault.getDreamState();
-        const value = overview && typeof overview === "object" && !Array.isArray(overview) ? overview : { state: overview };
-        const runtime = value.runtime && typeof value.runtime === "object" ? value.runtime : {};
-        const dreamRuntime = runtime.scheduler && typeof runtime.scheduler === "object" ? runtime.scheduler : {};
-        return { ...value, runtime: { ...runtime, scheduler: { ...dreamRuntime, ...getDreamSchedulerStatus() } } };
+        // Legacy diagnostics may inspect the stopped service, never cross-project journals.
+        return { ok: true, config: { enabled: false }, runtime: { scheduler: getDreamSchedulerStatus() } };
       }
       case "memory:dream:save":
-      case "memory:dream:update": return getMemoryVault().updateDreamConfig(payload || {});
-      case "memory:dream:run": {
-        const lease = beginDreamRun("manual-run", () => getMemoryVault().runDreamCycle({ reason: (payload && payload.reason) || "manual", projectRoot: payload && payload.projectRoot, force: !!(payload && payload.force), agentRunner: payload && typeof payload.agentRunner === "function" ? payload.agentRunner : undefined }));
-        if (!lease.started) return { ok: false, status: "busy", error: "dream_busy" };
-        const r = await lease.promise;
-        let journal = [];
-        try { journal = (getMemoryVault().getDreamState() || {}).journal || []; } catch {}
-        return { ...r, journal };
-      }
+      case "memory:dream:update":
+      case "memory:dream:run": return { ok: false, error: "dream_disabled_project_memory_only" };
       case "embed:status": {
         const status = await embedManager.getStatus();
-        try {
-          const stats = memoryVault.getStats({});
+        delete status.vectorStats;
+        delete status.vectorStatsError;
+        if (payload?.projectRoot != null) try {
+          const stats = memoryVault.getStats(projectMemoryPayload(payload));
           if (stats?.ok === false) { delete status.vectorStats; status.vectorStatsError = stats.error || "记忆库统计不可用"; }
           else if (stats?.vectorStats) { status.vectorStats = stats.vectorStats; delete status.vectorStatsError; }
         } catch { delete status.vectorStats; status.vectorStatsError = "记忆库统计不可用"; }
         try { await enrichWithEmbedMetrics(status); if (status.vectorStats) await enrichWithEmbedMetrics(status.vectorStats); } catch {}
         return status;
       }
+      case "embed:test": return await embedManager.testEmbedding();
       case "embed:trim": {
         try {
           const beforeHealth = await fetchEmbedHealthJson().catch(() => null);
@@ -3482,18 +3498,19 @@ async function hubCall(action, payload = {}) {
         }
       }
       case "embed:switch": {
+        const project = payload?.projectRoot != null ? projectMemoryPayload(payload) : null;
         try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
         const switchResult = await embedManager.switchModel({
           ...(payload || {}),
           onReadyReindex: () => {
             try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
-            return memoryVault.reindexVectors({ forceModelSync: true });
+            return project ? memoryVault.reindexVectors({ ...project, forceModelSync: true }) : { ok: false, error: "project_memory_context_required" };
           },
         });
         try {
-          if (switchResult && switchResult.ok && switchResult.mode === "mlx") {
+          if (project && switchResult && switchResult.ok && switchResult.mode === "mlx") {
             try { memoryVault.invalidateEmbedHealthCache?.(); } catch {}
-            memoryVault.reindexVectors({ forceModelSync: true });
+            memoryVault.reindexVectors({ ...project, forceModelSync: true });
           }
         } catch {}
         return switchResult;

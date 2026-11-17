@@ -33,6 +33,8 @@ Continue from `docs/HANDOFF.md`, `docs/REQUIREMENTS-AND-EXPERIMENTS.zh-CN.md`, a
 
 Read the relevant project memories before changing memory, routing, ACP, installation, or lifecycle code. Do not store private user/business memory in this repository. Dream reports distinguish local cleanup from an Agent review; a healthy timer does not prove a model call succeeded.
 
+Memory is project-only: all reads, writes, ID mutations, Markdown synchronization and vector statistics/reindexing require a confirmed project root. Do not read or write legacy global memory or guess a recent project when context is missing. Preserve old data in place. Distinct subprojects inside one Git repository remain distinct; corresponding linked worktrees share only project-shared records and keep worktree-private records isolated. Agent-supplied paths must not override the MCP process's project binding. The embedding test uses fixed non-sensitive text against the already-running local service and must not write memory, download or switch models, or start/restart services.
+
 ## Verification
 
 Use targeted tests with the repository's built-in Node runner, for example `node --test tests/hub-v3-frontend-contract-xss.test.cjs` or `node --test tests/hub-autodream-runtime.test.cjs`. Select the suite that covers the change; do not claim `npm test` exists because `package.json` defines no test script. For real host changes, verify saved files, runtime status, and observed host behavior separately. Simulation or a file hash alone is not end-to-end proof.

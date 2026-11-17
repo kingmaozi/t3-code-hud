@@ -62,6 +62,7 @@ function harness(rpc = async () => ({}), environment = {}) {
       switchTab,
       runImport, setSkillScope, saveMcpMode, renderChrome, renderTab, parseScopeParts,
       renderMemoryAgentAccess, setMemoryAgentAccess, runMemorySetup, copyMemorySetupPrompt, renderMemoryRuntime, memoryMcpConfigText, copyMemoryMcpConfig, refreshMemoryAgentAccess, openMemoryFromTitle, toggleMemoryAccessFromTitle, renderMemoryTitleControls,
+      memoryPayload, memoryProjectReady, selectedMemoryRoot, selectedMemoryProject, loadMemories, refreshMemoryOverview, renderMemoryNav, renderMemoryList, renderNewMemory, memorySelection, runMemoryVectorTest,
       planStepProgress,
       saveMemory, deleteMemory, promoteMemory, consolidateMemory, rollbackMemory,
       isContextLoading: () => contextLoading,
@@ -77,13 +78,21 @@ function harness(rpc = async () => ({}), environment = {}) {
   return { ...ui, root, content, nodes, sandbox };
 }
 
+function confirmMemoryProject(ui, projectRoot = "/fixture", threadId = "thread-a") {
+  ui.ready();
+  Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot, threadId, context: { threadId, projectRoot } });
+  ui.setCurrentRoute();
+}
+
 test("Hub exposes only the lightweight memory workspace", () => {
   const ui = harness();
   ui.renderChrome();
   const nav = ui.root.querySelector(".hub-tabs").innerHTML;
+  const header = ui.root.querySelector(".hub-header").innerHTML;
   assert.deepEqual([...nav.matchAll(/data-tab="([^"]+)"/g)].map((match) => match[1]), ["memory"]);
   assert.match(nav, /记忆/);
   assert.doesNotMatch(nav, /个性化|子智能体|技能与 MCP|插件|Hooks/);
+  assert.doesNotMatch(header, /本机 · 全局|Local · Global/);
 });
 
 test("legacy Hub tabs migrate to memory without deleting saved data", () => {
@@ -95,11 +104,57 @@ test("legacy Hub tabs migrate to memory without deleting saved data", () => {
   }
 });
 
+test("restored global or other-project memory selection safely migrates to current project", () => {
+  for (const previousMemoryProject of ["global", "/previous-project"]) {
+    const writes = [];
+    const ui = harness(async () => ({}), {
+      window: { __t3SidecarHub: { snapshot: () => ({ scope: "global", memoryProject: previousMemoryProject, memoryScope: "global" }) } },
+      localStorage: { getItem: key => key === "t3-hub-scope" ? "global" : null, setItem: (...args) => writes.push(args) },
+    });
+    assert.equal(ui.state.scope, "project");
+    assert.equal(ui.state.memoryProject, "current");
+    assert.equal(ui.state.memoryScope, "smart");
+    assert.ok(writes.some(([key, value]) => key === "t3-hub-scope" && value === "project"));
+
+    confirmMemoryProject(ui, "/confirmed-project");
+    assert.deepEqual(JSON.parse(JSON.stringify(ui.memoryPayload())), { projectRoot: "/confirmed-project", scope: "project", scopeFilter: "default", query: "", limit: 500 });
+    assert.equal(ui.selectedMemoryRoot(), "/confirmed-project");
+    ui.renderMemoryNav(); ui.renderNewMemory();
+    assert.doesNotMatch(ui.nodes.get("#t3-hub-memory-nav").innerHTML, /global|全局通用/i);
+  }
+});
+
+test("without a confirmed project, memory content reads stop and local service status stays independent", async () => {
+  const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { items: [{ id: "should-not-show", title: "Wrong scope" }], agents: [] }; });
+  ui.ready(); Object.assign(ui.state, { open: true, tab: "memory", connected: false, projectRoot: null });
+  ui.cache.overview = { total: 900, projects: [{ slug: "global", total: 900 }] };
+  ui.cache.memory = { items: [{ id: "stale", title: "Stale project memory" }] };
+  await ui.loadTab();
+  ui.renderMemory();
+  const nav = ui.nodes.get("#t3-hub-memory-nav").innerHTML;
+  const list = ui.nodes.get("#t3-hub-memory-list").innerHTML;
+  assert.match(nav, /尚未确认项目/);
+  assert.match(list, /请先确认当前项目/);
+  assert.doesNotMatch(`${nav}${list}`, /Stale project memory|should-not-show|全局通用记忆/);
+  assert.match(ui.content.innerHTML, /name="memoryQuery"[^>]*disabled/);
+  assert.ok(calls.some(({ action }) => action === "memory:connections"));
+  assert.ok(calls.some(({ action }) => action === "memory:agentAccess:get"));
+  const embed = calls.find(({ action }) => action === "embed:status");
+  assert.deepEqual(JSON.parse(JSON.stringify(embed.payload)), {});
+  assert.ok(!calls.some(({ action }) => ["memory:list", "memory:search", "memory:overview", "memory:worktreeInfo", "memory:health"].includes(action)));
+  await ui.refreshMemoryOverview(); await ui.loadMemories();
+  assert.ok(!calls.some(({ action }) => ["memory:list", "memory:search", "memory:overview"].includes(action)));
+  Object.assign(ui.state, { projectRoot: "/stale-unconfirmed-project", connected: false });
+  ui.cache.memory = { items: [{ id: "stale-write", title: "Must not be edited", content: "stale" }] };
+  ui.snapshot().drafts.__new = { title: "Blocked draft", content: "No confirmed project", scope: "project" };
+  await ui.saveMemory(null); await ui.deleteMemory("stale-write"); await ui.promoteMemory("stale-write"); await ui.consolidateMemory(); await ui.rollbackMemory("stale-write", 1, "rev");
+  assert.ok(!calls.some(({ action }) => ["memory:save", "memory:delete", "memory:promote", "memory:consolidate", "memory:rollback"].includes(action)));
+});
+
 test("opening memory reads local access and vector status without Dream or hidden catalogs", async () => {
   const calls = [];
   const ui = harness(async action => { calls.push(action); return { items: [], agents: [] }; });
-  ui.ready();
-  Object.assign(ui.state, { open: true, connected: true, projectRoot: "/fixture" });
+  confirmMemoryProject(ui);
   await ui.loadTab();
   assert.ok(calls.includes("memory:connections"));
   assert.ok(calls.includes("memory:agentAccess:get"));
@@ -128,7 +183,7 @@ test("local memory onboarding reports pending providers without claiming setup, 
     if (action === "memory:list") return { items: [{ id: "keep", title: "Existing local note", content: "Retain this memory" }] };
     return {};
   });
-  ui.ready(); Object.assign(ui.state, { open: true, connected: true, projectRoot: "/fixture" });
+  confirmMemoryProject(ui);
   await ui.loadTab();
   ui.renderMemory();
   let html = ui.nodes.get("#t3-hub-memory-access").innerHTML;
@@ -202,6 +257,43 @@ test("memory services show backend model and port separately from stdio MCP, and
   assert.doesNotMatch(copied[0], /\/Users\/|token|secret|127\.0\.0\.1|~\/\.t3/);
 });
 
+test("vector model testing is explicit, sends no project or caller text, and reports backend results", async () => {
+  const calls = [];
+  let finish;
+  const ui = harness((action, payload) => {
+    calls.push({ action, payload });
+    return new Promise(resolve => { finish = resolve; });
+  });
+  ui.cache.embed = { mode: "mlx", running: true, activeModelId: "active/model" };
+  ui.renderMemoryRuntime();
+  assert.match(ui.root.querySelector("#t3-hub-memory-runtime").innerHTML, /测试向量模型/);
+  assert.equal(calls.length, 0, "rendering or refreshing the service card does not run a vector test");
+  const run = ui.runMemoryVectorTest();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].action, "embed:test");
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].payload)), {});
+  assert.match(ui.root.querySelector("#t3-hub-memory-runtime").innerHTML, /正在测试向量模型/);
+  const duplicate = ui.runMemoryVectorTest();
+  assert.equal(calls.length, 1, "a second click cannot queue another test while one is running");
+  finish({ ok: true, modelId: "mlx-community/Octen-Embedding-4B-MLX-4bit", dimensions: 2560, latencyMs: 366 });
+  await Promise.all([run, duplicate]);
+  const html = ui.root.querySelector("#t3-hub-memory-runtime").innerHTML;
+  assert.match(html, /测试成功/);
+  assert.match(html, /Octen-Embedding-4B-MLX-4bit/);
+  assert.match(html, /2560 维度/);
+  assert.match(html, /366 ms/);
+  assert.match(html, /无需打开 oMLX/);
+});
+
+test("vector model test failures are reported without claiming success", async () => {
+  const ui = harness(async action => action === "embed:test" ? { ok: false, error: "model_not_ready" } : {});
+  await ui.runMemoryVectorTest();
+  const html = ui.root.querySelector("#t3-hub-memory-runtime").innerHTML;
+  assert.match(html, /测试失败/);
+  assert.match(html, /model_not_ready/);
+  assert.doesNotMatch(html, /测试成功/);
+});
+
 test("first memory setup prompt uses the fixed local commands and verifies memory_status", async () => {
   const copied = [], ui = harness(undefined, { window: { navigator: { clipboard: { writeText: async (value) => copied.push(value) } } } });
   await ui.copyMemorySetupPrompt();
@@ -209,6 +301,10 @@ test("first memory setup prompt uses the fixed local commands and verifies memor
   assert.match(copied[0], /~\/\.t3\/bin\/t3-memory-setup status/);
   assert.match(copied[0], /~\/\.t3\/bin\/t3-memory-setup setup/);
   assert.match(copied[0], /memory_status/);
+  assert.match(copied[0], /先确认本会话当前选中的 T3 项目与工作树/);
+  assert.match(copied[0], /传当前 T3 项目的绝对 projectRoot/);
+  assert.match(copied[0], /如提示项目未绑定，不改传别的路径绕过，请报告缺口/);
+  assert.match(copied[0], /不查找或使用全局通用记忆/);
   assert.match(copied[0], /只改 Hub MCP/);
   assert.match(copied[0], /不要修改.*认证.*模型.*原生路由/);
   assert.match(copied[0], /不要重启 T3/);
@@ -330,7 +426,8 @@ test("title plan pill shows the active step in a blue progress ring and marks a 
 
 test("project changes invalidate connection status before the next memory refresh", async () => {
   const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { agents: [] }; });
-  Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot: "/project-b" });
+  Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot: "/project-b", threadId: "thread-b", context: { threadId: "thread-b", projectRoot: "/project-b" } });
+  ui.ready(); ui.setCurrentRoute();
   ui.cache.connections = { agents: [{ id: "codex", mcp: { status: "configured" } }] };
   ui.errors.connections = new Error("stale project error");
   ui.resetProjectData();
@@ -1009,6 +1106,7 @@ test("a late settings response cannot replace a newer reload of the same host", 
 
 test("memory, settings and avatar attributes escape hostile text", (t) => {
   const f = fixture(t), ui = harness();
+  confirmMemoryProject(ui);
   const attack = attacks.join(" ");
   ui.state.tab = "memory";
   ui.cache.memory = { items: [{ id: attack, title: attack, content: attack, tags: [attack], agent: attack }] };
@@ -2216,6 +2314,7 @@ test("promoted draft router and pathname candidates resolve without borrowing st
 
 test("memory list/detail, version rollback and recall show local YYYY-MM-DD HH:mm", () => {
   const ui = harness();
+  confirmMemoryProject(ui);
   const timestamp = new Date(2026, 10, 15, 22, 55, 37).toISOString();
   assert.equal(ui.formatExactTime(timestamp), "2026-11-15 22:55");
   assert.equal(ui.formatExactTime(timestamp, true), "2026-11-15 22:55:37");
@@ -2223,7 +2322,7 @@ test("memory list/detail, version rollback and recall show local YYYY-MM-DD HH:m
   assert.equal(ui.formatExactTime(null), "");
   assert.equal(ui.formatExactTime("not a date"), "未知");
   const item = { id: "precise-time", title: "主题与排版约定", content: "纯白默认", updatedAt: timestamp, lastRecalledAt: timestamp, version: 2, history: [{ version: 1, timestamp, content: "old" }] };
-  Object.assign(ui.state, { tab: "memory", selectedMemory: item.id, historyExpanded: { [`current\u0000${item.id}`]: true } });
+  Object.assign(ui.state, { tab: "memory", selectedMemory: item.id, historyExpanded: { [`/fixture\u0000${item.id}`]: true } });
   ui.cache.memory = { items: [item] };
   ui.renderMemoryList();
   const html = ui.nodes.get("#t3-hub-memory-list").innerHTML;
@@ -2266,7 +2365,7 @@ test("[P1] clear on thread-a sends only that threadId, never a bare projectRoot 
 
 test("memory-only navigation loads its live data without requesting hidden catalogs", async () => {
   const calls = [], ui = harness(async (action) => { calls.push(action); return { items: [], agents: [] }; });
-  ui.ready(); Object.assign(ui.state, { open: true, connected: true, tab: "memory", projectRoot: "/fixture", threadId: "thread-a", context: { threadId: "thread-a", projectRoot: "/fixture" } });
+  confirmMemoryProject(ui);
   ui.renderChrome();
   const tabs = ui.root.querySelector(".hub-tabs").innerHTML;
   assert.deepEqual([...tabs.matchAll(/data-tab="([^"]+)"/g)].map((match) => match[1]), ["memory"]);
@@ -2668,17 +2767,34 @@ for (const operation of ["create", "save", "delete", "promote", "consolidate", "
   assert.match(ui.root.querySelector(".hub-toast").innerHTML, /当前项目/);
 });
 
-for (const selection of ["verified-current", "explicit-project", "global-draft"]) test(`Round-3 #1 memory write protection keeps authorized selections usable (${selection})`, async () => {
+test("current project writes always carry the confirmed root and never a global scope", async () => {
   const calls = [], ui = harness(async (action, payload) => { calls.push({ action, payload }); return { item: { id: "memory-a" }, items: [] }; });
-  ui.ready();
-  Object.assign(ui.state, { connected: true, threadId: "thread-a", projectRoot: "/project-a", context: { threadId: "thread-a", projectRoot: "/project-a" }, memoryProject: selection === "explicit-project" ? "/chosen-project" : "current", tab: "board" });
-  ui.cache.memory = { items: [{ id: "memory-a", title: "Memory", content: "Selected project memory", scope: "project" }] };
-  ui.setCurrentRoute();
-  if (selection !== "verified-current") ui.sandbox.location.search = "?projectRoot=%2Fproject-b";
-  if (selection === "global-draft") ui.snapshot().drafts.__new = { title: "Global memory", content: "Global content", scope: "global" };
-  await ui.saveMemory(selection === "global-draft" ? null : "memory-a");
+  confirmMemoryProject(ui, "/project-a");
+  ui.state.tab = "board";
+  ui.cache.memory = { items: [{ id: "memory-a", title: "Memory", content: "Project memory", scope: "project" }] };
+  await ui.saveMemory("memory-a");
   const write = calls.find(call => call.action === "memory:save");
   assert.ok(write);
-  assert.equal(write.payload.projectRoot, selection === "explicit-project" ? "/chosen-project" : selection === "global-draft" ? null : "/project-a");
-  assert.equal(write.payload.scope, selection === "global-draft" ? "global" : "project");
+  assert.equal(write.payload.projectRoot, "/project-a");
+  assert.equal(write.payload.scope, "project");
+  assert.equal("projectSlug" in write.payload, false);
+  assert.equal(write.payload.projectRoot === null, false);
+});
+
+test("restored global memory draft is rebound to the confirmed current project before saving", async () => {
+  const calls = [];
+  const ui = harness(async (action, payload) => { calls.push({ action, payload }); return action === "memory:save" ? { item: { id: "saved-current" } } : { items: [], total: 0 }; }, {
+    window: { __t3SidecarHub: { snapshot: () => ({ scope: "global", memoryProject: "global", memoryScope: "global", drafts: { __new: { open: true, scope: "global", title: "Migrated note", content: "Saved only in the confirmed project" } } }) } },
+  });
+  confirmMemoryProject(ui, "/project-current");
+  ui.renderMemory();
+  const form = ui.nodes.get("#t3-hub-new-memory").innerHTML;
+  assert.match(form, /本项目共享/);
+  assert.doesNotMatch(form, /全局通用|Global/);
+  await ui.saveMemory(null);
+  const write = calls.find(call => call.action === "memory:save");
+  assert.ok(write);
+  assert.equal(write.payload.projectRoot, "/project-current");
+  assert.equal(write.payload.scope, "project");
+  assert.equal("projectSlug" in write.payload, false);
 });

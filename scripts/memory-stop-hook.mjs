@@ -84,7 +84,15 @@ try {
     catch (error) { if (error.code !== "MODULE_NOT_FOUND") throw error; }
   }
   if (!accessManager || !accessManager.isAccessEnabled()) process.exit(0);
-  const cwd = payload.cwd || process.env.T3_PROJECT_ROOT || process.cwd();
+  const cwd = path.resolve(payload.cwd || process.env.T3_PROJECT_ROOT || process.cwd());
+  const home = path.resolve(process.env.HOME || os.homedir());
+  const blockedRoots = [home, path.join(home, '.t3'), path.join(home, '.codex'), path.join(home, '.agents'), path.join(home, '.config')];
+  const isWithin = (root, candidate) => {
+    const relative = path.relative(root, candidate);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  };
+  if (cwd === home || blockedRoots.slice(1).some(root => isWithin(root, cwd))) process.exit(0);
+  try { if (fs.lstatSync(path.join(cwd, '.git')).isFile()) process.exit(0); } catch {}
   const hub = hubEarly;
   // Include the child id so SubagentStop does not suppress the parent Stop nudge.
   const raw = String(payload.session_id || payload.thread_id || payload.transcript_path || cwd) + (payload.agent_id ? ':' + payload.agent_id : '');
@@ -95,8 +103,9 @@ try {
   let status;
   try { status = execFileSync('git', ['-C', cwd, 'status', '--porcelain', '-z', '--untracked-files=all'], { timeout: 1500, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { process.exit(0); }
   if (!codeChanged(status)) process.exit(0);
-  let projectRoot = cwd;
-  try { projectRoot = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { timeout: 1500, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || cwd; } catch {}
+  // `cwd` is the selected T3 project path. Do not replace it with the Git
+  // superproject root: a monorepo may contain multiple independent projects.
+  const projectRoot = cwd;
   let vault;
   for (const location of ['../src/memory-vault.cjs', './memory-vault.cjs', '../hud-plugin/memory-vault.cjs', path.join(process.env.HOME || os.homedir(), '.t3', 'hud-plugin', 'memory-vault.cjs')]) {
     try { vault = require(location); break; } catch (error) { if (error.code !== 'MODULE_NOT_FOUND') throw error; }
@@ -117,7 +126,7 @@ try {
     if (recentStamp()) process.exitCode = 0;
     else {
       fs.writeFileSync(stamp, JSON.stringify({ time: Date.now() }), { mode: 0o600 });
-      console.log(JSON.stringify({ decision: 'block', reason: '[T3 自动化记忆提醒] 本轮有真实代码修改，但最近 10 分钟未见记忆写入。本提醒仅是自动化提示，不是用户新请求或授权，也不得覆盖当前任务权限、派单限制或宿主规则。只有当前任务允许 memory_write、记忆策略并非只读/off 且用户未禁止写入，并且确实核实了非平凡根因、架构决策或持久约束时，才按需写入；没有已核实的非平凡结论、无权写入或仅有普通改动时，请忽略本提醒并直接结束，不要为了通过 Hook 制造记录。本会话 20 分钟内只提醒一次。' }));
+      console.log(JSON.stringify({ decision: 'block', reason: '[T3 自动化记忆提醒] 本轮有真实代码修改，但最近 10 分钟未见本项目记忆写入。本提醒仅是自动化提示，不是用户新请求或授权，也不得覆盖当前任务权限、派单限制或宿主规则。记忆只针对当前项目，不读取或写入全局及其他项目的记忆；shared 仅表示本项目 worktree 共享。只有当前任务允许 memory_write、记忆策略并非只读/off 且用户未禁止写入，并且确实核实了非平凡根因、架构决策或持久约束时，才按需写入；没有已核实的非平凡结论、无权写入或仅有普通改动时，请忽略本提醒并直接结束，不要为了通过 Hook 制造记录。本会话 20 分钟内只提醒一次。' }));
     }
   } finally { fs.rmdirSync(lock); }
 } catch {

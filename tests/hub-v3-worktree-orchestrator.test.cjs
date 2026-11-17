@@ -77,8 +77,9 @@ describe("worktree context canonical slug", () => {
     assert.equal(ctxKefu.isLinkedWorktree, true);
     assert.equal(ctxTmall.isLinkedWorktree, true);
     assert.equal(ctxMain.isLinkedWorktree, false);
-    assert.equal(ctxKefu.worktreeId, "wt-kefu");
-    assert.equal(ctxTmall.worktreeId, "wt-tmall");
+    assert.match(ctxKefu.worktreeId, /^~[a-f0-9]{64}$/);
+    assert.match(ctxTmall.worktreeId, /^~[a-f0-9]{64}$/);
+    assert.notEqual(ctxKefu.worktreeId, ctxTmall.worktreeId);
     assert.equal(ctxKefu.branchName, "feat-kefu");
     assert.equal(ctxTmall.branchName, "feat-tmall");
     // Vault slug unified by canonical root
@@ -120,7 +121,7 @@ describe("shared vs worktree isolation auto", () => {
     });
     assert.equal(w.ok, true, JSON.stringify(w));
     assert.equal(w.item.scope, "worktree");
-    assert.equal(w.item.worktreeId, "wt-kefu");
+    assert.equal(w.item.worktreeId, resolveWorktreeContext(wt.wtKefu).worktreeId);
 
     // Smart default: kind progress -> auto worktree
     const smart = v.saveMemory({
@@ -132,7 +133,7 @@ describe("shared vs worktree isolation auto", () => {
     });
     assert.equal(smart.ok, true, JSON.stringify(smart));
     assert.equal(smart.item.scope, "worktree", "smart default should be worktree for progress kind");
-    assert.equal(smart.item.worktreeId, "wt-kefu");
+    assert.equal(smart.item.worktreeId, resolveWorktreeContext(wt.wtKefu).worktreeId);
 
     // Search from other worktree with default auto
     const foundShared = v.listMemories({ projectRoot: wt.wtTmall, query: sharedToken });
@@ -161,8 +162,7 @@ describe("shared vs worktree isolation auto", () => {
     const onlyWorktreeSelf = v.listMemories({ projectRoot: wt.wtKefu, scopeFilter: "worktree", query: worktreeToken });
     assert.ok(onlyWorktreeSelf.items.some((i) => i.title.includes(worktreeToken)));
     const allFromTmall = v.listMemories({ projectRoot: wt.wtTmall, scopeFilter: "all", query: worktreeToken });
-    // "all" includes all worktrees for the project, so should see worktree from kefu
-    assert.ok(allFromTmall.items.some((i) => i.title.includes(worktreeToken)), "all should include all worktree memories");
+    assert.ok(!allFromTmall.items.some((i) => i.title.includes(worktreeToken)), "all must not expose a sibling worktree");
 
     // Stash ids for next test via closure? Save to global for promotion test.
     // Store on vault instance via property for next test.
@@ -192,7 +192,7 @@ describe("promoteWorktreeMemory", () => {
     assert.equal(w.item.scope, "worktree");
     const before = v.listMemories({ projectRoot: wt.wtTmall, query: token });
     assert.ok(!before.items.some((i) => i.title.includes(token)), "before promote, other worktree should not see");
-    const promoted = v.promoteWorktreeMemory({ id: w.item.id });
+    const promoted = v.promoteWorktreeMemory({ projectRoot: wt.wtKefu, id: w.item.id });
     assert.equal(promoted.ok, true, JSON.stringify(promoted));
     assert.equal(promoted.item.scope, "shared");
     assert.equal(promoted.item.worktreeId, "");
@@ -203,7 +203,7 @@ describe("promoteWorktreeMemory", () => {
     const sharedFile = path.join(vaultDir, "projects", slug, "topics.md");
     const content = fs.readFileSync(sharedFile, "utf8");
     assert.ok(content.includes(token), "promoted token should be in shared markdown");
-    const wtFile = path.join(vaultDir, "projects", slug, "_worktrees", "wt-kefu", "topics.md");
+    const wtFile = path.join(vaultDir, "projects", slug, "_worktrees", w.item.worktreeId, "topics.md");
     if (fs.existsSync(wtFile)) {
       const wtContent = fs.readFileSync(wtFile, "utf8");
       // The promoted entry must not remain in worktree file as worktree scoped? It should be removed from worktree file.
