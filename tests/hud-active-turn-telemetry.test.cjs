@@ -696,6 +696,23 @@ function regressionDb(threadId, provider = "codex") {
   return db;
 }
 
+test("local context follows the active provider thread, then report time", () => {
+  const id = "thread:context-projection";
+  for (const [activeProviderThreadId, expected] of [["current", 24000], ["idle", 0], [undefined, 24000]]) {
+    const db = regressionDb(id, "antigravity");
+    db.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?")
+      .run(JSON.stringify({ activeProviderThreadId, modelSelection: { provider: "antigravity", model: "gemini-fixture" } }), id);
+    const insert = db.prepare("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?)");
+    insert.run("current", id, "antigravity", "2026-11-16T12:00:00Z", JSON.stringify({ contextUsage: { usedTokens: 24000, maxTokens: 1000000 } }));
+    insert.run("idle", id, "antigravity", "2026-11-16T09:00:00Z", JSON.stringify({ contextUsage: { usedTokens: 0, maxTokens: 1000000 } }));
+    db.close();
+    const stats = backend.getThreadStats(id);
+    assert.equal(stats.ok, true, stats.error);
+    assert.equal(stats.tokens.contextUsed, expected, activeProviderThreadId || "latest report");
+    assert.equal(stats.tokens.contextMax, 1000000);
+  }
+});
+
 test("R54: new turn start cannot refresh a prior turn's two native calls or its 90% per-call cache", async (t) => {
   const varint = value => {
     let n = BigInt(value); const bytes = [];
