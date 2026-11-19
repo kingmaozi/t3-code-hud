@@ -146,6 +146,15 @@ function slugFromProjectRoot(projectRoot) {
   const base = path.basename(resolved) || resolved;
   return slugify(base);
 }
+function stableWorktreeId(gitDir) {
+  const real = fs.realpathSync(gitDir);
+  const st = fs.statSync(real, { bigint: true });
+  if (!st.isDirectory() || !st.ino || st.birthtimeNs <= 0n) throw new Error("worktree identity unavailable");
+  // Git may reuse a worktree name after deletion. Binding to the actual
+  // Git-dir inode AND creation time prevents inheriting an older checkout's
+  // private memories without evidence of ownership.
+  return "~" + crypto.createHash("sha256").update(`${real}\0${st.dev}\0${st.ino}\0${st.birthtimeNs}`).digest("hex");
+}
 function resolveWorktreeContext(cwd) {
   const raw = cwd == null ? "" : String(cwd);
   if (!raw) {
@@ -176,7 +185,7 @@ function resolveWorktreeContext(cwd) {
             }
           } catch {}
         }
-        return { canonicalProjectRoot: fs.realpathSync(cur) || cur, worktreePath: cur, worktreeId: "", worktreeName: "", branchName, isLinkedWorktree: false, canonicalSlug: slugFromProjectRoot(cur) };
+        return { canonicalProjectRoot: fs.realpathSync(cur) || cur, worktreePath: cur, worktreeId: stableWorktreeId(gitPath), worktreeName: "", branchName, isLinkedWorktree: false, canonicalSlug: slugFromProjectRoot(cur) };
       } else if (st.isFile()) {
         let gd = null;
         try {
@@ -232,7 +241,7 @@ function resolveWorktreeContext(cwd) {
           }
           let canon = canonicalRoot;
           try { canon = fs.realpathSync(canonicalRoot); } catch { canon = path.resolve(canonicalRoot); }
-          return { canonicalProjectRoot: canon, worktreePath: cur, worktreeId: slugify(worktreeName), worktreeName, branchName, isLinkedWorktree: true, canonicalSlug: slugFromProjectRoot(canon) };
+          return { canonicalProjectRoot: canon, worktreePath: cur, worktreeId: stableWorktreeId(gd), worktreeName, branchName, isLinkedWorktree: true, canonicalSlug: slugFromProjectRoot(canon) };
         }
         // Fallback via git rev-parse
         try {
@@ -244,9 +253,12 @@ function resolveWorktreeContext(cwd) {
             let b = "";
             try { const r2 = spawnSync("git", ["-C", worktreePath, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 1000, maxBuffer: 2 * 1024 * 1024 }); if (r2.status === 0) b = r2.stdout.trim(); } catch {}
             if (b === "HEAD" || b.startsWith("detached")) b = "";
-            return { canonicalProjectRoot: canon, worktreePath, worktreeId: "", worktreeName: "", branchName: b, isLinkedWorktree: true, canonicalSlug: slugFromProjectRoot(canon) };
+            const gdResult = spawnSync("git", ["-C", cur, "rev-parse", "--absolute-git-dir"], { encoding: "utf8", timeout: 1000, maxBuffer: 2 * 1024 * 1024 });
+            if (gdResult.status !== 0) throw new Error("worktree identity unavailable");
+            return { canonicalProjectRoot: canon, worktreePath: cur, worktreeId: stableWorktreeId(gdResult.stdout.trim()), worktreeName: path.basename(gdResult.stdout.trim()), branchName: b, isLinkedWorktree: true, canonicalSlug: slugFromProjectRoot(canon) };
           }
         } catch {}
+        throw new Error("worktree identity unavailable");
       }
       break;
     }
@@ -254,7 +266,40 @@ function resolveWorktreeContext(cwd) {
     if (parent === cur) break;
     cur = parent;
   }
-  return { canonicalProjectRoot: worktreePath, worktreePath, worktreeId: "", worktreeName: "", branchName: "", isLinkedWorktree: false, canonicalSlug: slugFromProjectRoot(worktreePath) };
+  return { canonicalProjectRoot: worktreePath, worktreePath, worktreeId: stableWorktreeId(worktreePath), worktreeName: "", branchName: "", isLinkedWorktree: false, canonicalSlug: slugFromProjectRoot(worktreePath) };
+}
+function canonicalProjectPath(projectRoot) {
+  const input = normalizeProjectRoot(projectRoot);
+  const ctx = resolveWorktreeContext(input);
+  const worktreeRoot = normalizeProjectRoot(ctx.worktreePath || input);
+  const relative = path.relative(worktreeRoot, input);
+  if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw new Error("invalid project/worktree identity");
+  return normalizeProjectRoot(path.join(ctx.canonicalProjectRoot || worktreeRoot, relative));
+}
+// Map a T3 workspace project to the same relative project in an actual
+// linked checkout. Both repo identities and the final real directory must
+// agree; a checkout root is not itself the project for a nested workspace.
+function resolveSessionProjectRoot({ projectRoot, worktreePath } = {}) {
+  if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot) || !dirExists(projectRoot)) throw new Error("valid absolute projectRoot required");
+  const project = normalizeProjectRoot(projectRoot);
+  if (worktreePath == null || worktreePath === "") return project;
+  if (typeof worktreePath !== "string" || !path.isAbsolute(worktreePath) || !dirExists(worktreePath)) throw new Error("valid absolute worktreePath required");
+  const target = normalizeProjectRoot(worktreePath);
+  const projectContext = resolveWorktreeContext(project), targetContext = resolveWorktreeContext(target);
+  const projectRepo = normalizeProjectRoot(projectContext.canonicalProjectRoot);
+  const targetRepo = normalizeProjectRoot(targetContext.canonicalProjectRoot);
+  if (!projectRepo || projectRepo !== targetRepo) throw new Error("worktree belongs to another project repository");
+  const projectCheckout = normalizeProjectRoot(projectContext.worktreePath);
+  const targetCheckout = normalizeProjectRoot(targetContext.worktreePath);
+  const projectRel = path.relative(projectCheckout, project);
+  const targetRel = path.relative(targetCheckout, target);
+  const outside = rel => rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel);
+  if (outside(projectRel) || outside(targetRel) || (targetRel && targetRel !== projectRel)) throw new Error("worktree project path mismatch");
+  const candidate = targetRel ? target : path.join(targetCheckout, projectRel);
+  if (!dirExists(candidate)) throw new Error("project directory is absent from worktree");
+  const real = normalizeProjectRoot(candidate), relative = path.relative(targetCheckout, real);
+  if (outside(relative) || relative !== projectRel || canonicalProjectPath(real) !== canonicalProjectPath(project)) throw new Error("worktree project path mismatch");
+  return real;
 }
 function inferScopeFromKindAndTags(kind, tags) {
   const k = String(kind ?? "").trim().toLowerCase();
@@ -474,7 +519,6 @@ function createMemoryVault(opts = {}) {
   function ensureVaultDirs() {
     safeMkdir(vaultDir);
     safeMkdir(projectsDir());
-    safeMkdir(path.join(vaultDir, "global"));
   }
   function openDb() {
     ensureVaultDirs();
@@ -519,9 +563,13 @@ function createMemoryVault(opts = {}) {
   function ensureProjectVault(slug, { title, projectRoot } = {}) {
     ensureVaultDirs();
     const dir = projectDirFor(slug);
+    if (slug !== GLOBAL_SLUG) {
+      const claimed = readJsonFile(path.join(dir, "_meta.json"), null) || readJsonFile(path.join(dir, "meta.json"), null);
+      if (!projectRoot || !projectMetaMatchesRoot(claimed, canonicalProjectPath(projectRoot))) throw new Error("project memory identity changed");
+    }
     safeMkdir(dir);
     const metaPath = path.join(dir, "_meta.json");
-    let meta = readJsonFile(metaPath, null);
+    let meta = readJsonFile(metaPath, null) || readJsonFile(path.join(dir, "meta.json"), null);
     const t = nowIso();
     if (!meta || typeof meta !== "object") {
       meta = {
@@ -654,7 +702,7 @@ function createMemoryVault(opts = {}) {
     writeTextAtomic(f, serializeEntries(module, entries));
     recordSyncState(f, transaction && transaction.db);
   }
-  function rewriteModules(db, slug, modules, transaction = null, deletedWorktreeHints = null) {
+  function rewriteModules(db, slug, modules, transaction = null, deletedWorktreeHints = null, scopeWorktreeId = null) {
     for (const mod of new Set(modules)) {
       if (slug === GLOBAL_SLUG) {
         const rows = db.prepare("SELECT * FROM memories WHERE project_slug=? AND module=? ORDER BY created_at ASC, id ASC").all(slug, mod);
@@ -665,14 +713,16 @@ function createMemoryVault(opts = {}) {
       rewriteModuleFile(slug, mod, sharedRows.map(rowToItem), transaction);
       // Include deleted worktrees and directories whose final row was removed.
       // Query, enumeration and write failures must reach journal recovery.
-      const candidate = new Set(db.prepare("SELECT DISTINCT worktree_id FROM memories WHERE project_slug=? AND module=? AND memory_scope='worktree'").all(slug, mod).map((r) => String(r.worktree_id || "")).filter(Boolean));
+      const candidate = scopeWorktreeId === null
+        ? new Set(db.prepare("SELECT DISTINCT worktree_id FROM memories WHERE project_slug=? AND module=? AND memory_scope='worktree'").all(slug, mod).map((r) => String(r.worktree_id || "")).filter(Boolean))
+        : new Set(scopeWorktreeId ? [scopeWorktreeId] : []);
       for (const h of deletedWorktreeHints || []) {
         const wid = typeof h === "string" ? h : (h && (h.worktree_id || h.worktreeId || h.id));
-        if (wid) candidate.add(String(wid));
+        if (wid && (scopeWorktreeId === null || String(wid) === scopeWorktreeId)) candidate.add(String(wid));
       }
       const wtRoot = path.join(projectDirFor(slug), "_worktrees");
       let dirs = [];
-      try { dirs = fs.readdirSync(wtRoot, { withFileTypes: true }); }
+      try { if (scopeWorktreeId === null) dirs = fs.readdirSync(wtRoot, { withFileTypes: true }); }
       catch (e) { if (e.code !== "ENOENT") throw e; }
       for (const ent of dirs) if (ent.isDirectory()) candidate.add(ent.name);
       for (const wid of candidate) {
@@ -855,11 +905,26 @@ function createMemoryVault(opts = {}) {
   function requireDreamTxLock() {
     const lock = acquireDreamTxLock();
     if (!lock) throw new Error("dream transaction lock busy: active or unknown owner");
+    // Older Dream journals may include several projects and global records.
+    // Do not recover/rewrite them implicitly during an unrelated project call.
+    let pending = false;
+    try { fs.lstatSync(dreamTxJournalPath()); pending = true; } catch (error) { if (error.code !== "ENOENT") { releaseDreamTxLock(lock); throw error; } }
+    if (pending) {
+      releaseDreamTxLock(lock);
+      throw new Error("pending legacy memory transaction requires review");
+    }
     return lock;
   }
-  function captureMarkdownPreImages(slug, module, currentRows) {
+  function captureMarkdownPreImages(slug, module, currentRows, scopeWorktreeId = null) {
     const out = [{ filePath: moduleFileFor(slug, module), pre: snapshotFile(moduleFileFor(slug, module)) }];
     if (slug === GLOBAL_SLUG) return out;
+    if (scopeWorktreeId !== null) {
+      if (scopeWorktreeId) {
+        const file = worktreeModuleFileFor(slug, scopeWorktreeId, module);
+        out.push({ filePath: file, pre: snapshotFile(file) });
+      }
+      return out;
+    }
     const wids = new Set();
     for (const row of currentRows?.values() || []) {
       if (normalizedDreamScopeFromRow(row) === "worktree" && normalizedWorktreeFromRow(row)) wids.add(normalizedWorktreeFromRow(row));
@@ -899,7 +964,8 @@ function createMemoryVault(opts = {}) {
         if (relative[0] === "_worktrees" && relative[1]) hints.add(relative[1]);
       }
       const modules = cl.modules || [cl.module];
-      rewriteModules(db, cl.projectSlug, modules, { db }, [...hints]);
+      const scopeWorktreeId = typeof cl.scopeWorktreeId === "string" ? cl.scopeWorktreeId : null;
+      rewriteModules(db, cl.projectSlug, modules, { db }, [...hints], scopeWorktreeId);
       if (!committed) for (const m of images) {
         // Rewrites can create formerly absent files. Rollback must remove them.
         if (!m.pre.exists) {
@@ -908,7 +974,7 @@ function createMemoryVault(opts = {}) {
         }
       }
       // Flush every rewritten destination, including empty directories/worktrees.
-      for (const mod of modules) for (const m of captureMarkdownPreImages(cl.projectSlug, mod, [])) {
+      for (const mod of modules) for (const m of captureMarkdownPreImages(cl.projectSlug, mod, [], scopeWorktreeId)) {
         if (m.pre.exists) { fsyncFile(m.filePath); fsyncDir(path.dirname(m.filePath)); }
       }
     }
@@ -1006,6 +1072,16 @@ function createMemoryVault(opts = {}) {
   function activeEmbedModelId() {
     return getEmbedHealthSync().modelId || "local";
   }
+  function assertMarkdownOwnership(db, entries, slug, module, scope, worktreeId = "") {
+    const find = db.prepare("SELECT project_slug, module, memory_scope, worktree_id FROM memories WHERE id=?");
+    for (const entry of entries) {
+      const entryScope = String(entry.scope || scope).trim().toLowerCase();
+      if (entryScope !== scope || (scope === "worktree" && entry.worktreeId && entry.worktreeId !== worktreeId)) throw new Error("memory file contains a different scope");
+      if (!entry.id) continue;
+      const row = find.get(String(entry.id));
+      if (row && (row.project_slug !== slug || row.module !== module || String(row.memory_scope || "shared").trim().toLowerCase() !== scope || (scope === "worktree" && String(row.worktree_id || "") !== worktreeId))) throw new Error("memory file contains an ID from another scope");
+    }
+  }
   function syncWorktreeOneFile(db, slug, worktreeId, module) {
     const f = worktreeModuleFileFor(slug, worktreeId, module);
     if (!fileExists(f)) return { changed: false, upserted: 0, deleted: 0 };
@@ -1019,6 +1095,7 @@ function createMemoryVault(opts = {}) {
     }
     const fallbackKind = MODULE_DEFAULT_KIND[module];
     const entries = parseMarkdownEntries(text, fallbackKind);
+    assertMarkdownOwnership(db, entries, slug, module, "worktree", worktreeId);
     const existing = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? AND memory_scope='worktree' AND worktree_id=?").all(slug, module, worktreeId);
     const byId = new Map(existing.map((r) => [r.id, r]));
     const seenIds = new Set();
@@ -1030,7 +1107,7 @@ function createMemoryVault(opts = {}) {
         const ch = contentHashFor(e.content);
         const dup = existing.find((r) => r.content_hash === ch && r.title === e.title);
         if (dup) e.id = dup.id;
-        else e.id = "mem_" + ch.slice(0, 16);
+        else e.id = "mem_" + crypto.createHash("sha256").update(`${slug}\0${module}\0worktree\0${worktreeId}\0${ch}\0${e.title}`).digest("hex").slice(0, 24);
         e.createdAt = e.createdAt || nowIso();
         e.updatedAt = e.updatedAt || nowIso();
         needsRewrite = true;
@@ -1041,6 +1118,7 @@ function createMemoryVault(opts = {}) {
       if (containsSecret(e.title) || containsSecret(e.content)) continue;
       seenIds.add(e.id);
     }
+    assertMarkdownOwnership(db, entries, slug, module, "worktree", worktreeId);
     const filtered = entries.filter((e) => !e.id || (!containsSecret(e.title) && !containsSecret(e.content)));
     for (const e of filtered) {
       const row = byId.get(e.id);
@@ -1095,7 +1173,8 @@ function createMemoryVault(opts = {}) {
     }
     const fallbackKind = MODULE_DEFAULT_KIND[module];
     const entries = parseMarkdownEntries(text, fallbackKind);
-    const existing = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ?").all(slug, module);
+    assertMarkdownOwnership(db, entries, slug, module, "shared");
+    const existing = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? AND (memory_scope='shared' OR memory_scope IS NULL OR memory_scope='')").all(slug, module);
     const byId = new Map(existing.map((r) => [r.id, r]));
     const seenIds = new Set();
     let upserted = 0;
@@ -1109,7 +1188,7 @@ function createMemoryVault(opts = {}) {
         if (dup) {
           e.id = dup.id;
         } else {
-          e.id = "mem_" + ch.slice(0, 16);
+          e.id = "mem_" + crypto.createHash("sha256").update(`${slug}\0${module}\0shared\0${ch}\0${e.title}`).digest("hex").slice(0, 24);
         }
         e.createdAt = e.createdAt || nowIso();
         e.updatedAt = e.updatedAt || nowIso();
@@ -1121,6 +1200,7 @@ function createMemoryVault(opts = {}) {
       if (containsSecret(e.title) || containsSecret(e.content)) continue;
       seenIds.add(e.id);
     }
+    assertMarkdownOwnership(db, entries, slug, module, "shared");
     const filtered = entries.filter((e) => !e.id || (!containsSecret(e.title) && !containsSecret(e.content)));
     for (const e of filtered) {
       const row = byId.get(e.id);
@@ -1235,12 +1315,16 @@ function createMemoryVault(opts = {}) {
     }
     return { changed: upserted > 0 || deleted > 0 || needsRewrite, upserted, deleted };
   }
-  function syncFromMarkdownIfChanged(projectSlug, heldLock = null) {
+  function syncFromMarkdownIfChanged(projectSlug, heldLock = null, scopeWorktreeId = "", projectRoot = null) {
+    if (!projectSlug || String(projectSlug).toLowerCase() === GLOBAL_SLUG) return { ok: false, error: "project memory scope required" };
     const lock = heldLock || requireDreamTxLock();
     let db;
     try {
       recoverPendingDreamJournal(lock);
       db = openDb();
+      const boundRoot = projectRoot || readMetaFor(projectSlug)?.projectRoot;
+      if (!boundRoot) throw new Error("项目记忆归属无法确认，已暂停访问；原有数据保留");
+      assertProjectRowsBound(db, projectSlug, scopeWorktreeId, canonicalProjectPath(boundRoot));
       const slugs = projectSlug ? [String(projectSlug)] : discoverSlugs(db);
       let changedFiles = 0;
       let upserted = 0;
@@ -1253,22 +1337,14 @@ function createMemoryVault(opts = {}) {
           upserted += r.upserted;
           deleted += r.deleted;
         }
-        // Also sync per-worktree markdown files if present.
-        try {
-          const wtRoot = path.join(projectDirFor(slug), "_worktrees");
-          if (dirExists(wtRoot)) {
-            for (const ent of fs.readdirSync(wtRoot, { withFileTypes: true })) {
-              if (!ent.isDirectory()) continue;
-              const wtId = ent.name;
-              for (const m of MODULES) {
-                const r = syncWorktreeOneFile(db, slug, wtId, m);
-                if (r.changed) changedFiles += 1;
-                upserted += r.upserted;
-                deleted += r.deleted;
-              }
-            }
-          }
-        } catch {}
+        // Only the active worktree may be reconciled; a sibling may contain
+        // newer edits which must not be read or overwritten by this session.
+        if (scopeWorktreeId) for (const m of MODULES) {
+          const r = syncWorktreeOneFile(db, slug, scopeWorktreeId, m);
+          if (r.changed) changedFiles += 1;
+          upserted += r.upserted;
+          deleted += r.deleted;
+        }
       }
       return { ok: true, synced: changedFiles > 0, changedFiles, upserted, deleted };
     } finally {
@@ -1377,7 +1453,8 @@ function createMemoryVault(opts = {}) {
     if (activeDim != null && activeDim > 0 && Number(row.v_dim) !== Number(activeDim)) return true;
     return false;
   }
-  async function performBatchEmbedding({ targetModelId } = {}) {
+  async function performBatchEmbedding({ targetModelId, projectSlug, worktreeId = "", projectRoot } = {}) {
+    if (!projectSlug || projectSlug === GLOBAL_SLUG) return { ok: false, error: "project memory scope required" };
     if (_reindexing) return { ok: true, queued: 0, alreadyReindexing: true };
     _reindexing = true;
     try {
@@ -1387,7 +1464,8 @@ function createMemoryVault(opts = {}) {
       const db = openDb();
       let rows = [];
       try {
-        const all = db.prepare("SELECT m.id, m.title, m.content, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id").all();
+        const owners = assertProjectRowsBound(db, projectSlug, worktreeId, canonicalProjectPath(projectRoot));
+        const all = db.prepare(`SELECT m.id, m.title, m.content, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id=m.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)}`).all(projectSlug, worktreeId, ...owners);
         rows = all.filter((r) => needsReindexRow(r, activeId, activeDim));
       } finally {
         db.close();
@@ -1404,80 +1482,121 @@ function createMemoryVault(opts = {}) {
         }
       }
       return { ok: true, queued: total };
-    } catch {
-      return { ok: true, queued: 0 };
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
     } finally {
       _reindexing = false;
     }
   }
   function triggerBatchEmbedding(opts = {}) {
     const targetModelId = opts && typeof opts === "object" ? (opts.targetModelId || null) : null;
-    const promise = performBatchEmbedding({ targetModelId });
+    let projectSlug;
+    try { rejectGlobalScope(opts); projectSlug = resolveSlug(opts.projectSlug, opts.projectRoot); }
+    catch (error) { return Promise.resolve({ ok: false, error: error.message || String(error) }); }
+    const promise = performBatchEmbedding({ targetModelId, projectSlug, worktreeId: projectWorktreeId(opts.projectRoot), projectRoot: opts.projectRoot });
     promise.catch(() => {});
     return promise;
   }
-  function resolveVaultSlug(projectRoot) {
-    const raw = String(projectRoot);
-    let normRoot = "";
-    try { normRoot = normalizeProjectRoot(raw); } catch { normRoot = path.resolve(raw); }
-    // Unified canonical slug: worktrees of same repo share canonicalProjectRoot slug.
-    let canonRoot = normRoot;
+  function projectMetaMatchesRoot(meta, root) {
+    if (!meta || typeof meta !== "object") return false;
+    if (meta.projectRoot && path.isAbsolute(String(meta.projectRoot))) {
+      let oldRoot = normalizeProjectRoot(String(meta.projectRoot));
+      try { oldRoot = canonicalProjectPath(String(meta.projectRoot)); } catch {}
+      return oldRoot === root;
+    }
+    return !!meta.scopeHash && String(meta.scopeHash) === scopeHashFor(root);
+  }
+  function unboundSlugHasRows(slug) {
+    if (!fileExists(indexDbPath)) return false;
+    const db = new DatabaseSync(indexDbPath, { readOnly: true });
     try {
-      const ctx = resolveWorktreeContext(raw);
-      if (ctx && ctx.canonicalProjectRoot) canonRoot = ctx.canonicalProjectRoot;
-    } catch {}
-    if (canonRoot) {
-      try { normRoot = normalizeProjectRoot(canonRoot); } catch {}
-      const baseSlug = slugFromProjectRoot(normRoot);
-      const expectedHash = scopeHashFor(normRoot);
-      const hash6 = expectedHash ? expectedHash.slice(0, 6) : "000000";
-      const candidateDir = path.join(projectsDir(), baseSlug);
-      if (!dirExists(candidateDir)) return baseSlug;
-      let meta = readJsonFile(path.join(candidateDir, "_meta.json"), null);
-      if (!meta) meta = readJsonFile(path.join(candidateDir, "meta.json"), null);
-      if (meta && typeof meta === "object") {
-        const metaRaw = meta.projectRoot ? String(meta.projectRoot) : null;
-        let metaRoot = metaRaw ? normalizeProjectRoot(metaRaw) : null;
-        // Canonicalize meta root as well: if meta stored a worktree path, its canonical is same repo root.
-        if (metaRaw) {
-          try {
-            const mctx = resolveWorktreeContext(metaRaw);
-            if (mctx && mctx.canonicalProjectRoot) metaRoot = normalizeProjectRoot(mctx.canonicalProjectRoot);
-          } catch {}
-          // Also canonicalize scopeHash equivalently via canonical root hash.
-          // If stored hash was of worktree path, recompute expected hash for canonical comparison when needed.
-        }
-        if ((metaRoot && metaRoot === normRoot) || (meta.scopeHash && expectedHash && String(meta.scopeHash) === expectedHash)) return baseSlug;
-        // Also accept if stored hash equals hash of meta canonical root (legacy worktree-stored)
-        try {
-          if (metaRaw) {
-            const metaCanon = resolveWorktreeContext(metaRaw).canonicalProjectRoot;
-            const metaHash = scopeHashFor(metaCanon);
-            if (metaHash && meta.scopeHash && String(meta.scopeHash) === metaHash && metaCanon === normRoot) return baseSlug;
-          }
-        } catch {}
-        return baseSlug + "-" + hash6;
-      }
-      return baseSlug + "-" + hash6;
+      const present = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='memories'").get();
+      return !!present && !!db.prepare("SELECT 1 AS present FROM memories WHERE project_slug=? LIMIT 1").get(slug);
+    } finally { db.close(); }
+  }
+  function resolveVaultSlug(projectRoot) {
+    if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot) || !dirExists(projectRoot)) throw new Error("valid absolute projectRoot required");
+    const root = canonicalProjectPath(projectRoot);
+    const forbiddenRoots = [homeDir, hubDir, vaultDir].map(normalizeProjectRoot);
+    if (!root || root === path.parse(root).root || forbiddenRoots.includes(root)) throw new Error("valid absolute projectRoot required");
+    const baseRaw = slugFromProjectRoot(root), base = baseRaw.toLowerCase() === GLOBAL_SLUG ? `${baseRaw}-project` : baseRaw, hash = scopeHashFor(root);
+    // Preserve existing uniquely bound project vaults, including old worktree
+    // metadata; never guess an unowned directory or reuse a colliding suffix.
+    let available = null;
+    for (const slug of [base, `${base}-${hash.slice(0, 6)}`, `${base}-${hash}`]) {
+      const dir = projectDirFor(slug);
+      let stat;
+      try { stat = fs.lstatSync(dir); } catch (e) { if (e.code === "ENOENT") { if (!unboundSlugHasRows(slug)) available ||= slug; continue; } throw e; }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe project memory directory");
+      const meta = readJsonFile(path.join(dir, "_meta.json"), null) || readJsonFile(path.join(dir, "meta.json"), null);
+      if (projectMetaMatchesRoot(meta, root)) return slug;
     }
-    const baseSlug = slugFromProjectRoot(normRoot);
-    const expectedHash = scopeHashFor(normRoot);
-    const hash6 = expectedHash ? expectedHash.slice(0, 6) : "000000";
-    const candidateDir = path.join(projectsDir(), baseSlug);
-    if (!dirExists(candidateDir)) return baseSlug;
-    let meta = readJsonFile(path.join(candidateDir, "_meta.json"), null);
-    if (!meta) meta = readJsonFile(path.join(candidateDir, "meta.json"), null);
-    if (meta && typeof meta === "object") {
-      const metaRoot = meta.projectRoot ? normalizeProjectRoot(String(meta.projectRoot)) : null;
-      if ((metaRoot && metaRoot === normRoot) || (meta.scopeHash && expectedHash && String(meta.scopeHash) === expectedHash)) return baseSlug;
-      return baseSlug + "-" + hash6;
-    }
-    return baseSlug + "-" + hash6;
+    if (available) return available;
+    throw new Error("project memory identity conflict");
   }
   function resolveSlug(projectSlug, projectRoot) {
-    if (projectSlug) return String(projectSlug);
-    if (projectRoot) return resolveVaultSlug(String(projectRoot));
-    return null;
+    if (projectSlug != null && String(projectSlug).toLowerCase() === GLOBAL_SLUG) throw new Error("global memory is unavailable");
+    if (typeof projectRoot !== "string" || !path.isAbsolute(projectRoot) || !dirExists(projectRoot)) throw new Error("valid absolute projectRoot required");
+    // Established owner metadata is immutable for this identity: avoid the
+    // process-wide lock on ordinary reads and embeddings. An unbound candidate
+    // must always be re-resolved under the lock before claiming it.
+    const initial = resolveVaultSlug(projectRoot), root = canonicalProjectPath(projectRoot);
+    const initialMeta = readJsonFile(path.join(projectDirFor(initial), "_meta.json"), null) || readJsonFile(path.join(projectDirFor(initial), "meta.json"), null);
+    if (projectMetaMatchesRoot(initialMeta, root)) {
+      if (projectSlug && String(projectSlug) !== initial) throw new Error("project memory identity mismatch");
+      return initial;
+    }
+    const lock = requireDreamTxLock();
+    try {
+      const slug = resolveVaultSlug(projectRoot);
+      if (projectSlug && String(projectSlug) !== slug) throw new Error("project memory identity mismatch");
+      const dir = projectDirFor(slug), metaPath = path.join(dir, "_meta.json");
+      let stat;
+      try { stat = fs.lstatSync(dir); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      if (!stat) {
+        ensureVaultDirs();
+        fs.mkdirSync(dir, { mode: 0o700 });
+        const now = nowIso();
+        const meta = { slug, title: path.basename(root), projectRoot: root, scopeHash: scopeHashFor(root), createdAt: now, updatedAt: now };
+        const temp = metaPath + `.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+        try {
+          fs.writeFileSync(temp, JSON.stringify(meta, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+          fs.renameSync(temp, metaPath);
+        } finally { try { fs.unlinkSync(temp); } catch (error) { if (error.code !== "ENOENT") throw error; } }
+      } else {
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe project memory directory");
+        const meta = readJsonFile(metaPath, null) || readJsonFile(path.join(dir, "meta.json"), null);
+        if (!projectMetaMatchesRoot(meta, root)) throw new Error("project memory identity changed");
+      }
+      return slug;
+    } finally { releaseDreamTxLock(lock); }
+  }
+  function rejectGlobalScope(args = {}) {
+    if ([args.scope, args.scopeFilter, args.memory_scope, args.memoryScope].some(value => String(value || "").trim().toLowerCase() === "global") || String(args.projectSlug || "").trim().toLowerCase() === GLOBAL_SLUG) throw new Error("global memory is unavailable");
+  }
+  function projectWorktreeId(projectRoot) {
+    return String(resolveWorktreeContext(projectRoot).worktreeId || "");
+  }
+  function projectVisibleScope(alias = "") {
+    const p = alias ? `${alias}.` : "";
+    return `(${p}memory_scope='shared' OR ${p}memory_scope IS NULL OR ${p}memory_scope='' OR (${p}memory_scope='worktree' AND ${p}worktree_id=?))`;
+  }
+  function visibleRowInWorktree(row, slug, worktreeId) {
+    const scope = String(row?.memory_scope || "shared");
+    return row?.project_slug === slug && (scope === "shared" || scope === "" || (scope === "worktree" && String(row.worktree_id || "") === worktreeId));
+  }
+  function rowProjectMatches(row, root) {
+    if (typeof row?.project_root !== "string" || !path.isAbsolute(row.project_root)) return false;
+    try { return canonicalProjectPath(row.project_root) === root; }
+    catch { return normalizeProjectRoot(row.project_root) === root; }
+  }
+  function assertProjectRowsBound(db, slug, worktreeId, root) {
+    const rows = db.prepare(`SELECT DISTINCT project_root FROM memories WHERE project_slug=? AND ${projectVisibleScope()}`).all(slug, worktreeId);
+    if (rows.some(row => !rowProjectMatches(row, root))) throw new Error("项目记忆归属无法确认，已暂停访问；原有数据保留");
+    return rows.map(row => row.project_root);
+  }
+  function projectOwnersFilter(column, roots) {
+    return roots.length ? `${column} IN (${roots.map(() => "?").join(",")})` : "0";
   }
   function vectorsFor(db, items) {
     const vectors = new Map();
@@ -1545,19 +1664,24 @@ function createMemoryVault(opts = {}) {
   }
   function saveMemory(args = {}) {
     try {
-      const projectRoot = args.projectRoot ? path.resolve(String(args.projectRoot)) : null;
+      rejectGlobalScope(args);
+      const projectRoot = args.projectRoot;
+      const slug = resolveSlug(args.projectSlug, projectRoot);
       // Determine scope up-front: explicit scope or smart default by kind/tags.
       const explicitScope = args.scope || args.memory_scope || args.memoryScope || null;
       const inferredScope = inferScopeFromKindAndTags(args.kind, args.tags);
       let determinedScope = explicitScope ? String(explicitScope) : inferredScope;
       if (!["shared","worktree","global"].includes(determinedScope)) determinedScope = "shared";
       const ctxForScope = projectRoot ? resolveWorktreeContext(projectRoot) : null;
-      const worktreeIdForScope = String(args.worktreeId || args.worktree_id || (determinedScope === "worktree" ? (ctxForScope && ctxForScope.worktreeId ? ctxForScope.worktreeId : "") : ""));
+      const currentWorktreeId = String(ctxForScope?.worktreeId || "");
+      const requestedWorktreeId = args.worktreeId ?? args.worktree_id;
+      if (requestedWorktreeId != null && String(requestedWorktreeId) !== currentWorktreeId) throw new Error("memory belongs to another worktree");
+      if (determinedScope === "worktree" && !currentWorktreeId) {
+        if (explicitScope === "worktree") throw new Error("select a linked worktree for worktree memory");
+        determinedScope = "shared";
+      }
+      const worktreeIdForScope = determinedScope === "worktree" ? currentWorktreeId : "";
       const branchForScope = String(args.branchName || args.branch || args.branch_name || (ctxForScope && ctxForScope.branchName ? ctxForScope.branchName : ""));
-      let slug = null;
-      if (determinedScope === "global") slug = GLOBAL_SLUG;
-      else slug = resolveSlug(args.projectSlug ? String(args.projectSlug) : null, projectRoot);
-      if (!slug) return { ok: false, error: "projectRoot or projectSlug required" };
       // Preserve scope fields for later upsert, unless overridden by args.worktreeId/etc.
       const _saveScope = determinedScope;
       const _saveWorktreeId = worktreeIdForScope;
@@ -1570,7 +1694,7 @@ function createMemoryVault(opts = {}) {
       if (containsSecret(title) || containsSecret(content)) return { ok: false, error: SECRET_ERROR };
       const saveTxLock = requireDreamTxLock();
       try {
-      syncFromMarkdownIfChanged(slug, saveTxLock);
+      syncFromMarkdownIfChanged(slug, saveTxLock, currentWorktreeId, projectRoot);
       const incoming = {
         id: generateMemId(), projectSlug: slug, module: mod,
         kind: args.kind ? String(args.kind) : MODULE_DEFAULT_KIND[mod], title, content,
@@ -1592,9 +1716,12 @@ function createMemoryVault(opts = {}) {
         const targetId = args.id || args.supersedesId;
         if (targetId) {
           const row = db.prepare("SELECT * FROM memories WHERE id=?").get(String(targetId));
-          if (row && row.project_slug !== slug) return { ok: false, error: "memory belongs to another project" };
+          if (row && !visibleRowInWorktree(row, slug, currentWorktreeId)) return { ok: false, error: "memory belongs to another project or worktree" };
           if (!row && args.supersedesId) return { ok: false, error: "memory not found: " + targetId };
           existing = row ? rowToItem(row) : null;
+          if (args.rejectProtectedSupersedes === true && args.supersedesId && existing && isAutoEvolveProtectedItem(existing)) {
+            return { ok: false, error: "protected memory requires a human edit" };
+          }
           incoming.id = String(targetId);
           action = args.supersedesId && !args.id ? "superseded" : "updated";
           reason = action === "superseded" ? "superseded" : "manual-edit";
@@ -1621,6 +1748,8 @@ function createMemoryVault(opts = {}) {
             } catch {
               candidates = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY updated_at DESC, id ASC").all(slug).map(rowToItem);
             }
+            // Pin Shield: natural-language similarity cannot modify human-pinned or core rules.
+            candidates = candidates.filter((item) => !isAutoEvolveProtectedItem(item));
             vectors = vectorsFor(db, [...candidates, incoming]);
             const ranked = candidates.map((item) => ({ item, sim: similarity(incoming, item, vectors) }));
             ranked.sort((a, b) => (b.sim.cosine ?? b.sim.lexicalSim) - (a.sim.cosine ?? a.sim.lexicalSim));
@@ -1666,7 +1795,7 @@ function createMemoryVault(opts = {}) {
           }
           if (args.supersedesId) item.supersedesId = String(args.supersedesId);
         }
-        const canonForVault = ctxForScope && ctxForScope.canonicalProjectRoot ? ctxForScope.canonicalProjectRoot : projectRoot;
+        const canonForVault = canonicalProjectPath(projectRoot);
         const meta = ensureProjectVault(slug, { title: path.basename(canonForVault || projectRoot || slug), projectRoot: canonForVault });
         const projectPath = canonForVault || projectRoot || meta.projectRoot || null;
         const textChanged = !existing || embeddingText(existing) !== embeddingText(item);
@@ -1681,16 +1810,16 @@ function createMemoryVault(opts = {}) {
           const embedded = vec || embedTextsSync([embeddingText(item)], { inputType: "document" })?.[0];
           if (validVector(embedded)) putVector(db, item.id, embedded, activeEmbedModelId());
         }
-        rewriteModules(db, slug, [mod, ...(existing ? [existing.module] : [])]);
+        rewriteModules(db, slug, [mod, ...(existing ? [existing.module] : [])], null, null, currentWorktreeId);
         touchProject(slug, item.updatedAt);
         // 第 4 重：水位线自动合并 —— 同项目同模块活跃条目数超水位时异步静默合并（不阻塞写入返回）
         try {
           const threshold = args.autoConsolidateThreshold != null ? Number(args.autoConsolidateThreshold) : vaultAutoConsolidateThreshold;
           if (threshold != null && Number.isFinite(threshold) && threshold > 0) {
-            const cntRow = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE project_slug = ? AND module = ?").get(slug, mod);
+            const cntRow = db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE project_slug=? AND module=? AND ${projectVisibleScope()}`).get(slug, mod, currentWorktreeId);
             if (cntRow && Number(cntRow.c) > threshold) {
-              const slugForConsolidate = slug;
-              setImmediate(() => { try { consolidateMemories({ projectSlug: slugForConsolidate }); } catch {} });
+              const rootForConsolidate = projectRoot;
+              setImmediate(() => { try { consolidateMemories({ projectRoot: rootForConsolidate }); } catch {} });
             }
           }
         } catch {}
@@ -1703,26 +1832,23 @@ function createMemoryVault(opts = {}) {
   function deleteMemory(args = {}) {
     let delTxLock = null;
     try {
+      rejectGlobalScope(args);
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      const worktreeId = projectWorktreeId(args.projectRoot);
       const id = args.id ? String(args.id) : null;
       if (!id) return { ok: false, error: "id required" };
       delTxLock = requireDreamTxLock();
-      recoverPendingDreamJournal(delTxLock);
+      syncFromMarkdownIfChanged(slug, delTxLock, worktreeId, args.projectRoot);
       const db = openDb();
       try {
-        const row = db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
+        const row = db.prepare(`SELECT * FROM memories WHERE id=? AND project_slug=? AND ${projectVisibleScope()}`).get(id, slug, worktreeId);
         if (!row) return { ok: true, deleted: false };
-        const slug = args.projectSlug ? String(args.projectSlug) : row.project_slug;
         const mod = row.module;
         const widHint = (String(row.memory_scope || "") === "worktree" && String(row.worktree_id || "")) ? [String(row.worktree_id)] : [];
         deleteRowById(db, id);
         // Rewrite scope-aware modules (shared + per-worktree) without the deleted entry.
         // P1-A: 删除前已记录 widHint，空 worktree 同步清空防止复活
-        try { rewriteModules(db, slug, [mod], null, widHint); } catch {}
-        try {
-          if (slug !== GLOBAL_SLUG) {
-            const allRows = db.prepare("SELECT * FROM memories WHERE project_slug = ? AND module = ? ORDER BY created_at ASC").all(slug, mod);
-          }
-        } catch {}
+        try { rewriteModules(db, slug, [mod], null, widHint, worktreeId); } catch {}
         return { ok: true, deleted: true };
       } finally {
         db.close();
@@ -1735,26 +1861,36 @@ function createMemoryVault(opts = {}) {
   }
   function pinToAgentsMd(args = {}) {
     try {
-      if (!args.projectRoot) return { ok: false, error: "projectRoot required" };
+      rejectGlobalScope(args);
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      const worktreeId = projectWorktreeId(args.projectRoot);
       if (!args.id) return { ok: false, error: "id required" };
-      const projectRoot = path.resolve(String(args.projectRoot));
+      const projectRoot = fs.realpathSync(String(args.projectRoot));
       const id = String(args.id);
       const db = openDb();
       let row = null;
       try {
-        row = db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
+        assertProjectRowsBound(db, slug, worktreeId, canonicalProjectPath(projectRoot));
+        row = db.prepare(`SELECT * FROM memories WHERE id=? AND project_slug=? AND ${projectVisibleScope()}`).get(id, slug, worktreeId);
+        if (row && !rowProjectMatches(row, canonicalProjectPath(projectRoot))) throw new Error("项目记忆归属无法确认，已暂停访问；原有数据保留");
       } finally {
         db.close();
       }
       if (!row) return { ok: false, error: "memory not found: " + id };
       const agentsMdPath = path.join(projectRoot, "AGENTS.md");
       let content = "";
-      if (fileExists(agentsMdPath)) {
+      let originalStat = null;
+      try { originalStat = fs.lstatSync(agentsMdPath); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      if (originalStat) {
+        if (originalStat.isSymbolicLink() || !originalStat.isFile() || originalStat.nlink !== 1) throw new Error("AGENTS.md is not a single-link regular file");
+        const fd = fs.openSync(agentsMdPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
         try {
-          content = fs.readFileSync(agentsMdPath, "utf8");
-        } catch {
-          content = "";
-        }
+          const opened = fs.fstatSync(fd);
+          if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== originalStat.dev || opened.ino !== originalStat.ino) throw new Error("AGENTS.md changed during read");
+          content = fs.readFileSync(fd, "utf8");
+          originalStat = fs.fstatSync(fd);
+        } finally { fs.closeSync(fd); }
       }
       const marker = "<!-- pinned:" + id + " -->";
       if (content.includes(marker)) return { ok: true, agentsMdPath };
@@ -1774,8 +1910,21 @@ function createMemoryVault(opts = {}) {
           content = content.slice(0, insertAt) + entry + "\n" + content.slice(insertAt);
         }
       }
-      safeMkdir(projectRoot);
-      writeTextAtomic(agentsMdPath, content);
+      const temp = agentsMdPath + `.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+      try {
+        fs.writeFileSync(temp, content, { flag: "wx", mode: originalStat ? originalStat.mode & 0o777 : 0o600 });
+        let current = null;
+        try { current = fs.lstatSync(agentsMdPath); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (originalStat) {
+          if (!current?.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.dev !== originalStat.dev || current.ino !== originalStat.ino || current.size !== originalStat.size || current.mtimeMs !== originalStat.mtimeMs || current.ctimeMs !== originalStat.ctimeMs) throw new Error("AGENTS.md changed during update");
+          fs.renameSync(temp, agentsMdPath);
+        } else {
+          if (current) throw new Error("AGENTS.md appeared during update");
+          fs.linkSync(temp, agentsMdPath); // exclusive create; never replace an unexpected new file
+          fs.unlinkSync(temp);
+        }
+      } finally { try { fs.unlinkSync(temp); } catch (error) { if (error.code !== "ENOENT") throw error; } }
       return { ok: true, agentsMdPath };
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
@@ -1783,199 +1932,81 @@ function createMemoryVault(opts = {}) {
   }
   function getOverview(args = {}) {
     try {
+      rejectGlobalScope(args);
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      const worktreeId = projectWorktreeId(args.projectRoot);
+      const root = canonicalProjectPath(args.projectRoot);
       const db = openDb();
       try {
-        const slugs = discoverSlugs(db);
-        try {
-          ensureProjectVault(GLOBAL_SLUG, { title: GLOBAL_TITLE, projectRoot: null });
-        } catch {}
-        const migrated = readJsonFile(receiptPath, null);
-        const migratedCount = migrated && migrated.stats && Number.isFinite(migrated.stats.total) ? Number(migrated.stats.total) : 0;
-        const totalRow = db.prepare("SELECT COUNT(*) AS c FROM memories").get();
-        const totalMemories = totalRow ? Number(totalRow.c) : 0;
-        const currentProjectSlug = args.projectRoot ? resolveVaultSlug(String(args.projectRoot)) : null;
-        const projects = [];
-        for (const slug of slugs) {
-          const meta = readMetaFor(slug);
-          const cnt = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE project_slug = ?").get(slug);
-          const byRows = db.prepare("SELECT module, COUNT(*) AS c FROM memories WHERE project_slug = ? GROUP BY module").all(slug);
-          const byModule = { constraints: 0, architecture: 0, pitfalls: 0, topics: 0 };
-          for (const r of byRows) byModule[String(r.module)] = Number(r.c);
-          const mx = db.prepare("SELECT MAX(updated_at) AS m FROM memories WHERE project_slug = ?").get(slug);
-          if (slug === GLOBAL_SLUG) {
-            projects.push({
-              slug: GLOBAL_SLUG,
-              title: (meta && meta.title) || GLOBAL_TITLE,
-              projectRoot: null,
-              total: cnt ? Number(cnt.c) : 0,
-              byModule,
-              updatedAt: (mx && mx.m) || (meta && meta.updatedAt) || null,
-            });
-          } else {
-            projects.push({
-              slug,
-              title: (meta && meta.title) || slug,
-              projectRoot: (meta && meta.projectRoot) || null,
-              total: cnt ? Number(cnt.c) : 0,
-              byModule,
-              updatedAt: (mx && mx.m) || (meta && meta.updatedAt) || null,
-            });
-          }
-        }
-        projects.sort((a, b) => {
-          if (a.slug === GLOBAL_SLUG) return -1;
-          if (b.slug === GLOBAL_SLUG) return 1;
-          return String(a.slug).localeCompare(String(b.slug));
-        });
-        // 体积健康字段：第 4 重容量监控指标
-        let dbSizeBytes = 0;
-        try {
-          const st = fs.statSync(indexDbPath);
-          dbSizeBytes = Number(st.size) || 0;
-        } catch {
-          dbSizeBytes = 0;
-        }
-        const dbSizeMb = Math.round((dbSizeBytes / (1024 * 1024)) * 100) / 100;
-        let vectorCount = 0;
-        let staleVectorCount = 0;
-        let worktreeMemoryCount = 0;
-        try {
-          const vc = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors").get();
-          vectorCount = vc ? Number(vc.c) : 0;
-        } catch { vectorCount = 0; }
-        try {
-          const sv = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)").get();
-          staleVectorCount = sv ? Number(sv.c) : 0;
-        } catch { staleVectorCount = 0; }
-        try {
-          const wc = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE memory_scope = 'worktree'").get();
-          worktreeMemoryCount = wc ? Number(wc.c) : 0;
-        } catch { worktreeMemoryCount = 0; }
-        let archivedCount = 0;
-        try {
-          for (const slug of slugs) {
-            try {
-              const dir = path.join(projectDirFor(slug), "_archive");
-              if (!dirExists(dir)) continue;
-              for (const name of fs.readdirSync(dir)) {
-                if (!name.endsWith(".md")) continue;
-                const f = path.join(dir, name);
-                try {
-                  const text = fs.readFileSync(f, "utf8");
-                  const parsed = parseMarkdownEntries(text, "topic");
-                  if (parsed && parsed.length) archivedCount += parsed.length;
-                  else {
-                    const m = text.match(/^## /gm);
-                    if (m) archivedCount += m.length;
-                  }
-                } catch {}
-              }
-            } catch {}
-          }
-        } catch { archivedCount = 0; }
-        let dream = null;
-        try { dream = readDreamConfig(); } catch { dream = defaultDreamConfig(); }
-        let health = null;
-        try {
-          health = getMemoryHealth({});
-        } catch {}
-        if (!health) {
-          health = { total: totalMemories, pinnedCount: 0, staleCount: 0, brokenLinks: [], isolatedCount: 0, ceilingStatus: "ok", brokenCount: 0 };
-        }
-        return { ok: true, currentProjectSlug, migratedCount, totalMemories, projects, dbSizeBytes, dbSizeMb, vectorCount, staleVectorCount, worktreeMemoryCount, archivedCount, dream, health };
-      } finally {
-        db.close();
-      }
-    } catch (e) {
-      return { ok: false, error: e.message || String(e) };
-    }
+        const owners = assertProjectRowsBound(db, slug, worktreeId, root);
+        const predicate = `project_slug = ? AND ${projectVisibleScope()} AND ${projectOwnersFilter('project_root', owners)}`;
+        const params = [slug, worktreeId, ...owners];
+        const totalMemories = Number(db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE ${predicate}`).get(...params).c);
+        const byModule = { constraints: 0, architecture: 0, pitfalls: 0, topics: 0 };
+        for (const row of db.prepare(`SELECT module, COUNT(*) AS c FROM memories WHERE ${predicate} GROUP BY module`).all(...params)) byModule[String(row.module)] = Number(row.c);
+        const updated = db.prepare(`SELECT MAX(updated_at) AS m FROM memories WHERE ${predicate}`).get(...params);
+        const worktreeMemoryCount = Number(db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE ${predicate} AND memory_scope='worktree'`).get(...params).c);
+        const vectorCount = Number(db.prepare(`SELECT COUNT(*) AS c FROM memory_vectors v JOIN memories m ON m.id=v.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)}`).get(...params).c);
+        const meta = readMetaFor(slug);
+        const projects = [{ slug, title: meta?.title || path.basename(root), projectRoot: root, total: totalMemories, byModule, updatedAt: updated?.m || meta?.updatedAt || null }];
+        const health = getMemoryHealth({ projectRoot: args.projectRoot });
+        return { ok: true, currentProjectSlug: slug, totalMemories, projects, vectorCount, worktreeMemoryCount, health };
+      } finally { db.close(); }
+    } catch (e) { return { ok: false, error: e.message || String(e) }; }
   }
   function listMemories(args = {}) {
     try {
+      rejectGlobalScope(args);
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
       const limit = Number(args.limit) > 0 ? Math.min(500, Math.floor(Number(args.limit))) : 50;
       const module = args.module && args.module !== "all" ? String(args.module) : "all";
       const query = typeof args.query === "string" ? args.query : "";
       // Resolve scopeFilter: auto/shared/worktree/global/all
       const rawScopeFilter = String(args.scopeFilter || args.scope || "auto").toLowerCase();
-      const scopeFilter = ["auto","shared","worktree","global","all"].includes(rawScopeFilter) ? rawScopeFilter : "auto";
+      const scopeFilter = ["auto","shared","worktree","all"].includes(rawScopeFilter) ? rawScopeFilter : "auto";
       // For legacy callers that pass scopeFilter explicitly as separate param "scope", treat same.
       const ctxForFilter = args.projectRoot ? resolveWorktreeContext(String(args.projectRoot)) : null;
       const worktreeIdForFilter = ctxForFilter && ctxForFilter.worktreeId ? ctxForFilter.worktreeId : "";
-      const isLinkedForFilter = !!(ctxForFilter && ctxForFilter.isLinkedWorktree);
-      let slug = null;
-      if (scopeFilter === "global") slug = GLOBAL_SLUG;
-      else slug = resolveSlug(args.projectSlug ? String(args.projectSlug) : null, args.projectRoot ? String(args.projectRoot) : null);
-      const autoIncludeGlobal = args.includeGlobal === true || (args.includeGlobal !== false && (isLinkedForFilter || !slug));
-      const syncGlobal = scopeFilter === "global" || scopeFilter === "all" || (scopeFilter === "auto" && (slug === GLOBAL_SLUG || autoIncludeGlobal));
-      // Auto-sync Markdown edits before reading.
-      try {
-        if (slug && (slug !== GLOBAL_SLUG || syncGlobal)) syncFromMarkdownIfChanged(slug);
-        if (syncGlobal && slug !== GLOBAL_SLUG) syncFromMarkdownIfChanged(GLOBAL_SLUG);
-      } catch {}
+      // A failed ownership check must not return stale or cross-project data.
+      syncFromMarkdownIfChanged(slug, null, worktreeIdForFilter, args.projectRoot);
       const db = openDb();
       try {
+        const expectedRoot = canonicalProjectPath(args.projectRoot);
+        const owners = assertProjectRowsBound(db, slug, worktreeIdForFilter, expectedRoot);
         const buildFilter = () => {
-          const conds = [];
-          const params = [];
+          const conds = ["project_slug = ?", "LOWER(COALESCE(memory_scope, 'shared')) != 'global'", projectOwnersFilter("project_root", owners)];
+          const params = [slug, ...owners];
           const filt = scopeFilter;
-          if (filt === "global") {
-            conds.push("project_slug = ?");
-            params.push(GLOBAL_SLUG);
-          } else if (filt === "shared") {
-            if (slug) {
-              conds.push("project_slug = ? AND (memory_scope='shared' OR memory_scope IS NULL OR memory_scope='')");
-              params.push(slug);
-            } else {
-              conds.push("(memory_scope='shared' OR memory_scope IS NULL)");
-            }
+          if (filt === "shared") {
+            conds.push("(memory_scope='shared' OR memory_scope IS NULL OR memory_scope='')");
           } else if (filt === "worktree") {
-            if (slug) {
-              conds.push("project_slug = ? AND memory_scope='worktree' AND worktree_id=?");
-              params.push(slug, worktreeIdForFilter);
-            } else {
-              conds.push("memory_scope='worktree' AND worktree_id=?");
-              params.push(worktreeIdForFilter);
-            }
-          } else if (filt === "all") {
-            if (slug && slug !== GLOBAL_SLUG) {
-              conds.push("(project_slug = ? OR project_slug = ?)");
-              params.push(slug, GLOBAL_SLUG);
-            } else if (slug === GLOBAL_SLUG) {
-              conds.push("project_slug = ?");
-              params.push(GLOBAL_SLUG);
-            }
-          } else { // auto
-            if (slug) {
-              if (slug === GLOBAL_SLUG) {
-                conds.push("project_slug = ?");
-                params.push(GLOBAL_SLUG);
-              } else {
-                const incG = autoIncludeGlobal;
-                if (incG) {
-                  conds.push("((project_slug = ? AND (memory_scope='shared' OR memory_scope IS NULL OR memory_scope='' OR (memory_scope='worktree' AND worktree_id=?))) OR project_slug=?)");
-                  params.push(slug, worktreeIdForFilter, GLOBAL_SLUG);
-                } else {
-                  conds.push("project_slug = ? AND (memory_scope='shared' OR memory_scope IS NULL OR memory_scope='' OR (memory_scope='worktree' AND worktree_id=?))");
-                  params.push(slug, worktreeIdForFilter);
-                }
-              }
-            } else if (!autoIncludeGlobal) { conds.push("project_slug != ?"); params.push(GLOBAL_SLUG); }
+            conds.push("memory_scope='worktree' AND worktree_id=?");
+            params.push(worktreeIdForFilter);
+          } else if (filt === "auto" || filt === "all") {
+            conds.push("(memory_scope='shared' OR memory_scope IS NULL OR memory_scope='' OR (memory_scope='worktree' AND worktree_id=?))");
+            params.push(worktreeIdForFilter);
           }
           if (module !== "all") {
             conds.push("module = ?");
             params.push(module);
           }
-          return { conds, params, filt, worktreeId: worktreeIdForFilter, isLinked: isLinkedForFilter, autoIncludeGlobal };
+          if (args.id != null && String(args.id).trim()) {
+            conds.push("id = ?");
+            params.push(String(args.id));
+          }
+          return { conds, params, filt, worktreeId: worktreeIdForFilter };
         };
         function rowMatchesScope(row, filterInfo) {
           const r = row;
+          if (args.id != null && String(args.id).trim() && String(r.id) !== String(args.id)) return false;
+          if (!rowProjectMatches(r, expectedRoot)) return false;
           const ps = r.project_slug;
           const ms = r.memory_scope || "shared";
           const wid = r.worktree_id || "";
           const filt = filterInfo.filt;
           const curWid = filterInfo.worktreeId;
           const slugVal = slug;
-          if (filt === "global") return ps === GLOBAL_SLUG;
+          if (ps !== slugVal || String(ms).toLowerCase() === "global") return false;
           if (filt === "shared") {
             if (ps !== slugVal) return false;
             return ms === "shared" || ms === "" || ms == null;
@@ -1984,16 +2015,8 @@ function createMemoryVault(opts = {}) {
             if (ps !== slugVal) return false;
             return ms === "worktree" && wid === curWid;
           }
-          if (filt === "all") {
-            return ps === slugVal || ps === GLOBAL_SLUG;
-          }
+          if (filt === "all") return ms === "shared" || ms === "" || ms == null || (ms === "worktree" && wid === curWid);
           // auto
-          if (slugVal === GLOBAL_SLUG) {
-            if (ps === GLOBAL_SLUG) return true;
-            return false;
-          }
-          if (!slugVal) return ps !== GLOBAL_SLUG || filterInfo.autoIncludeGlobal;
-          if (ps === GLOBAL_SLUG) return filterInfo.autoIncludeGlobal;
           if (ps === slugVal) {
             if (ms === "shared" || ms === "" || ms == null) return true;
             if (ms === "worktree" && wid === curWid) return true;
@@ -2025,7 +2048,7 @@ function createMemoryVault(opts = {}) {
             .map((t) => '"' + String(t).replace(/"/g, '""') + '"')
             .join(" OR ");
           try {
-            const qualified = whereSuffix.replace(/project_slug/g, "m.project_slug").replace(/memory_scope/g, "m.memory_scope").replace(/worktree_id/g, "m.worktree_id").replace(/\bmodule\b/g, "m.module");
+            const qualified = whereSuffix.replace(/project_slug/g, "m.project_slug").replace(/project_root/g, "m.project_root").replace(/memory_scope/g, "m.memory_scope").replace(/worktree_id/g, "m.worktree_id").replace(/\bmodule\b/g, "m.module").replace(/\bid\b/g, "m.id");
             const filterInfoForFts = buildFilter();
             const rows = db
               .prepare("SELECT m.*, bm25(memories_fts) AS _rank FROM memories_fts JOIN memories m ON m.id = memories_fts.id WHERE memories_fts MATCH ?" + (whereSuffix ? qualified : ""))
@@ -2079,8 +2102,8 @@ function createMemoryVault(opts = {}) {
             const isLegacy = activeId === "mlx-community/embeddinggemma-2-8bit";
             let vrows = [];
             try {
-              if (isLegacy) vrows = db.prepare("SELECT * FROM memory_vectors WHERE model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND dim = ?").all(dim);
-              else vrows = db.prepare("SELECT * FROM memory_vectors WHERE model_id = ? AND dim = ?").all(activeId, dim);
+              if (isLegacy) vrows = db.prepare(`SELECT v.* FROM memory_vectors v JOIN memories m ON m.id=v.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)} AND v.model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND v.dim = ?`).all(slug, worktreeIdForFilter, ...owners, dim);
+              else vrows = db.prepare(`SELECT v.* FROM memory_vectors v JOIN memories m ON m.id=v.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)} AND v.model_id = ? AND v.dim = ?`).all(slug, worktreeIdForFilter, ...owners, activeId, dim);
             } catch {
               vrows = [];
             }
@@ -2139,7 +2162,7 @@ function createMemoryVault(opts = {}) {
             if (!touched.has(item.projectSlug)) touched.set(item.projectSlug, new Set());
             touched.get(item.projectSlug).add(item.module);
           }
-          for (const [project, modules] of touched) rewriteModules(db, project, modules);
+          for (const [project, modules] of touched) rewriteModules(db, project, modules, null, null, worktreeIdForFilter);
         }
         return { ok: true, projectSlug: slug, items: hits };
       } finally {
@@ -2152,14 +2175,19 @@ function createMemoryVault(opts = {}) {
   function consolidateMemories(args = {}) {
     let lock;
     try {
+      rejectGlobalScope(args);
       const slug = resolveSlug(args.projectSlug, args.projectRoot);
-      if (!slug) return { ok: false, error: "projectRoot or projectSlug required" };
+      const worktreeId = projectWorktreeId(args.projectRoot);
       lock = requireDreamTxLock();
-      syncFromMarkdownIfChanged(slug, lock);
+      syncFromMarkdownIfChanged(slug, lock, worktreeId, args.projectRoot);
       const db = openDb();
       try {
-        const sourceRows = db.prepare("SELECT * FROM memories WHERE project_slug=? ORDER BY created_at ASC, id ASC").all(slug)
-          .filter((row) => args.excludeProtected !== true || !isDreamProtectedRow(row));
+        // Consolidation is always an automated rewrite/removal operation,
+        // including when an agent explicitly invokes memory_consolidate.
+        // Pinned/core and secret-bearing entries remain available to search,
+        // but can only be changed through an explicit human edit/rollback.
+        const sourceRows = db.prepare(`SELECT * FROM memories WHERE project_slug=? AND ${projectVisibleScope()} ORDER BY created_at ASC, id ASC`).all(slug, worktreeId)
+          .filter((row) => !isDreamProtectedRow(row));
         const items = sourceRows.map(rowToItem);
         const originals = new Map(sourceRows.map((row) => [row.id, row]));
         const roots = new Map(sourceRows.map((row) => [row.id, String(row.project_root || "")]));
@@ -2167,7 +2195,7 @@ function createMemoryVault(opts = {}) {
         const retainedExactPairs = new Set();
         const retainedReferencedPairs = new Set();
         let retainedExactConflicts = 0;
-        const referenced = args.exactOnly === true ? referencedDreamIds(db) : new Set();
+        const referenced = args.exactOnly === true ? referencedDreamIds(db, slug, worktreeId) : new Set();
         const normalizeExact = (value) => String(value ?? "").replace(/\r\n/g, "\n");
         const overlaps = (sim, a, b) => {
           if (args.exactOnly !== true) return sim.cosine >= 0.82 || sim.titleSim >= 0.75 || sim.lexicalSim >= 0.60;
@@ -2204,22 +2232,24 @@ function createMemoryVault(opts = {}) {
         let mergedCount = 0;
         if (!pairs.length) return { ok: true, mergedCount: 0, retainedExactDuplicates: retainedExactPairs.size, retainedReferencedDuplicates: retainedReferencedPairs.size, items: [] };
         const affected = new Set(pairs.flatMap((p) => [active.get(p.id).module, active.get(p.mergeId).module]));
-        const currentRows = db.prepare("SELECT * FROM memories WHERE project_slug=?").all(slug);
+        const currentRows = db.prepare(`SELECT * FROM memories WHERE project_slug=? AND ${projectVisibleScope()}`).all(slug, worktreeId);
         const journal = { version: 2, kind: "consolidate", txId: crypto.randomUUID(), createdAt: nowIso(), clusters: [{
-          projectSlug: slug, modules: [...affected],
+          projectSlug: slug, scopeWorktreeId: worktreeId, modules: [...affected],
           deletedWorktreeHints: [...new Set(currentRows.map(normalizedWorktreeFromRow).filter(Boolean))],
-          markdownPreImages: [...affected].flatMap((mod) => captureMarkdownPreImages(slug, mod, currentRows)), proposals: [],
+          markdownPreImages: [...affected].flatMap((mod) => captureMarkdownPreImages(slug, mod, currentRows, worktreeId)), proposals: [],
         }] };
         let committed = false;
         db.exec("PRAGMA synchronous = FULL");
         db.exec("BEGIN IMMEDIATE");
         try {
-          const checkLiveStmt = db.prepare(args.exactOnly === true ? "SELECT * FROM memories WHERE id = ?" : "SELECT version, updated_at, content_hash FROM memories WHERE id = ?");
-          const liveReferences = args.exactOnly === true ? referencedDreamIds(db) : new Set();
+          const checkLiveStmt = db.prepare("SELECT * FROM memories WHERE id = ?");
+          const liveReferences = args.exactOnly === true ? referencedDreamIds(db, slug, worktreeId) : new Set();
           const rowStillMatchesSnapshot = (snapItem) => {
-            if (changed.has(snapItem.id)) return true;
             const live = checkLiveStmt.get(snapItem.id);
-            if (!live) return false;
+            // Recheck protection after BEGIN IMMEDIATE, immediately before a
+            // merge/delete. A tag edit racing the candidate scan must win.
+            if (!live || isDreamProtectedRow(live) || isAutoEvolveProtectedItem(snapItem)) return false;
+            if (changed.has(snapItem.id)) return true;
             if (args.exactOnly === true) return !isDreamProtectedRow(live) && dreamRowFingerprint(live) === dreamRowFingerprint(originals.get(snapItem.id));
             return Number(live.version) === Number(snapItem.version)
               && String(live.updated_at || "") === String(snapItem.updatedAt || "")
@@ -2302,29 +2332,46 @@ function createMemoryVault(opts = {}) {
   function rollbackMemory(args = {}) {
     let rbTxLock = null;
     try {
+      rejectGlobalScope(args);
       const slug = resolveSlug(args.projectSlug, args.projectRoot);
-      if (!slug || !args.id) return { ok: false, error: "projectRoot or projectSlug and id required" };
+      const worktreeId = projectWorktreeId(args.projectRoot);
+      if (!args.id) return { ok: false, error: "id required" };
       rbTxLock = requireDreamTxLock();
-      syncFromMarkdownIfChanged(slug, rbTxLock);
+      syncFromMarkdownIfChanged(slug, rbTxLock, worktreeId, args.projectRoot);
       const db = openDb();
       try {
-        const row = db.prepare("SELECT * FROM memories WHERE project_slug=? AND id=?").get(slug, String(args.id));
-        if (!row) return { ok: false, error: "memory not found: " + args.id };
-        const current = rowToItem(row);
-        const matches = args.revisionId != null
-          ? current.history.filter((entry) => entry.revisionId === args.revisionId)
-          : args.targetVersion != null
-            ? current.history.filter((entry) => entry.version === Number(args.targetVersion))
-            : current.history.slice(-1);
-        if (matches.length > 1) return { ok: false, error: "ambiguous history version; revisionId required" };
-        const target = matches[0];
-        if (!target) return { ok: false, error: "history version not found" };
-        if (containsSecret(target.title) || containsSecret(target.content)) return { ok: false, error: SECRET_ERROR };
-        const item = { ...current, title: target.title, content: target.content, agent: target.agent,
-          version: current.version + 1, updatedAt: nowIso(), history: archiveRevision(current, "rollback") };
-        upsertRow(db, { ...item, projectRoot: row.project_root });
-        db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
-        rewriteModules(db, slug, [item.module]);
+        db.exec("BEGIN IMMEDIATE");
+        let item;
+        let target;
+        try {
+          // Read and check protection in the same transaction as the write so
+          // an agent rollback cannot race a human pin/core tag change.
+          const row = db.prepare(`SELECT * FROM memories WHERE project_slug=? AND id=? AND ${projectVisibleScope()}`).get(slug, String(args.id), worktreeId);
+          if (!row) { db.exec("ROLLBACK"); return { ok: false, error: "memory not found: " + args.id }; }
+          if (args.rejectProtectedRollback === true && isDreamProtectedRow(row)) {
+            db.exec("ROLLBACK");
+            return { ok: false, error: "protected memory requires a human edit" };
+          }
+          const current = rowToItem(row);
+          const matches = args.revisionId != null
+            ? current.history.filter((entry) => entry.revisionId === args.revisionId)
+            : args.targetVersion != null
+              ? current.history.filter((entry) => entry.version === Number(args.targetVersion))
+              : current.history.slice(-1);
+          if (matches.length > 1) { db.exec("ROLLBACK"); return { ok: false, error: "ambiguous history version; revisionId required" }; }
+          target = matches[0];
+          if (!target) { db.exec("ROLLBACK"); return { ok: false, error: "history version not found" }; }
+          if (containsSecret(target.title) || containsSecret(target.content)) { db.exec("ROLLBACK"); return { ok: false, error: SECRET_ERROR }; }
+          item = { ...current, title: target.title, content: target.content, agent: target.agent,
+            version: current.version + 1, updatedAt: nowIso(), history: archiveRevision(current, "rollback") };
+          upsertRow(db, { ...item, projectRoot: row.project_root });
+          db.prepare("DELETE FROM memory_vectors WHERE id=?").run(item.id);
+          db.exec("COMMIT");
+        } catch (e) {
+          try { db.exec("ROLLBACK"); } catch {}
+          throw e;
+        }
+        rewriteModules(db, slug, [item.module], null, null, worktreeId);
         touchProject(slug, item.updatedAt);
         triggerBackgroundEmbedding(item.id, item.title, item.content);
         return { ok: true, action: "rolled-back", restoredFromVersion: target.version, restoredFromRevisionId: target.revisionId, item };
@@ -2354,6 +2401,10 @@ function createMemoryVault(opts = {}) {
     return String(v);
   }
   function migrateFromPowerContext(args = {}) {
+    // The legacy importer mixes global and unrelated source scopes. Preserve
+    // the existing data until project ownership can be verified explicitly.
+    return { ok: false, error: "cross-project migration is unavailable" };
+    /* istanbul ignore next -- retained as historical compatibility code */
     try {
       const dbPath = args.dbPath ? String(args.dbPath) : path.join(homeDir, "Library", "Application Support", "powercontext", "powercontext.db");
       const force = Boolean(args.force);
@@ -2631,10 +2682,11 @@ function createMemoryVault(opts = {}) {
   }
   function ensureProject(args = {}) {
     try {
+      rejectGlobalScope(args);
       const slug = resolveSlug(args.projectSlug ? String(args.projectSlug) : null, args.projectRoot ? String(args.projectRoot) : null);
       if (!slug) return { ok: false, error: "projectRoot or projectSlug required" };
-      const existed = dirExists(projectDirFor(slug));
-      const meta = ensureProjectVault(slug, { title: args.title, projectRoot: args.projectRoot ? String(args.projectRoot) : null });
+      const existed = MODULES.some(module => fileExists(moduleFileFor(slug, module)));
+      const meta = ensureProjectVault(slug, { title: args.title, projectRoot: canonicalProjectPath(args.projectRoot) });
       return { ok: true, slug, projectSlug: slug, created: !existed, meta };
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
@@ -2644,30 +2696,39 @@ function createMemoryVault(opts = {}) {
     const targetModelId = opts && typeof opts === "object" ? (opts.targetModelId || null) : null;
     let queued = 0;
     try {
+      rejectGlobalScope(opts);
+      const slug = resolveSlug(opts.projectSlug, opts.projectRoot);
       const health = getEmbedHealthSync();
       const activeId = targetModelId || health.modelId || "local";
       const activeDim = health.dim || null;
       const db = openDb();
       try {
-        const all = db.prepare("SELECT m.id, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id = m.id").all();
+        const worktreeId = projectWorktreeId(opts.projectRoot);
+        const owners = assertProjectRowsBound(db, slug, worktreeId, canonicalProjectPath(opts.projectRoot));
+        const all = db.prepare(`SELECT m.id, v.model_id AS v_model, v.dim AS v_dim FROM memories m LEFT JOIN memory_vectors v ON v.id=m.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)}`).all(slug, worktreeId, ...owners);
         queued = all.filter((r) => needsReindexRow(r, activeId, activeDim)).length;
       } finally {
         db.close();
       }
-    } catch {}
-    const promise = triggerBatchEmbedding({ targetModelId });
+    } catch (error) { return { ok: false, error: error.message || String(error) }; }
+    const promise = triggerBatchEmbedding({ targetModelId, projectRoot: opts.projectRoot, projectSlug: opts.projectSlug });
     return { ok: true, queued, promise };
   }
   function promoteWorktreeMemory(args = {}) {
+    let txLock = null;
     try {
+      rejectGlobalScope(args);
+      const slug = resolveSlug(args.projectSlug, args.projectRoot);
+      const worktreeId = projectWorktreeId(args.projectRoot);
       const id = args.id ? String(args.id) : null;
       if (!id) return { ok: false, error: "id required" };
+      txLock = requireDreamTxLock();
+      syncFromMarkdownIfChanged(slug, txLock, worktreeId, args.projectRoot);
       const db = openDb();
       try {
-        const row = db.prepare("SELECT * FROM memories WHERE id=?").get(id);
+        const row = db.prepare("SELECT * FROM memories WHERE id=? AND project_slug=? AND memory_scope='worktree' AND worktree_id=?").get(id, slug, worktreeId);
         if (!row) return { ok: false, error: "memory not found" };
         if ((row.memory_scope || "shared") !== "worktree") return { ok: false, error: "memory is not worktree scoped" };
-        const slug = row.project_slug;
         const mod = row.module;
         const wid = row.worktree_id || "";
         db.exec("BEGIN");
@@ -2675,23 +2736,23 @@ function createMemoryVault(opts = {}) {
           db.prepare("UPDATE memories SET memory_scope='shared', worktree_id='', branch_name='' WHERE id=?").run(id);
           db.exec("COMMIT");
         } catch (e) { db.exec("ROLLBACK"); throw e; }
-        try { rewriteModules(db, slug, [mod]); } catch {}
+        try { rewriteModules(db, slug, [mod], null, [wid], worktreeId); } catch {}
         try { touchProject(slug, nowIso()); } catch {}
         const updated = db.prepare("SELECT * FROM memories WHERE id=?").get(id);
         return { ok: true, promoted: true, item: rowToItem(updated), fromWorktreeId: wid };
       } finally { db.close(); }
     } catch (e) { return { ok: false, error: e.message || String(e) }; }
+    finally { releaseDreamTxLock(txLock); }
   }
   function resolveWorktreeContextLocal(cwd) {
     return resolveWorktreeContext(cwd);
   }
   function ensureProjectMemoryLink(projectRoot) {
     try {
-      if (!projectRoot) return { ok: false, error: "projectRoot required" };
+      resolveSlug(null, projectRoot);
       const rawRoot = path.resolve(String(projectRoot));
-      const ctx = resolveWorktreeContext(rawRoot);
-      const canonRoot = ctx.canonicalProjectRoot || rawRoot;
-      const slug = resolveVaultSlug(canonRoot);
+      const canonRoot = canonicalProjectPath(rawRoot);
+      const slug = resolveVaultSlug(rawRoot);
       const vaultPath = projectDirFor(slug);
       ensureProjectVault(slug, { title: path.basename(canonRoot), projectRoot: canonRoot });
       const linkDir = path.join(rawRoot, ".t3");
@@ -2708,18 +2769,10 @@ function createMemoryVault(opts = {}) {
           let canonResolved = resolvedTarget;
           try { canonResolved = fs.realpathSync(resolvedTarget); } catch { canonResolved = path.resolve(resolvedTarget); }
           if (canonResolved === canonVault || resolvedTarget === vaultPath) linked = true;
-          else {
-            fs.unlinkSync(linkPath);
-            fs.symlinkSync(vaultPath, linkPath, "dir");
-            linked = true;
-          }
+          else return { ok: false, error: "existing project memory link points elsewhere", linkPath };
         } else if (st.isDirectory()) {
           linked = false;
-        } else {
-          fs.unlinkSync(linkPath);
-          fs.symlinkSync(vaultPath, linkPath, "dir");
-          linked = true;
-        }
+        } else return { ok: false, error: "existing project memory path is not a directory", linkPath };
       } catch (e) {
         if (e && e.code === "ENOENT") {
           fs.symlinkSync(vaultPath, linkPath, "dir");
@@ -2940,6 +2993,9 @@ function createMemoryVault(opts = {}) {
     }
   }
   function runHygiene(opts = {}) {
+    // The old pass can mutate every project. Preserve data rather than guess.
+    return { ok: false, error: "cross-project hygiene is unavailable" };
+    /* istanbul ignore next -- retained as historical compatibility code */
     let dreamLock = null;
     try {
       const o = opts && typeof opts === "object" ? opts : {};
@@ -3285,12 +3341,14 @@ function createMemoryVault(opts = {}) {
       row.memory_scope, row.worktree_id, row.branch_name, row.version, row.history_json, row.supersedes_id,
       row.content_hash, row.hit_count, row.last_recalled_at]);
   }
-  function dreamRowPinned(row) {
-    const tags = rowToItem(row).tags;
-    return tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase()));
+  function isAutoEvolveProtectedItem(item) {
+    const tags = Array.isArray(item && item.tags) ? item.tags : [];
+    return tags.some((tag) => ["pinned", "core"].includes(String(tag).trim().toLowerCase())) ||
+      containsSecret(item && item.title) || containsSecret(item && item.content) ||
+      tags.some((tag) => containsSecret(tag));
   }
   function isDreamProtectedRow(row) {
-    return dreamRowPinned(row) || containsSecret(row && row.title) || containsSecret(row && row.content) || containsSecret(row && row.tags_json);
+    return isAutoEvolveProtectedItem(rowToItem(row)) || containsSecret(row && row.tags_json);
   }
   function dreamArchiveHistorySafe(row) {
     try {
@@ -3300,8 +3358,9 @@ function createMemoryVault(opts = {}) {
   }
   // Restrict automatic removal when another in-vault memory depends on an
   // ID, title, module or supersedes edge. This mirrors health's link syntax.
-  function referencedDreamIds(db) {
-    const rows = db.prepare("SELECT id,title,content,module,supersedes_id FROM memories").all();
+  function referencedDreamIds(db, slug, worktreeId = "") {
+    if (!slug || slug === GLOBAL_SLUG) throw new Error("project memory scope required");
+    const rows = db.prepare(`SELECT id,title,content,module,supersedes_id FROM memories WHERE project_slug=? AND ${projectVisibleScope()}`).all(slug, worktreeId);
     const targets = new Set();
     for (const row of rows) {
       for (const link of extractMemoryLinks(String(row.title || "") + "\n" + String(row.content || ""))) targets.add(link);
@@ -5497,6 +5556,9 @@ function createMemoryVault(opts = {}) {
   function getMemoryHealth(opts = {}) {
     try {
       const o = opts && typeof opts === "object" ? opts : {};
+      rejectGlobalScope(o);
+      const slug = resolveSlug(o.projectSlug, o.projectRoot);
+      const worktreeId = projectWorktreeId(o.projectRoot);
       const staleDays = o.staleDays != null ? Number(o.staleDays) : 60;
       let nowMs = Date.now();
       if (o.now != null) {
@@ -5507,7 +5569,8 @@ function createMemoryVault(opts = {}) {
       const db = openDb();
       let rows = [];
       try {
-        rows = db.prepare("SELECT id, title, module, content, tags_json, updated_at, created_at FROM memories").all();
+        const owners = assertProjectRowsBound(db, slug, worktreeId, canonicalProjectPath(o.projectRoot));
+        rows = db.prepare(`SELECT id,title,module,content,tags_json,updated_at,created_at FROM memories WHERE project_slug=? AND ${projectVisibleScope()} AND ${projectOwnersFilter('project_root', owners)}`).all(slug, worktreeId, ...owners);
       } finally { db.close(); }
       const total = rows.length;
       const titleSet = new Set(rows.map((r) => String(r.title || "").trim()));
@@ -5555,6 +5618,9 @@ function createMemoryVault(opts = {}) {
     }
   }
   function importHostMemories(opts = {}) {
+    // Host-wide text has no proven project binding, so never import it silently.
+    return { ok: false, error: "unattributed host memory import is unavailable" };
+    /* istanbul ignore next -- retained as historical compatibility code */
     try {
       const o = opts && typeof opts === "object" ? opts : {};
       const scanRoots = o.scanRoots;
@@ -5708,39 +5774,30 @@ function createMemoryVault(opts = {}) {
       return { ok: false, error: e.message || String(e), scanned: 0, imported: 0, skipped: 0, byHost: {} };
     }
   }
-  function getStats() {
-    let totalMemories = 0;
-    let syncedVectors = 0;
-    let activeModelId = "local";
+  function getStats(opts = {}) {
     try {
+      rejectGlobalScope(opts);
+      const slug = resolveSlug(opts.projectSlug, opts.projectRoot);
+      const worktreeId = projectWorktreeId(opts.projectRoot);
       const health = getEmbedHealthSync();
-      activeModelId = health.modelId || "local";
-      const activeDim = health.dim || null;
-      const isLegacy = activeModelId === "mlx-community/embeddinggemma-2-8bit";
+      const activeModelId = health.modelId || "local", activeDim = health.dim || null;
       const db = openDb();
       try {
-        const t = db.prepare("SELECT COUNT(*) AS c FROM memories").get();
-        totalMemories = t ? Number(t.c) : 0;
-        if (isLegacy) {
-          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND dim=768").get();
-          syncedVectors = s ? Number(s.c) : 0;
-        } else if (activeDim) {
-          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id=? AND dim=?").get(activeModelId, activeDim);
-          syncedVectors = s ? Number(s.c) : 0;
-        } else {
-          const s = db.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model_id=?").get(activeModelId);
-          syncedVectors = s ? Number(s.c) : 0;
-        }
-      } finally {
-        db.close();
-      }
-    } catch {
-      return { ok: false, error: "记忆库统计不可用，请检查索引数据库" };
+        const owners = assertProjectRowsBound(db, slug, worktreeId, canonicalProjectPath(opts.projectRoot));
+        const params = [slug, worktreeId, ...owners];
+        const totalMemories = Number(db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE project_slug=? AND ${projectVisibleScope()} AND ${projectOwnersFilter('project_root', owners)}`).get(...params).c);
+        const base = `SELECT COUNT(*) AS c FROM memory_vectors v JOIN memories m ON m.id=v.id WHERE m.project_slug=? AND ${projectVisibleScope('m')} AND ${projectOwnersFilter('m.project_root', owners)}`;
+        let row;
+        if (activeModelId === "mlx-community/embeddinggemma-2-8bit") row = db.prepare(base + " AND v.model_id IN ('mlx-community/embeddinggemma-2-8bit','local','powercontext-legacy') AND v.dim=768").get(...params);
+        else if (activeDim) row = db.prepare(base + " AND v.model_id=? AND v.dim=?").get(...params, activeModelId, activeDim);
+        else row = db.prepare(base + " AND v.model_id=?").get(...params, activeModelId);
+        return { ok: true, vectorStats: { totalMemories, syncedVectors: Number(row.c), activeModelId, reindexing: _reindexing } };
+      } finally { db.close(); }
+    } catch (error) {
+      return { ok: false, error: String(error.message || "").startsWith("项目记忆归属无法确认") ? error.message : "记忆库统计不可用，请检查项目和索引数据库" };
     }
-    return { ok: true, vectorStats: { totalMemories, syncedVectors, activeModelId, reindexing: _reindexing } };
   }
-  // P1-B: vault 初始化时恢复遗留意图日志
-  recoverPendingDreamJournal();
+  // Old multi-project Dream journals are left untouched for explicit review.
   return {
     vaultDir,
     hubDir,
@@ -5758,7 +5815,12 @@ function createMemoryVault(opts = {}) {
     deleteMemory,
     pinToAgentsMd,
     migrateFromPowerContext,
-    syncFromMarkdownIfChanged,
+    syncFromMarkdownIfChanged: (args = {}) => {
+      try {
+        rejectGlobalScope(args);
+        return syncFromMarkdownIfChanged(resolveSlug(args.projectSlug, args.projectRoot), null, projectWorktreeId(args.projectRoot), args.projectRoot);
+      } catch (error) { return { ok: false, error: error.message || String(error) }; }
+    },
     ensureProject,
     resolveProjectSlug: resolveVaultSlug,
     getStats,
@@ -5895,6 +5957,7 @@ module.exports = {
   promoteWorktreeMemory: promoteWorktreeMemoryExport,
   ensureProjectMemoryLink: ensureProjectMemoryLinkExport,
   resolveWorktreeContext: resolveWorktreeContextExport,
+  resolveSessionProjectRoot,
   consolidateMemories,
   rollbackMemory,
   deleteMemory,

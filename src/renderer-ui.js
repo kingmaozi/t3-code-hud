@@ -302,14 +302,17 @@
   }
 
   function getRouteHint() {
+    // The app may keep its hash on /draft/<id> after promoting a draft. In
+    // that case the router's resolved pathname is the current conversation;
+    // use it before falling back to the unchanged hash.
+    try {
+      const rp = getRouterPathname(findTanStackRouter());
+      if (typeof rp === "string" && rp) return rp === "/" ? "__NEW__" : resolvePromotedDraftRoute(rp);
+    } catch {}
     const hash = window.location.hash || "";
     if (hash.startsWith("#/") || hash.length > 1) {
       return resolvePromotedDraftRoute(hash.slice(1));
     }
-    try {
-      const rp = getRouterPathname(findTanStackRouter());
-      if (rp && rp !== "/") return resolvePromotedDraftRoute(rp);
-    } catch {}
     return resolvePromotedDraftRoute(window.location.pathname || "/");
   }
 
@@ -811,6 +814,51 @@
     }
     return null;
   }
+
+  function getHudRemoteProject(request = {}) {
+    const wantedEnv = typeof request.environmentId === "string" ? request.environmentId : "";
+    const wantedThread = typeof request.threadId === "string" ? request.threadId : "";
+    if (!wantedEnv || !wantedThread) return null;
+    const route = String(getRouteHint() || "").split(/[?#]/, 1)[0];
+    const parts = route.split("/").filter(Boolean);
+    let envPart = null;
+    if (parts[0] === "_t3_env_" && parts.length === 3) envPart = parts[1];
+    else if (parts.length === 2 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parts[0])) envPart = parts[0];
+    if (!envPart) return null;
+    let routeEnv;
+    try { routeEnv = decodeURIComponent(envPart); } catch { return null; }
+    if (routeEnv !== wantedEnv || extractLastThreadIdFromHint(route) !== wantedThread) return null;
+    try {
+      const rootEl = document.getElementById("root");
+      const key = rootEl && Object.keys(rootEl).find((name) => name.startsWith("__reactContainer") || name.startsWith("__reactFiber"));
+      let entry = key ? rootEl[key] : null;
+      const ancestors = new Set();
+      while (entry?.return && !entry.stateNode?.current && ancestors.size < 400 && !ancestors.has(entry)) {
+        ancestors.add(entry); entry = entry.return;
+      }
+      if (entry?.return && !entry.stateNode?.current) return null;
+      const committed = entry?.stateNode?.current || entry?.current || entry;
+      const stack = committed ? [committed] : [], seen = new Set();
+      while (stack.length && seen.size < 20000) {
+        const fiber = stack.pop();
+        if (!fiber || seen.has(fiber)) continue;
+        seen.add(fiber);
+        const props = fiber.memoizedProps;
+        const cwd = props?.gitCwd;
+        const absolute = typeof cwd === "string" && (/^\//.test(cwd) || /^[A-Za-z]:[\\\\/]/.test(cwd));
+        const safe = absolute && !/[\u0000-\u001f\u007f]/.test(cwd) && !cwd.split(/[\\\\/]+/).includes("..");
+        if (props?.isServerThread === true && props.environmentId === wantedEnv && props.threadId === wantedThread && safe) {
+          if (getRouteHint() !== route) return null;
+          return { environmentId: wantedEnv, threadId: wantedThread, projectRoot: cwd };
+        }
+        if (fiber.sibling) stack.push(fiber.sibling);
+        if (fiber.child) stack.push(fiber.child);
+      }
+    } catch {}
+    return null;
+  }
+
+  if (typeof window !== "undefined") window.__t3HudRemoteProject = getHudRemoteProject;
 
   function fallbackModelRate(model) {
     const m = String(model || "").trim().toLowerCase();
@@ -1425,7 +1473,7 @@
       weekLeft: "周余",
       graph: "图谱",
       newSession: "新会话",
-      streaming: "生成中...",
+      waitingForOutput: "等待输出...",
       contextCapacity: "上下文容量",
       contextMaxLabel: "模型/上报容量",
       contextMaxSourceLabel: "容量来源",
@@ -1450,10 +1498,10 @@
       lastTurnSpeed: "末轮速度",
       e2eSpeed: "端到端速度 (含首字预填充)",
       turnCacheRate: "本轮缓存命中率",
-      cachePendingShort: "待上报",
-      cachePendingTitle: "等待本轮缓存上报（流式期间上游未提供本轮缓存明细，不回退旧轮）",
-      cachePendingPopover: "等待本轮上报",
-      cachePendingNote: "本轮 / 末次调用 / 会话累计口径不同；流式期间上游未上报时不沿用旧值",
+      cacheSessionShort: "累计缓存",
+      cacheSessionTitle: "本轮缓存用量暂缺；当前显示本会话累计命中率",
+      cacheUnknownTitle: "暂无缓存数据",
+      turnCacheUnavailableNote: "本轮缓存数据暂不可用；顶部显示会话累计命中率（如有）",
       lastCallCacheRate: "最近模型调用（原生记录）",
       mainSessionCacheRate: "主会话累计",
       inclusiveSessionCacheRate: "含子代理累计",
@@ -1503,7 +1551,7 @@
       weekLeft: "Wk",
       graph: "Graph",
       newSession: "New",
-      streaming: "Streaming...",
+      waitingForOutput: "Waiting for output...",
       contextCapacity: "Context Capacity",
       contextMaxLabel: "Model / reported capacity",
       contextMaxSourceLabel: "Source",
@@ -1528,10 +1576,10 @@
       lastTurnSpeed: "Last Turn Speed",
       e2eSpeed: "End-to-end (incl. prefill)",
       turnCacheRate: "This-turn cache hit rate",
-      cachePendingShort: "Pending",
-      cachePendingTitle: "Waiting for this turn's cache report (upstream has not provided this turn's cache details during streaming; not falling back to previous turn)",
-      cachePendingPopover: "Waiting for this turn",
-      cachePendingNote: "Turn / last-call / session totals differ; not reusing previous turn's value before this turn reports",
+      cacheSessionShort: "Session cache",
+      cacheSessionTitle: "Current-turn cache usage is unavailable; showing this chat's cumulative rate",
+      cacheUnknownTitle: "No cache data",
+      turnCacheUnavailableNote: "Current-turn cache data is unavailable; the top bar shows the cumulative rate when available",
       lastCallCacheRate: "Latest model call (native record)",
       mainSessionCacheRate: "Main session total",
       inclusiveSessionCacheRate: "Total incl. subagents",
@@ -1747,6 +1795,7 @@
     }
 
     #t3-hud-topbar {
+      box-sizing: border-box;
       pointer-events: auto;
       -webkit-app-region: no-drag;
       position: fixed;
@@ -1768,6 +1817,25 @@
       max-width: calc(100vw - 80px);
       z-index: 30;
     }
+    #t3-hud-header-tools, #t3-hud-context-control {
+      pointer-events: auto;
+      -webkit-app-region: no-drag;
+      position: fixed;
+      z-index: 30;
+      align-items: center;
+    }
+    #t3-hud-header-tools { display: flex; gap: 4px; height: 32px; }
+    #t3-hud-header-tools.is-compact #t3-hud-branch { display: none; }
+    #t3-hud-context-control { display: inline-flex; justify-content: center; width: 22px; height: 28px; border: 0; padding: 0; background: transparent; color: var(--hud-fg); cursor: pointer; }
+    #t3-hud-header-tools.is-hidden, #t3-hud-context-control.is-hidden { display: none !important; }
+    #t3-hud-quota-rings { display: inline-flex; align-items: center; gap: 4px; }
+    #t3-hud-quota-rings:empty { display: none; }
+    .t3-hud-quota-ring { position: relative; display: inline-flex; flex: 0 0 32px; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; padding: 0; color: var(--hud-fg); background: transparent; cursor: pointer; border-radius: 50%; }
+    .t3-hud-quota-ring:hover, .t3-hud-quota-ring:focus-visible, #t3-hud-context-control:hover, #t3-hud-context-control:focus-visible { background: var(--hud-hover); outline: 2px solid transparent; }
+    .t3-hud-quota-ring > svg { width: 32px; height: 32px; transform: rotate(-90deg); }
+    .t3-hud-provider-logo { position: absolute; display: inline-flex; align-items: center; justify-content: center; width: 12px; height: 12px; font-size: 9px; font-weight: 700; line-height: 1; }
+    .t3-hud-provider-logo svg { width: 100%; height: 100%; }
+    .t3-hud-quota-ring .quota-arc { transition: stroke-dashoffset .25s ease; }
     #t3-hud-topbar.is-hidden {
       display: none !important;
     }
@@ -2473,10 +2541,12 @@
     #t3-hud-root .t3-quota-fill.mid,#t3-hud-root .t3-quota-fill.warn,#t3-hud-root #t3-hud-quota-bar.mid,#t3-hud-root #t3-hud-quota-bar.warn{background:#d97706}#t3-hud-root .t3-quota-val.mid,#t3-hud-root .t3-quota-val.warn,#t3-hud-root #t3-hud-quota.mid,#t3-hud-root #t3-hud-quota.warn{color:#d97706}
     #t3-hud-root .t3-quota-fill.err,#t3-hud-root #t3-hud-quota-bar.err{background:#dc2626}#t3-hud-root .t3-quota-val.err,#t3-hud-root #t3-hud-quota.err{color:#dc2626}
     #t3-hud-root :is(.t3-diff-add,.t3-diff-del,.t3-patch-hunk){color:var(--hud-fg)}#t3-hud-root .t3-diff-add{font-weight:600}#t3-hud-root .t3-diff-del{opacity:.65}
-    #t3-hud-topbar.is-tight .t3-hud-compact-hide{display:none}#t3-hud-topbar.is-mini .t3-hud-metric:not(#t3-hud-cache-item):not(#t3-hud-quota-item):not(#t3-hud-ctx-item),#t3-hud-topbar.is-mini .t3-hud-sep{display:none}#t3-hud-topbar.is-mini{gap:6px}#t3-hud-topbar.is-mini #t3-hud-branch{max-width:54px}#t3-hud-topbar.is-mini #t3-hud-cache-lbl{display:inline;font-size:9px}
-    #t3-hud-root #t3-hud-topbar.has-quota #t3-hud-quota-item{display:inline-flex!important}#t3-hud-root #t3-hud-topbar:not(.has-quota) #t3-hud-quota-item{display:none!important}
-    @media(max-width:639px){#t3-hud-topbar{max-width:306px}#t3-hud-topbar .t3-hud-quota-track{width:18px}#t3-hud-popover{max-height:calc(100dvh - 120px);overflow:auto}}
-    @media(max-width:399px){#t3-hud-topbar.is-mini #t3-hud-git-btn,#t3-hud-topbar.is-mini .t3-hud-quota-track{display:none}#t3-hud-topbar.is-mini{gap:5px}}
+    #t3-hud-topbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; max-width: none; }
+    #t3-hud-topbar::-webkit-scrollbar { display: none; }
+    #t3-hud-topbar.is-tight .t3-hud-metric { padding: 0 3px; }
+    #t3-hud-topbar.is-mini .t3-hud-metric { padding: 0 2px; }
+    #t3-hud-topbar.is-mini .t3-hud-sep { margin: 0; }
+    @media(max-width:639px){#t3-hud-popover{max-height:calc(100dvh - 120px);overflow:auto}}
     @media(prefers-reduced-motion:reduce){#t3-hud-root *,#t3-hud-root *:before,#t3-hud-root *:after{animation:none!important;transition:none!important}}
 
   `;
@@ -2498,35 +2568,29 @@
         <span class="lbl" id="t3-hud-cache-lbl">本轮缓存</span>
         <span id="t3-hud-cache" class="val">--%</span>
       </div>
-      <span class="t3-hud-sep t3-hud-compact-hide"></span>
-      <div class="t3-hud-metric t3-hud-compact-hide" data-hud-hover="stats">
+      <span class="t3-hud-sep"></span>
+      <div class="t3-hud-metric" data-hud-hover="stats">
         <span id="t3-hud-tokens" class="val">0 tok</span>
       </div>
       <span class="t3-hud-sep"></span>
       <div class="t3-hud-metric" data-hud-hover="stats">
         <span id="t3-hud-cost" class="val">$0.00</span>
       </div>
-      <span id="t3-hud-quota-sep" class="t3-hud-sep" style="display:none"></span>
-      <div id="t3-hud-quota-item" class="t3-hud-metric" data-hud-hover="stats" style="display:none">
-        <span class="lbl" id="t3-hud-week-lbl">周余</span>
-        <span class="t3-hud-quota-track" aria-hidden="true"><span id="t3-hud-quota-bar" style="display:block;width:0%"></span></span>
-        <span id="t3-hud-quota" class="val">--%</span>
-      </div>
-      <span class="t3-hud-sep"></span>
-      <div id="t3-hud-ctx-item" class="t3-hud-metric" data-hud-hover="context" style="gap:4.5px">
-        <svg class="t3-hud-ring-svg" viewBox="0 0 14 14" aria-hidden="true">
-          <circle cx="7" cy="7" r="5.2" fill="none" stroke="color-mix(in srgb, var(--hud-fg) 16%, transparent)" stroke-width="2.1" />
-          <circle id="t3-hud-ring-arc" cx="7" cy="7" r="5.2" fill="none" stroke="var(--hud-fg)" stroke-width="2.1" stroke-linecap="round" stroke-dasharray="${RING_CIRC}" stroke-dashoffset="${RING_CIRC}" />
-        </svg>
-        <span id="t3-hud-ctx-pct" class="val">--%</span>
-      </div>
-      <span class="t3-hud-sep"></span>
+    </div>
+    <div id="t3-hud-header-tools" class="is-hidden" data-t3-hud-header-tools>
       <button id="t3-hud-git-btn" type="button" title="打开/关闭 Git 图谱悬浮窗 (Option+G)" aria-controls="t3-hud-git-drawer" aria-expanded="false">
         ${GIT_GRAPH_ICON}
         <span id="t3-hud-branch" class="t3-hud-branch-text">Git 图谱</span>
         <span id="t3-hud-dirty" class="t3-hud-dirty-dot" style="display:none"></span>
       </button>
+      <span id="t3-hud-quota-rings"></span>
     </div>
+    <button id="t3-hud-context-control" class="is-hidden" type="button" data-hud-hover="context" aria-label="上下文容量：未知">
+      <svg class="t3-hud-ring-svg" viewBox="0 0 14 14" aria-hidden="true">
+        <circle cx="7" cy="7" r="5.2" fill="none" stroke="color-mix(in srgb, var(--hud-fg) 16%, transparent)" stroke-width="2.1" />
+        <circle id="t3-hud-ring-arc" cx="7" cy="7" r="5.2" fill="none" stroke="var(--hud-fg)" stroke-width="2.1" stroke-linecap="round" stroke-dasharray="${RING_CIRC}" stroke-dashoffset="${RING_CIRC}" />
+      </svg>
+    </button>
 
     <div id="t3-hud-popover"></div>
 
@@ -2593,15 +2657,12 @@
   const speedEl = document.getElementById("t3-hud-speed");
   const cacheEl = document.getElementById("t3-hud-cache");
   const cacheLblEl = document.getElementById("t3-hud-cache-lbl");
-  const weekLblEl = document.getElementById("t3-hud-week-lbl");
   const tokensEl = document.getElementById("t3-hud-tokens");
   const costEl = document.getElementById("t3-hud-cost");
-  const quotaSepEl = document.getElementById("t3-hud-quota-sep");
-  const quotaItemEl = document.getElementById("t3-hud-quota-item");
-  const quotaEl = document.getElementById("t3-hud-quota");
-  const quotaBarEl = document.getElementById("t3-hud-quota-bar");
+  const headerTools = document.getElementById("t3-hud-header-tools");
+  const quotaRings = document.getElementById("t3-hud-quota-rings");
+  const contextControl = document.getElementById("t3-hud-context-control");
   const ringArcEl = document.getElementById("t3-hud-ring-arc");
-  const ctxPctEl = document.getElementById("t3-hud-ctx-pct");
   const branchBtnText = document.getElementById("t3-hud-branch");
   const dirtyBadge = document.getElementById("t3-hud-dirty");
   const gitBtn = document.getElementById("t3-hud-git-btn");
@@ -2624,6 +2685,7 @@
   let lastRemotePayload = null;
   let liveStreamTps = null;
   let turnSpeedState = createHudTurnSpeedState(currentPathHint);
+  let sessionSpeedState = createHudSessionSpeedState();
   let latestGraph = null;
   let drawerOpen = false;
   let selectedCommitHash = null;
@@ -2741,6 +2803,31 @@
     if (view?.kind === "turn") return `${labels.turn} ${view.value.toFixed(1)} tok/s`;
     if (view?.kind === "waiting") return labels.waiting;
     return "-- tok/s";
+  }
+
+  function createHudSessionSpeedState() {
+    return { route: "", threadId: "", provider: "", kind: "unknown", value: null };
+  }
+
+  function resolveHudSessionSpeed(state, stats, routeKey) {
+    const route = String(routeKey || "");
+    const clear = () => { state.threadId = ""; state.provider = ""; state.kind = "unknown"; state.value = null; };
+    if (state.route !== route) { state.route = route; clear(); }
+    if (stats?.nonThreadRoute === "new") {
+      clear(); state.kind = "new"; state.value = 0;
+    } else if (stats?.ok) {
+      const threadId = String(stats.threadId || ""), provider = String(stats.provider || "");
+      if (state.threadId && threadId && state.threadId !== threadId) clear();
+      if (state.kind === "new") { state.kind = "unknown"; state.value = null; }
+      if (state.kind === "last" && state.provider && provider && state.provider !== provider) { state.kind = "unknown"; state.value = null; }
+      if (threadId) state.threadId = threadId;
+      if (provider) state.provider = provider;
+      const valid = (value) => typeof value === "number" && Number.isFinite(value) && value > 0;
+      if (valid(stats.speed?.tokPerSec)) { state.kind = "average"; state.value = stats.speed.tokPerSec; }
+      else if (state.kind !== "average" && valid(stats.speed?.lastDecodeTps)) { state.kind = "last"; state.value = stats.speed.lastDecodeTps; }
+      else if (state.kind === "unknown" && stats.turnCount === 0 && stats.tokens?.output === 0) { state.kind = "new"; state.value = 0; }
+    }
+    return { kind: state.kind, value: state.value };
   }
 
   function isCurrentStatsSnapshot(requestId, latestRequestId, requestedRoute, currentRoute) {
@@ -3082,6 +3169,8 @@
         lastLayoutState.hidden = true;
       }
       if (popover.classList.contains("visible")) popover.classList.remove("visible");
+      headerTools.classList.add("is-hidden");
+      contextControl.classList.add("is-hidden");
       try {
         const hint = getRouteHint();
         if ((hint === "/settings" || hint.startsWith("/settings/")) && drawerOpen) {
@@ -3093,7 +3182,90 @@
     return true;
   }
 
-  // Position HUD capsule centered directly ABOVE the chat composer box!
+  // Select an actually free horizontal interval instead of covering native
+  // controls. The injected surfaces stay in our root and never mutate React.
+  function hudFreeIntervals(left, right, obstacles) {
+    let intervals = [{ left, right }];
+    for (const item of obstacles || []) {
+      if (!item || item.right <= item.left) continue;
+      intervals = intervals.flatMap((gap) => {
+        if (item.right <= gap.left || item.left >= gap.right) return [gap];
+        return [
+          { left: gap.left, right: Math.min(gap.right, item.left - 3) },
+          { left: Math.max(gap.left, item.right + 3), right: gap.right },
+        ].filter((part) => part.right > part.left);
+      });
+    }
+    return intervals;
+  }
+
+  function calculateHudLayout({ header, title, headerObstacles, attach, model, footerObstacles, viewportWidth, headerFullWidth = 152, headerCompactWidth = 96 }) {
+    const result = { header: null, context: null, stats: null };
+    if (header && header.width >= 120) {
+      const left = Math.max(header.left + 8, title ? title.right + 8 : header.left + 8);
+      const gaps = hudFreeIntervals(left, Math.min(header.right - 8, viewportWidth - 8), headerObstacles)
+        .filter((gap) => gap.right - gap.left >= headerCompactWidth).sort((a, b) => b.right - a.right);
+      if (gaps.length) {
+        const gap = gaps[0], compact = gap.right - gap.left < headerFullWidth, width = compact ? headerCompactWidth : headerFullWidth;
+        result.header = { left: gap.right - width, top: header.top + (header.height - 32) / 2, width, compact };
+      }
+    }
+    if (attach && model && model.left > attach.right && model.width > 0 && attach.width > 0) {
+      const contextRight = model.left - 3, contextLeft = contextRight - 22;
+      const occupied = (footerObstacles || []).some((rect) => rect.right > contextLeft && rect.left < contextRight);
+      if (!occupied && contextLeft > attach.right + 3) {
+        result.context = { left: contextLeft, top: model.top + (model.height - 28) / 2, width: 22 };
+        const gaps = hudFreeIntervals(attach.right + 5, contextLeft - 4, footerObstacles)
+          .filter((gap) => gap.right - gap.left >= 42).sort((a, b) => (b.right - b.left) - (a.right - a.left));
+        if (gaps.length) {
+          const gap = gaps[0];
+          result.stats = { left: gap.left, top: model.top + (model.height - 27) / 2, width: gap.right - gap.left };
+        }
+      }
+    }
+    return result;
+  }
+
+  function visibleHudRect(node) {
+    if (!node || node.hidden || node.closest?.('[hidden], [inert], [aria-hidden="true"]')) return null;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? rect : null;
+  }
+
+  function placeHudElement(element, layout) {
+    element.classList.toggle("is-hidden", !layout);
+    if (!layout) return;
+    element.style.left = `${Math.round(layout.left)}px`;
+    element.style.top = `${Math.round(layout.top)}px`;
+    element.style.right = "auto";
+    if (element === topbar) element.style.maxWidth = `${Math.max(0, Math.floor(layout.width))}px`;
+  }
+
+  function measureHudHeaderWidths() {
+    // Measure a hidden clone outside the possibly hidden/compact header, including
+    // the current dirty badge. Never guess a width when measurement is unavailable.
+    const clone = gitBtn.cloneNode(true);
+    clone.style.position = "fixed";
+    clone.style.left = "-10000px";
+    clone.style.visibility = "hidden";
+    clone.style.pointerEvents = "none";
+    clone.setAttribute("aria-hidden", "true");
+    clone.tabIndex = -1;
+    root.appendChild(clone);
+    const full = clone.getBoundingClientRect().width;
+    const label = clone.querySelector("#t3-hud-branch");
+    if (label) label.style.display = "none";
+    const compact = clone.getBoundingClientRect().width;
+    clone.remove();
+    const count = quotaRings.children.length;
+    const ringSpace = count * 36; // 32px each plus 4px gaps, including the gap to Git.
+    return {
+      headerFullWidth: full > 0 ? Math.ceil(full + ringSpace) + 2 : Infinity,
+      headerCompactWidth: compact > 0 ? Math.ceil(compact + ringSpace) + 2 : Infinity,
+    };
+  }
+
+  // Anchor to the native title/composer controls without altering them.
   function updateLayoutPosition() {
     if (document.hidden) return;
     const graphLabel = t(window.innerWidth < 640 ? "graph" : "gitGraph");
@@ -3112,71 +3284,26 @@
 
     if (!syncUiVisibility()) return;
 
-    if (!chatCol && !header) {
-      setComposerTopSpacing(null);
-      if (lastLayoutState.hidden !== true) {
-        topbar.classList.add("is-hidden");
-        lastLayoutState.hidden = true;
-      }
-      return;
-    }
-
-    const hRect = header ? header.getBoundingClientRect() : null;
-    const cRect = chatCol ? chatCol.getBoundingClientRect() : null;
-    if ((cRect && cRect.width < 120) || (hRect && hRect.width < 120)) {
-      setComposerTopSpacing(null);
-      if (lastLayoutState.hidden !== true) {
-        topbar.classList.add("is-hidden");
-        lastLayoutState.hidden = true;
-      }
-      return;
-    }
-
-    if (lastLayoutState.hidden !== false) {
-      topbar.classList.remove("is-hidden");
-      lastLayoutState.hidden = false;
-    }
-
-    const surface = composer ? findComposerSurface(composer) : null;
-    const sRect = surface?.getBoundingClientRect();
-    const available = Math.max(200, Math.min((sRect?.width || cRect?.width || innerWidth) - 16, innerWidth - 24));
-    topbar.classList.toggle("is-tight", available < 610);
-    topbar.classList.toggle("is-mini", available < 420);
-    topbar.style.maxWidth = `${available}px`;
-    const tbWidth = topbar.offsetWidth || 220;
-    let nextTop = "";
-    let nextLeft = "";
-    let nextRight = "auto";
-    if (composer && sRect?.width > 120) {
-      const stackEl = composer.closest('[class*="group/composer-stack"]');
-      setComposerTopSpacing(stackEl);
-      const minLeft = Math.max(12, sRect.left + 8);
-      const idealLeft = sRect.left + (sRect.width - tbWidth) / 2;
-      nextLeft = `${Math.round(Math.max(minLeft, Math.min(innerWidth - 12 - tbWidth, idealLeft)))}px`;
-      const tbHeight = topbar.offsetHeight || 26;
-      nextTop = `${Math.max(42, Math.round(sRect.top - tbHeight - 2))}px`;
-    }
-
-    if (!nextTop && hRect) {
-      setComposerTopSpacing(null);
-      nextTop = `${Math.round(hRect.top + (hRect.height - 25) / 2)}px`;
-      nextLeft = "auto";
-      nextRight = "112px";
-    }
-
-    if (lastLayoutState.top !== nextTop) {
-      topbar.style.top = nextTop;
-      lastLayoutState.top = nextTop;
-    }
-    if (lastLayoutState.left !== nextLeft) {
-      topbar.style.left = nextLeft;
-      lastLayoutState.left = nextLeft;
-    }
-    if (lastLayoutState.right !== nextRight) {
-      topbar.style.right = nextRight;
-      lastLayoutState.right = nextRight;
-    }
-
+    setComposerTopSpacing(null);
+    const title = header?.querySelector('[aria-label^="Thread actions for"], h1, h2');
+    const attach = composer?.querySelector('button[aria-label="Attach files"]');
+    const model = composer?.querySelector('[data-chat-provider-model-picker]');
+    const footer = composer?.querySelector('[data-chat-composer-footer="true"]');
+    const hRect = visibleHudRect(header), titleRect = visibleHudRect(title);
+    const modelRect = visibleHudRect(model), attachRect = visibleHudRect(attach);
+    const headerObstacles = [...(header?.querySelectorAll('button, [role="button"]') || [])]
+      .filter((el) => el !== title && !el.contains(title) && !title?.contains(el)).map(visibleHudRect).filter(Boolean);
+    const footerObstacles = [...(footer?.querySelectorAll('button, [role="button"]') || [])]
+      .filter((el) => el !== attach && el !== model && !el.contains(attach) && !el.contains(model) && !attach?.contains(el) && !model?.contains(el))
+      .map(visibleHudRect).filter((r) => r && modelRect && r.top < modelRect.bottom && r.bottom > modelRect.top);
+    const layout = calculateHudLayout({ header: hRect, title: titleRect, headerObstacles, attach: attachRect, model: modelRect, footerObstacles, viewportWidth: window.innerWidth, ...measureHudHeaderWidths() });
+    headerTools.classList.toggle("is-compact", !!layout.header?.compact);
+    topbar.classList.toggle("is-tight", !!layout.stats && layout.stats.width < 360);
+    topbar.classList.toggle("is-mini", !!layout.stats && layout.stats.width < 240);
+    placeHudElement(headerTools, layout.header);
+    placeHudElement(contextControl, layout.context);
+    placeHudElement(topbar, layout.stats);
+    lastLayoutState.hidden = !layout.stats;
   }
 
   // Draggable floating drawer support
@@ -3287,7 +3414,45 @@
 
   // Context, cache, running state and Git stay monochrome. Only quota carries semantic color.
   function contextColor() { return "var(--hud-fg)"; }
+  function isValidHudCacheRate(rate) {
+    return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 && rate <= 1;
+  }
+
+  function resolveHudCacheDisplay(stats) {
+    if (!stats?.ok || stats.nonThreadRoute === "new") return { kind: "unknown", rate: null };
+    const turnRate = stats.cache?.turnRate;
+    if (turnRate != null) return isValidHudCacheRate(turnRate) ? { kind: "turn", rate: turnRate } : { kind: "unknown", rate: null };
+    const sessionRate = stats.cache?.withSubagentsSessionRate ?? stats.cache?.sessionRate ?? stats.cache?.mainSessionRate;
+    if (sessionRate != null) return isValidHudCacheRate(sessionRate) ? { kind: "session", rate: sessionRate } : { kind: "unknown", rate: null };
+    return { kind: "unknown", rate: null };
+  }
+
+  function refreshHudStatsPopover(popoverElement, mode, activeElement, renderStats) {
+    if (mode !== "stats" || !popoverElement?.classList?.contains("visible")) return false;
+    if (typeof renderStats !== "function") return false;
+    const controls = popoverElement.contains?.(activeElement)
+      ? Array.from(popoverElement.querySelectorAll?.("button") || [])
+      : [];
+    const focusIndex = controls.indexOf(activeElement);
+    renderStats();
+    if (focusIndex >= 0) {
+      const nextControl = popoverElement.querySelectorAll?.("button")?.[focusIndex];
+      try { nextControl?.focus?.({ preventScroll: true }); }
+      catch { try { nextControl?.focus?.(); } catch {} }
+    }
+    return true;
+  }
+
   function cacheColor() { return "var(--hud-fg)"; }
+
+  function selectHudFiveHourWindow(windows) {
+    return windows.find((w) => {
+      // T3's native usage contract reports the authoritative duration in minutes.
+      // A generic Session label alone does not establish a five-hour window.
+      if (w.windowDurationMins != null) return w.windowDurationMins === 300;
+      return /(?:^|[^\d])(?:5\s*[-_ ]?\s*(?:h|hours?|小时)|five\s*[-_ ]?\s*hours?)(?:$|[^a-z])/i.test(`${w.kind || ""} ${w.id || ""} ${w.label || ""}`);
+    }) || null;
+  }
 
   function computeQuotaAndContext(stats) {
     const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider } = readLiveT3State();
@@ -3350,6 +3515,8 @@
     if (!live || !Array.isArray(live.providers)) {
       return {
         primaryWeekly: null,
+        primaryFiveHour: null,
+        providerQuotas: [],
         currentWindows: [],
         otherWindows: [],
         ctxUsed,
@@ -3371,13 +3538,15 @@
       null;
 
     const toWinItem = (w, prefix = "") => {
-      const rem = Math.max(0, Math.min(100, Math.round(100 - (Number(w.usedPercent) || 0))));
+      if (!w || typeof w.usedPercent !== "number" || !Number.isFinite(w.usedPercent) || w.usedPercent < 0 || w.usedPercent > 100) return null;
+      const rem = Math.round(100 - w.usedPercent);
       const tone = rem >= 50 ? "ok" : rem >= 20 ? "mid" : "err";
       const reset = formatResetShort(w.resetsAt);
       const rawLbl = String(w.label || w.id || "Quota").replace(" (shared)", "");
       return {
         id: String(w.id || ""),
         kind: w.kind,
+        windowDurationMins: w.windowDurationMins,
         label: prefix ? `${prefix} · ${rawLbl}` : rawLbl,
         remainingPct: rem,
         tone,
@@ -3385,11 +3554,11 @@
       };
     };
 
-    const currentWindows = (activeProv?.usageLimits?.windows || []).map((w) => toWinItem(w));
+    const currentWindows = (activeProv?.usageLimits?.windows || []).map((w) => toWinItem(w)).filter(Boolean);
 
     let primaryWeekly = null;
     const weeklyCandidates = currentWindows.filter(
-      (w) => w.kind === "weekly" || /weekly/i.test(w.label)
+      (w) => w.kind === "weekly" || /weekly|周/.test(w.label.toLowerCase())
     );
     if (weeklyCandidates.length === 1) {
       primaryWeekly = weeklyCandidates[0];
@@ -3407,17 +3576,29 @@
     }
 
     const otherWindows = [];
-    const provDisplayName = { muse: "Muse", codex: "Codex", antigravity: "AGY", claudeAgent: "Claude" };
+    const providerQuotas = [];
+    const provDisplayName = { muse: "Muse", codex: "Codex", openai: "Codex", antigravity: "AGY", claudeagent: "Claude", claude: "Claude" };
     for (const p of live.providers) {
-      if (p === activeProv || !p.usageLimits?.windows?.length) continue;
-      const pName = provDisplayName[p.driver] || provDisplayName[p.instanceId] || p.instanceId;
-      for (const w of p.usageLimits.windows) {
-        otherWindows.push(toWinItem(w, pName));
+      if (!p.usageLimits?.windows?.length) continue;
+      const instanceId = String(p.instanceId || p.driver || "");
+      const driver = String(p.driver || p.instanceId || "").toLowerCase();
+      const pName = provDisplayName[driver] || provDisplayName[instanceId.toLowerCase()] || instanceId || "Provider";
+      const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w)).filter(Boolean);
+      const weekly = p === activeProv ? primaryWeekly : windows.find((w) => w.kind === "weekly" || /weekly|周/.test(w.label.toLowerCase())) || null;
+      const fiveHour = selectHudFiveHourWindow(windows);
+      if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, name: pName, weekly, fiveHour });
+      if (p !== activeProv) {
+        for (const w of p.usageLimits.windows) {
+          const item = toWinItem(w, pName);
+          if (item) otherWindows.push(item);
+        }
       }
     }
 
     return {
       primaryWeekly,
+      primaryFiveHour: selectHudFiveHourWindow(currentWindows),
+      providerQuotas,
       currentWindows,
       otherWindows,
       ctxUsed,
@@ -3472,7 +3653,6 @@
 
   function applyLangToDom() {
     if (cacheLblEl) cacheLblEl.textContent = t("cache");
-    if (weekLblEl) weekLblEl.textContent = t("weekLeft");
     if (gitBtn) gitBtn.title = t("overlay");
     gitBtn.setAttribute("aria-label", t("gitGraph"));
     repoTitleEl.textContent = t("gitGraph");
@@ -3601,10 +3781,11 @@
         ? `${formatContextPair(qInfo.ctxUsed, qInfo.ctxMax)}${qInfo.ctxPct != null ? ` (${qInfo.ctxPct.toFixed(1)}%)` : ""}`
         : "--";
 
-    const cacheText = (rate) => rate != null ? `${(rate * 100).toFixed(1)}%` : "--";
-    const turnCachePending = s.cache.turnRate == null && s.isRunning === true;
-    const turnCache = turnCachePending ? t("cachePendingPopover") : cacheText(s.cache.turnRate);
-    const turnCacheNote = turnCachePending ? `<div style="margin-top:2px;font-size:10px;color:var(--hud-muted)">${escapeHtml(t("cachePendingNote"))}</div>` : "";
+    const cacheText = (rate) => isValidHudCacheRate(rate) ? `${(rate * 100).toFixed(1)}%` : "--";
+    const cacheView = resolveHudCacheDisplay(s);
+    const turnCacheRateValid = isValidHudCacheRate(s.cache?.turnRate);
+    const turnCache = turnCacheRateValid ? cacheText(s.cache.turnRate) : "--";
+    const turnCacheNote = turnCacheRateValid ? "" : `<div style="margin-top:2px;font-size:10px;color:var(--hud-muted)">${escapeHtml(t(cacheView.kind === "session" ? "turnCacheUnavailableNote" : "cacheUnknownTitle"))}</div>`;
     const lastCallCache = cacheText(s.cache.lastCallRate);
     const mainSessionCache = cacheText(s.cache.mainSessionRate);
     const inclusiveSessionCache = cacheText(s.cache.withSubagentsSessionRate ?? s.cache.sessionRate);
@@ -3671,16 +3852,15 @@
     else renderStatsPopover();
     const popW = mode === "context" ? 268 : 324;
     const anchorRect = anchorEl.getBoundingClientRect();
-    const barRect = topbar.getBoundingClientRect();
-    const centerX = mode === "context" ? anchorRect.left + anchorRect.width / 2 : barRect.left + barRect.width / 2;
+    const centerX = anchorRect.left + anchorRect.width / 2;
     const leftPos = Math.max(12, Math.min(window.innerWidth - popW - 14, Math.round(centerX - popW / 2)));
     popover.style.left = `${leftPos}px`;
-    if (barRect.top > 260) {
+    if (anchorRect.top > 260) {
       popover.style.top = "auto";
-      popover.style.bottom = `${Math.round(window.innerHeight - barRect.top + 8)}px`;
+      popover.style.bottom = `${Math.round(window.innerHeight - anchorRect.top + 8)}px`;
     } else {
       popover.style.bottom = "auto";
-      popover.style.top = `${Math.round(barRect.bottom + 6)}px`;
+      popover.style.top = `${Math.round(anchorRect.bottom + 6)}px`;
     }
     popover.classList.add("visible");
     window.dispatchEvent(new CustomEvent("t3-hud-popover-change", { detail: { visible: true } }));
@@ -3689,25 +3869,84 @@
   function hidePopoverDelayed() {
     clearTimeout(popoverHideTimer);
     popoverHideTimer = setTimeout(() => {
-      if (!popover.matches(":hover")) {
+      if (!popover.matches(":hover") && !popover.contains(document.activeElement)) {
         popover.classList.remove("visible");
         window.dispatchEvent(new CustomEvent("t3-hud-popover-change", { detail: { visible: false } }));
       }
     }, 140);
   }
 
-  topbar.querySelectorAll("[data-hud-hover]").forEach((el) => {
+  root.querySelectorAll("[data-hud-hover]").forEach((el) => {
     const mode = el.getAttribute("data-hud-hover");
     el.addEventListener("mouseenter", () => {
       clearTimeout(popoverHideTimer);
       showPopoverAbove(el, mode);
     });
     el.addEventListener("mouseleave", () => hidePopoverDelayed());
+    el.addEventListener("focus", () => { clearTimeout(popoverHideTimer); showPopoverAbove(el, mode); });
+    el.addEventListener("blur", () => hidePopoverDelayed());
+  });
+  // Provider buttons are updated dynamically; keep hover and keyboard focus
+  // behavior attached to the stable parent rather than to replaced children.
+  quotaRings.addEventListener("mouseover", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (!button || button.contains(event.relatedTarget)) return;
+    clearTimeout(popoverHideTimer);
+    showPopoverAbove(button, "stats");
+  });
+  quotaRings.addEventListener("mouseout", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (button && !button.contains(event.relatedTarget)) hidePopoverDelayed();
+  });
+  quotaRings.addEventListener("focusin", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (!button) return;
+    clearTimeout(popoverHideTimer);
+    showPopoverAbove(button, "stats");
+  });
+  quotaRings.addEventListener("focusout", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (button && !button.contains(event.relatedTarget)) hidePopoverDelayed();
   });
   popover.addEventListener("mouseenter", () => clearTimeout(popoverHideTimer));
   popover.addEventListener("mouseleave", () => hidePopoverDelayed());
+  popover.addEventListener("focusin", () => clearTimeout(popoverHideTimer));
+  popover.addEventListener("focusout", () => hidePopoverDelayed());
 
   gitLangBtn?.addEventListener("click", () => switchLang(langSwitchTarget()));
+
+  // Provider artwork follows the icons shipped with T3 Code.
+  const HUD_PROVIDER_LOGOS = {"codex":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"100 100 411 411\" fill=\"currentColor\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z\"/></svg>","openai":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"100 100 411 411\" fill=\"currentColor\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z\"/></svg>","muse":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 287.56 191\" fill=\"none\"><defs><linearGradient id=\"muse-a\" x1=\"61\" y1=\"117\" x2=\"259\" y2=\"127\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#0064e1\"/><stop offset=\".4\" stop-color=\"#0064e1\"/><stop offset=\".83\" stop-color=\"#0073ee\"/><stop offset=\"1\" stop-color=\"#0082fb\"/></linearGradient><linearGradient id=\"muse-b\" x1=\"45\" y1=\"139\" x2=\"45\" y2=\"66\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#0082fb\"/><stop offset=\"1\" stop-color=\"#0064e0\"/></linearGradient></defs><path fill=\"#0081fb\" d=\"m31.06,125.96c0,10.98 2.41,19.41 5.56,24.51 4.13,6.68 10.29,9.51 16.57,9.51 8.1,0 15.51-2.01 29.79-21.76 11.44-15.83 24.92-38.05 33.99-51.98l15.36-23.6c10.67-16.39 23.02-34.61 37.18-46.96 11.56-10.08 24.03-15.68 36.58-15.68 21.07,0 41.14,12.21 56.5,35.11 16.81,25.08 24.97,56.67 24.97,89.27 0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75l0-31.02c17.63,0 22.03-16.2 22.03-34.74 0-26.42-6.16-55.74-19.73-76.69-9.63-14.86-22.11-23.94-35.84-23.94-14.85,0-26.8,11.2-40.23,31.17-7.14,10.61-14.47,23.54-22.7,38.13l-9.06,16.05c-18.2,32.27-22.81,39.62-31.91,51.75-15.95,21.24-29.57,29.29-47.5,29.29-21.27,0-34.72-9.21-43.05-23.09-6.8-11.31-10.14-26.15-10.14-43.06z\"/><path fill=\"url(#muse-a)\" d=\"m24.49,37.3c14.24-21.95 34.79-37.3 58.36-37.3 13.65,0 27.22,4.04 41.39,15.61 15.5,12.65 32.02,33.48 52.63,67.81l7.39,12.32c17.84,29.72 27.99,45.01 33.93,52.22 7.64,9.26 12.99,12.02 19.94,12.02 17.63,0 22.03-16.2 22.03-34.74l27.4-.86c0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75-12.8,0-24.14-2.78-36.68-14.61-9.64-9.08-20.91-25.21-29.58-39.71l-25.79-43.08c-12.94-21.62-24.81-37.74-31.68-45.04-7.39-7.85-16.89-17.33-32.05-17.33-12.27,0-22.69,8.61-31.41,21.78z\"/><path fill=\"url(#muse-b)\" d=\"m82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78-12.33,18.61-19.88,46.33-19.88,72.95 0,10.98 2.41,19.41 5.56,24.51l-26.48,17.44c-6.8-11.31-10.14-26.15-10.14-43.06 0-30.75 8.44-62.8 24.49-87.55 14.24-21.95 34.79-37.3 58.36-37.3z\"/></svg>","antigravity":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><image href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAIKADAAQAAAABAAAAIAAAAACshmLzAAAGPElEQVRYCcVXbYidxRU+Z2be73u3G9JUsQ0EtXGNaZtWGyKtdRuJWEVRaegfK6Kl4g8Ff9TEWOhCo2lLE/pDWrXW/GgsrYJCCc2Psn4QE02IKKn4hWLElDTIxmT37r3vOzPnHM+Vpppd1/2I0IGX+84wM88z5zznmfcC/J8bLhT/xMMXnItjsAKOGwMT8PrA/f96fSF7zZvAO08OLbPRbknH5crkGA7YY1bMuJuw4+YpW2cb88f3vDEfIvMicGD0wnOSIDvLngzhmDTJB0jZCUvpCYNuHCvbM4dcwGuyJ/e+MlcScyawd+/FRe3NTlfD2qQjE8kJ4WwcuTwOkh1HzDuIySS0rIcXq164HHftG58LCTeXSf05R6T9ExRYiwzjiUBMEahE4WAFqgSQnNg8kU4aeHUndbfrknvnsvecIvDo7qsW1Zi+wI1ZCj2s3STGbBKpmpD+A60JwlaHbNklW3QpSz2PZURrWn8fPTobiTlFYMx+4WoK+NUmJhNAjlEsZ2CoMsCVIWgsQXRByHqhxENB8SwGvk7BHzhtAiMyYiaeO3yDgrOnFIiyfrxBIw6FoLSQpLEBvAsQkhoCNcjcNNH79TI8/DA+80z8LBKzRqDZfWSoptaans98TaVEJQCcgqMEckCoDYO3UYJtmNJGCXSZuFdX0v3Gq4uLryn4S6dFoBcHrwict7sh79ZNhSGUIDFDqyRSNqZBoWCipkBPH3vg065E6XKUyVZu/LrTJtCJ1eV1qKTxldS+ghgqFCWBMbGJWAqAJmLoRwAprYFhUqj/4GQoQ3dYYOS3CCM8UxQ+MwU3jm7+8mS3+mbt26H2LQVvQ/BKIBZGCxEStkBgkFUDpCJkqbVKK4zQxYidMGA7K/9xCy+FP8G7CyLQmVh0cZRyifet2vfBYxtIwSXkqoNcxWYNiQgjixh9NA2MJRL2QAtSYiwXF2m9RsEXRqAXB9ZS1Lz7lgQlQEE1HwvQ02sBpqiICg+gBiWAAcRmIpiBYA5sco1KYSpuLlUCf5spAjMa0fD27Tlkgy+wb63U0DekGuBYAXMuegOoFxo0WopGK8EpgRRYMiCp2EMlnlvcwAD1korrN5e4o5fcOnJ199NIzKiBxpxxvkr6XPFt3wcWavXBPzq9SKq1aNR+sNFjS0TFVgII0jPGalCcAZuy2JQi52f3uFih4AfmRcDH8vuG80pC1VVwAcq14DILkjgF/aee/nESfA1AJSB2ORlzvQe5ClGNAZxyCipOx2JclUreT8M8CGgm40P715lYRqAW40lwSknB73ypzh6EERX8x22fvv75u7+WH6sh3w+IhVZnALA67CiHcJmKZRuiqmVK+1QNrHzwwDkmpnuRWqXeeWq9qUXOUhF7x8sb8t9P2eOU7iW/am6wmGxPUE1bmDIkdczYQaq/s+PuL711ymTtmKkD/b4uW8dUDjIVDOr/qvgCyPxlNvD+2t0bsx1amn+M6LIGranB6QWaLA5p1XfFaW06gZGnnYTses25ukvSB9ecu3fJyKZpq2caYPOLwPJ2FEw9WlQS3Ejyw+ERmSb6aQRWfHHZhSD5Kj25B+4TMFrcZuvBDeXhmfCmju/ehO9rhWyJxhjPoJe0iY3g6nYbLpo6dxoB9uZmo98UwJmqO01VdPvFHntk6sLZ+oMF7IgMewhNGgTVpmzhmX86dd0pBM773XtfV9B1+tRaZgaUubC55+DPzpycunC2/q47sGGJG1UPdQS0GongBa4d/o2s+uTajwk8JtaKu9NwUiA7NRVXqtf94eA9yegnF8znfd/G5Dmt6G1sIFHPANVEW33j5+vXq4X+t/2PwPmHj96kwN9DSRojSQFsn+3B8V+enLjQ31DDvUQwSgh5FPBK4sr/XMS3ndzvIx8Y2nbkUstuq+GsheIGjbj31PHWv3w3Hjo58XR+v71ZlqKDXbrHBWrUHTR6XwPftmeDewKHtr6/XL+st6mdf0XDv0hzf8iy3PripmxBf7VmIrr6PlmuWfirpmCVQRw3ImN6wdxsLNvbjeRnGrZWw74zmORHnzd4n9T+Tfim3hI/UEt+hPTTgQCWMNq7cNWWD5axLbX28d8H70r2qY9P8+uZTrXQ8W9tljXOwdl6VTy/0D0+t3UfAoMJQboJ7md2AAAAAElFTkSuQmCC\" width=\"32\" height=\"32\"/></svg>"};
+
+  function hudQuotaRingMarkup(provider) {
+    const description = (quota, label) => quota && `${label}: ${quota.remainingPct}% ${hudLang === "zh" ? "剩余" : "remaining"}${quota.reset ? ` · ${quota.reset}` : ""}`;
+    const parts = [provider.name, description(provider.weekly, hudLang === "zh" ? "周额度（外圈）" : "Weekly quota (outer)"), description(provider.fiveHour, hudLang === "zh" ? "5 小时额度（内圈）" : "5-hour quota (inner)")].filter(Boolean);
+    const arc = (quota, kind, radius) => {
+      if (!quota || !Number.isFinite(quota.remainingPct)) return "";
+      const circumference = 2 * Math.PI * radius;
+      const offset = circumference * (1 - Math.max(0, Math.min(100, quota.remainingPct)) / 100);
+      const color = quota.tone === "err" ? "#dc2626" : quota.tone === "mid" ? "#d97706" : "#10a37f";
+      return `<circle cx="16" cy="16" r="${radius}" fill="none" stroke="color-mix(in srgb, var(--hud-fg) 14%, transparent)" stroke-width="2"/><circle class="quota-arc quota-${kind}-arc" cx="16" cy="16" r="${radius}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-dasharray="${circumference.toFixed(2)}" stroke-dashoffset="${offset.toFixed(2)}"/>`;
+    };
+    const key = String(provider.driver || provider.instanceId || "").toLowerCase();
+    const logo = HUD_PROVIDER_LOGOS[key] || escapeHtml(String(provider.name || "?").slice(0, 1).toUpperCase());
+    const text = escapeHtml(parts.join(" · "));
+    return `<button class="t3-hud-quota-ring" type="button" data-hud-provider="${escapeHtml(provider.instanceId)}" title="${text}" aria-label="${text}"><svg viewBox="0 0 32 32" aria-hidden="true">${arc(provider.weekly, "week", 13.5)}${arc(provider.fiveHour, "five", 9.5)}</svg><span class="t3-hud-provider-logo" aria-hidden="true">${logo}</span></button>`;
+  }
+
+  let lastQuotaRingsSig = "";
+  function renderQuotaRing(providers) {
+    const signature = JSON.stringify([hudLang, providers]);
+    if (signature === lastQuotaRingsSig) return;
+    lastQuotaRingsSig = signature;
+    const activeButton = document.activeElement?.closest?.(".t3-hud-quota-ring");
+    const activeProvider = activeButton && quotaRings.contains(activeButton) ? activeButton.getAttribute("data-hud-provider") : null;
+    quotaRings.innerHTML = providers.map(hudQuotaRingMarkup).join("");
+    if (activeProvider != null) {
+      const replacement = [...quotaRings.querySelectorAll(".t3-hud-quota-ring")].find((button) => button.getAttribute("data-hud-provider") === activeProvider);
+      try { replacement?.focus({ preventScroll: true }); } catch { replacement?.focus(); }
+    }
+  }
 
   let lastTopbarSig = "";
   function renderTopbarStats(stats) {
@@ -3765,28 +4004,29 @@
       }
     }
     const qInfo = computeQuotaAndContext(stats);
-    const wk = qInfo.primaryWeekly;
-    topbar.classList.toggle("has-quota", !!wk);
+    const sessionSpeed = resolveHudSessionSpeed(sessionSpeedState, stats, currentPathHint);
+    renderQuotaRing(qInfo.providerQuotas);
 
     let nextDotClass;
     let nextSpeed;
     let nextCache;
+    let nextCacheLabel = t("cache");
     let nextCacheTitle = "";
     let nextCacheColor = "var(--hud-fg)";
     let nextTokens;
     let nextCost;
-    let nextQuota = wk ? `${wk.remainingPct}%` : "";
-    let nextQuotaTone = wk ? wk.tone : "";
-    const ctxPctNum = qInfo.ctxPct != null ? Math.round(qInfo.ctxPct) : 0;
-    const nextCtxTxt = qInfo.ctxPct != null ? `${ctxPctNum}%` : "0%";
+    const ctxPctNum = qInfo.ctxPct != null ? Math.round(qInfo.ctxPct) : null;
+    const nextCtxTxt = ctxPctNum != null ? `${ctxPctNum}%` : "--";
     const nextRingOffset = (RING_CIRC * (1 - Math.max(0, Math.min(100, qInfo.ctxPct || 0)) / 100)).toFixed(2);
     const nextRingColor = contextColor(qInfo.ctxPct);
     let nextBranch = t(window.innerWidth < 640 ? "graph" : "gitGraph");
     let hideDirty = false;
+    const speedLabel = sessionSpeed.kind === "average" ? (hudLang === "zh" ? "均速 " : "Avg ") :
+      sessionSpeed.kind === "last" ? (hudLang === "zh" ? "末轮 " : "Last ") : "";
+    nextSpeed = sessionSpeed.value == null ? "-- tok/s" : `${speedLabel}${sessionSpeed.value.toFixed(1)} tok/s`;
 
     if (!stats || !stats.ok) {
       nextDotClass = "t3-hud-dot";
-      nextSpeed = stats?.nonThreadRoute === "new" ? t("newSession") : "-- tok/s";
       nextCache = "--%";
       nextTokens = "0 tok";
       nextCost = "$0.00";
@@ -3794,47 +4034,36 @@
     } else {
       const activelyStreaming = Boolean(stats.isRunning) || speedView.kind === "estimated";
       nextDotClass = "t3-hud-dot " + (activelyStreaming ? "running" : "ready");
-      nextSpeed = formatHudTurnSpeed(speedView, {
-        approx: t("approxSpeedPrefix"),
-        turn: t("turnSpeedPrefix"),
-        waiting: t("streaming"),
-      });
-      const rate = stats.cache.turnRate ?? null;
-      const cachePending = rate == null && stats.isRunning === true;
-      nextCache = rate != null ? `${Math.round(rate * 100)}%` : cachePending ? t("cachePendingShort") : "--%";
-      nextCacheTitle = cachePending ? t("cachePendingTitle") : "";
-      nextCacheColor = cacheColor(rate);
+      const cacheView = resolveHudCacheDisplay(stats);
+      nextCache = cacheView.rate != null ? `${Math.round(cacheView.rate * 100)}%` : "--%";
+      if (cacheView.kind === "session") {
+        nextCacheLabel = t("cacheSessionShort");
+        nextCacheTitle = t("cacheSessionTitle");
+      } else if (cacheView.kind === "unknown") {
+        nextCacheTitle = t("cacheUnknownTitle");
+      }
+      nextCacheColor = cacheColor(cacheView.rate);
       nextTokens = `${formatCompactTokens(stats.tokens.total)} tok`;
       const totalUsd = stats.cost.withSubagentsUsd;
       const subSuffix = stats.cost.subagentCount > 0 ? `<span class="t3-hud-sub-badge">(+${escapeHtml(stats.cost.subagentCount)}${escapeHtml(t("sub"))})</span>` : "";
       nextCost = `${formatUsd(totalUsd)}${subSuffix}`;
     }
 
-    const sig = `${nextDotClass}|${nextSpeed}|${nextCache}|${nextCacheTitle}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextQuota}|${nextQuotaTone}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
+    const sig = `${nextDotClass}|${nextSpeed}|${nextCacheLabel}|${nextCache}|${nextCacheTitle}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
     if (sig !== lastTopbarSig) {
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
       speedEl.textContent = nextSpeed;
       speedEl.style.color = "var(--hud-fg)";
+      cacheLblEl.textContent = nextCacheLabel;
       cacheEl.textContent = nextCache;
       cacheEl.style.color = nextCacheColor;
       cacheEl.title = nextCacheTitle;
       cacheEl.setAttribute("aria-label", nextCacheTitle || nextCache);
       tokensEl.textContent = nextTokens;
       costEl.innerHTML = nextCost;
-      if (nextQuota) {
-        quotaSepEl.style.display = "inline-block";
-        quotaItemEl.style.display = "inline-flex";
-        quotaEl.textContent = nextQuota;
-        quotaEl.className = `val ${nextQuotaTone}`;
-        quotaBarEl.className = nextQuotaTone;
-        quotaBarEl.style.width = `${wk.remainingPct}%`;
-      } else {
-        quotaSepEl.style.display = "none";
-        quotaItemEl.style.display = "none";
-      }
-      ctxPctEl.textContent = nextCtxTxt;
-      ctxPctEl.style.color = nextRingColor;
+      contextControl.setAttribute("aria-label", `${t("contextCapacity")}: ${nextCtxTxt}`);
+      contextControl.title = `${t("contextCapacity")}: ${nextCtxTxt}`;
       ringArcEl.setAttribute("stroke-dashoffset", nextRingOffset);
       ringArcEl.style.stroke = nextRingColor;
       branchBtnText.textContent = nextBranch;
@@ -3842,6 +4071,7 @@
     }
 
     updateLayoutPosition();
+    refreshHudStatsPopover(popover, currentPopoverMode, document.activeElement, renderStatsPopover);
   }
 
   function graphLaneCount(maxLanes) {
@@ -3991,7 +4221,9 @@
     }
 
     const historyText = latestGraph.partialHistory
-      ? (hudLang === "en" ? "Partial remote history; merge connections may be incomplete." : "仅显示部分远端历史；合并分支的连线可能不完整。")
+      ? latestGraph.historyScope === "repo-activity"
+        ? (hudLang === "en" ? "Recent repository activity may include other branches; relationships are unknown." : "最近仓库活动可能包含其他分支；提交关系未知。")
+        : (hudLang === "en" ? "Showing available history; commit relationships may be unknown." : "显示当前可用历史；提交之间的关系可能未知。")
       : latestGraph.firstParentOnly ? (hudLang === "en" ? "Remote history follows first parents; merge connections may be incomplete." : "远端提交历史；合并分支的连线可能不完整。") : "";
     const historyNotice = historyText ? `<div class="t3-empty-msg">${escapeHtml(historyText)}</div>` : "";
     gitListEl.innerHTML = header + historyNotice + commits.map((c) => {
@@ -4054,76 +4286,119 @@
 
   // Remote Git bundle over the T3 Connect WebSocket relay: pulls the raw git
   // metadata files out of the remote repo and lets the backend assemble them.
-  async function fetchRemoteGitBundle(envId, cwd, branch) {
-    if (typeof window.__t3HudRemoteRpc !== "function") return null;
-    if (!envId || !cwd) return null;
-    const rpc = (tag, rpcPayload) =>
-      window.__t3HudRemoteRpc(envId, tag, rpcPayload, 4500)
-        .then((r) => (r && r.ok ? r.value : null))
-        .catch(() => null);
-    const readFile = (relativePath) =>
-      rpc("projects.readFile", { cwd, relativePath, allowMissing: true });
-    const toText = (v) => {
-      if (typeof v === "string") return v;
-      if (v && typeof v === "object" && !v.truncated && v.exists !== false) return v.contents ?? v.content ?? v.text ?? v.fileContent ?? null;
-      return null;
-    };
-    const [gitConfigRaw, gitHeadRaw, packedRefsRaw, headLogRaw, vcsRefs, vcsStatus, branchCommits] =
-      await Promise.all([
-        readFile(".git/config"),
-        readFile(".git/HEAD"),
-        readFile(".git/packed-refs"),
-        readFile(".git/logs/HEAD"),
-        rpc("vcs.listRefs", { cwd, limit: 50 }),
-        rpc("vcs.refreshStatus", { cwd }),
+  async function fetchRemoteGitBundle(envId, cwd, branch, options = {}) {
+    if (typeof window.__t3HudRemoteRpc !== "function" || !envId || !cwd) return null;
+    const identity = JSON.stringify([envId, cwd, branch || "", options.threadId || ""]);
+    const inFlight = fetchRemoteGitBundle.inFlight ||= new Map();
+    if (inFlight.has(identity)) return inFlight.get(identity);
+    const work = (async () => {
+      const rpc = (tag, payload) => window.__t3HudRemoteRpc(envId, tag, payload, 4500)
+        .then((result) => result?.ok ? result.value : null).catch(() => null);
+      const readFile = (relativePath) => rpc("projects.readFile", { cwd, relativePath, allowMissing: true });
+      const toText = (value) => {
+        if (typeof value === "string") return value;
+        if (value && typeof value === "object" && !value.truncated && value.exists !== false) return value.contents ?? value.content ?? value.text ?? value.fileContent ?? null;
+        return null;
+      };
+      const [headRaw, packedRaw, logRaw, configRaw, refs, status, branchResult] = await Promise.all([
+        readFile(".git/HEAD"), readFile(".git/packed-refs"), readFile(".git/logs/HEAD"), readFile(".git/config"),
+        rpc("vcs.listRefs", { cwd, limit: 50 }), rpc("vcs.refreshStatus", { cwd }),
         rpc("review.getBranchCommits", { cwd }),
       ]);
-    // Review ranges exclude their base. Without an upstream, ask for the
-    // latest commit relative to its first parent and clearly mark it partial.
-    let reviewCommits = branchCommits;
-    if (!toText(headLogRaw) && (!branchCommits || !branchCommits.commits?.length)) {
-      const range = await rpc("review.getBranchCommits", { cwd, baseRef: "HEAD~1" });
-      if (range?.commits?.length) reviewCommits = range;
-    }
-    const gitHead = toText(gitHeadRaw);
-    const headRef = gitHead?.trim().match(/^ref: (refs\/[A-Za-z0-9_./-]+)$/)?.[1];
-    const looseHead = headRef ? toText(await readFile(`.git/${headRef}`))?.trim() : gitHead?.trim();
-    const packedHead = headRef ? toText(packedRefsRaw)?.split("\n").find(line => line.endsWith(` ${headRef}`))?.split(" ")[0] : null;
-    const headLog = toText(headLogRaw);
-    const logTip = headLog?.trim().split("\n").at(-1)?.split(" ")[1];
-    let nextSha = [looseHead, packedHead, logTip, reviewCommits?.commits?.[0]?.sha].find(value => /^[a-f0-9]{40}$/i.test(value || ""));
-    const nativeCommits = [];
-    const visited = new Set();
-    let nativeHistoryTruncated = true;
-    // The native preview resolves a full SHA and its first parent, including
-    // the root commit excluded from review ranges. Never invent reflog edges.
-    while (nextSha && nativeCommits.length < 80 && !visited.has(nextSha)) {
-      visited.add(nextSha);
-      const preview = await rpc("review.getDiffPreview", { cwd, commitSha: nextSha, metadataOnly: true });
-      const source = preview?.sources?.find(value => value.kind === "commit" && value.headRef?.toLowerCase() === nextSha.toLowerCase());
-      if (!source) break;
-      const parent = source.baseRef;
-      const isRoot = parent === "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-      nativeCommits.push({ hash: nextSha.toLowerCase(), subject: source.commitSubject || "(no message)", parents: !isRoot && /^[a-f0-9]{40}$/i.test(parent || "") ? [parent.toLowerCase()] : [] });
-      if (isRoot) { nativeHistoryTruncated = false; break; }
-      nextSha = /^[a-f0-9]{40}$/i.test(parent || "") ? parent.toLowerCase() : null;
-    }
-    const bundle = {
-      environmentId: envId,
-      cwd,
-      branch: branch || null,
-      gitConfig: toText(gitConfigRaw),
-      gitHead,
-      packedRefs: toText(packedRefsRaw),
-      headLog,
-      vcsRefs: vcsRefs ?? null,
-      vcsStatus: vcsStatus ?? null,
-      branchCommits: reviewCommits ?? null,
-      nativeCommits,
-      nativeHistoryTruncated,
-    };
-    const res = await callBackend("getRemoteGitGraph", bundle);
-    return res || null;
+      let branchCommits = branchResult;
+      if (!toText(logRaw) && (!Array.isArray(branchResult?.commits) || !branchResult.commits.length)) {
+        const range = await rpc("review.getBranchCommits", { cwd, baseRef: "HEAD~1" });
+        if (Array.isArray(range?.commits) && range.commits.length) branchCommits = range;
+      }
+      // Existing reflog/branch rows are displayed as partial history. Reflog
+      // entries are never treated as parent edges; no per-commit requests run
+      // until a user opens a commit's detail.
+      const bundle = {
+        environmentId: envId, cwd, branch: branch || null,
+        gitConfig: null, gitHead: toText(headRaw), packedRefs: toText(packedRaw), headLog: toText(logRaw),
+        vcsRefs: refs ?? null, vcsStatus: status ?? null, branchCommits: branchCommits ?? null,
+        nativeCommits: [], nativeHistoryTruncated: true,
+      };
+      // Reflogs can outlive or be edited independently of the actual ref.
+      // Only a detached HEAD or a verified loose/packed ref proves the tip.
+      const headText = (bundle.gitHead || "").trim();
+      const refMatch = headText.match(/^ref:\s*(refs\/heads\/[A-Za-z0-9_./-]+)$/);
+      const headRef = refMatch && !refMatch[1].split("/").some((part) => part === "." || part === "..") ? refMatch[1] : null;
+      const headBranch = headRef ? headRef.slice("refs/heads/".length) : null;
+      const looseRaw = headRef ? await readFile(`.git/${headRef}`) : null;
+      const loose = toText(looseRaw)?.trim() || "";
+      const packed = headRef && looseRaw?.exists === false ? bundle.packedRefs?.split("\n").find((line) => line.endsWith(` ${headRef}`))?.split(/\s+/)[0] : null;
+      const headSha = (/^[a-f0-9]{40}$/i.test(headText) ? headText : /^[a-f0-9]{40}$/i.test(loose) ? loose : packed || "").toLowerCase();
+      const verifiedHead = /^[a-f0-9]{40}$/.test(headSha) && !/^0{40}$/.test(headSha) ? headSha : null;
+      bundle.resolvedHeadSha = verifiedHead;
+      const origin = toText(configRaw)?.match(/\[remote\s+"origin"\]\s*\n([\s\S]*?)(?:\n\s*\[[^\]\n]+\]\s*\n|$)/i)?.[1]?.match(/^\s*url\s*=\s*(.+?)\s*$/im)?.[1]?.trim();
+      const github = origin?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i);
+      const githubRepo = github ? `${github[1]}/${github[2]}` : null;
+      // Revalidate HEAD, refs, status and available commit rows before reuse;
+      // cache is in-memory, bounded and scoped to this exact chat/repository.
+      const cache = fetchRemoteGitBundle.cache ||= new Map();
+      const now = Date.now();
+      for (const [key, value] of cache) if (now - value.at > 120000) cache.delete(key);
+      const key = JSON.stringify([identity, bundle.gitHead, bundle.packedRefs, bundle.headLog, verifiedHead, githubRepo, refs, status, branchCommits]);
+      const safeToCache = key.length <= 65536 && headRaw != null && (!headRef || looseRaw != null) && packedRaw != null && logRaw != null && configRaw != null && refs != null && status != null && branchCommits != null;
+      const hit = safeToCache && cache.get(key);
+      if (hit) return JSON.parse(hit.value);
+      let result = await callBackend("getRemoteGitGraph", bundle) || null;
+      if (result?.ok && Array.isArray(result.commits)) {
+        const historyScope = bundle.headLog?.split("\n").some((line) => /\t(?:commit|merge\b)/i.test(line)) ? "repo-activity" : "branch-range";
+        result = { ...result, githubRepo, historyScope, commits: result.commits.map((commit) => {
+          const refs = Array.isArray(commit.refs) ? commit.refs : [];
+          const falselyMarked = refs.some((ref) => ref?.isHead === true || ref?.kind === "head");
+          const cleanRefs = refs.filter((ref) => ref?.isHead !== true && ref?.kind !== "head" &&
+            !(headBranch && ref?.kind === "branch" && ref?.label === headBranch) &&
+            !(falselyMarked && ref?.kind === "branch" && ref?.label === result.branch));
+          if (verifiedHead && String(commit.hash || "").toLowerCase() === verifiedHead) {
+            cleanRefs.unshift({ kind: "head", label: "HEAD", isHead: true });
+            if (headBranch && !cleanRefs.some((ref) => ref?.kind === "branch" && ref.label === headBranch)) cleanRefs.splice(1, 0, { kind: "branch", label: headBranch, isHead: false });
+          }
+          return { ...commit, refs: cleanRefs };
+        }) };
+      }
+      if (safeToCache && result?.ok) {
+        const value = JSON.stringify(result);
+        if (value.length <= 512 * 1024) {
+          cache.set(key, { at: Date.now(), value });
+          while (cache.size > 8) cache.delete(cache.keys().next().value);
+        }
+      }
+      return result;
+    })();
+    if (inFlight.size < 8) inFlight.set(identity, work);
+    try { return await work; }
+    finally { if (inFlight.get(identity) === work) inFlight.delete(identity); }
+  }
+
+  async function fetchRemoteCommitPreview(envId, cwd, branch, threadId, hash) {
+    if (!envId || !cwd || !/^[a-f0-9]{6,40}$/i.test(hash || "") || typeof window.__t3HudRemoteRpc !== "function") return null;
+    const identity = JSON.stringify([envId, cwd, branch || "", threadId || "", hash.toLowerCase()]);
+    const cache = fetchRemoteCommitPreview.cache ||= new Map();
+    const inFlight = fetchRemoteCommitPreview.inFlight ||= new Map();
+    const now = Date.now();
+    for (const [key, value] of cache) if (now - value.at > 30000) cache.delete(key);
+    const hit = cache.get(identity);
+    if (hit) return JSON.parse(hit.value);
+    if (inFlight.has(identity)) return inFlight.get(identity);
+    const work = (async () => {
+      const result = await window.__t3HudRemoteRpc(envId, "review.getDiffPreview", { cwd, commitSha: hash }, 4500).catch(() => null);
+      const sources = Array.isArray(result?.value?.sources) ? result.value.sources : [];
+      const source = sources.find((item) => item?.kind === "commit" && typeof item.headRef === "string" && item.headRef.toLowerCase() === hash.toLowerCase());
+      if (result?.ok && source) {
+        const value = JSON.stringify(result);
+        if (value.length <= 512 * 1024) {
+          cache.set(identity, { at: Date.now(), value });
+          while (cache.size > 8) cache.delete(cache.keys().next().value);
+        }
+      }
+      return result;
+    })();
+    if (inFlight.size < 8) inFlight.set(identity, work);
+    try { return await work; }
+    finally { if (inFlight.get(identity) === work) inFlight.delete(identity); }
   }
 
   async function openCommitDetail(hash) {
@@ -4141,19 +4416,25 @@
     commitBodyEl.textContent = "";
 
     let res;
-    if (latestGraph?.isRemoteGit) {
+    const hintSnap = getRouteHint();
+    const graphSnap = latestGraph;
+    const threadSnap = lastRemotePayload?.threadId || null;
+    const branchSnap = lastRemotePayload?.branch || null;
+    if (graphSnap?.isRemoteGit) {
       const fb = getFallbackCwd();
-      const cwd = fb?.cwd || latestGraph.repoPath || "";
+      const cwd = fb?.cwd || graphSnap.repoPath || "";
       const envId = fb?.environmentId || lastRemotePayload?.environmentId || "";
-      const entry = (latestGraph.commits || []).find((c) => c.hash === hash) || {};
-      const previewResult = envId && cwd && typeof window.__t3HudRemoteRpc === "function"
-        ? await window.__t3HudRemoteRpc(envId, "review.getDiffPreview", { cwd, commitSha: hash }, 4500).catch(() => null)
-        : null;
-      const source = previewResult?.ok && previewResult.value?.sources?.find((item) => item.kind === "commit");
+      const entry = (graphSnap.commits || []).find((c) => c.hash === hash) || {};
+      const previewResult = await fetchRemoteCommitPreview(envId, cwd, branchSnap, threadSnap, hash);
+      if (selectedCommitHash !== hash || !drawerOpen || getRouteHint() !== hintSnap ||
+          getFallbackCwd()?.environmentId !== envId || getFallbackCwd()?.cwd !== cwd ||
+          (lastRemotePayload?.threadId || null) !== threadSnap || (lastRemotePayload?.branch || null) !== branchSnap) return;
+      const sources = Array.isArray(previewResult?.value?.sources) ? previewResult.value.sources : [];
+      const source = previewResult?.ok && sources.find((item) => item?.kind === "commit" && typeof item.headRef === "string" && item.headRef.toLowerCase() === hash.toLowerCase());
       if (source) {
         res = { ok: true, hash, authorName: entry.author || "", authorEmail: "", message: source.commitSubject || entry.subject || "", files: (source.files || []).map((f) => ({ path: f.path, added: f.additions, deleted: f.deletions })), patch: source.diff || "", diffUnavailable: !!(source.truncated || source.patchesDeferred || previewResult.value.incomplete) };
       } else res = await callBackend("getRemoteCommitDetail", {
-        githubRepo: latestGraph.githubRepo || null,
+        githubRepo: graphSnap.githubRepo || null,
         hash,
         cwd,
         environmentId: envId,
@@ -4162,7 +4443,7 @@
     } else {
       res = await callBackend("getCommitDetail", getRouteHint(), hash, getFallbackCwd());
     }
-    if (selectedCommitHash !== hash || !drawerOpen) return;
+    if (selectedCommitHash !== hash || !drawerOpen || getRouteHint() !== hintSnap || (lastRemotePayload?.threadId || null) !== threadSnap) return;
     if (!res || !res.ok) {
       commitMsgEl.textContent = res?.error || t("readFail");
       return;
@@ -4238,7 +4519,10 @@
       const cwd = fbSnap?.cwd || "";
       if (envId && cwd) {
         try {
-          const remote = await fetchRemoteGitBundle(envId, cwd, branchSnap);
+          const remote = await fetchRemoteGitBundle(envId, cwd, branchSnap, { threadId: threadSnap });
+          if (reqSeq !== gitGraphReqSeq || !drawerOpen || getRouteHint() !== hint ||
+              getFallbackCwd()?.environmentId !== envId || getFallbackCwd()?.cwd !== cwd ||
+              (lastRemotePayload?.threadId || null) !== threadSnap || (lastRemotePayload?.branch || null) !== branchSnap) return;
           if (remote) {
             if (!remote.threadId && threadSnap) remote.threadId = threadSnap;
             graph = remote;
@@ -4717,6 +5001,7 @@
     history.replaceState = origReplaceState;
     document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());
     document.querySelectorAll(".t3-hud-composer-spaced").forEach((el) => el.classList.remove("t3-hud-composer-spaced"));
+    if (window.__t3HudRemoteProject === getHudRemoteProject) delete window.__t3HudRemoteProject;
     root.remove();
     styleEl.remove();
     window.__t3HudInitialized = false;

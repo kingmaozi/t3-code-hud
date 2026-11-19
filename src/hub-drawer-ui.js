@@ -10,30 +10,34 @@
     const existing = window.__t3SidecarHub;
     if (existing) { restored = existing.snapshot?.() || restored; try { existing.destroy?.(); } catch {} }
     const initial = restored; restored = null;
-    const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), slashCache = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
+    const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
     let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, planHandle, style, palette, liveBoard, occlusionBoardRect = null;
+    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, style, liveBoard, occlusionBoardRect = null;
     let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
-    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, embedVersion = 0, settingsVersion = 0, settingsSelectionVersion = 0;
+    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
     let lastRoute = "", lastBoardRoute = "", cachedRouter = null, unsubscribeRouter = null, routerProbeAt = 0;
-    let drag = null, boardDrag = null, suppressClick = false, contextLoading = true;
-    let slashVersion = 0, slashInserting = false, composing = false, slashSession = null;
-    const tabKeys = ["memory", "skills", "plugins", "subagents", "hooks", "settings", "board", "agents"];
-    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, overview: null, memory: null, worktree: null, dream: null, health: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
+    let boardDrag = null, contextLoading = true;
+    const tabKeys = ["memory"];
+    const tabAliases = { skills: "memory", mcp: "memory", plugins: "memory", hooks: "memory", subagents: "memory", settings: "memory", agents: "memory", board: "memory" };
+    const storedTab = initial?.tab || storageGet("t3-hub-tab") || "memory";
+    const restoredSubView = initial?.settingsSubView || (storedTab === "agents" ? "agents" : "native");
+    const normalizedTab = tabAliases[storedTab] || storedTab;
+    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
     const errors = {}, drafts = initial?.drafts || {};
     const state = {
- open: initial?.open ?? false, tab: initial?.tab || storageGet("t3-hub-tab") || "memory", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
- resourceFilters: initial?.resourceFilters || {}, memoryScope: initial?.memoryScope || "smart",
+ open: initial?.open ?? false, tab: normalizedTab, settingsSubView: restoredSubView === "agents" ? "agents" : "native", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
+ resourceFilters: initial?.resourceFilters || {}, memoryScope: ["smart", "project", "worktree"].includes(initial?.memoryScope) ? initial.memoryScope : "smart",
  boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
- dreamSaving: false, dreamRunning: false, dreamEngineDraft: initial?.dreamEngineDraft || null, memoryImporting: false, embedTrimming: false,
+ planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
+ memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
  clearedHostFields: new Set(Array.isArray(initial?.clearedHostFields) ? initial.clearedHostFields : []),
- scope: initial?.scope || storageGet("t3-hub-scope") || "global", libraryView: "skills", hooksOpen: false, dreamOpen: initial?.dreamOpen ?? readStoredDreamOpen() ?? true,
+ scope: initial?.scope || storageGet("t3-hub-scope") || "global", libraryView: "skills", hooksOpen: false,
  mcpQuery: "", mcpFilter: initial?.mcpFilter || "all", hookDraft: null, historyExpanded: initial?.historyExpanded || {}, supersedeItems: [], supersedeLoading: false,
  lang: "zh", theme: storageGet("t3-hub-theme") || "white", dark: false, context: null, connected: false, threadId: null, contextError: "", projectRoot: null, refreshing: false,
  skillQuery: initial?.skillQuery || "", skillFilter: initial?.skillFilter || "all", importScope: "project", importRepo: initial?.importRepo || "",
@@ -43,8 +47,17 @@
  modelChoice: "", customModel: "", useMirror: false, mcpAddOpen: false, mcpForm: { kind: "form", name: "", transport: "stdio", command: "", args: "", url: "", json: "" },
  syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
     };
-    if (!tabKeys.includes(state.tab)) state.tab = "memory";
+ if (!tabKeys.includes(state.tab)) state.tab = "memory";
+ if (storedTab !== state.tab) storageSet("t3-hub-tab", state.tab);
     if (!["global", "project"].includes(state.scope)) state.scope = "global";
+    // Memory is always bound to the current confirmed project. Migrate restored global or
+    // previously selected-project state before rendering so it cannot silently widen scope.
+    const migrateMemoryScope = state.scope !== "project" || state.memoryProject !== "current" || !["smart", "project", "worktree"].includes(state.memoryScope);
+    state.scope = "project";
+    state.memoryProject = "current";
+    if (!["smart", "project", "worktree"].includes(state.memoryScope)) state.memoryScope = "smart";
+    if (drafts.__new?.scope === "global") { drafts.__new.scope = "project"; drafts.__new.migratedFromGlobal = true; }
+    if (migrateMemoryScope) storageSet("t3-hub-scope", "project");
 
     async function hubRpc(action, payload = {}) {
  let result;
@@ -52,7 +65,6 @@
  else if (typeof window.__t3HubRpc === "function") result = await window.__t3HubRpc(action, payload);
  else if (typeof window.__t3HudBridge?.getGitGraph === "function") result = await window.__t3HudBridge.getGitGraph("__HUB_RPC__", action, payload);
  else throw new Error(tr("Hub 连接暂不可用", "Hub connection is unavailable"));
- if (result?.ok !== false && result?.success !== false && ["skills:setScope", "skills:importGitHub", "skills:updatePackage", "skills:removePackage", "skills:toggleAgent", "subagents:update", "subagents:save", "subagents:delete"].includes(action)) invalidateSlashCache();
  return result;
     }
     async function request(action, payload = {}) {
@@ -64,13 +76,21 @@
  }
  return result?.data ?? result?.result ?? result ?? {};
     }
+    async function requestMemoryAccess(action, payload = {}) {
+ const raw = await hubRpc(action, payload);
+ const value = raw?.data ?? raw?.result ?? raw ?? {};
+ const hasMemoryStatus = (result) => result && typeof result === "object" && (Object.hasOwn(result, "setupSummary") || Object.hasOwn(result, "access") || ["enabled", "disabled", "unknown"].includes(result.state));
+ if ((raw?.ok === false && !hasMemoryStatus(raw)) || raw?.success === false || (value?.ok === false && !hasMemoryStatus(value))) {
+ const error = new Error(raw?.error?.message || raw?.error || value?.error?.message || value?.error || raw?.message || value?.message || tr("本机记忆接入检查未完成", "Local memory access could not be completed"));
+ error.code = raw?.error?.code || raw?.code || value?.error?.code || value?.code;
+ throw error;
+ }
+ return value;
+    }
     function storageGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
     function storageSet(key, value) { try { localStorage.setItem(key, String(value)); } catch {} }
-    function readStoredDreamOpen() {
- const value = storageGet("t3-hub:dream-open");
- return value === "true" ? true : value === "false" ? false : null;
-    }
     function tr(zh, en) { return state.lang === "en" ? en : zh; }
+    function isAgentsView() { return state.tab === "settings" && state.settingsSubView === "agents"; }
     function esc(value) {
  return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
@@ -176,7 +196,7 @@
  state.theme = Object.hasOwn(hubThemes, theme) ? theme : "white";
  state.dark = isDark();
  const value = hubThemes[state.theme];
- for (const node of [root, liveBoard, handle, palette].filter(Boolean)) {
+ for (const node of [root, liveBoard, handle, planHandle, titleControls].filter(Boolean)) {
  node.dataset.theme = state.theme;
  node.classList.toggle("is-dark", state.dark);
  const variables = { "hub-bg": value.bg, "hub-bg-subtle": value.subtle, "hub-border": value.border, "hub-ink": value.ink, "hub-secondary": value.secondary, "hub-muted": value.secondary, "hub-active": value.accent, "hub-on-active": state.dark ? "#0f172a" : "#ffffff", "hub-accent": value.accent,
@@ -195,19 +215,23 @@
     function build() {
  if (disposed) return;
  document.getElementById("t3-sidecar-hub")?.remove();
+ document.getElementById("t3-hub-handle")?.remove();
+ document.getElementById("t3-hub-title-controls")?.remove();
+ document.getElementById("t3-hub-plan-handle")?.remove();
  document.getElementById("t3-sidecar-hub-root")?.remove();
  document.getElementById("t3-sidecar-hub-styles")?.remove();
  style = document.createElement("style");
       style.id = "t3-sidecar-hub-styles";
-      style.textContent = `.hub-board-studio .hub-step-text{min-width:0;overflow-wrap:anywhere}.hub-board-add .hub-input{min-width:0}
+      style.textContent = `#t3-hub-plan-handle{position:relative;right:auto;top:auto;z-index:1;display:inline-flex;align-items:center;justify-content:center;min-width:25px;height:25px;padding:3px 7px;border:1px solid var(--hub-border);border-radius:7px;background:var(--hub-bg);color:var(--hub-ink);font-size:10px;line-height:1;vertical-align:middle;cursor:pointer}#t3-hub-plan-handle[hidden]{display:none!important}.hub-plan-indicator{display:inline-flex;align-items:center;gap:3px;font-variant-numeric:tabular-nums}.hub-plan-indicator i{font-style:normal;color:var(--hub-muted)}#t3-hub-live-board{z-index:2147483001;box-sizing:border-box;padding:0;max-width:calc(100vw - 16px);overflow:auto;border:1px solid var(--hub-border);border-radius:11px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:0 12px 36px #0f172a24,0 2px 8px #0f172a12;font:11px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#t3-hub-live-board[hidden]{display:none!important}.hub-plan-popover{padding:12px 14px}.hub-plan-summary{display:flex;align-items:baseline;gap:6px;margin-bottom:8px;color:var(--hub-secondary);font-size:10px}.hub-plan-summary strong{color:var(--hub-ink);font-size:12px;font-variant-numeric:tabular-nums}.hub-plan-steps{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}.hub-plan-steps .hub-board-step{display:flex;gap:8px;align-items:flex-start;min-width:0;font-size:11px;line-height:1.55}.hub-plan-steps .hub-step-icon{flex:none;margin-top:1px}.hub-plan-steps .hub-step-text{min-width:0;overflow-wrap:anywhere}.hub-plan-document{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--hub-secondary);font-size:10px}.hub-plan-steps .is-completed .hub-step-text{text-decoration:line-through;color:var(--hub-muted)}
+.hub-board-studio .hub-step-text{min-width:0;overflow-wrap:anywhere}.hub-board-add .hub-input{min-width:0}
 @media(max-width:600px){.hub-artifact-preview>.hub-row>.hub-grow{flex-basis:100%}}
 .hub-native-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:0 20px;margin-top:16px}.hub-native-key{display:block;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-muted);overflow-wrap:anywhere}.hub-native-fields .hub-hint{margin-top:5px}.hub-native-settings .hub-settings-host-description{overflow-wrap:anywhere}
 .hub-native-field-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px 8px;min-height:24px}.hub-native-field-heading label{font-weight:550}.hub-native-clear{border:0;border-radius:5px;background:var(--hub-bg-subtle);padding:3px 6px;font-size:9px!important;line-height:1.6;white-space:nowrap}.hub-native-clear:hover{background:var(--hud-hover)}.hub-native-field textarea{resize:vertical;min-height:36px}.hub-native-empty{display:inline-flex;margin-top:5px;padding:2px 6px;border:1px solid var(--hub-border);border-radius:5px;font-size:9px;line-height:1.6;color:var(--hub-secondary);background:var(--hub-bg-subtle)}
 #t3-sidecar-hub-root{--hub-bg:#fff;--hub-bg-subtle:#f7f7f8;--hub-border:#ececec;--hub-ink:#0d0d0d;--hub-secondary:#5d5d5d;--hub-muted:#8e8e93;--hub-active:#0d0d0d;--hub-on-active:#fff;--hud-bg:var(--hub-bg);--hud-bg-solid:var(--hub-bg);--hud-fg:var(--hub-ink);--hud-muted:var(--hub-secondary);--hud-surface:var(--hub-bg-subtle);--hud-border:var(--hub-border);--hud-hover:rgba(0,0,0,.045);--hud-shadow:0 16px 64px #00000014,0 2px 8px #00000008;--hud-emerald:var(--hub-ink);--hud-blue:var(--hub-ink);--hud-violet:var(--hub-ink);--hud-amber:var(--hub-secondary);--hud-red:var(--hub-ink);--hub-accent-bg:var(--hub-bg-subtle);position:fixed;inset:0;z-index:9993;pointer-events:none;color:var(--hub-ink);font:12px/1.6 -apple-system,BlinkMacSystemFont,"Inter Variable","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;color-scheme:light}
 #t3-sidecar-hub-root,#t3-sidecar-hub-root *{box-sizing:border-box}#t3-sidecar-hub-root :is(button,input,select,textarea){font:inherit;letter-spacing:inherit;color:inherit}#t3-sidecar-hub-root button{cursor:pointer;-webkit-app-region:no-drag}#t3-sidecar-hub-root button:disabled{opacity:.38;cursor:not-allowed}#t3-sidecar-hub-root :is(button,input,select,textarea):focus-visible{outline:2px solid var(--hub-ink);outline-offset:3px}#t3-sidecar-hub-root svg{flex:none;vertical-align:middle}#t3-sidecar-hub-root [hidden]{display:none!important}
-#t3-hub-handle{position:fixed;right:0;top:42%;transform:translateY(-50%);width:28px;min-height:92px;padding:10px 4px;display:flex;flex-direction:column;align-items:center;gap:8px;justify-content:center;border:1px solid var(--hub-border);border-right:0;border-radius:10px 0 0 10px;background:var(--hub-bg);color:var(--hub-secondary);pointer-events:auto;touch-action:none;user-select:none;box-shadow:-2px 3px 16px #00000008}.hub-handle-label{writing-mode:vertical-rl;font-size:9px;letter-spacing:2px}.hub-handle-count{font-size:9px}.is-open #t3-hub-handle{opacity:0;pointer-events:none}
-#t3-hub-plan-handle{position:fixed;right:0;padding:6px 8px;border:1px solid var(--hub-border);border-right:0;border-radius:8px 0 0 8px;background:var(--hub-bg);color:var(--hub-ink);font-size:10px;pointer-events:auto}.is-open #t3-hub-plan-handle{display:none}
-#t3-sidecar-hub-root #t3-hub-drawer{position:fixed;right:12px;top:12px;bottom:12px;width:min(var(--hub-width,880px),94vw);max-height:calc(100dvh - 24px);display:grid;grid-template-columns:196px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:none;visibility:hidden;opacity:0;transform:translateX(calc(100% + 28px));transition:transform .24s ease,opacity .2s,visibility .24s;-webkit-app-region:no-drag}#t3-sidecar-hub-root.is-open #t3-hub-drawer{pointer-events:auto;visibility:visible;opacity:1;transform:none}#t3-sidecar-hub-root.is-occluded{visibility:hidden!important}#t3-sidecar-hub-root.is-occluded :is(#t3-hub-drawer,#t3-hub-handle,#t3-hub-live-board){visibility:hidden!important;pointer-events:none!important}
+#t3-hub-title-controls{display:inline-flex;align-items:center;gap:6px;margin-left:8px;vertical-align:middle;pointer-events:auto;white-space:nowrap;-webkit-app-region:no-drag}#t3-hub-title-controls[hidden]{display:none!important}#t3-hub-title-controls>button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-width:0;height:27px;padding:4px 9px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;color:#253247;font:10px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:550;white-space:nowrap;cursor:pointer;pointer-events:auto;-webkit-app-region:no-drag}#t3-hub-title-controls>button:hover,#t3-hub-title-controls>button:focus-visible{background:#f1f6ff;border-color:#c8dcff}#t3-hub-memory-toggle[aria-checked="true"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}#t3-hub-memory-toggle[aria-checked="mixed"]{border-style:dashed;color:#64748b}#t3-hub-memory-toggle:disabled{opacity:.55;cursor:wait}
+#t3-hub-plan-handle{position:relative;padding:4px 9px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;color:#253247;font-size:10px;pointer-events:auto}.is-open #t3-hub-plan-handle{display:none}
+#t3-sidecar-hub-root #t3-hub-drawer{position:fixed;right:12px;top:12px;bottom:12px;width:min(var(--hub-width,880px),94vw);max-height:calc(100dvh - 24px);display:grid;grid-template-columns:196px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:none;visibility:hidden;opacity:0;transform:translateX(calc(100% + 28px));transition:transform .24s ease,opacity .2s,visibility .24s;-webkit-app-region:no-drag}#t3-sidecar-hub-root.is-open #t3-hub-drawer{pointer-events:auto;visibility:visible;opacity:1;transform:none}#t3-sidecar-hub-root.is-occluded{visibility:hidden!important}#t3-sidecar-hub-root.is-occluded :is(#t3-hub-drawer,#t3-hub-live-board){visibility:hidden!important;pointer-events:none!important}
 #t3-hub-drawer.is-compact{grid-template-columns:156px minmax(0,1fr)}.hub-header{grid-column:1/-1;padding:20px 24px 16px;border-bottom:1px solid var(--hub-border)}.hub-title-row,.hub-row{display:flex;align-items:center;gap:9px;min-width:0}.hub-title-row{gap:11px}.hub-brand{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-grow{min-width:0;flex:1}.hub-title{font-size:17px;font-weight:650;letter-spacing:-.5px;line-height:1.4}.hub-version{font-size:10px;color:var(--hub-muted);font-weight:450;margin-left:5px}.hub-kicker{color:var(--hub-secondary);font-size:11px;margin-top:2px}.hub-icon-btn{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--hub-secondary)!important}.hub-icon-btn:hover{background:var(--hud-hover);color:var(--hub-ink)!important}.hub-scope-bar{display:flex;gap:8px;align-items:center;margin-top:15px}.hub-scope-select{max-width:280px}.hub-shortcut{font-size:10px;color:var(--hub-muted);margin-left:auto}.hub-context{display:flex;align-items:center;min-width:0;margin-top:10px;font-size:10px;color:var(--hub-secondary)}.hub-context-status{display:flex;gap:6px;align-items:center;overflow:hidden}.hub-context-status>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.hub-widths{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px}.hub-widths button{font-size:10px!important;padding:4px 8px;border:0;border-radius:5px;background:transparent;color:var(--hub-secondary)}.hub-widths button.is-active{background:var(--hub-active);color:var(--hub-on-active)}
 .hub-tabs{grid-column:1;grid-row:2;display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:18px 11px;overflow:auto;background:var(--hub-bg-subtle);border-right:1px solid var(--hub-border)}.hub-tab{display:flex;gap:10px;align-items:center;text-align:left;padding:10px 11px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--hub-secondary)!important;font-size:11px!important;line-height:1.5;white-space:nowrap}.hub-tab:hover{background:var(--hud-hover)}.hub-tab[aria-selected=true]{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-tab-count{margin-left:auto;font-size:9px;opacity:.65;font-variant-numeric:tabular-nums}.hub-content{grid-column:2;grid-row:2;min-width:0;min-height:0;padding:26px 28px 32px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--hub-border) transparent}.hub-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 8px;font-size:15px;font-weight:620;letter-spacing:-.2px}.hub-count{font-size:10px;font-weight:450;color:var(--hub-secondary);font-variant-numeric:tabular-nums}.hub-description{font-size:11px;line-height:1.8;color:var(--hub-secondary);margin:0 0 20px}.hub-card{padding:16px;border:1px solid var(--hub-border);border-radius:12px;background:var(--hub-bg);margin-bottom:12px;min-width:0}.hub-card-top{display:flex;gap:11px;align-items:flex-start;min-width:0}.hub-card-name{font-size:12px;font-weight:600;line-height:1.65;overflow-wrap:anywhere}.hub-card-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:4px}.hub-card-description{color:var(--hub-secondary);font-size:11px;line-height:1.75;margin:8px 0 12px;overflow-wrap:anywhere}.hub-badge,.hub-capability{display:inline-flex;gap:4px;align-items:center;border:1px solid var(--hub-border);border-radius:5px;padding:1px 6px;color:var(--hub-secondary);font-size:9px;line-height:1.7;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-capabilities{display:flex;gap:5px;flex-wrap:wrap;margin:8px 0}.hub-badge>span{overflow:hidden;text-overflow:ellipsis}.hub-asset-icon,.hub-brand-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;position:relative;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);color:var(--hub-ink);overflow:hidden}.hub-brand-icon>img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;filter:none!important}.hub-brand-icon.has-image>svg{opacity:0}.hub-brand-icon.is-small{width:24px;height:24px;border-radius:6px}.hub-brand-icon.is-small>img{inset:2px;width:calc(100% - 4px);height:calc(100% - 4px)}.hub-connection-dot{position:absolute;right:2px;bottom:2px;width:5px;height:5px;border-radius:50%;background:var(--hub-muted);box-shadow:0 0 0 2px var(--hub-bg)}.hub-connection-dot.is-connected{background:var(--hub-ink)}
 .hub-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 11px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);font-size:11px!important;line-height:1.4;white-space:nowrap}.hub-btn:hover:not(:disabled){background:var(--hud-hover)}.hub-btn.hub-primary{background:var(--hub-active);border-color:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-btn.hub-primary:hover:not(:disabled){opacity:.85;background:var(--hub-active)}.hub-btn.hub-small{font-size:10px!important;min-height:27px;padding:5px 9px}.hub-btn.is-busy{pointer-events:none;opacity:.65}.hub-spinner{display:inline-block;flex:none;width:12px;height:12px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:hub-spin .7s linear infinite}@keyframes hub-spin{to{transform:rotate(360deg)}}
@@ -217,7 +241,6 @@
 .hub-subagent-scopes{display:flex;gap:8px;margin:18px 0}.hub-subagent-scope{flex:1;min-width:0;text-align:left;border:1px solid var(--hub-border);border-radius:9px;background:transparent;padding:10px 12px;font-size:11px!important}.hub-subagent-scope[aria-pressed=true]{background:var(--hub-bg-subtle);border-color:var(--hub-ink)}.hub-subagent-scope small{display:block;color:var(--hub-secondary);font-size:9px;margin-top:3px}.hub-subagent-heading{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:20px 0 10px}.hub-subagent-heading h3{font-size:13px;margin:0}.hub-subagent-heading h3>span{font-size:10px;color:var(--hub-secondary);margin-left:7px;font-weight:400}.hub-subagent-list{border:1px solid var(--hub-border);border-radius:11px;overflow:hidden}.hub-subagent-card{padding:16px;border-bottom:1px solid var(--hub-border);min-width:0}.hub-subagent-card:last-child{border-bottom:0}.hub-subagent-main{display:grid;grid-template-columns:28px minmax(0,1fr);gap:9px;align-items:center}.hub-subagent-summary{min-width:0;text-align:left;border:0;background:transparent;padding:0}.hub-subagent-name{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;font-weight:600}.hub-tool-badge{font-size:8px;line-height:1.5;font-weight:400;padding:2px 5px;border:1px solid var(--hub-border);border-radius:4px;color:var(--hub-secondary)}.hub-subagent-desc{display:block;font-size:10px;color:var(--hub-secondary);line-height:1.7;margin-top:3px;overflow-wrap:anywhere}.hub-subagent-controls{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1.3fr) minmax(0,.8fr);gap:6px;grid-column:2}.hub-subagent-controls .hub-select{font-size:10px!important;padding:7px 20px 7px 8px}.hub-subagent-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin:10px 0 0 37px}.hub-memory-policy{width:170px;padding:5px 18px 5px 7px;font-size:9px!important}.hub-subagent-edit{display:inline-flex;gap:4px;align-items:center;margin-left:auto;font-size:9px!important;border:0;background:transparent;padding:3px 0;color:var(--hub-secondary)!important}.hub-subagent-expand{display:none}.hub-subagent-expand.is-expanded{display:block}.hub-subagent-editor{border-top:1px solid var(--hub-border);margin-top:14px;padding-top:14px}.hub-subagent-custom{padding:12px;border:1px solid var(--hub-border);border-radius:8px;margin-top:10px}.hub-subagent-note{display:flex;align-items:flex-start;gap:6px;margin-top:14px;font-size:10px;color:var(--hub-secondary);line-height:1.8}.hub-commander{padding:18px;background:var(--hub-bg-subtle)}.hub-commander-title{font-size:14px;font-weight:600;margin-bottom:4px}.hub-commander .hub-description{margin-bottom:16px}.hub-commander-note{padding:10px 12px;border-left:2px solid var(--hub-ink);font-size:10px;line-height:1.9;color:var(--hub-secondary);margin:12px 0 16px}.hub-control-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-top:1px solid var(--hub-border)}.hub-control-row strong{font-size:11px;font-weight:550;display:block}.hub-control-row small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:3px}.hub-range{display:flex;align-items:center;gap:8px;max-width:170px}.hub-range input[type=range]{width:100px;accent-color:var(--hub-active)}.hub-range input[type=number]{width:49px;padding:5px;font-size:10px!important}
 .hub-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 24px;border-top:1px solid var(--hub-border);color:var(--hub-secondary);font-size:9px;min-height:40px;background:var(--hub-bg)}.hub-footer-status{display:flex;align-items:center;gap:6px}.hub-footer-key{color:var(--hub-muted)}.hub-toast{position:absolute;left:20px;right:20px;bottom:53px;display:flex;gap:8px;align-items:center;padding:11px 14px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-active);color:var(--hub-on-active);font-size:11px;box-shadow:var(--hud-shadow);pointer-events:auto;z-index:4}.hub-empty{display:flex;flex-direction:column;align-items:center;gap:9px;padding:36px 18px;color:var(--hub-secondary);text-align:center;font-size:11px}.hub-empty strong{font-size:12px;color:var(--hub-ink);font-weight:550}.hub-empty>svg{opacity:.5}.hub-empty>span{font-size:10px;line-height:1.8;max-width:280px}.hub-error{display:flex;gap:9px;align-items:flex-start;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:13px;margin:12px 0;color:var(--hub-ink)}.hub-error>div{flex:1;min-width:0}.hub-error strong{font-size:11px;display:block}.hub-error span{display:block;font-size:10px;color:var(--hub-secondary);margin-top:4px;overflow-wrap:anywhere}.hub-skeleton>div{border-bottom:1px solid var(--hub-border);padding:18px 0}.hub-skeleton i{display:block;background:var(--hub-bg-subtle);height:9px;border-radius:3px;margin:9px 0;animation:hub-pulse 1.3s ease infinite}.hub-skeleton i:first-child{width:40%}.hub-skeleton i:last-child{width:70%}@keyframes hub-pulse{50%{opacity:.35}}
 #t3-hub-resize-handle{position:absolute;z-index:5;left:0;top:0;bottom:0;width:7px;background:transparent;cursor:ew-resize;touch-action:none;border:0;padding:0}#t3-hub-resize-handle:after{content:"";position:absolute;top:45%;left:2px;width:2px;height:32px;background:var(--hub-border);border-radius:3px}#t3-hub-resize-handle:hover:after{background:var(--hub-ink)}
-#t3-hub-slash-palette{position:fixed;pointer-events:auto;z-index:3;display:flex;flex-direction:column;overflow:hidden;width:360px;max-height:480px;background:var(--hub-bg);border:1px solid var(--hub-border);border-radius:13px;box-shadow:var(--hud-shadow);-webkit-app-region:no-drag}.hub-slash-header{display:flex;gap:8px;align-items:center;padding:14px 14px 9px;font-size:12px;font-weight:600}.hub-slash-project{margin-left:auto;font-size:9px;font-weight:400;color:var(--hub-secondary);max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-slash-search{padding:0 12px 10px}.hub-slash-search .hub-input{background:var(--hub-bg-subtle);padding:8px 10px;font-size:11px!important}.hub-slash-tabs{display:flex;gap:3px;padding:0 10px 10px;border-bottom:1px solid var(--hub-border)}.hub-slash-tabs button{padding:5px 8px;font-size:9px!important}.hub-slash-list{overflow:auto;min-height:0;overscroll-behavior:contain;padding:6px;scrollbar-width:thin}.hub-slash-row{display:flex;gap:6px;align-items:center;border-radius:8px;margin:2px 0}.hub-slash-row.is-active{background:var(--hub-bg-subtle)}.hub-slash-select{display:flex;align-items:center;gap:9px;flex:1;min-width:0;padding:9px 8px;border:0;background:transparent;border-radius:8px;text-align:left}.hub-slash-label{display:block;font-size:11px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-slash-description{display:block;font-size:9px;color:var(--hub-secondary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-slash-type{display:grid;place-items:center;width:24px;height:24px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg-subtle);flex:none}.hub-slash-badge{font-size:8px;max-width:27%;flex-shrink:1}.hub-slash-edit{border:0;background:transparent;font-size:9px!important;color:var(--hub-secondary);padding:5px}.hub-slash-empty{padding:22px 12px;font-size:10px;color:var(--hub-secondary);display:flex;gap:7px;align-items:center}.hub-slash-footer{display:flex;justify-content:space-between;gap:7px;padding:9px 14px;border-top:1px solid var(--hub-border);font-size:8px;color:var(--hub-muted)}
 #t3-hub-live-board{position:fixed;z-index:2147483000;pointer-events:auto;min-width:0;background:var(--hub-bg);color:var(--hub-ink);border:1px solid var(--hub-border);border-radius:0 0 12px 12px;padding:12px 14px;box-shadow:none;overflow:hidden;font:12px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#t3-hub-live-board[hidden]{display:none!important}#t3-hub-live-board,#t3-hub-live-board *{box-sizing:border-box}#t3-hub-live-board :is(button,input){font:inherit;color:inherit}#t3-hub-live-board button{cursor:pointer}#t3-hub-live-board :focus-visible{outline:2px solid var(--hub-accent);outline-offset:2px}#t3-hub-live-board.is-collapsed{}.hub-board-toggle{flex:1;min-width:0;width:100%;display:flex;gap:8px;align-items:center;justify-content:space-between;border:0;background:transparent;text-align:left;padding:0;font-size:11px!important;font-weight:550}.is-collapsed .hub-board-toggle{padding:0;font-size:11px!important}.hub-board-content{padding:14px 0 0;max-height:420px;overflow:auto}.hub-board-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 15px}.hub-board-heading strong{font-size:14px;font-weight:600}.hub-board-background{margin:0 0 16px;padding:10px 11px;background:var(--hub-bg-subtle);border-radius:7px;font-size:10px;color:var(--hub-secondary);white-space:pre-wrap;line-height:1.85}.hub-board-section{font-size:10px;color:var(--hub-secondary);display:flex;align-items:center;justify-content:space-between;margin:18px 0 10px;font-weight:550}.hub-board-section:first-child{margin-top:4px}.hub-board-section b{font-size:11px;font-weight:600;color:var(--hub-ink)}.hub-board-steps{display:flex;flex-direction:column;gap:12px;margin:0;padding:0;list-style:none}.hub-board-step{display:flex;gap:10px;align-items:flex-start;font-size:11px;line-height:1.7;min-width:0}.hub-step-icon{display:grid;place-items:center;flex:none;width:16px;height:19px;font-size:13px;font-weight:600}.hub-board-step.is-completed{color:var(--hub-muted)}.hub-board-step.is-completed .hub-step-text{text-decoration:line-through}.hub-board-step.is-in-progress{font-weight:600;color:var(--hub-ink)}.is-in-progress .hub-step-icon{animation:hub-pulse 1.5s ease infinite}.hub-step-check{padding:0;border:0;background:transparent;line-height:1;color:inherit}.hub-artifacts{display:flex;flex-wrap:wrap;gap:6px}.hub-artifact-chip{border:1px solid var(--hub-border);border-radius:6px;font-size:9px!important;padding:5px 7px;background:var(--hub-bg-subtle);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-board-studio{border:1px solid var(--hub-border);border-radius:12px;padding:20px;margin:0 0 16px}.hub-board-studio .hub-board-step{font-size:12px}.hub-board-studio .hub-board-steps{gap:14px}.hub-board-add{display:flex;gap:7px;margin-top:20px}.hub-board-add .hub-input{flex:1}.hub-artifact-preview{padding:16px;background:var(--hub-bg-subtle);border:1px solid var(--hub-border);border-radius:10px;margin-top:16px}.hub-artifact-preview pre{white-space:pre-wrap;overflow-wrap:anywhere;font:10px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:340px;overflow:auto}.hub-native-hosts{margin-bottom:18px}.hub-settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:18px 0}.hub-settings-host-description{margin:8px 0 18px;font-size:10px;color:var(--hub-secondary)}
 .hub-agents-targets{display:flex;gap:8px;margin:12px 0}.hub-agents-target{min-width:0;flex:1;border:1px solid var(--hub-border);border-radius:9px;background:transparent;padding:12px;text-align:left}.hub-agents-target.is-active{background:var(--hub-bg-subtle);border-color:var(--hub-ink)}.hub-agents-target strong{display:block;font-size:11px}.hub-agents-target small{display:block;font-size:9px;color:var(--hub-secondary)}.hub-token-bar{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:16px 0 9px;font-size:11px}.hub-token{font-size:9px;color:var(--hub-secondary)}.hub-token-warning{font-size:10px;color:var(--hub-secondary)}.hub-agents-editor{min-height:300px}.hub-agents-save{display:flex;gap:8px;justify-content:space-between;margin-top:12px;align-items:center}.hub-saved-hint{font-size:10px;color:var(--hub-secondary)}.hub-sync-badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:14px}.hub-soft-route{margin-top:16px}
 #t3-hub-drawer.is-wide .hub-resource-row{grid-template-columns:32px minmax(0,1fr) auto;align-items:center}#t3-hub-drawer.is-wide .hub-resource-row .hub-resource-toggle{grid-column:3;grid-row:1;margin:0}#t3-hub-drawer.is-wide .hub-subagent-main{grid-template-columns:28px minmax(0,1fr) minmax(280px,1fr)}#t3-hub-drawer.is-wide .hub-subagent-controls{grid-column:3}#t3-hub-drawer.is-compact .hub-content{padding:20px 16px}#t3-hub-drawer.is-compact .hub-header{padding:16px}#t3-hub-drawer.is-compact .hub-resource-row .hub-resource-toggle{grid-column:1/-1}#t3-hub-drawer.is-compact .hub-agent-toggle button{padding-inline:5px}#t3-hub-drawer.is-compact .hub-agent-toggle .hub-agent-mark{display:none}#t3-hub-drawer.is-compact .hub-import-grid{grid-template-columns:minmax(0,1fr) auto}#t3-hub-drawer.is-compact .hub-import-grid .hub-select{grid-column:1/-1}#t3-hub-drawer.is-compact .hub-engine-controls{flex-wrap:wrap}#t3-hub-drawer.is-compact .hub-engine-controls .hub-select{flex-basis:100%}#t3-hub-drawer.is-compact .hub-subagent-controls{grid-column:1/-1}#t3-hub-drawer.is-compact .hub-subagent-meta{margin-left:0}
@@ -235,27 +258,35 @@
 .hub-resource-grid{align-items:stretch;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.hub-resource-card{display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:14px;margin:0;min-width:0}.hub-resource-card .hub-card-top{align-items:flex-start;min-width:0}.hub-resource-card .hub-grow{min-width:0}.hub-resource-card .hub-card-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:6px;min-width:0}.hub-resource-card .hub-card-description{margin:0;min-height:42px}.hub-resource-card .hub-resource-toggle{width:100%;max-width:none;align-items:flex-start;margin-top:auto;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-resource-card .hub-agent-toggle{width:100%;justify-content:flex-start}.hub-resource-controls-label{font-size:9px;color:var(--hub-secondary);margin-top:2px}.hub-resource-card .hub-mcp-mode-controls{grid-column:auto;width:100%;grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:0;padding:9px}.hub-resource-card .hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}.hub-unavailable-hint{color:var(--hub-secondary);font-size:9px}.hub-unavailable{border-color:color-mix(in srgb,var(--hud-amber) 45%,var(--hub-border));color:var(--hub-secondary)}.hub-route-status{white-space:normal;text-overflow:clip}
 @media(max-width:639px){.hub-mcp-mode-controls{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.hub-mcp-mode-controls>.hub-btn{grid-column:1/-1;justify-self:start}}
 #t3-hub-live-board{border-radius:14px;padding:0;box-shadow:0 12px 36px #0f172a24,0 2px 8px #0f172a12;max-width:calc(100vw - 16px)}#t3-hub-live-board .hub-artifacts{display:grid;grid-template-columns:minmax(0,1fr);gap:7px}#t3-hub-live-board .hub-artifact-card{display:flex;align-items:center;gap:10px;min-width:0;width:100%;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle);color:var(--hub-ink);text-align:left;font-size:11px;cursor:pointer}#t3-hub-live-board .hub-artifact-card:hover{border-color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-icon{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:7px;background:var(--hub-bg);color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-board-toolbar{gap:4px;flex-wrap:nowrap;padding:10px 10px 8px;border-bottom:1px solid var(--hub-border)}.hub-board-drag{display:flex;align-items:center;gap:7px;min-width:0;flex:1;cursor:grab;user-select:none;touch-action:none;-webkit-app-region:no-drag}.hub-board-drag:active{cursor:grabbing}.hub-board-grip{font-size:15px;letter-spacing:-3px;color:var(--hub-muted);padding-right:4px}.hub-board-drag strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.hub-board-drag .hub-board-status{font-size:10px;color:var(--hub-secondary);white-space:nowrap}.hub-board-toolbar .hub-icon-btn{width:25px;height:25px;flex:none}.hub-board-content{padding:10px 12px 12px}.hub-board-source{display:flex;justify-content:space-between;gap:6px;font-size:10px;color:var(--hub-secondary);margin-bottom:8px}.hub-board-meter{height:5px;border-radius:10px;background:var(--hub-border);overflow:hidden;margin:0 0 12px}.hub-board-meter>i{display:block;height:100%;border-radius:inherit;background:var(--hub-accent)}.hub-dashboard-links{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--hub-border);margin-top:12px;padding-top:10px}.hub-dashboard-links button{border:0;border-radius:7px;background:var(--hub-bg-subtle);padding:4px 7px;color:var(--hub-secondary);font-size:10px!important}.hub-dashboard-links button:hover{color:var(--hub-ink)}.hub-progress-ring{flex:none;transform:rotate(-90deg)}.hub-step-icon{width:16px;height:16px;border:1.5px solid var(--hub-muted);border-radius:50%;font-size:10px;line-height:1}.hub-board-step.is-completed .hub-step-icon{background:var(--hub-accent);border-color:var(--hub-accent);color:var(--hub-on-active)}.hub-board-step.is-in-progress .hub-step-icon{border-color:var(--hub-accent)}.hub-commander .hub-segments>button[aria-pressed=true],.hub-commander .hub-segments>button[aria-pressed=true]:hover{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:600}.hub-subagent-main{grid-template-columns:36px minmax(0,1fr)}#t3-hub-drawer.is-wide .hub-subagent-main{grid-template-columns:36px minmax(0,1fr) minmax(280px,1fr)}.hub-robot{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;background:var(--hub-bg-subtle);flex:none}.hub-robot-face{width:23px;height:23px;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:4px;background:var(--robot-color,#3980f6);box-shadow:inset 0 -2px #00000012}.hub-robot-face i{display:block;width:4px;height:7px;background:#fff;border-radius:4px}.hub-subagent-meta{margin-left:45px}#t3-hub-drawer.is-compact .hub-subagent-meta{margin-left:0}`;
+      style.textContent += `#t3-hub-plan-handle{position:relative!important;right:auto!important;top:auto!important;padding:3px 7px!important;border-radius:7px!important;border-right:1px solid var(--hub-border)!important;background:var(--hub-bg)!important}#t3-hub-live-board{display:block;flex:none;min-height:0;padding:0;border-radius:11px;overflow:auto}#t3-hub-live-board[hidden]{display:none!important}.hub-connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:8px;margin:12px 0}.hub-connection-agent{min-width:0;padding:10px 12px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg)}.hub-connection-agent h3{margin:0 0 8px;font-size:11px}.hub-connection-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.hub-connection-cell{min-width:0;padding:7px;border-radius:7px;background:var(--hub-bg-subtle)}.hub-connection-cell>span,.hub-connection-cell>strong,.hub-connection-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-connection-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-connection-cell>strong{margin-top:2px;font-size:9px}.hub-connection-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:8px;line-height:1.45}.hub-connection-cell>strong[data-status="configured"]{color:#047857}.hub-connection-cell>strong[data-status="missing"]{color:var(--hub-secondary)}.hub-connection-cell>strong[data-status="unsupported"]{color:var(--hub-muted)}.hub-connection-cell>strong[data-status="unknown"]{color:#b45309}.hub-connection-note{align-items:center;flex-wrap:wrap}.hub-connection-error{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border:1px solid var(--hub-border);border-radius:8px;color:var(--hub-secondary);font-size:10px}@media(max-width:639px){.hub-connection-grid{grid-template-columns:minmax(0,1fr)}.hub-connection-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
+      style.textContent += `#t3-hub-plan-handle{justify-content:flex-start!important;gap:7px!important;width:auto!important;min-width:0!important;height:27px!important;padding:4px 10px!important;border:1px solid #dbe4f0!important;border-radius:999px!important;background:#f8fafc!important;color:#253247!important;box-shadow:0 1px 4px #0f172a12!important;font-size:10px!important;font-weight:550!important;line-height:1!important;white-space:nowrap!important}#t3-hub-plan-handle:hover,#t3-hub-plan-handle:focus-visible{background:#f1f6ff!important;border-color:#c8dcff!important}.hub-plan-indicator{gap:7px!important;white-space:nowrap}.hub-plan-ring{display:block;flex:none;width:15px;height:15px;transform:rotate(-90deg)}.hub-plan-ring-track{fill:none;stroke:#dbeafe;stroke-width:2.4}.hub-plan-ring-progress{fill:none;stroke:#3980f6;stroke-width:2.4;stroke-linecap:round;transition:stroke-dashoffset .18s ease}.hub-plan-label{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-memory-access-switch{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;font-weight:550;color:var(--hub-ink)}.hub-memory-access-switch input{flex:none;width:15px;height:15px;accent-color:#3980f6}.hub-memory-access-state{font-size:10px;color:var(--hub-secondary);white-space:normal;text-align:right}.hub-memory-access-actions{flex-wrap:wrap;margin-top:10px}.hub-memory-access-summary{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hub-memory-access-summary>span{padding:2px 7px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary)}.hub-memory-access-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:6px;margin-top:9px}.hub-memory-access-provider{min-width:0;padding:7px 9px;border:1px solid var(--hub-border);border-radius:8px;font-size:9px}.hub-memory-access-provider strong,.hub-memory-access-provider small{display:block;overflow-wrap:anywhere}.hub-memory-access-provider small{margin-top:2px;color:var(--hub-secondary)}.hub-memory-access-prompt{margin-top:10px;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:120px;resize:vertical;white-space:pre-wrap}@media(max-width:639px){.hub-memory-access-switch{align-items:flex-start}.hub-memory-access-state{text-align:left}}`;
+      style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<button type="button" id="t3-hub-handle" aria-controls="t3-hub-drawer" aria-expanded="false">${icon("hub", 15)}<span class="hub-handle-label">HUB</span><span class="hub-handle-count" hidden></span></button><button type="button" id="t3-hub-plan-handle" data-action="open-board-studio" aria-controls="t3-hub-drawer" hidden></button><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="任务面板" hidden></section>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
- handle = root.querySelector("#t3-hub-handle");
+ handle = null;
+ titleControls = root.querySelector("#t3-hub-title-controls");
+ memoryHandle = root.querySelector("#t3-hub-memory-handle");
+ memoryToggle = root.querySelector("#t3-hub-memory-toggle");
  planHandle = root.querySelector("#t3-hub-plan-handle");
  content = root.querySelector(".hub-content");
  liveBoard = root.querySelector("#t3-hub-live-board");
- palette = document.createElement("section");
- palette.id = "t3-hub-slash-palette";
- palette.hidden = true;
- palette.setAttribute("aria-label", "Skills 与编排指令");
- root.appendChild(palette);
  state.lang = detectLang(); state.dark = isDark();
  applyTheme(); renderChrome(); applyWidth(); renderLiveBoard(); positionHandle();
  listen(root, "click", onClick); listen(root, "input", onInput); listen(root, "change", onChange);
+ listen(planHandle, "pointerdown", handlePlanPointerDown);
+ listen(planHandle, "click", handlePlanClick);
+ listen(planHandle, "pointerenter", handlePlanPointerEnter);
+ listen(planHandle, "pointerleave", handlePlanPointerLeave);
+ listen(planHandle, "focus", () => { setPlanPopover(true); pollBoard().then(renderLiveBoard); });
+ listen(planHandle, "blur", () => deferPlanPopoverClose());
+ listen(liveBoard, "pointerenter", () => { state.planHovering = true; });
+ listen(liveBoard, "pointerleave", (event) => { if (event.relatedTarget && (planHandle.contains(event.relatedTarget) || liveBoard.contains(event.relatedTarget))) return; state.planHovering = false; deferPlanPopoverClose(); });
+ listen(document, "pointerdown", (event) => { if (!planHandle.contains(event.target) && !liveBoard.contains(event.target) && state.planPinned) setPlanPopover(false); });
  listen(root, "focusout", () => later(flushBoardRender, 0));
- listen(liveBoard, "pointerdown", startBoardDrag); listen(liveBoard, "pointermove", moveBoardDrag);
- listen(liveBoard, "pointerup", endBoardDrag); listen(liveBoard, "pointercancel", cancelBoardDrag);
  listen(root, "error", (event) => { if (event.target.matches?.(".hub-brand-icon>img")) { event.target.parentElement.classList.remove("has-image"); event.target.remove(); } }, true);
  const resizeHandle = root.querySelector("#t3-hub-resize-handle");
  listen(resizeHandle, "pointerdown", startResize);
@@ -269,26 +300,9 @@
  const form = event.target.dataset.form;
  if (["import", "hook"].includes(form)) { event.preventDefault(); if (form === "import") runImport(); if (form === "hook") saveHook(); }
  });
- listen(handle, "pointerdown", onDragStart);
- listen(handle, "pointermove", onDragMove);
- listen(handle, "pointerup", onDragEnd);
- listen(handle, "pointercancel", onDragCancel);
+ listen(memoryHandle, "click", openMemoryFromTitle);
+ listen(memoryToggle, "click", toggleMemoryAccessFromTitle);
  listen(window, "keydown", onKeydown);
- listen(document, "input", onComposerInput, true);
- listen(document, "focusin", onComposerInput, true);
- listen(document, "click", onComposerInput, true);
- listen(document, "keyup", onComposerKeyup, true);
- listen(document, "keydown", onComposerKeydown, true);
- listen(document, "compositionstart", () => { composing = true; closeSlash(); }, true);
- listen(document, "compositionend", (event) => { composing = false; onComposerInput(event); }, true);
- listen(document, "focusout", () => later(() => { if (slashSession && document.activeElement !== slashSession.editor && !palette.contains(document.activeElement)) closeSlash(); }, 0), true);
- listen(document, "pointerdown", (event) => { if (slashSession && !slashSession.editor.contains(event.target) && !palette.contains(event.target)) closeSlash(); }, true);
- listen(palette, "pointerdown", (event) => { if (event.target.closest("button")) event.preventDefault(); });
- listen(palette, "pointermove", (event) => { const row = event.target.closest("[data-slash-index]"); if (row && slashSession) setSlashActive(Number(row.dataset.slashIndex)); });
- listen(window, "resize", positionSlash);
- listen(window, "blur", closeSlash);
- listen(document, "scroll", positionSlash, true);
- if (window.visualViewport) { listen(window.visualViewport, "resize", positionSlash); listen(window.visualViewport, "scroll", positionSlash); }
  listen(window, "resize", positionHandle);
  listen(window, "resize", () => { applyWidth(); positionConversationTools(); });
  listen(window, "t3-hud-popover-change", positionConversationTools);
@@ -323,13 +337,15 @@
  state.threadId = currentThreadId();
  syncOcclusion();
  setOpen(state.open, false);
+ refreshMemoryAgentAccess(false);
  refreshContext();
  scheduleBoardPoll();
     }
 
     function renderChrome() {
  if (!root || disposed) return;
- root.dataset.tab = state.tab;
+ const navTab = "memory";
+ root.dataset.tab = navTab;
  const context = state.context || {};
  const projectName = projectTitle();
  const rawCli = context.activeProvider || context.activeCli || context.cli || context.provider || context.providerInstanceId;
@@ -337,43 +353,56 @@
  const cliNames = { codex: "Codex", antigravity: "AGY", agy: "AGY", muse: "Muse", pi: "Pi", claude: "Claude", claudeAgent: "Claude" };
  const model = typeof context.activeModel === "object" ? context.activeModel?.name || context.activeModel?.id : context.activeModel;
  const cliName = [cliNames[String(cli)] || cli, model].filter(Boolean).join(" · ") || tr("本地工作区就绪", "Workspace ready");
- const count = context.activeProjectCount ?? context.projectCount ?? (Array.isArray(context.projects) ? context.projects.length : null);
- const badge = root.querySelector(".hub-handle-count");
- badge.hidden = count == null;
- badge.textContent = String(count ?? "");
- handle.title = tr("Hub 工作台 · ⌘⇧K / Alt+H", "Hub Studio · ⌘⇧K / Alt+H");
- handle.setAttribute("aria-label", tr("打开 Hub 工作台", "Open Hub Studio"));
- root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("工作空间作用域", "Workspace scope"))}"><option value="global" ${state.scope === "global" ? "selected" : ""}>${esc(tr("本机 · 全局", "Local · Global"))}</option><option value="project" ${state.scope === "project" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}>${esc(tr("当前项目", "Project"))} · ${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
- const tabs = [["memory", "memory", tr("记忆库", "Memory")], ["skills", "bolt", tr("技能与 MCP", "Skills & MCP")], ["plugins", "plug", tr("插件", "Plugins")], ["subagents", "hub", tr("编排路由", "Routing")], ["hooks", "check", "Hooks"], ["settings", "edit", tr("宿主设置", "Settings")]];
+ renderMemoryTitleControls();
+ root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("当前项目", "Current project"))}" disabled><option value="project" selected>${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
+ const tabs = [["memory", "memory", tr("记忆", "Memory")]];
  root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, glyph, label]) => {
  const count = tabCount(key);
- return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === state.tab}" tabindex="${key === state.tab ? 0 : -1}">${icon(glyph, 14)}<span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
+ return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === navTab}" tabindex="${key === navTab ? 0 : -1}">${icon(glyph, 14)}<span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
  }).join("");
- content.setAttribute("aria-labelledby", `t3-hub-tab-${state.tab === "agents" ? "settings" : state.tab}`);
+ content.setAttribute("aria-labelledby", `t3-hub-tab-${navTab}`);
  root.querySelector(".hub-footer").innerHTML = `<span class="hub-footer-status"><i class="hub-dot"></i>${esc(state.connected ? tr("已连接 · 所有更改保存在本机", "Connected · Changes stay local") : tr("等待 Hub 连接", "Waiting for Hub"))}</span><span class="hub-footer-key">Esc ${esc(tr("收起", "Close"))}</span>`;
+    }
+    function memoryAccessHeaderState() {
+ const access = cache.agentAccess || {}, summary = access.setupSummary || {};
+ if (errors.agentAccess || access.enabled == null) return { checked: "mixed", label: tr("未知", "Unknown"), detail: tr("无法确认本机记忆接入开关状态", "Local memory access state is unknown") };
+ if (access.enabled === false) return { checked: "false", label: tr("关", "Off"), detail: tr("本机 T3 Agent 记忆访问已关闭，记忆内容会保留", "Local T3 Agent memory access is off; stored memories are kept") };
+ const pending = memoryAccessIssues(summary) || !Array.isArray(summary.providers) || summary.providers.length === 0;
+ return { checked: "true", label: pending ? tr("待处理", "Pending") : tr("开", "On"), detail: pending ? tr("本机访问已开启，仍有配置待处理；当前会话未验证", "Local access is on; setup has pending items and current session is unverified") : tr("本机访问已开启；当前会话是否加载尚未验证", "Local access is on; current session loading is unverified") };
+    }
+    function renderMemoryTitleControls() {
+ if (!memoryToggle) return;
+ const status = memoryAccessHeaderState();
+ memoryToggle.setAttribute("aria-checked", status.checked);
+ memoryToggle.setAttribute("aria-label", `${tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory")} · ${status.label}`);
+ memoryToggle.title = status.detail;
+ memoryToggle.disabled = state.memoryAgentAccessUpdating;
+ memoryToggle.innerHTML = `<span aria-hidden="true">${status.checked === "true" ? "●" : status.checked === "false" ? "○" : "◌"}</span><span>${esc(status.label)}</span>`;
+ if (memoryHandle) {
+  memoryHandle.title = tr("打开本机记忆工作台", "Open local Memory workspace");
+  memoryHandle.setAttribute("aria-label", tr("打开本机记忆工作台", "Open local Memory workspace"));
+ }
     }
     function tabCount(key) {
  const counts = state.context?.counts || {};
  if (key === "board") { const b = boardData(); return b.progress.total ? `${b.progress.completed}/${b.progress.total}` : null; }
- if (key === "mcp") return cache.mcp ? mcpServers().length : counts.activeMcps ?? null;
- if (key === "skills") return cache.skills ? items(cache.skills, ["items", "skills"]).length : counts.activeSkills ?? null;
- if (key === "plugins") return cache.plugins ? pluginItems().length : null;
- if (key === "hooks") return cache.hooks ? hookItems().length : counts.hooks ?? null;
  if (key === "subagents") return cache.subagents ? subagentItems().length : counts.subagents ?? null;
  if (key === "memory") {
- const project = items(cache.overview, ["projects", "items"]).find((entry) => state.memoryProject === "global" ? ["global", "_global"].includes(entry.slug) : entry.projectRoot === selectedMemoryRoot());
- return project?.total ?? cache.overview?.total ?? counts.projectMemories ?? (cache.memory ? memoryRecords().length : null);
+ if (!memoryProjectReady()) return null;
+ const projects = items(cache.overview, ["projects", "items"]);
+ const project = projects.find((entry) => entry.slug === cache.overview?.currentProjectSlug) || projects.find((entry) => entry.projectRoot === state.projectRoot || entry.root === state.projectRoot || entry.path === state.projectRoot);
+ return cache.memory?.total ?? project?.total ?? (cache.memory ? memoryRecords().length : null);
  }
  return null;
     }
     function defaultScope() { return state.scope === "project" && state.projectRoot ? "project" : "global"; }
     function setScope(scope) {
- if (scope === "project" && projectDisabled()) return;
+ if (scope !== "project" || projectDisabled()) return;
  state.scope = scope;
  state.importScope = scope;
  state.subagentScope = scope;
  state.agentsTarget = scope;
- state.memoryProject = scope === "project" ? "current" : "global";
+ state.memoryProject = "current";
  state.selectedMemory = null;
  state.supersedeItems = [];
  state.supersedeLoading = false;
@@ -488,7 +517,6 @@
  }
  if (disposed || version !== contextVersion) return;
  cache[domain] = refreshed;
- invalidateSlashCache();
  if (state.tab === domain || domain === "mcp" && state.tab === "skills" && state.libraryView === "mcp") renderTab();
  const failed = results.filter((result) => result.status === "rejected");
  const confirmedItem = domain === "mcp"
@@ -594,14 +622,8 @@
     }
     function renderTab() {
  if (!content || disposed) return;
- if (state.tab === "skills") state.libraryView === "mcp" ? renderMcp() : renderSkills();
- if (state.tab === "plugins") renderPlugins();
- if (state.tab === "subagents") renderSubagents();
- if (state.tab === "hooks") renderHooks();
- if (state.tab === "memory") renderMemory();
- if (state.tab === "board") renderBoardTab();
- if (state.tab === "settings") renderSettings();
- if (state.tab === "agents") renderAgents();
+ state.tab = "memory";
+ renderMemory();
     }
     function pluginItems() {
  return items(cache.plugins, ["installed", "items", "plugins"]).filter((item) => item.installed !== false && item.catalogSection !== "marketplace");
@@ -976,19 +998,16 @@
     }
 
     function selectedMemoryProject() {
+ if (!memoryProjectReady()) return null;
  const projects = items(cache.overview, ["projects", "items"]);
- return projects.find((project) => project.slug === state.memoryProject || project.projectRoot === state.memoryProject || project.root === state.memoryProject || project.path === state.memoryProject);
+ return projects.find((project) => project.slug === cache.overview?.currentProjectSlug) || projects.find((project) => project.projectRoot === state.projectRoot || project.root === state.projectRoot || project.path === state.projectRoot);
     }
+    function memoryProjectReady() { return state.memoryProject === "current" && projectContextReady(); }
     function selectedMemoryRoot() {
- if (state.memoryProject === "current") return state.projectRoot;
- if (state.memoryProject === "global") return null;
- const selected = selectedMemoryProject();
- return selected?.projectRoot || selected?.root || selected?.path || (state.memoryProject.startsWith("/") ? state.memoryProject : null);
+ return memoryProjectReady() ? state.projectRoot : null;
     }
     function memoryPayload() {
- const selected = selectedMemoryProject();
- const projectSlug = state.memoryProject === "global" ? "_global" : state.memoryProject === "current" ? cache.overview?.currentProjectSlug : selected?.slug;
- return { projectRoot: selectedMemoryRoot(), projectSlug: projectSlug || undefined, scope: state.memoryProject === "global" ? "global" : "project", scopeFilter: state.memoryScope === "smart" ? "default" : state.memoryScope === "project" ? "shared" : state.memoryScope, module: state.memoryModule === "all" ? undefined : state.memoryModule, query: state.memoryQuery.trim(), limit: 500 };
+ return { projectRoot: selectedMemoryRoot(), scope: "project", scopeFilter: state.memoryScope === "smart" ? "default" : state.memoryScope === "project" ? "shared" : state.memoryScope, module: state.memoryModule === "all" ? undefined : state.memoryModule, query: state.memoryQuery.trim(), limit: 500 };
     }
     function moduleOptions() {
  return [["all", tr("全部", "All"), ""], ["constraints", tr("铁律", "Rules"), ""], ["pitfalls", tr("踩坑", "Pitfalls"), ""], ["architecture", tr("架构", "Architecture"), ""], ["topics", tr("专题", "Topics"), ""]];
@@ -996,196 +1015,250 @@
     function normalizeModule(module) {
  return ({ constraint: "constraints", rule: "constraints", rules: "constraints", pitfall: "pitfalls", experience: "pitfalls", topic: "topics", "topic-memory": "topics", memory: "constraints" })[module] || module || "topics";
     }
-    function renderMemory() {
- content.innerHTML = `<div id="t3-hub-dream"></div><details class="hub-import"><summary>向量引擎与管理</summary><div id="t3-hub-memory-governance"></div><div id="t3-hub-engine"></div></details><div class="hub-section-heading"><span>${esc(tr("让经验留在项目里", "Keep what your projects learn"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆 · 关键词 + 语义", "Search memories · Keywords + meaning"))}" value="${esc(state.memoryQuery)}"></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
- renderEngine();
- renderDream();
+ function renderMemory() {
+ content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签。本机接入状态不代表当前会话已加载。", "Read and maintain shared knowledge and worktree notes for the currently confirmed project only. Local access status does not prove the current session loaded it."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
+ renderMemoryAgentAccess();
+ renderMemoryRuntime();
+ renderMemoryConnections();
  renderWorktreeScopes();
  renderMemoryNav();
  renderMemoryList();
  renderNewMemory();
     }
-    function dreamConfig() {
- const data = cache.dream?.config || cache.dream?.dream || cache.dream || cache.overview?.dream || {};
- return { dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", maxInputTokens: 8000, ...data, enabled: data.enabled === true, dreamTime: /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(data.dreamTime || "") ? data.dreamTime : "03:00", catchUpOnWake: data.catchUpOnWake !== false };
+    const memoryConnectionAgents = [
+ { id: "t3", label: "T3" }, { id: "codex", label: "Codex" }, { id: "muse", label: "Muse" },
+ { id: "agy", label: "AGY" }, { id: "claude", label: "Claude" }, { id: "pi", label: "Pi" },
+    ];
+    const memorySetupPrompt = [
+ "请帮我完成本机 T3 Agent 的记忆首次接入：",
+ "0. 先确认本会话当前选中的 T3 项目与工作树；如果无法确认，停止记忆读取和写入。主 Agent 与子 Agent 每次记忆调用都传当前 T3 项目的绝对 projectRoot；如提示项目未绑定，不改传别的路径绕过，请报告缺口。每次调用都只绑定此项目/工作树，不查找或使用全局通用记忆，也不自行改成其他项目。",
+ "1. 运行固定命令 `~/.t3/bin/t3-memory-setup status` 检查当前状态。",
+ "2. 运行固定命令 `~/.t3/bin/t3-memory-setup setup` 完成本机接入。",
+ "3. 调用可用的 `memory_status` 工具核验记忆状态；如果当前会话没有这个工具，请说明可能需要新会话后再次验证，不要重启 T3。",
+ "只改 Hub MCP 接入，保留已有正确的 Magpie 记忆条目和其他 MCP；不要修改认证、模型或原生路由。遇到检查失败、冲突、未知或待处理项时如实报告，不要声称接入成功。关闭 Agent 访问时保留所有记忆内容和手工维护的配置。",
+    ].join("\n");
+    function memoryAccessIssues(summary = {}) {
+ return ["missing", "conflict", "unsupported", "unknown", "pending"].some((key) => Number(summary[key]) > 0);
     }
-    function dreamPresets() {
- const presets = items(cache.dream, ["presets", "dreamAgentPresets", "DREAM_AGENT_PRESETS"]);
- if (presets.length) return presets;
- return [
- { id: "local-zero", dreamMode: "local", providerInstanceId: "local", model: "mlx-vector-only", label: tr("纯本地向量聚变 · 0 Token ($0/晚)", "Local vector fusion · 0 tokens ($0/night)"), estCostPerNightUsd: 0 },
- { id: "muse-ember", dreamMode: "agent", providerInstanceId: "muse", model: "muse-ember-1.0", label: "Muse · muse-ember-1.0", estCostPerNightUsd: 0.0018 },
- { id: "codex-terra", dreamMode: "agent", providerInstanceId: "codex", model: "gpt-6.1-terra", label: "Codex · gpt-6.1-terra", estCostPerNightUsd: 0.012 },
- { id: "codex-sol", dreamMode: "agent", providerInstanceId: "codex", model: "gpt-6.1-sol", label: "Codex · gpt-6.1-sol", estCostPerNightUsd: 0.018 },
- { id: "claude-sonnet", dreamMode: "agent", providerInstanceId: "claude", model: "claude-sonnet-4-6", label: "Claude · claude-sonnet-4-6", estCostPerNightUsd: 0.015 },
- { id: "pi-magpie", dreamMode: "agent", providerInstanceId: "pi", model: "magpie/group/code", label: "Pi · magpie/group/code", estCostPerNightUsd: 0.005 },
- ];
+    function memoryAccessIssueText(reason) {
+ return ({ managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"), agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"), entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"), unknown: tr("状态无法确认", "Status could not be confirmed") })[String(reason || "")] || tr("需要进一步检查", "Needs review");
     }
-    function dreamEngineDraft() {
- const config = dreamConfig();
- return state.dreamEngineDraft || { providerInstanceId: config.dreamMode === "local" ? "local" : config.providerInstanceId, model: config.model || "", reasoningEffort: config.reasoningEffort || "medium" };
+    async function refreshMemoryAgentAccess(force = false) {
+ if (disposed || cache.agentAccess && !force) return cache.agentAccess;
+ if (memoryAccessLoading && !force) return memoryAccessLoading;
+ const version = ++memoryAccessVersion;
+ delete errors.agentAccess;
+ renderChrome();
+ const task = (async () => {
+  try {
+   const data = await requestMemoryAccess("memory:agentAccess:get");
+   if (disposed || version !== memoryAccessVersion) return cache.agentAccess;
+   cache.agentAccess = data;
+   delete errors.agentAccess;
+  } catch (error) {
+   if (!disposed && version === memoryAccessVersion) errors.agentAccess = error;
+  } finally {
+   if (!disposed && version === memoryAccessVersion) {
+    renderMemoryTitleControls();
+    renderChrome();
+    if (state.tab === "memory") renderMemoryAgentAccess();
+   }
+  }
+  return cache.agentAccess;
+ })();
+ memoryAccessLoading = task;
+ try { return await task; }
+ finally { if (memoryAccessLoading === task) memoryAccessLoading = null; }
     }
-    function dreamProviderAvailability(id) {
- const providers = Array.isArray(cache.dream?.runtime?.providers) ? cache.dream.runtime.providers : [];
- const entry = providers.find((provider) => provider.id === id);
- const status = /^(agy|antigravity)$/i.test(String(id)) || providers.length && !entry ? "unsupported" : entry?.status;
- return { entry, blocked: ["missing", "unsupported"].includes(status), suffix: status === "missing" ? tr(" · 未安装 CLI", " · CLI not installed") : status === "unsupported" ? tr(" · 暂不支持", " · unsupported") : "" };
+    function openMemoryFromTitle() {
+ if (disposed) return;
+ state.tab = "memory";
+ setOpen(true);
     }
-    function dreamPresetDraft(preset) {
- const { entry } = dreamProviderAvailability(preset.providerInstanceId);
- const efforts = Array.isArray(entry?.efforts) && entry.efforts.length ? entry.efforts : ["low", "medium", "high"];
- const effort = preset.reasoningEffort || "medium";
- return { providerInstanceId: preset.providerInstanceId, model: preset.providerInstanceId === "local" ? "mlx-vector-only" : preset.model || "", reasoningEffort: efforts.includes(effort) ? effort : efforts.includes("medium") ? "medium" : efforts[0] };
+    function toggleMemoryAccessFromTitle() {
+ if (disposed || state.memoryAgentAccessUpdating) return;
+ return setMemoryAgentAccess(cache.agentAccess?.enabled !== true);
     }
-    function dreamPresetOptions(draft = dreamEngineDraft()) {
- const presets = dreamPresets();
- const selected = presets.find((preset) => {
- const value = dreamPresetDraft(preset);
- return draft.providerInstanceId === value.providerInstanceId && draft.model === value.model && (draft.providerInstanceId === "local" || draft.reasoningEffort === value.reasoningEffort);
- });
- return `${!selected ? `<option value="custom" selected>${esc(tr("自定义引擎与模型", "Custom engine & model"))}</option>` : ""}${presets.map((preset) => {
- const availability = dreamProviderAvailability(preset.providerInstanceId);
- return `<option value="${esc(preset.id)}" ${selected === preset ? "selected" : ""} ${availability.blocked ? "disabled" : ""}>${esc(preset.label || `${preset.providerInstanceId} · ${preset.model}`)}${esc(availability.suffix)}</option>`;
- }).join("")}`;
-    }
-    function onDreamToggle(event) {
- const details = event.currentTarget;
- if (!details?.isConnected || !root.contains(details)) return;
- state.dreamOpen = details.open;
- storageSet("t3-hub:dream-open", state.dreamOpen);
-    }
-    function renderDream() {
- const node = root.querySelector("#t3-hub-dream");
+    function renderMemoryAgentAccess() {
+ const node = root.querySelector("#t3-hub-memory-access");
  if (!node) return;
- const data = dreamConfig(), overview = cache.overview || {}, runtime = cache.dream?.runtime || {};
- const busy = state.dreamSaving || state.dreamRunning, loaded = !!(cache.dream || overview.dream);
- const report = data.lastReport || cache.dream?.lastReport || overview.dream?.lastReport;
- const draft = dreamEngineDraft(), providers = Array.isArray(runtime.providers) ? runtime.providers : [];
- const selectedRuntime = runtime.selected || providers.find((provider) => provider.id === data.providerInstanceId);
- const selectedBlocked = data.dreamMode !== "local" && (/^(agy|antigravity)$/i.test(String(data.providerInstanceId)) || ["missing", "unsupported"].includes(selectedRuntime?.status));
- const providerLabels = { local: tr("本地整理", "Local"), muse: "Muse", codex: "Codex", claude: "Claude", pi: "Pi · Magpie", antigravity: "AGY", agy: "AGY" };
- const choices = ["local", "muse", "codex", "claude", "pi"];
- if (!choices.includes(draft.providerInstanceId)) choices.push(draft.providerInstanceId);
- const providerOptions = choices.map((id) => {
- const availability = dreamProviderAvailability(id);
- return `<option value="${esc(id)}" ${draft.providerInstanceId === id ? "selected" : ""} ${availability.blocked ? "disabled" : ""}>${esc(providerLabels[id] || id)}${esc(availability.suffix)}</option>`;
+ const access = cache.agentAccess || {}, summary = access.setupSummary || {}, providers = Array.isArray(summary.providers) ? summary.providers : [];
+ const enabled = access.enabled === true, updating = state.memoryAgentAccessUpdating;
+ const status = errors.agentAccess ? tr("无法读取本机状态", "Local status unavailable")
+  : state.memorySetupNotice === "incomplete" ? tr("检查未完成", "Check incomplete")
+  : enabled ? !Array.isArray(summary.providers) ? tr("已允许 · 接入状态待检查", "Allowed · setup status not checked") : summary.providers.length === 0 ? tr("已允许 · 未发现可接入 Agent", "Allowed · no eligible agent found") : memoryAccessIssues(summary) ? tr("已允许 · 有待处理项", "Allowed · some agents are pending") : tr("已允许 · 配置就绪，会话加载未验证", "Allowed · configured, session loading unverified")
+  : access.enabled === false ? tr("已关闭", "Disabled") : tr("无法确认", "Unknown");
+ const counts = [["configured", tr("配置就绪", "Configured")], ["pending", tr("待处理", "Pending")], ["missing", tr("缺少接入", "Missing")], ["conflict", tr("冲突", "Conflict")], ["unknown", tr("无法确认", "Unknown")], ["unsupported", tr("不支持", "Unsupported")]]
+  .filter(([key]) => Number(summary[key]) > 0).map(([key, label]) => `<span>${esc(label)} ${esc(Number(summary[key]))}</span>`).join("");
+ const providerHtml = providers.map((provider) => {
+  const stateName = ["configured", "missing", "conflict", "unsupported", "unknown", "pending"].includes(provider?.status) ? provider.status : "unknown";
+  const label = provider?.displayName || provider?.instanceId || tr("Agent", "Agent");
+  const detail = stateName === "configured" ? tr("已找到 Hub MCP 配置", "Hub MCP configuration found") : memoryAccessIssueText(provider?.reason);
+  return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small></div>`;
  }).join("");
- const agentProvider = providers.find((entry) => entry.id === draft.providerInstanceId);
- const draftBlocked = /^(agy|antigravity)$/i.test(String(draft.providerInstanceId)) || ["missing", "unsupported"].includes(agentProvider?.status) || providers.length > 0 && !agentProvider;
- const supportedEfforts = Array.isArray(agentProvider?.efforts) && agentProvider.efforts.length ? agentProvider.efforts : ["low", "medium", "high"];
- const efforts = [...new Set([...(draft.reasoningEffort ? [draft.reasoningEffort] : []), ...supportedEfforts])];
- const optionLabels = { none: tr("关闭", "None"), minimal: tr("极简", "Minimal"), low: tr("低", "Low"), medium: tr("中", "Medium"), high: tr("高", "High"), xhigh: tr("超高", "Extra high"), max: tr("最高", "Max"), ultra: tr("极高", "Ultra") };
- const presetModels = dreamPresets().filter((preset) => preset.providerInstanceId === draft.providerInstanceId).map((preset) => preset.model).filter(Boolean);
- const status = state.dreamRunning ? tr("正在整理…", "Organizing…") : state.dreamSaving ? tr("保存中…", "Saving…") : !loaded ? tr("正在读取", "Loading") : data.enabled ? tr(`已开启 · 每日 ${data.dreamTime}`, `Enabled · Daily ${data.dreamTime}`) : tr("未开启", "Disabled");
- const resultLabels = { success: tr("完成", "Completed"), skipped: tr("已跳过", "Skipped"), failed: tr("失败", "Failed"), partial: tr("部分完成", "Partial"), deferred: tr("已延期", "Deferred"), unavailable: tr("暂不可用", "Unavailable"), unsupported: tr("不支持", "Unsupported") };
- const resultText = (part) => {
- if (!part) return tr("暂无记录", "No result yet");
- const label = resultLabels[part.status] || tr("状态未知", "Unknown status");
- const detail = part.reason || part.error;
- return detail ? `${label} · ${errorText(detail)}` : label;
- };
- const schedule = runtime.scheduler || {};
- const nextDue = data.enabled && schedule.nextDueAt ? exactTimeMarkup(schedule.nextDueAt) : esc(data.enabled ? tr("等待调度信息", "Awaiting scheduler information") : tr("未开启", "Disabled"));
- const schedulerStatus = schedule.started === true ? schedule.running === true ? tr("定时器正在检查", "Scheduler checking") : tr("定时器运行中", "Scheduler running") : schedule.started === false ? tr("定时器未运行", "Scheduler stopped") : tr("定时器状态待确认", "Scheduler status unknown");
- const vectors = cache.embed?.vectorStats;
- const syncSummary = cache.embed?.vectorStatsError ? tr("记忆统计不可用", "Memory statistics unavailable") : vectors?.syncedVectors != null && vectors?.totalMemories != null ? `${Number(vectors.syncedVectors).toLocaleString()}/${Number(vectors.totalMemories).toLocaleString()} ${tr("向量同步", "vectors synced")}` : tr("统计读取中", "Loading statistics");
- node.innerHTML = `<details class="hub-dream-card" ${state.dreamOpen ? "open" : ""}><summary data-action="dream-fold"><span class="hub-dream-summary-title">${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}</span><span class="hub-dream-summary-meta">${esc(status)} · ${esc(syncSummary)} · ${esc(tr("配置 / 立即整理", "Configure / Run now"))}</span></summary><section aria-label="${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}" aria-busy="${busy}"><div class="hub-dream-heading"><span class="hub-dream-title">${icon("moon", 16)}${esc(tr("梦境系统 · AutoDream", "Memory Dream · AutoDream"))}</span><span class="hub-badge">${esc(status)}</span></div><p class="hub-dream-description">${esc(tr("T3 和 Hub 运行时按本地时间检查是否需要整理；未运行时不会执行，唤醒补做以设置为准。", "While T3 and Hub are running, the scheduler checks the local time; it does not run while closed. Catch-up follows your setting."))}</p><div class="hub-form-grid hub-dream-form">
-<label class="hub-field hub-dream-preset">${esc(tr("预设方案", "Preset"))}<select class="hub-select" name="dream-preset" aria-label="${esc(tr("AutoDream 预设方案", "AutoDream preset"))}" ${busy || !loaded ? "disabled" : ""}>${dreamPresetOptions(draft)}</select></label>
-<label class="hub-field">${esc(tr("执行引擎", "Execution engine"))}<select class="hub-select" name="dream-provider" aria-label="${esc(tr("AutoDream 执行引擎", "AutoDream execution engine"))}" ${busy || !loaded ? "disabled" : ""}>${providerOptions}</select></label>
-<label class="hub-field">${esc(tr("模型", "Model"))}<input class="hub-input" name="dream-model" list="t3-hub-dream-models" value="${esc(draft.model)}" aria-label="${esc(tr("AutoDream 模型", "AutoDream model"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}><datalist id="t3-hub-dream-models">${presetModels.map((model) => `<option value="${esc(model)}"></option>`).join("")}</datalist></label>
-<label class="hub-field">${esc(tr("思考强度", "Reasoning effort"))}<select class="hub-select" name="dream-effort" aria-label="${esc(tr("AutoDream 思考强度", "AutoDream reasoning effort"))}" ${busy || !loaded || draft.providerInstanceId === "local" || draftBlocked ? "disabled" : ""}>${efforts.map((effort) => `<option value="${esc(effort)}" ${draft.reasoningEffort === effort ? "selected" : ""} ${!supportedEfforts.includes(effort) ? "disabled" : ""}>${esc(optionLabels[effort] || effort)} (${esc(effort)})${!supportedEfforts.includes(effort) ? ` · ${esc(tr("请重新选择", "select another"))}` : ""}</option>`).join("")}</select></label>
-<div class="hub-field hub-dream-engine-actions"><div class="hub-row">${button("save-dream-engine", tr("保存引擎", "Save engine"), { small: true, primary: true, icon: "save", disabled: busy || !loaded || !state.dreamEngineDraft || draftBlocked })}${button("cancel-dream-engine", tr("取消修改", "Discard changes"), { small: true, disabled: busy || !state.dreamEngineDraft })}</div></div>
-</div><p class="hub-hint">${esc(tr("找到可执行程序不代表已登录或有模型权限；AGY 暂不支持自动执行。", "An executable does not prove sign-in or model access. AGY automatic execution is not supported."))}</p>${selectedBlocked ? `<p class="hub-dream-error">${esc(tr("当前 Agent 暂不可执行；可更换 Agent 或关闭自动整理。", "The configured agent is unavailable; choose another or disable the schedule."))}</p>` : ""}<div class="hub-dream-controls"><span class="hub-dream-enable"><span>${esc(tr("启用", "Enable"))}</span><button type="button" role="switch" class="hub-switch" data-action="toggle-dream" aria-label="${esc(tr("启用每日梦境整理", "Enable daily Memory Dream"))}" aria-checked="${data.enabled}" ${busy || !loaded || !data.enabled && selectedBlocked ? "disabled" : ""}><span></span></button></span><label class="hub-dream-time">${esc(tr("每日", "Daily"))}<input class="hub-input" name="dream-time" type="time" value="${esc(data.dreamTime)}" step="60" aria-label="${esc(tr("每日整理时间", "Daily time"))}" ${busy || !loaded ? "disabled" : ""}></label><label class="hub-checkbox"><input type="checkbox" name="dream-catch-up" ${data.catchUpOnWake ? "checked" : ""} ${busy || !loaded ? "disabled" : ""}>${esc(tr("休眠唤醒补做", "Catch up on wake"))}</label>${button("run-dream", state.dreamRunning ? tr("整理中…", "Organizing…") : tr("立即整理", "Run now"), { primary: true, small: true, icon: state.dreamRunning ? undefined : "moon", disabled: busy || !loaded || selectedBlocked || !!state.dreamEngineDraft })}</div><div class="hub-dream-times"><span>${esc(schedulerStatus)}</span><span>${esc(tr("下次计划", "Next scheduled time"))} ${nextDue}${schedule.timeZone ? ` · ${esc(schedule.timeZone)}` : ""}</span><span>${esc(tr("最近浅睡", "Last light sleep"))} ${data.lastDreamAt ? exactTimeMarkup(data.lastDreamAt) : "—"}</span><span>${esc(tr("最近深睡", "Last deep sleep"))} ${data.lastAgentDreamAt ? exactTimeMarkup(data.lastAgentDreamAt) : "—"}</span>${schedule.lastCheckAt ? `<span>${esc(tr("最近调度检查", "Last scheduler check"))} ${exactTimeMarkup(schedule.lastCheckAt)}</span>` : ""}</div><div class="hub-dream-report">${schedule.lastError ? `<div class="hub-dream-error">${esc(tr("调度错误", "Scheduler error"))}：${esc(errorText(schedule.lastError))}</div>` : ""}<div>${esc(tr("本地整理", "Local result"))}：${esc(resultText(report?.local))}</div><div>${esc(tr("Agent 整理", "Agent result"))}：${esc(resultText(report?.agent))}</div>${report?.agent?.providerInstanceId || report?.agent?.model ? `<div class="hub-hint">${esc([report.agent.providerInstanceId, report.agent.model, report.agent.reasoningEffort].filter(Boolean).join(" · "))}</div>` : ""}</div>${errors.dream ? `<p class="hub-dream-error" role="alert">${esc(errorText(errors.dream))}</p>` : ""}</section></details>`;
- node.querySelector?.("details.hub-dream-card")?.addEventListener("toggle", onDreamToggle);
+ const errorHtml = errors.agentAccess ? `<p class="hub-hint" role="status">${esc(tr("暂时无法核验本机 T3 Agent 的记忆接入状态。", "Could not verify local T3 Agent memory access."))}</p>`
+  : state.memorySetupNotice === "incomplete" ? `<p class="hub-hint" role="status">${esc(tr("接入检查未完成，仍有 Agent 待处理或无法确认；请勿将其视为已全部接入。", "Setup is incomplete. Some agents remain pending or unverified; access is not confirmed for all agents."))}</p>`
+  : state.memorySetupNotice === "checked" ? `<p class="hub-hint" role="status">${esc(tr("本机配置检查完成；当前会话是否已加载仍未验证。", "Local configuration was checked; current session loading remains unverified."))}</p>` : "";
+ node.innerHTML = `<section class="hub-card hub-memory-access"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryAgentAccess" aria-label="${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}" aria-checked="${access.enabled == null ? "mixed" : String(enabled)}" ${enabled ? "checked" : ""} ${updating ? "disabled" : ""}><span>${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${errors.agentAccess || access.enabled == null ? "unknown" : state.memorySetupNotice === "incomplete" || enabled && memoryAccessIssues(summary) ? "pending" : enabled ? "configured" : "missing"}">${esc(status)}</span></div><p class="hub-card-description">${esc(tr("这是本机设置，不用于 Connect 远端会话。关闭访问会保留记忆内容和手工配置。开关会即时控制 Hub MCP 接入；已加载 MCP 的旧会话需自然重连后更新，不会由这里强制结束。当前会话可用 memory_status 验证。", "This is a local setting and does not apply to Connect remote chats. Disabling access keeps saved memories and manual configuration. The switch immediately controls Hub MCP access; an existing session that already loaded the MCP updates after it naturally reconnects. This does not force that session to close. Verify the current session with memory_status."))}</p><div class="hub-memory-access-actions">${button("memory-access-setup", tr("检查并接入", "Check and set up"), { primary: true, small: true, icon: "check", disabled: updating })}${button("memory-access-copy-prompt", tr("复制首次接入提示词", "Copy setup prompt"), { small: true, disabled: updating })}${button("memory-access-refresh", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh", disabled: updating })}</div>${counts ? `<div class="hub-memory-access-summary">${counts}</div>` : ""}${providerHtml ? `<div class="hub-memory-access-providers">${providerHtml}</div>` : ""}${errorHtml}${state.memorySetupPromptVisible ? `<label class="hub-field" style="margin-top:10px">${esc(tr("首次接入提示词（可手动复制）", "First setup prompt (copy manually)"))}<textarea class="hub-input hub-memory-access-prompt" readonly spellcheck="false">${esc(memorySetupPrompt)}</textarea></label>` : ""}</section>`;
+ renderMemoryTitleControls();
+ renderMemoryRuntime();
     }
-    async function saveDreamEngine() {
- if (!state.dreamEngineDraft) return;
- const draft = state.dreamEngineDraft, provider = String(draft.providerInstanceId || "");
- const providers = cache.dream?.runtime?.providers || [];
- const candidate = providers.find((entry) => entry.id === provider);
- if (!["local", "muse", "codex", "claude", "pi"].includes(provider) || ["missing", "unsupported"].includes(candidate?.status) || providers.length && !candidate) { toast(tr("该 Agent 暂不可执行，请选择其他 Agent", "That agent is unavailable; choose another"), true); return; }
- const model = provider === "local" ? "mlx-vector-only" : String(draft.model || "").trim();
- if (!model) { toast(tr("请填写模型 ID", "Enter a model ID"), true); return; }
- if (provider !== "local" && Array.isArray(candidate?.efforts) && !candidate.efforts.includes(draft.reasoningEffort)) { toast(tr("请选择该 Agent 支持的思考程度", "Choose an effort supported by this agent"), true); return; }
- await saveDream({ dreamMode: provider === "local" ? "local" : "agent", providerInstanceId: provider, model, ...(provider === "local" ? {} : { reasoningEffort: draft.reasoningEffort }) });
+    async function setMemoryAgentAccess(enabled) {
+ if (typeof enabled !== "boolean" || disposed || state.memoryAgentAccessUpdating) return;
+ memoryAccessVersion++;
+ state.memoryAgentAccessUpdating = true; state.memorySetupNotice = ""; delete errors.agentAccess; renderMemoryAgentAccess();
+ renderMemoryTitleControls(); renderChrome();
+ try {
+  const result = await requestMemoryAccess("memory:agentAccess:set", { enabled });
+  cache.agentAccess = result.access || result;
+  if (result.setupSummary && !cache.agentAccess.setupSummary) cache.agentAccess = { ...cache.agentAccess, setupSummary: result.setupSummary };
+  if (enabled && (result.ok === false || result.setupOk === false || memoryAccessIssues(cache.agentAccess.setupSummary || {}))) state.memorySetupNotice = "incomplete";
+  else if (enabled) state.memorySetupNotice = "checked";
+  delete errors.agentAccess;
+ } catch (error) { errors.agentAccess = error; }
+ finally { state.memoryAgentAccessUpdating = false; renderMemoryAgentAccess(); renderMemoryTitleControls(); renderChrome(); }
     }
-    async function saveDream(patch) {
- if (disposed || state.dreamSaving || state.dreamRunning) return;
- const data = { ...dreamConfig(), ...patch };
- if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(data.dreamTime || "")) { toast(tr("请选择有效时间（HH:MM）", "Choose a valid time (HH:MM)"), true); renderDream(); return; }
- const version = contextVersion;
- state.dreamSaving = true; delete errors.dream; renderDream();
+    async function runMemorySetup() {
+ if (disposed || state.memoryAgentAccessUpdating) return;
+ memoryAccessVersion++;
+ state.memoryAgentAccessUpdating = true; state.memorySetupNotice = ""; delete errors.agentAccess; renderMemoryAgentAccess();
+ renderMemoryTitleControls(); renderChrome();
  try {
- const payload = Object.fromEntries(Object.entries(patch).filter(([key]) => ["enabled", "dreamTime", "catchUpOnWake", "dreamMode", "providerInstanceId", "model", "maxInputTokens", "reasoningEffort"].includes(key)));
- let result;
- try { result = await request("memory:dream:save", payload); }
- catch (error) {
- if (!/unknown|unsupported|unrecognized|not found|未知|不支持/i.test(errorText(error))) throw error;
- result = await request("memory:dream:update", payload);
- }
- if (disposed || version !== contextVersion) return;
- const readback = await request("memory:dream:get", {});
- if (disposed || version !== contextVersion) return;
- const confirmed = readback.config || readback.dream || {};
- cache.dream = { ...cache.dream, ...result, ...readback, config: confirmed };
- if (cache.overview) cache.overview.dream = cache.dream.config;
- if (Object.entries(payload).some(([key, value]) => confirmed[key] !== value)) throw new Error(tr("设置已提交，但读取到的值不同；请检查后重试。", "Settings were submitted but the readback differs; review and try again."));
- if (["dreamMode", "providerInstanceId", "model", "reasoningEffort"].some((key) => Object.hasOwn(payload, key))) state.dreamEngineDraft = null;
- toast(tr("梦境设置已保存", "Memory Dream settings saved"));
- } catch (error) { if (!disposed && version === contextVersion) { errors.dream = error; toast(errorText(error), true); } }
- finally { state.dreamSaving = false; if (!disposed) renderDream(); }
+  const result = await requestMemoryAccess("memory:setup");
+  cache.agentAccess = result.access || result;
+  if (result.setupSummary && !cache.agentAccess.setupSummary) cache.agentAccess = { ...cache.agentAccess, setupSummary: result.setupSummary };
+  if (result.ok === false || result.setupOk === false || memoryAccessIssues(cache.agentAccess.setupSummary || {})) {
+   state.memorySetupNotice = "incomplete";
+   toast(tr("检查未完成，请查看待处理或冲突项", "Setup is incomplete. Review pending or conflicting agents."), true);
+  } else {
+   state.memorySetupNotice = "checked";
+   toast(tr("本机接入配置已检查；当前会话仍需单独验证", "Local access was checked; verify current session separately"));
+  }
+ } catch (error) { errors.agentAccess = error; toast(tr("接入检查失败，未确认完成", "Setup failed; completion was not confirmed"), true); }
+ finally { state.memoryAgentAccessUpdating = false; renderMemoryAgentAccess(); renderMemoryTitleControls(); renderChrome(); }
     }
-    async function runDream() {
- if (disposed || state.dreamSaving || state.dreamRunning) return;
- const config = dreamConfig();
- const selected = cache.dream?.runtime?.selected;
- if (state.dreamEngineDraft || config.dreamMode !== "local" && (/^(agy|antigravity)$/i.test(String(config.providerInstanceId)) || ["missing", "unsupported"].includes(selected?.status))) { toast(tr("请先保存可执行的整理配置", "Save an available execution configuration first"), true); return; }
- const version = contextVersion, projectRoot = state.projectRoot;
- state.dreamRunning = true; delete errors.dream; renderDream();
+    async function copyMemorySetupPrompt() {
  try {
- const response = await hubRpc("memory:dream:run", { projectRoot });
- const result = response?.data ?? response?.result ?? response ?? {};
- const failed = response?.ok === false || response?.success === false || result?.ok === false;
- if (failed && !result.report) throw new Error(result.error?.message || result.error || tr("整理未完成", "The run did not complete"));
- if (disposed || version !== contextVersion) return;
- cache.dream = { ...cache.dream, ...result, config: { ...dreamConfig(), ...(result.config || {}), ...(result.report ? { lastReport: result.report } : {}) } };
- try {
- const readback = await request("memory:dream:get", {});
- if (disposed || version !== contextVersion) return;
- cache.dream = { ...cache.dream, ...readback, config: { ...cache.dream.config, ...(readback.config || {}), ...(result.report ? { lastReport: result.report } : {}) } };
+  const clipboard = window.navigator?.clipboard;
+  if (typeof clipboard?.writeText !== "function") throw new Error("clipboard_unavailable");
+  await clipboard.writeText(memorySetupPrompt);
+  state.memorySetupPromptVisible = false; renderMemoryAgentAccess();
+  toast(tr("首次接入提示词已复制", "Setup prompt copied"));
  } catch {
- if (cache.dream?.runtime?.scheduler) cache.dream.runtime.scheduler = { ...cache.dream.runtime.scheduler, started: undefined };
+  state.memorySetupPromptVisible = true; renderMemoryAgentAccess();
+  toast(tr("无法自动复制；已显示提示词供手动复制", "Clipboard unavailable; the prompt is shown for manual copy"), true);
  }
- if (cache.overview) cache.overview.dream = cache.dream.config;
- await Promise.all([refreshMemoryOverview(), refreshEmbed(false, true), loadMemories(false)]);
- if (disposed || version !== contextVersion) return;
- if (state.tab === "memory") { renderEngine(); renderMemoryList(); }
- if (failed) throw new Error(result.error?.message || result.error || tr("本地整理已完成，Agent 整理未完成；请查看结果。", "Local processing completed, but the agent did not finish; review the result."));
- toast(tr("整理周期已结束，请查看本地与 Agent 结果", "Run finished; review the local and agent results"));
- } catch (error) { if (!disposed && version === contextVersion) { errors.dream = error; toast(errorText(error), true); } }
- finally { state.dreamRunning = false; if (!disposed) renderDream(); }
+    }
+    function connectionStatusLabel(status) {
+ return ({ configured: tr("已配置", "Configured"), missing: tr("未配置", "Not configured"), conflict: tr("冲突", "Conflict"), pending: tr("待处理", "Pending"), unsupported: tr("不支持", "Unsupported"), unknown: tr("无法确认", "Unknown") })[status] || tr("无法确认", "Unknown");
+    }
+    function renderMemoryConnections() {
+ const node = root.querySelector("#t3-hub-memory-connections");
+ if (!node) return;
+ const agents = Array.isArray(cache.connections?.agents) ? cache.connections.agents : [];
+ const byId = new Map(agents.map((agent) => [String(agent.id || "").toLowerCase(), agent]));
+ const domains = [["mcp", "MCP"], ["skill", tr("技能", "Skills")], ["hook", "Hook"]];
+ const errorHint = errors.connections ? `<div class="hub-connection-error" role="status">${esc(tr("暂时无法读取接入状态。", "Connection status is temporarily unavailable."))} ${button("refresh-memory-connections", tr("重试", "Retry"), { small: true, icon: "refresh" })}</div>` : "";
+ node.innerHTML = `${errorHint}<div class="hub-connection-grid" aria-label="${esc(tr("Agent 记忆接入状态", "Agent memory connection status"))}">${memoryConnectionAgents.map(({ id, label }) => {
+ const agent = byId.get(id) || {};
+ const cells = domains.map(([key, title]) => {
+ const record = agent[key] || { status: "unknown", summary: tr("尚无配置证据", "No configuration evidence") };
+ return `<div class="hub-connection-cell"><span>${esc(title)}</span><strong data-status="${["configured", "missing", "unsupported", "unknown"].includes(record.status) ? record.status : "unknown"}">${esc(connectionStatusLabel(record.status))}</strong><small>${esc(record.summary || "")}</small></div>`;
+ }).join("");
+ const runtime = agent.runtime || { status: "unverified", summary: tr("当前会话未验证", "Current session not verified") };
+ return `<article class="hub-connection-agent"><h3>${esc(agent.label || label)}</h3><div class="hub-connection-fields">${cells}<div class="hub-connection-cell"><span>${esc(tr("当前会话", "Runtime"))}</span><strong data-status="unknown">${esc(runtime.status === "verified" ? tr("已验证", "Verified") : tr("未验证", "Unverified"))}</strong><small>${esc(runtime.summary || tr("当前会话未验证", "Current session not verified"))}</small></div></div></article>`;
+ }).join("")}</div><p class="hub-hint hub-connection-note">${esc(tr("这些状态来自本机配置检查，不代表当前对话已加载。Hook 属于可选能力，不是记忆读写的前提。", "These statuses come from local configuration checks and do not prove the current chat loaded them. Hooks are optional and are not required for memory access."))} ${button("refresh-memory-connections", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh" })}</p>`;
+    }
+    function memoryMcpConfigText() {
+ return JSON.stringify({ mcpServers: { t3_hub: { command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'] } } }, null, 2);
+    }
+    async function runMemoryVectorTest() {
+ if (disposed || state.memoryVectorTestRunning) return;
+ state.memoryVectorTestRunning = true;
+ state.memoryVectorTest = { status: "running" };
+ renderMemoryRuntime();
+ try {
+  const result = await request("embed:test", {});
+  if (disposed) return;
+  if (result?.ok !== true) throw new Error(result?.message || result?.error || tr("向量模型测试失败", "Vector model test failed"));
+  state.memoryVectorTest = { status: "success", modelId: result.modelId, dimensions: result.dimensions, latencyMs: result.latencyMs };
+ } catch (error) {
+  if (!disposed) state.memoryVectorTest = { status: "error", message: errorText(error) };
+ } finally {
+  state.memoryVectorTestRunning = false;
+  if (!disposed && state.tab === "memory") renderMemoryRuntime();
+ }
+    }
+    function renderMemoryRuntime() {
+ const node = root.querySelector("#t3-hub-memory-runtime");
+ if (!node) return;
+ const data = cache.embed, port = Number(data?.port);
+ const address = Number.isInteger(port) && port > 0 && port < 65536 ? `http://127.0.0.1:${port}` : "";
+ const configuredModel = typeof data?.configuredModelId === "string" && data.configuredModelId.trim() ? data.configuredModelId.trim() : "";
+ const activeModel = typeof data?.activeModelId === "string" && data.activeModelId.trim() ? data.activeModelId.trim() : "";
+ const running = data?.running === true;
+ const mode = String(data?.mode || "").toLowerCase();
+ const modelStatus = !data ? tr("无法确认", "Unknown") : running ? tr("运行中", "Running") : /^(fts5|keyword|none)$/.test(mode) ? tr("关键词模式", "Keyword mode") : data.running === false ? tr("未运行", "Not running") : tr("无法确认", "Unknown");
+ const access = cache.agentAccess || {}, summary = access.setupSummary || {}, providers = Array.isArray(summary.providers) ? summary.providers : [];
+ const count = (key) => Number.isFinite(Number(summary[key])) ? Math.max(0, Math.trunc(Number(summary[key]))) : 0;
+ const configuredCount = count("configured"), conflictCount = count("conflict"), pendingCount = count("pending") + count("unknown") + count("missing") + count("unsupported");
+ const setupKnown = !errors.agentAccess && Object.keys(summary).length > 0;
+ const mcpLabel = !setupKnown ? tr("无法确认", "Unknown")
+  : conflictCount || pendingCount ? tr(`配置 ${configuredCount} · 待处理 ${conflictCount + pendingCount}`, `Configured ${configuredCount} · ${conflictCount + pendingCount} pending`)
+  : configuredCount ? tr(`已配置 ${configuredCount} 个 Agent`, `${configuredCount} agents configured`)
+  : tr("尚无配置项", "No configured providers");
+ const providerSummary = [tr(`已配置 ${configuredCount}，冲突 ${conflictCount}，待处理 ${pendingCount}`, `Configured ${configuredCount}, conflicts ${conflictCount}, pending ${pendingCount}`), providers.map((provider) => `${provider.displayName || provider.instanceId || tr("Agent", "Agent")} · ${connectionStatusLabel(provider.status || "unknown")}`).join("；")].filter(Boolean).join("；");
+ const runtimeState = String(summary.runtime || "").toLowerCase();
+ const runtimeLabel = runtimeState === "verified" ? tr("已验证", "Verified") : runtimeState === "pending" ? tr("待处理", "Pending") : tr("未验证", "Unverified");
+ const runtimeDetail = runtimeState === "verified" ? tr("本机 Agent 会话已验证", "Local Agent session verified") : tr("当前会话是否已加载尚未验证", "Current session loading has not been verified");
+ const accessLabel = cache.agentAccess?.enabled === true ? tr("已开启", "Enabled") : cache.agentAccess?.enabled === false ? tr("已关闭", "Disabled") : tr("无法确认", "Unknown");
+ const addressText = address || tr("无法确认", "Unknown");
+ const modelText = running ? activeModel || tr("无法确认", "Unknown") : tr("未运行", "Not running");
+ const configuredText = configuredModel || (/^(fts5|keyword|none)$/.test(mode) ? tr("不适用（关键词模式）", "Not applicable (keyword mode)") : tr("尚未配置", "Not configured"));
+ const errorHtml = errors.embed ? `<p class="hub-hint" role="status">${esc(tr("暂时无法读取本机向量服务状态。", "Could not read local vector service status."))} ${button("refresh-memory-runtime", tr("重试", "Retry"), { small: true, icon: "refresh" })}</p>` : "";
+ const copyArea = state.memoryMcpConfigVisible ? `<textarea class="hub-input hub-memory-mcp-config" readonly spellcheck="false" aria-label="${esc(tr("MCP 配置 JSON", "MCP config JSON"))}">${esc(memoryMcpConfigText())}</textarea>` : "";
+ node.innerHTML = `<section class="hub-card hub-memory-runtime"><div class="hub-section-heading"><span>${esc(tr("本机记忆服务", "Local memory services"))}</span><span class="hub-badge">${esc(tr("仅本机", "Local only"))}</span></div><div class="hub-memory-runtime-grid"><div class="hub-memory-runtime-cell"><span>${esc(tr("向量状态", "Vector status"))}</span><strong>${esc(modelStatus)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("运行中的向量模型", "Active vector model"))}</span><strong>${esc(modelText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("已配置模型", "Configured model"))}</span><strong>${esc(configuredText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("本机服务地址", "Local service address"))}</span><strong>${esc(addressText)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("Agent 记忆开关", "Agent memory access"))}</span><strong>${esc(accessLabel)}</strong></div><div class="hub-memory-runtime-cell"><span>${esc(tr("Hub MCP 配置（Agent 汇总）", "Hub MCP config (agent summary)"))}</span><strong data-status="${setupKnown ? conflictCount || pendingCount ? "pending" : configuredCount ? "configured" : "unknown" : "unknown"}">${esc(mcpLabel)}</strong><small>${esc(redact(providerSummary || tr("本机配置状态未确认", "Local config status is unknown")))}</small></div><div class="hub-memory-runtime-cell"><span>${esc(tr("当前会话运行时", "Current session runtime"))}</span><strong>${esc(runtimeLabel)}</strong><small>${esc(runtimeDetail)}</small></div></div><div class="hub-memory-mcp"><div><strong>${esc(tr("连接方式：本机 stdio（由宿主启动）", "Connection: local stdio (started by the host)"))}</strong><code>${esc(tr("自动使用当前用户的 T3 路径", "Uses the current user's T3 path"))}</code></div>${button("copy-memory-mcp-config", tr("复制 MCP 配置", "Copy MCP config"), { small: true, icon: "terminal" })}</div><p class="hub-hint">${esc(tr("MCP 由宿主通过本机 stdio 启动，配置会自动使用当前宿主的 HOME 定位 T3 路由器；无需替换路径。它不是 HTTP 地址，也不包含真实 HOME 或令牌。", "The host starts the MCP over local stdio. The config uses the current host's HOME to locate the T3 router automatically, so no path replacement is needed. It is not an HTTP endpoint and contains no real HOME path or token."))}</p>${copyArea}${errorHtml}</section>`;
+ const vectorTest = state.memoryVectorTest;
+ const testOutput = !vectorTest ? "" : vectorTest.status === "running" ? `<p class="hub-hint" role="status">${esc(tr("正在测试向量模型…", "Testing the vector model…"))}</p>` : vectorTest.status === "success" ? `<p class="hub-hint" role="status" data-status="success">${esc(tr("测试成功", "Test passed"))} · ${esc(vectorTest.modelId || tr("模型未知", "Model unknown"))} · ${esc(vectorTest.dimensions ?? tr("维度未知", "dimensions unknown"))} ${esc(tr("维度", "dimensions"))} · ${esc(vectorTest.latencyMs ?? tr("耗时未知", "latency unknown"))} ms</p>` : `<p class="hub-hint" role="alert" data-status="error">${esc(tr("测试失败", "Test failed"))} · ${esc(vectorTest.message || tr("无法确认原因", "Reason unavailable"))}</p>`;
+ const vectorTestMarkup = `<div class="hub-memory-vector-test">${button("test-memory-vector", state.memoryVectorTestRunning ? tr("测试中…", "Testing…") : tr("测试向量模型", "Test vector model"), { small: true, icon: "check", disabled: state.memoryVectorTestRunning })}${testOutput}<p class="hub-hint">${esc(tr("本机独立 MLX 服务，无需打开 oMLX；是否可用以测试结果为准。", "The local MLX service runs independently; oMLX does not need to be open. Use the test result to confirm availability."))}</p></div>`;
+ node.innerHTML = node.innerHTML.replace("</section>", `${vectorTestMarkup}</section>`);
+    }
+    async function copyMemoryMcpConfig() {
+ const config = memoryMcpConfigText();
+ try {
+  const clipboard = window.navigator?.clipboard;
+  if (typeof clipboard?.writeText !== "function") throw new Error("clipboard_unavailable");
+  await clipboard.writeText(config);
+  state.memoryMcpConfigVisible = false; renderMemoryRuntime();
+  toast(tr("MCP 配置已复制", "MCP config copied"));
+ } catch {
+  state.memoryMcpConfigVisible = true; renderMemoryRuntime();
+  toast(tr("无法自动复制；已显示配置供手动复制", "Clipboard unavailable; the config is shown for manual copy"), true);
+ }
     }
     function renderWorktreeScopes() {
  const node = root.querySelector("#t3-hub-worktree");
  if (!node) return;
  const info = cache.worktree || {};
- node.innerHTML = `<div class="hub-worktree-bar"><div class="hub-segments" role="group" aria-label="${esc(tr("记忆范围", "Memory scope"))}">${[["smart", tr("智能默认（共享 + 当前工作树）", "Smart · Shared + current tree")], ["project", tr("项目长期共享", "Shared project memory")], ["worktree", tr("当前工作树便签", "Current worktree notes")], ["global", tr("全局通用", "Global")]].map(([scope, label]) => `<button type="button" class="${state.memoryScope === scope ? "is-active" : ""}" data-action="memory-scope-filter" data-scope="${scope}" aria-pressed="${state.memoryScope === scope}">${esc(label)}</button>`).join("")}</div><div class="hub-worktree-caption"><span>${esc(info.branch || info.branchName || info.worktreeName || tr("共享经验，隔离工作树便签", "Shared knowledge, isolated worktree notes"))}</span>${button("open-memory-folder", tr("打开记忆文件夹", "Open memory folder"), { small: true, icon: "folder" })}</div></div>`;
+ const ready = memoryProjectReady();
+ const caption = ready ? info.branch || info.branchName || info.worktreeName || tr("本项目共享经验与工作树便签", "Shared project knowledge and worktree notes") : tr("请先在 T3 中打开并确认一个项目，再读取或维护项目记忆。", "Open and confirm a project in T3 before reading or maintaining project memories.");
+ node.innerHTML = `<div class="hub-worktree-bar"><div class="hub-segments" role="group" aria-label="${esc(tr("项目记忆范围", "Project memory scope"))}">${[["smart", tr("智能默认（本项目共享 + 当前工作树）", "Smart · This project + current tree")], ["project", tr("本项目共享", "Shared in this project")], ["worktree", tr("当前工作树便签", "Current worktree notes")]].map(([scope, label]) => `<button type="button" class="${state.memoryScope === scope ? "is-active" : ""}" data-action="memory-scope-filter" data-scope="${scope}" aria-pressed="${state.memoryScope === scope}" ${ready ? "" : "disabled"}>${esc(label)}</button>`).join("")}</div><div class="hub-worktree-caption"><span>${esc(caption)}</span>${button("open-memory-folder", tr("打开记忆文件夹", "Open memory folder"), { small: true, icon: "folder", disabled: !ready })}</div></div>`;
  if (errors.worktree) node.insertAdjacentHTML("beforeend", `<p class="hub-hint">${esc(errorText(errors.worktree))}</p>`);
     }
     async function setMemoryScope(scope) {
+ if (!["smart", "project", "worktree"].includes(scope)) return;
  state.memoryScope = scope;
- if (scope === "global") state.memoryProject = "global";
- else if (state.memoryProject === "global" && state.projectRoot) state.memoryProject = "current";
+ state.memoryProject = "current";
  state.selectedMemory = null; cache.memory = null; memoryVersion++;
  renderWorktreeScopes(); renderMemoryNav(); renderMemoryList();
- await loadMemories();
+ if (memoryProjectReady()) await loadMemories();
     }
     async function promoteMemory(id, element) {
  if (!memoryWriteReady()) return;
- const version = contextVersion, payload = memoryPayload();
+ const selection = memorySelection(), payload = memoryPayload();
  await busy(`memory-promote:${id}`, element, async () => {
- await request("memory:promote", { ...payload, id, scope: "project" });
- if (disposed || version !== contextVersion) return;
+ await request("memory:promote", { projectRoot: payload.projectRoot, id, scope: "project" });
+ if (disposed || selection !== memorySelection()) return;
  await loadMemories(); toast(tr("已提炼为项目长期共享记忆", "Promoted to shared project memory"));
  });
     }
@@ -1263,26 +1336,6 @@
  const broken = count(data.brokenCount ?? data.brokenLinkCount ?? data.brokenLinks ?? data.danglingLinks ?? data.broken);
  return `<span class="hub-hint hub-memory-health">${esc(tr(`[[链接]]${links == null ? "" : ` ${links}`} · 断链 ${broken ?? "待检测"}`, `[[Links]]${links == null ? "" : ` ${links}`} · Broken ${broken ?? "Not checked"}`))}</span>`;
     }
-    async function importHostMemories(element) {
- if (state.memoryImporting) return;
- const version = contextVersion, projectRoot = state.projectRoot;
- state.memoryImporting = true;
- try {
- await busy("import-host-memories", element, async () => {
- const result = await request("memory:importHostMemories", { projectRoot });
- if (disposed || version !== contextVersion) return;
- const imported = result.importedCount ?? result.imported ?? result.stats?.importedCount ?? result.stats?.imported ?? result.totalImported;
- const count = Array.isArray(imported) ? imported.length : typeof imported === "number" ? imported : null;
- const health = await request("memory:health", { projectRoot }).catch(() => null);
- if (disposed || version !== contextVersion) return;
- if (health) cache.health = health;
- await Promise.all([refreshMemoryOverview(), loadMemories(false), refreshEmbed(false, true)]);
- if (disposed || version !== contextVersion) return;
- if (state.tab === "memory") { renderMemoryNav(); renderMemoryList(); renderEngine(); }
- toast(count == null ? result.message || tr("宿主记忆已汇聚到共享库", "Host memories gathered into the shared vault") : tr(`汇聚完成 · 导入 ${count} 条记忆`, `Import complete · ${count} memories imported`));
- });
- } finally { state.memoryImporting = false; if (!disposed && version === contextVersion && state.tab === "memory") renderMemoryNav(); }
-    }
     async function trimEmbedCache(element) {
  if (state.embedTrimming) return;
  state.embedTrimming = true;
@@ -1296,33 +1349,21 @@
  });
  } finally { state.embedTrimming = false; if (!disposed && state.tab === "memory") renderEngine(); }
     }
-    function renderMemoryGovernance() {
- const node = root.querySelector("#t3-hub-memory-governance");
- if (!node) return;
- node.innerHTML = `<div class="hub-memory-governance"><div class="hub-grow"><span class="hub-hint">${esc(tr("共享记忆治理", "Shared memory care"))}</span>${memoryHealthHint()}</div>${button("import-host-memories", state.memoryImporting ? tr("汇聚中…", "Importing…") : tr("汇聚宿主记忆", "Gather host memories"), { small: true, icon: "download", disabled: state.memoryImporting, attrs: `title="${esc(tr("无损导入本机 Claude、Codex、Gemini 的历史记忆", "Import local Claude, Codex, and Gemini memories without changing the originals"))}"` })}</div>`;
-    }
     function renderMemoryNav() {
- renderMemoryGovernance();
  const node = root.querySelector("#t3-hub-memory-nav");
  if (!node) return;
- const projects = items(cache.overview, ["projects", "items"]);
- const seen = new Set([state.projectRoot]);
- const projectOptions = projects.map((project) => {
- const path = typeof project === "string" ? project : project.projectRoot ?? project.root ?? project.path;
- const key = typeof project === "string" ? project : project.slug || path || project.id;
- if (!key || seen.has(path || key) || ["global", "_global", "__global__"].includes(key)) return "";
- seen.add(path || key);
- const name = typeof project === "string" ? project.split(/[\\/]/).filter(Boolean).pop() : project.title || project.name || project.projectName || String(path || key).split(/[\\/]/).filter(Boolean).pop();
- const count = project.count ?? project.total ?? project.memoryCount;
- return `<option value="${esc(key)}" ${state.memoryProject === key ? "selected" : ""}> ${esc(name)}${count == null ? "" : ` · ${count}`}</option>`;
- }).join("");
- node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("记忆所属项目", "Memory project"))}"><option value="current" ${state.memoryProject === "current" ? "selected" : ""} ${projectDisabled() ? "disabled" : ""}> ${esc(tr("当前项目", "Current project"))}</option><option value="global" ${state.memoryProject === "global" ? "selected" : ""}> ${esc(tr("全局通用记忆", "Global memories"))}</option>${projectOptions}</select>${button("new-memory", tr("新建 / 演进记忆", "New / evolve memory"), { icon: "plus", small: true })}</div><div class="hub-memory-toolbar">${button("consolidate-memory", tr(" 一键再记忆整理", " Consolidate memories"), { small: true, disabled: !selectedMemoryRoot(), attrs: `title="${esc(!selectedMemoryRoot() ? tr("请选择项目记忆库", "Select a project vault") : tr("合并重复经验，整理过时记忆", "Merge duplicates and outdated memories"))}"` })}<span class="hub-hint">${esc(tr("去重 · 演进 · 保留历史", "Deduplicate · Evolve · Keep history"))}</span></div>`;
+ const ready = memoryProjectReady();
+ const current = ready ? projectTitle() : tr("尚未确认项目", "No confirmed project");
+ const project = ready ? selectedMemoryProject() : null;
+ const total = project?.total ?? cache.memory?.total;
+ const prompt = ready ? "" : `<p class="hub-hint" role="status">${esc(tr("请先在 T3 中打开并确认当前项目；记忆只会读取和写入这个项目。", "Open and confirm the current project in T3 first. Memory reads and writes are limited to that project."))}</p>`;
+ node.innerHTML = `<div class="hub-project-picker"><select class="hub-select" name="memoryProject" aria-label="${esc(tr("当前记忆项目", "Current memory project"))}" disabled><option value="current" selected>${esc(current)}${total == null ? "" : ` · ${esc(total)}`}</option></select>${button("new-memory", tr("新建 / 演进记忆", "New / evolve memory"), { icon: "plus", small: true, disabled: !ready })}</div><div class="hub-memory-toolbar">${button("consolidate-memory", tr(" 一键再记忆整理", " Consolidate memories"), { small: true, disabled: !ready, attrs: `title="${esc(!ready ? tr("请先确认当前项目", "Confirm the current project first") : tr("合并重复经验，整理过时记忆", "Merge duplicates and outdated memories"))}"` })}<span class="hub-hint">${esc(tr("去重 · 演进 · 保留历史", "Deduplicate · Evolve · Keep history"))}</span></div>${prompt}`;
  if (errors.overview) node.insertAdjacentHTML("beforeend", inlineError(errors.overview));
     }
     function memoryRecords() { return items(cache.memory, ["items", "memories", "results"]); }
     function memoryId(item) { return String(item.id ?? item.key ?? item.path ?? ""); }
     function memoryBody(item) { return item.content ?? item.body ?? item.markdown ?? item.text ?? ""; }
-    function memoryDraftKey(id) { return `${state.memoryProject}\u0000${id}`; }
+    function memoryDraftKey(id) { return `${selectedMemoryRoot() || "unconfirmed"}\u0000${id}`; }
     function formatExactTime(value, seconds = false) {
  if (value == null || value === "") return "";
  const date = new Date(value);
@@ -1335,8 +1376,15 @@
     }
     function renderMemoryList() {
  if (state.tab !== "memory" || disposed) return;
+ const node = root.querySelector("#t3-hub-memory-list");
+ if (!memoryProjectReady()) {
+ root.querySelector("#t3-hub-memory-total").textContent = "";
+ root.querySelector("#t3-hub-memory-filters").innerHTML = "";
+ node.innerHTML = empty(tr("请先确认当前项目", "Confirm the current project first"), tr("为了避免不同项目的记忆混在一起，请在 T3 中打开一个项目并等待连接确认。", "To keep project memories separate, open a project in T3 and wait for its context to be confirmed."), "folder");
+ return;
+ }
  const records = memoryRecords();
- const project = state.memoryProject === "current" ? items(cache.overview, ["projects", "items"]).find((item) => item.slug === cache.overview?.currentProjectSlug || item.projectRoot === state.projectRoot) : state.memoryProject === "global" ? items(cache.overview, ["projects", "items"]).find((item) => ["global", "_global"].includes(item.slug)) : selectedMemoryProject();
+ const project = selectedMemoryProject();
  const moduleCounts = cache.memory?.moduleCounts || cache.memory?.counts || project?.byModule || {};
  const total = cache.memory?.total ?? project?.total ?? records.length;
  root.querySelector("#t3-hub-memory-total").textContent = tr(`${total} 条记忆`, `${total} memories`);
@@ -1344,7 +1392,6 @@
  const count = key === "all" ? total : moduleCounts[key];
  return `<button type="button" class="hub-pill ${state.memoryModule === key ? "is-active" : ""}" data-action="memory-module" data-module="${key}" aria-pressed="${state.memoryModule === key}">${emoji ? `${emoji} ` : ""}${esc(label)}${count == null ? "" : `<span class="hub-pill-count">${count}</span>`}</button>`;
  }).join("");
- const node = root.querySelector("#t3-hub-memory-list");
  node.innerHTML = errors.memory ? inlineError(errors.memory, "refresh-memory") : !cache.memory ? loading() : !records.length ? empty(tr("这里还没有匹配的记忆", "No memories found here"), tr("换一个项目、模块或关键词，也可以新建一条。", "Try another project, module, or search. Or add a memory."), "memory") : records.map((item) => {
  const id = memoryId(item);
  const selected = state.selectedMemory === id;
@@ -1364,8 +1411,13 @@
  }).join("")}</div></div>`;
     }
     async function openNewMemory() {
- const payload = memoryPayload(), selection = JSON.stringify([payload.projectRoot, payload.projectSlug]);
+ if (!memoryWriteReady()) return;
+ const payload = memoryPayload(), selection = memorySelection();
+ if (!payload.projectRoot) return;
  drafts.__new = { ...(drafts.__new || { module: state.memoryModule === "all" ? "topics" : state.memoryModule }), open: true };
+ if (!drafts.__new.projectRoot && drafts.__new.migratedFromGlobal) { drafts.__new.projectRoot = payload.projectRoot; delete drafts.__new.migratedFromGlobal; }
+ if (drafts.__new.projectRoot !== payload.projectRoot) drafts.__new = { open: true, projectRoot: payload.projectRoot, module: state.memoryModule === "all" ? "topics" : state.memoryModule };
+ if (!["project", "worktree"].includes(drafts.__new.scope)) drafts.__new.scope = state.memoryScope === "worktree" ? "worktree" : "project";
  state.supersedeLoading = true;
  state.supersedeItems = [];
  renderNewMemory();
@@ -1373,12 +1425,12 @@
  try {
  const data = await request("memory:list", { ...payload, module: undefined, query: "", limit: 500 });
  const current = memoryPayload();
- if (disposed || selection !== JSON.stringify([current.projectRoot, current.projectSlug])) return;
+ if (disposed || selection !== memorySelection() || current.projectRoot !== payload.projectRoot) return;
  state.supersedeItems = items(data, ["items", "memories", "results"]);
  } catch (error) { if (!disposed) toast(errorText(error), true); }
  finally {
  const current = memoryPayload();
- if (!disposed && selection === JSON.stringify([current.projectRoot, current.projectSlug])) {
+ if (!disposed && selection === memorySelection() && current.projectRoot === payload.projectRoot) {
  state.supersedeLoading = false;
  // Preserve text and focus while the optional choices load.
  const select = content.querySelector('[name="new-memory-supersedes"]');
@@ -1393,8 +1445,14 @@
  const node = root.querySelector("#t3-hub-new-memory");
  if (!node) return;
  const draft = drafts.__new;
- if (!draft?.open) { node.innerHTML = ""; return; }
- node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("保存范围", "Save scope"))}<select class="hub-select" name="new-memory-scope">${[["project", tr("项目长期共享", "Shared project memory")], ["worktree", tr("当前工作树便签", "Current worktree note")], ["global", tr("全局通用", "Global")]].map(([scope, label]) => `<option value="${scope}" ${(draft.scope || (state.memoryScope === "worktree" ? "worktree" : state.memoryProject === "global" ? "global" : "project")) === scope ? "selected" : ""} ${scope !== "global" && !selectedMemoryRoot() ? "disabled" : ""}>${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("覆盖旧记忆 (Supersede) · 可选", "Supersede an existing memory · optional"))}<select class="hub-select" name="new-memory-supersedes" ${state.supersedeLoading ? "disabled" : ""}>${supersedeOptions()}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
+ if (!draft?.open || !memoryProjectReady()) { node.innerHTML = ""; return; }
+ const projectRoot = selectedMemoryRoot();
+ if (draft.projectRoot !== projectRoot) {
+  if (!draft.projectRoot && draft.migratedFromGlobal) { draft.projectRoot = projectRoot; delete draft.migratedFromGlobal; }
+  else { node.innerHTML = ""; return; }
+ }
+ if (!["project", "worktree"].includes(draft.scope)) draft.scope = state.memoryScope === "worktree" ? "worktree" : "project";
+ node.innerHTML = `<div class="hub-new-memory"><div class="hub-section-heading">${esc(tr("记录一条可复用的经验", "Write something worth remembering"))}</div><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="new-memory-title" value="${esc(draft.title || "")}" placeholder="${esc(tr("一句话说清这条记忆", "A short, clear title"))}"></label><label class="hub-field">${esc(tr("保存范围", "Save scope"))}<select class="hub-select" name="new-memory-scope">${[["project", tr("本项目共享", "Shared in this project")], ["worktree", tr("当前工作树便签", "Current worktree note")]].map(([scope, label]) => `<option value="${scope}" ${draft.scope === scope ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("模块", "Module"))}<select class="hub-select" name="new-memory-module">${moduleOptions().filter(([key]) => key !== "all").map(([key, label, emoji]) => `<option value="${key}" ${draft.module === key ? "selected" : ""}>${emoji} ${esc(label)}</option>`).join("")}</select></label><label class="hub-field">${esc(tr("覆盖旧记忆 (Supersede) · 可选", "Supersede an existing memory · optional"))}<select class="hub-select" name="new-memory-supersedes" ${state.supersedeLoading ? "disabled" : ""}>${supersedeOptions()}</select></label><textarea class="hub-editor" name="new-memory-content" spellcheck="false" aria-label="${esc(tr("新记忆内容", "New memory content"))}" placeholder="${esc(tr("写下背景、结论与验证过的经验…", "Context, conclusions, and verified lessons…"))}">${esc(draft.content || "")}</textarea><div class="hub-editor-actions">${button("create-memory", tr("保存记忆", "Save memory"), { primary: true, icon: "save" })}${button("cancel-new-memory", tr("取消", "Cancel"))}</div></div>`;
     }
 
     function agentKey(target = state.agentsTarget) { return target === "global" ? "global" : `project:${state.projectRoot || ""}`; }
@@ -1513,34 +1571,61 @@
  }
  return null;
     }
-    let boardPosition = (() => {
- try {
- const value = JSON.parse(storageGet("t3-hub-dashboard-position-v1") || "null");
- return Number.isFinite(value?.x) && Number.isFinite(value?.y) ? { x: value.x, y: value.y } : null;
- } catch { return null; }
-    })();
+    function findConversationTitleAnchor() {
+ const expected = String(state.context?.threadTitle || state.context?.title || state.context?.thread?.title || "").trim();
+ const selectors = '[data-testid*="thread-title" i],[data-testid*="conversation-title" i],[data-testid*="chat-title" i],[data-slot*="thread-title" i],[data-slot*="conversation-title" i],[aria-label*="Thread actions" i] :is(h1,h2,[role="heading"]),[data-testid*="thread-actions" i] :is(h1,h2,[role="heading"]),main header h1,main header h2,main header [role="heading"],main h1,main h2,main [role="heading"],header h1,header h2';
+ const candidates = [...document.querySelectorAll(selectors)].filter((element) => {
+ const text = String(element.textContent || "").trim(), rect = element.getBoundingClientRect();
+ return text && text.length < 240 && rect.width > 0 && rect.top >= 0 && rect.top < 180 &&
+ !element.closest('#t3-sidecar-hub-root,[role="log"],[data-message-id],[data-message-role],[data-testid="chat-message"],[data-slot="message"],aside') && getComputedStyle(element).visibility !== "hidden";
+ });
+ if (expected) {
+ const exact = candidates.find((element) => String(element.textContent || "").trim() === expected);
+ if (exact) return exact;
+ }
+ return candidates.sort((a, b) => {
+ const aSpecific = /thread-title|conversation-title|chat-title/.test(`${a.getAttribute?.("data-testid") || ""} ${a.getAttribute?.("data-slot") || ""}`) ? 0 : 1;
+ const bSpecific = /thread-title|conversation-title|chat-title/.test(`${b.getAttribute?.("data-testid") || ""} ${b.getAttribute?.("data-slot") || ""}`) ? 0 : 1;
+ return aSpecific - bSpecific || a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+ })[0] || null;
+    }
+    function placePlanHandle() {
+ if (!titleControls || !planHandle || disposed) return false;
+ const title = findConversationTitleAnchor();
+ if (!title) { titleControls.hidden = true; planHandle.hidden = true; liveBoard.hidden = true; return false; }
+ const anchor = title.closest("button,[role=button]") || title;
+ if (titleControls.parentElement !== anchor.parentElement || titleControls.previousElementSibling !== anchor) anchor.after(titleControls);
+ titleControls.hidden = false;
+ Object.assign(titleControls.style, { position: "relative", inset: "auto", display: "inline-flex", alignItems: "center", verticalAlign: "middle", margin: "0 0 0 8px", width: "auto", minWidth: "0", height: "27px", zIndex: "1", WebkitAppRegion: "no-drag" });
+ Object.assign(planHandle.style, { position: "relative", inset: "auto", display: "inline-flex", alignItems: "center", justifyContent: "flex-start", verticalAlign: "middle", margin: "0", width: "auto", minWidth: "0", height: "27px", padding: "4px 10px", borderRadius: "999px", cursor: "pointer", zIndex: "1", WebkitAppRegion: "no-drag" });
+ return true;
+    }
     function positionConversationTools() {
  if (!root || !liveBoard || disposed) return;
- const routeHintValue = routeHint();
- const blocked = state.open || root.classList.contains("is-occluded") || /^\/(settings|usage|pair)(\/|$)/.test(routeHintValue) || routeHintValue === "/" ||
- (state.threadId === "__NEW__" && !/(?:^|\/)(?:new|draft)(?:\/|[?#]|$)/i.test(routeHintValue)) || (slashSession && innerWidth < 760);
- const width = Math.max(0, Math.min(320, innerWidth - 16));
- const desired = boardPosition || { x: innerWidth - width - 24, y: 96 };
- const x = Math.max(8, Math.min(Math.max(8, innerWidth - width - 8), desired.x));
- const visibleHeight = Math.min(Math.max(0, innerHeight - 16), state.boardExpanded ? 150 : 48);
- const y = Math.max(8, Math.min(Math.max(8, innerHeight - visibleHeight - 8), desired.y));
- Object.assign(liveBoard.style, { left: `${x}px`, width: `${width}px`, top: `${y}px`, maxHeight: `${Math.max(0, innerHeight - y - 8)}px` });
- liveBoard.classList.toggle("is-space-limited", false);
- liveBoard.hidden = !!blocked;
+ const anchored = placePlanHandle();
+ const board = boardData(), available = (state.connected || remotePlanContextReady()) && !boardProblem() && hasActualPlan(board) && !boardMismatch();
  if (planHandle) {
- planHandle.hidden = true;
- const status = boardStatus();
- planHandle.textContent = status;
- planHandle.title = `${tr("查看计划", "Open plan")} · ${status}`;
+ planHandle.hidden = !anchored || !available;
+ planHandle.setAttribute("aria-haspopup", "true");
+ planHandle.setAttribute("aria-controls", "t3-hub-live-board");
+ planHandle.setAttribute("aria-expanded", String(!!state.planOpen));
  }
- if (slashSession) positionSlash();
+ const show = anchored && available && state.planOpen && !state.open && !root.classList.contains("is-occluded");
+ liveBoard.hidden = !show;
+ if (show) {
+ const anchor = planHandle.getBoundingClientRect(), width = Math.min(360, Math.max(240, innerWidth - 24));
+ const left = Math.max(8, Math.min(innerWidth - width - 8, anchor.right - width));
+ const estimatedHeight = Math.min(360, Math.max(120, liveBoard.scrollHeight || 240));
+ const top = anchor.bottom + estimatedHeight + 12 <= innerHeight ? anchor.bottom + 8 : Math.max(8, anchor.top - estimatedHeight - 8);
+ Object.assign(liveBoard.style, { left: `${left}px`, width: `${width}px`, top: `${top}px`, maxHeight: `${Math.max(100, innerHeight - top - 8)}px` });
+ }
     }
     function boardMismatch() {
+ const remoteEnv = remotePlanEnvironmentId();
+ if (cache.board?.remote === true) {
+ const currentThread = currentThreadId();
+ return !remoteEnv || String(cache.board.environmentId || "").toLowerCase() !== remoteEnv.toLowerCase() || String(cache.board.threadId || "") !== currentThread || String(state.threadId || "") !== currentThread;
+ }
  const route = routeHint(), prefixed = /^\/?_t3_env_(?:\/|[?#]|$)/i.test(route);
  const explicitPair = route.match(/^\/?_t3_env_\/([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/i);
  if (prefixed && (!explicitPair || /\/\//.test(route.replace(/[?#].*$/, "")))) return true;
@@ -1569,11 +1654,18 @@
  return false;
     }
     function memoryWriteReady(scope = "project") {
- if (scope === "global") return !(contextLoading && state.memoryScope !== "global") || projectWriteReady("project");
- if (state.memoryProject !== "current" && state.memoryProject !== "global") return true;
- return state.memoryProject === "current" ? projectWriteReady("project") : (projectWriteReady("project"), false);
+ if (!["project", "worktree"].includes(scope)) {
+  toast(tr("记忆只支持当前项目范围", "Memory is limited to the current project"), true);
+  return false;
+ }
+ return memoryProjectReady() || projectWriteReady("project");
     }
     function boardProblem() {
+ if (cache.board?.remote === true) {
+ if (boardMismatch()) return tr("会话未匹配", "Session mismatch");
+ if (errors.board) return tr("远程计划暂不可用", "Remote plan unavailable");
+ return "";
+ }
  if (contextLoading) return tr("读取中", "Loading");
  if (!state.connected) return /无法确认(?:新)?会话所属项目/.test(state.contextError) ? tr("未确认所属项目", "Project not identified") : state.contextError ? tr("连接失败", "Connection failed") : tr("读取中", "Loading");
  if (boardMismatch()) return tr("会话未匹配", "Session mismatch");
@@ -1603,6 +1695,120 @@
  const completed = Number(raw.progress?.completed ?? steps.filter((step) => step.status === "completed").length) || 0;
  const total = Number(raw.progress?.total ?? steps.length) || 0;
  return { ...raw, steps, progress: { completed, total }, subagents: items(raw, ["subagents", "runs", "delegates"]), artifacts: items(raw, ["artifacts", "documents"]) };
+    }
+    function planStepProgress(board = boardData()) {
+ const steps = Array.isArray(board.steps) ? board.steps : [];
+ const total = Math.max(0, Number(board.progress?.total) || steps.length || 0);
+ if (!total) return { current: 0, total: 0, completed: 0, done: false, percent: 0, label: tr("查看计划", "View plan") };
+ const completed = Math.max(0, Number(board.progress?.completed) || 0);
+ const activeIndex = steps.findIndex((step) => step.status === "in-progress");
+ const pendingIndex = steps.findIndex((step) => step.status !== "completed" && step.status !== "in-progress");
+ const done = steps.length ? steps.length >= total && steps.slice(0, total).every((step) => step.status === "completed") : completed >= total;
+ const candidate = activeIndex >= 0 ? activeIndex + 1 : pendingIndex >= 0 ? pendingIndex + 1 : done ? total : completed + 1;
+ const current = Math.min(total, Math.max(1, candidate));
+ return { current, total, completed, done, percent: done ? 100 : Math.round(current / total * 100), label: done ? tr(`第 ${total} / ${total} 步 · 已完成`, `Step ${total} of ${total} · complete`) : tr(`第 ${current} / ${total} 步`, `Step ${current} of ${total}`) };
+    }
+    function activePlanRouteIdentity() {
+ const source = String(routeHint() || "");
+ const path = (source.includes("#") ? source.slice(source.lastIndexOf("#") + 1) : source).split(/[?#]/, 1)[0];
+ let environmentId = "", routeThreadId = "", explicitEnvironment = false;
+ let match = path.match(/^\/?_t3_env_\/([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/i);
+ if (match) { environmentId = match[1]; routeThreadId = match[2]; explicitEnvironment = true; }
+ else {
+ match = path.match(/^\/?([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/);
+ if (match && new RegExp(`^${UUID_RE}$`, "i").test(match[1])) { environmentId = match[1]; routeThreadId = match[2]; }
+ }
+ try { if (environmentId) environmentId = decodeURIComponent(environmentId); if (routeThreadId) routeThreadId = decodeURIComponent(routeThreadId); } catch { return { environmentId: "", threadId: "" }; }
+ const threadId = currentThreadId();
+ if (!environmentId || !routeThreadId || routeThreadId !== threadId || !explicitEnvironment && !new RegExp(`^${UUID_RE}$`, "i").test(environmentId)) return { environmentId: "", threadId };
+ return { environmentId, threadId, explicitEnvironment };
+    }
+    function remotePlanProject(environmentId, threadId) {
+ if (!environmentId || !threadId || typeof window.__t3HudRemoteProject !== "function") return null;
+ try {
+  const project = window.__t3HudRemoteProject({ environmentId, threadId });
+  const projectRoot = project?.projectRoot;
+  const absolute = typeof projectRoot === "string" && (/^\//.test(projectRoot) || /^[A-Za-z]:[\\/]/.test(projectRoot));
+  const safe = absolute && projectRoot.trim() === projectRoot && !/[\u0000-\u001f\u007f]/.test(projectRoot) && !projectRoot.split(/[\\/]+/).includes("..");
+  if (project?.environmentId !== environmentId || project?.threadId !== threadId || !safe) return null;
+  return { environmentId, threadId, projectRoot };
+ } catch { return null; }
+    }
+    function remotePlanEnvironmentId() {
+ if (!state.threadId || state.threadId === "__NEW__") return "";
+ const routeIdentity = activePlanRouteIdentity(), environmentId = routeIdentity.environmentId;
+ if (!environmentId || routeIdentity.threadId !== String(state.threadId)) return "";
+ if (remotePlanProject(environmentId, routeIdentity.threadId)) return environmentId;
+ const explicitRemote = state.context?.remote === true || state.context?.isRemote === true || state.context?.environment?.remote === true;
+ if (contextLoading && !explicitRemote) return "";
+ if (explicitRemote || !state.context && !!state.contextError) return environmentId;
+ return "";
+    }
+    function remotePlanContextReady() {
+ const environmentId = remotePlanEnvironmentId(), board = cache.board;
+ return !!environmentId && board?.remote === true && String(board.environmentId || "").toLowerCase() === environmentId.toLowerCase() && String(board.threadId || "") === currentThreadId();
+    }
+    function normalizeRemoteThreadPlan(projection, environmentId, threadId) {
+ if (String(projection?.thread?.id || "") !== threadId) throw new Error("remote thread mismatch");
+ const plans = Array.isArray(projection.plans) ? projection.plans : [];
+ const turns = [...items(projection, ["turnItems"]), ...items(projection, ["visibleTurnItems"])].map((turn) => turn?.item && typeof turn.item === "object" ? turn.item : turn);
+ const matches = [];
+ for (const plan of plans) {
+ const kind = String(plan?.kind || plan?.type || "");
+ if (String(plan?.threadId || "") !== threadId || String(plan?.status || "").toLowerCase() === "superseded" || !["todo_list", "proposed_plan"].includes(kind)) continue;
+ const planId = String(plan.id || plan.planId || "");
+ if (!kind || !planId) continue;
+ const update = turns.filter((turn) => {
+ const turnThreadId = String(turn?.threadId || turn?.thread?.id || projection.thread.id || "");
+ return turnThreadId === threadId && String(turn?.type || turn?.kind || "") === kind && String(turn?.planId || turn?.payload?.planId || "") === planId;
+ }).sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))[0];
+ if (update) matches.push({ plan, updatedAt: update.updatedAt || plan.updatedAt || "" });
+ }
+ matches.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+ const latest = matches[0]?.plan;
+ const rawSteps = Array.isArray(latest?.steps) ? latest.steps : [];
+ const steps = rawSteps.map((step, index) => {
+ const rawStatus = String(typeof step === "object" ? step.status || step.state || "pending" : "pending").toLowerCase().replace(/_/g, "-");
+ const status = ["completed", "done", "success", "succeeded"].includes(rawStatus) ? "completed" : ["running", "active", "started", "in-progress"].includes(rawStatus) ? "in-progress" : "pending";
+ return { id: typeof step === "object" ? String(step.id ?? index) : String(index), text: String(typeof step === "string" ? step : step?.text || step?.title || step?.content || step?.step || ""), status };
+ });
+ return { remote: true, environmentId, threadId, source: "t3-connect", planStatus: latest?.status || "", planMarkdown: typeof latest?.markdown === "string" ? latest.markdown : "", steps, updatedAt: matches[0]?.updatedAt || "", subagents: [], artifacts: [] };
+    }
+    async function planMirrorRelativePath(threadId) {
+ let key = String(threadId || "");
+ if (new RegExp(`^${UUID_RE}$`, "i").test(key)) key = key.toLowerCase();
+ else {
+ const cryptoApi = window.crypto?.subtle ? window.crypto : globalThis.crypto;
+ if (!cryptoApi?.subtle || typeof TextEncoder !== "function") throw new Error("remote plan unavailable");
+ const bytes = new Uint8Array(await cryptoApi.subtle.digest("SHA-256", new TextEncoder().encode(`t3-hub-plan-mirror-v1\0${key}`)));
+ const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("").slice(0, 32).split("");
+ hex[12] = "5";
+ hex[16] = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+ const compact = hex.join("");
+ key = `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+ }
+ return `.t3-hub/plans/${key}.json`;
+    }
+    function normalizeRemotePlanMirror(contents, environmentId, threadId, projectRoot) {
+ if (typeof contents !== "string" || !contents.trim()) return null;
+ if (contents.length > 262144) throw new Error("remote plan unavailable");
+ let mirror;
+ try { mirror = JSON.parse(contents); } catch { throw new Error("remote plan unavailable"); }
+ const isClear = mirror?.cleared === true, isUnavailable = mirror?.unavailable === true;
+ if (mirror?.schemaVersion !== 1 || String(mirror.threadId || "") !== threadId || typeof projectRoot !== "string" || mirror.projectRoot !== projectRoot || !Array.isArray(mirror.steps) || !Number.isFinite(Date.parse(mirror.updatedAt || "")) ||
+  isClear && (isUnavailable || mirror.source !== "hub-clear") || isUnavailable && mirror.source !== "hub-unavailable" || !isClear && !isUnavailable && mirror.source !== "hub-mcp") throw new Error("remote plan unavailable");
+ const steps = isClear || isUnavailable ? [] : mirror.steps.slice(0, 300).map((step, index) => {
+ const rawStatus = String(step?.status || "pending").toLowerCase().replace(/_/g, "-");
+ const status = ["completed", "done", "success", "succeeded"].includes(rawStatus) ? "completed" : ["running", "active", "started", "in-progress"].includes(rawStatus) ? "in-progress" : "pending";
+ return { id: String(step?.id ?? index).slice(0, 120), text: String(step?.text || "").slice(0, 2000), status };
+ });
+ return { remote: true, environmentId, threadId, source: isUnavailable ? "hub-mirror-unavailable" : "hub-mirror", planStatus: "active", planMarkdown: "", steps, updatedAt: mirror.updatedAt, cleared: isClear, unavailable: isUnavailable, subagents: [], artifacts: [] };
+    }
+    function newestRemotePlan(nativePlan, mirroredPlan) {
+ if (!mirroredPlan) return nativePlan;
+ if (!nativePlan) return mirroredPlan;
+ const nativeUpdated = Date.parse(nativePlan.updatedAt || "") || 0, mirrorUpdated = Date.parse(mirroredPlan.updatedAt || "") || 0;
+ return mirrorUpdated > nativeUpdated || mirrorUpdated === nativeUpdated && (mirroredPlan.cleared || mirroredPlan.unavailable) ? mirroredPlan : nativePlan;
     }
     function elapsedLabel(run) {
  const ms = Number(run.elapsedMs ?? run.durationMs ?? (run.startedAt ? (run.completedAt || run.endedAt ? new Date(run.completedAt || run.endedAt).getTime() : Date.now()) - new Date(run.startedAt).getTime() : (run.elapsedSeconds ?? run.elapsed ?? 0) * 1000));
@@ -1712,116 +1918,117 @@
  return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${escIdentity(step.id)}" data-step-text="${escIdentity(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!compact ? subagentSummary(board, true) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
     function renderLiveBoard() {
- if (!liveBoard) return;
- const problem = boardProblem(), status = boardStatus();
- const threadId = state.threadId || "";
- const sameThread = liveBoard.dataset.threadId === threadId && liveBoard.dataset.projectRoot === (state.projectRoot || "");
- const scrollTop = sameThread ? liveBoard.querySelector(".hub-board-content")?.scrollTop ?? 0 : 0;
- const active = document.activeElement;
- const focus = sameThread && liveBoard.contains(active) && active?.matches?.("[data-board-drag],button[data-action]")
- ? { drag: active.matches("[data-board-drag]"), action: active.dataset.action, stepId: active.dataset.stepId, stepText: active.dataset.stepText, tab: active.dataset.tab } : null;
- if (document.activeElement?.matches('input[name="board-step-draft"]') && liveBoard.contains(document.activeElement) && liveBoard.dataset.threadId === (state.threadId || "")) { positionConversationTools(); return; }
- liveBoard.dataset.threadId = threadId;
- liveBoard.dataset.projectRoot = state.projectRoot || "";
- liveBoard.classList.toggle("is-collapsed", !state.boardExpanded);
- const board = boardData(), hasPlan = hasActualPlan(board);
- const heading = tr("任务面板", "Task board");
- const percent = board.progress.total > 0 ? Math.max(0, Math.min(100, board.progress.completed / board.progress.total * 100)) : 0;
- liveBoard.innerHTML = `<div class="hub-board-toolbar"><div class="hub-board-drag" data-board-drag tabindex="0" aria-label="${esc(tr("拖动仪表盘；方向键可移动", "Drag dashboard; use arrow keys to move"))}" title="${esc(tr("拖动到窗口任意位置", "Drag anywhere in the window"))}"><span class="hub-board-grip" aria-hidden="true">⋮⋮</span><strong>${esc(heading)}</strong>${board.progress.total ? `<svg class="hub-progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-border)" stroke-width="3"></circle><circle cx="10" cy="10" r="7" fill="none" stroke="var(--hub-accent)" stroke-width="3" stroke-linecap="round" stroke-dasharray="44" stroke-dashoffset="${44 * (1 - percent / 100)}"></circle></svg>` : ""}<span class="hub-board-status">${esc(status)}</span></div><button type="button" class="hub-icon-btn" data-action="reset-dashboard-position" aria-label="${esc(tr("重置悬浮位置", "Reset dashboard position"))}" title="${esc(tr("重置悬浮位置", "Reset dashboard position"))}">${icon("refresh", 12)}</button><button type="button" class="hub-icon-btn" data-action="toggle-board" aria-expanded="${state.boardExpanded}" aria-label="${esc(state.boardExpanded ? tr("收起仪表盘", "Collapse dashboard") : tr("展开仪表盘", "Expand dashboard"))}">${state.boardExpanded ? "−" : "+"}</button><button type="button" class="hub-icon-btn" data-action="open-board-studio" aria-label="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}" title="${esc(tr("在 Hub 查看完整计划", "View the full plan in Hub"))}">${icon("hub", 14)}</button></div>${state.boardExpanded ? `<div class="hub-board-content">${problem ? `<p class="hub-hint">${esc(problem)}</p>` : `${hasPlan ? `<div class="hub-board-source"><span>${esc(planSourceSummary(board))}</span><span>${esc(board.progress.total ? status : tr("进度未量化", "Progress not quantified"))}</span></div>${board.progress.total ? `<div class="hub-board-meter" role="progressbar" aria-label="${esc(tr("计划完成进度", "Plan completion"))}" aria-valuemin="0" aria-valuemax="${board.progress.total}" aria-valuenow="${board.progress.completed}"><i style="width:${percent}%"></i></div>` : ""}` : ""}${boardMarkup(true, true)}`}</div>` : ""}`;
- rememberBoardView(liveBoard);
- applyTheme();
+ if (!liveBoard || disposed) return;
+ const board = boardData(), hasPlan = (state.connected || remotePlanContextReady()) && !boardProblem() && !boardMismatch() && hasActualPlan(board);
+ const planProgress = planStepProgress(board), ringCircumference = 37.7, ringOffset = (ringCircumference * (100 - planProgress.percent) / 100).toFixed(2);
+ liveBoard.dataset.threadId = state.threadId || "";
+ planHandle.innerHTML = `<span class="hub-plan-indicator" aria-hidden="true">${planProgress.total ? `<svg class="hub-plan-ring" viewBox="0 0 16 16"><circle class="hub-plan-ring-track" cx="8" cy="8" r="6"></circle><circle class="hub-plan-ring-progress" cx="8" cy="8" r="6" stroke-dasharray="${ringCircumference}" stroke-dashoffset="${ringOffset}"></circle></svg><span class="hub-plan-label">${esc(planProgress.label)}</span>` : icon("list", 13)}</span>`;
+ planHandle.setAttribute("aria-label", planProgress.total ? tr(`当前会话计划：${planProgress.label}`, `Current conversation plan: ${planProgress.label}`) : tr("查看当前会话计划", "View current conversation plan"));
+ planHandle.title = planProgress.label;
+ planHandle.setAttribute("aria-expanded", String(!!state.planOpen));
+ liveBoard.innerHTML = `<div class="hub-plan-popover" role="region" aria-label="${esc(tr("当前会话计划进度", "Current conversation plan progress"))}">${planProgress.total ? `<div class="hub-plan-summary"><strong>${esc(planProgress.label)}</strong><span>${planProgress.done ? esc(tr("已完成", "Complete")) : esc(tr(`已完成 ${planProgress.completed} 项`, `${planProgress.completed} completed`))}</span></div>` : ""}${board.steps.length ? `<ol class="hub-plan-steps">${board.steps.map((step) => `<li class="hub-board-step is-${esc(step.status)}"><span class="hub-step-icon" aria-hidden="true">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "•" : ""}</span><span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : `<div class="hub-plan-document">${esc(String(board.planMarkdown || "").trim().slice(0, 1800))}</div>`}</div>`;
  positionConversationTools();
- const scroller = liveBoard.querySelector(".hub-board-content");
- if (scroller) scroller.scrollTop = scrollTop;
- if (focus && !liveBoard.hidden && sameThread && state.threadId === threadId) {
- let next;
- if (focus.drag) next = liveBoard.querySelector("[data-board-drag]");
- else if (focus.action === "board-step") {
- if (focus.stepId && !/^(?:step[-_])?\d+$/i.test(focus.stepId)) {
- const matches = [...liveBoard.querySelectorAll('button[data-action="board-step"]')].filter((button) => button.dataset.stepId === focus.stepId && button.dataset.stepText === focus.stepText);
- if (matches.length === 1) next = matches[0];
- }
- next ||= liveBoard.querySelector("[data-board-drag]");
- } else if (focus.action === "read-artifact") next = liveBoard.querySelector("[data-board-drag]");
- else {
- const matches = [...liveBoard.querySelectorAll("button[data-action]")].filter((button) => button.dataset.action === focus.action && button.dataset.tab === focus.tab);
- next = matches.length === 1 ? matches[0] : liveBoard.querySelector("[data-board-drag]");
- }
- next?.focus?.({ preventScroll: true });
- }
+ applyTheme();
+    }
+    function setPlanPopover(open, pinned = false) {
+ state.planOpen = !!open;
+ state.planPinned = !!open && !!pinned;
+ if (!state.planOpen) state.planHovering = false;
+ renderLiveBoard();
+    }
+    function deferPlanPopoverClose() {
+ later(() => {
+ if (!state.planPinned && !state.planHovering && document.activeElement !== planHandle) setPlanPopover(false);
+ }, 90);
+    }
+    function handlePlanPointerDown(event) {
+ state.planActivationPointerType = String(event?.pointerType || "").toLowerCase();
+    }
+    function handlePlanPointerEnter(event) {
+ if (String(event?.pointerType || "").toLowerCase() === "touch") return;
+ state.planHovering = true;
+ setPlanPopover(true);
+ pollBoard().then(renderLiveBoard);
+    }
+    function handlePlanPointerLeave(event) {
+ if (event?.relatedTarget && (planHandle?.contains(event.relatedTarget) || liveBoard?.contains(event.relatedTarget))) return;
+ state.planHovering = false;
+ deferPlanPopoverClose();
+    }
+    function handlePlanClick(event) {
+ event?.preventDefault?.(); event?.stopPropagation?.();
+ if (planHandle?.hidden) return;
+ const activation = state.planActivationPointerType || (event?.detail === 0 ? "keyboard" : "");
+ state.planActivationPointerType = "";
+ const pin = activation === "touch" || activation === "keyboard" || !state.planHovering;
+ setPlanPopover(state.planPinned ? false : true, pin);
+ if (state.planOpen) pollBoard().then(renderLiveBoard);
     }
     function artifactMarkup() {
  if (!state.artifact) return "";
  return `<section class="hub-artifact-preview"><div class="hub-row" style="flex-wrap:wrap"><strong class="hub-grow" style="overflow-wrap:anywhere">${esc(state.artifact.name)}</strong>${button("artifact-folder", tr("打开所在文件夹", "Open containing folder"), { small: true })}${button("reveal-artifact", tr("在 Finder 中显示", "Show in Finder"), { small: true })}${button("close-artifact", tr("关闭", "Close"), { small: true })}</div><pre>${esc(state.artifact.content)}</pre></section>`;
     }
-    function renderBoardTab({ preserveDraftEditor = false, inPlace = false } = {}) {
- if (preserveBoardEditorOnReadError()) return;
- const sameScope = sameBoardViewScope(boardViewSnapshots.get(content));
- const mismatched = boardMismatch() || errors.board?.code === "board_thread_mismatch";
- const liveInput = sameScope && !mismatched ? content.querySelector('[name="board-step-draft"]') : null;
- const input = preserveDraftEditor ? liveInput : null;
- const draftEditor = input ? { value: input.value, focused: document.activeElement === input, start: input.selectionStart, end: input.selectionEnd, direction: input.selectionDirection } : null;
- if (sameScope && !mismatched && boardEditorActive() && !draftEditor) { boardTabRenderPending = true; return; }
- const problem = boardProblem();
- boardTabRenderPending = false;
- boardEditorNeedsSync = false;
- if (problem) { boardRenderedSignature = ""; boardRenderKey = ""; boardViewSnapshots.delete(content); content.innerHTML = `<p class="hub-hint">${esc(problem)} · ${esc(tr("可点右上角刷新连接", "Use refresh to reconnect"))}</p>`; return; }
- if (draftEditor) state.boardDraft = draftEditor.value;
- const board = boardData(), editable = isManualBoard(board), canCreate = !hasActualPlan(board);
- const hasUnsavedDraft = Boolean(state.boardDraft);
- const showDraftEditor = editable || canCreate || hasUnsavedDraft;
- const readonlyNativeDraft = !(editable || canCreate) && hasUnsavedDraft;
- const nextRenderKey = JSON.stringify([state.lang, projectTitle(), cache.board, state.boardBackground, state.artifact, showDraftEditor, readonlyNativeDraft, editable]);
- if (inPlace && input && cache.board && boardRenderKey === nextRenderKey) {
- rememberBoardView(content);
- boardRenderedSignature = JSON.stringify(cache.board);
- return;
+    function renderBoardTab() { renderMemory(); }
+    async function pollRemotePlan(environmentId) {
+ if (boardLoading || !environmentId) return false;
+ const threadId = currentThreadId();
+ if (!threadId || threadId === "__NEW__" || threadId.startsWith("__ROUTE_")) return false;
+ const route = routeKey(), scopeVer = boardScopeVersion, version = ++boardVersion;
+ boardLoading = true;
+ if (cache.board && (cache.board.remote !== true || String(cache.board.environmentId || "").toLowerCase() !== environmentId.toLowerCase() || String(cache.board.threadId || "") !== threadId)) {
+ cache.board = null; boardSignature = ""; boardRenderedSignature = ""; state.planOpen = false; state.planPinned = false; state.planHovering = false;
+ planHandle.hidden = true; liveBoard.hidden = true;
  }
- const footHtml = `${showDraftEditor ? `${readonlyNativeDraft ? `<p class="hub-hint">${esc(tr("已切换为原生只读计划，未提交草稿已保留供复制", "Switched to native read-only plan; unsaved draft preserved for copying"))}</p>` : ""}${editable ? `<div class="hub-editor-actions">${button("board-clear", tr("清空手动计划", "Clear manual plan"), { small: true })}</div>` : ""}` : ""}<p class="hub-hint">${esc(tr("约每 3.5 秒同步", "Synced every 3.5s"))}</p>`;
- const bodyEl = inPlace && liveInput && showDraftEditor && cache.board ? content.querySelector("[data-board-body]") : null;
- const footEl = bodyEl ? content.querySelector("[data-board-foot]") : null;
- const prevEl = bodyEl ? content.querySelector("[data-board-preview]") : null;
- if (bodyEl && footEl && prevEl) {
- const countEl = content.querySelector(".hub-section-heading .hub-count");
- if (countEl) countEl.textContent = projectTitle();
- bodyEl.innerHTML = boardMarkup(true);
- if (!preserveDraftEditor && liveInput.value !== state.boardDraft) liveInput.value = state.boardDraft;
- liveInput.setAttribute?.("value", liveInput.value);
- liveInput.readOnly = readonlyNativeDraft;
- if (readonlyNativeDraft) liveInput.setAttribute("readonly", ""); else liveInput.removeAttribute("readonly");
- const addBtn = content.querySelector('[data-action="board-add"]');
- if (addBtn) {
- addBtn.disabled = readonlyNativeDraft;
- if (readonlyNativeDraft) addBtn.setAttribute("disabled", ""); else addBtn.removeAttribute("disabled");
+ try {
+ if (typeof window.__t3HudRemoteRpc !== "function") throw new Error("remote plan unavailable");
+ const response = await window.__t3HudRemoteRpc(environmentId, "orchestration.getThreadProjection", { threadId }, 4500);
+ if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ let nativePlan = null;
+ if (response?.ok && response.value) {
+ try { nativePlan = normalizeRemoteThreadPlan(response.value, environmentId, threadId); } catch {}
  }
- footEl.innerHTML = footHtml;
- prevEl.innerHTML = artifactMarkup();
- boardRenderKey = nextRenderKey;
- rememberBoardView(content);
- boardRenderedSignature = JSON.stringify(cache.board);
- return;
+ let mirroredPlan = null;
+ const project = remotePlanProject(environmentId, threadId), projectRoot = project?.projectRoot || "";
+ if (projectRoot) {
+ try {
+ const relativePath = await planMirrorRelativePath(threadId);
+ if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ const mirrorResponse = await window.__t3HudRemoteRpc(environmentId, "projects.readFile", { cwd: projectRoot, relativePath, allowMissing: true }, 4500);
+ if (!mirrorResponse?.ok) throw new Error("remote plan unavailable");
+ const mirrorValue = mirrorResponse.value ?? mirrorResponse.data ?? mirrorResponse;
+ const contents = mirrorValue?.contents;
+ mirroredPlan = normalizeRemotePlanMirror(typeof contents === "string" ? contents : "", environmentId, threadId, projectRoot);
+ } catch {}
  }
- content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("任务面板", "Task board"))}</span><span class="hub-count">${esc(projectTitle())}</span></div><p class="hub-description">${esc(tr("本会话的计划与产物，随会话实时同步。Agent 原生计划为只读。", "Plans and artifacts in this conversation are synced. Agent-native plans are read-only."))}</p>${!cache.board ? loading() : `<section class="hub-board-studio"><div data-board-body>${boardMarkup(true)}</div>${showDraftEditor ? `<div class="hub-board-add"><input class="hub-input" name="board-step-draft" value="${esc(state.boardDraft)}"${readonlyNativeDraft ? " readonly" : ""} placeholder="${esc(tr("添加手动计划步骤…", "Add a manual step…"))}" aria-label="${esc(tr("手动计划步骤", "Manual plan step"))}">${button("board-add", tr("添加", "Add"), { small: true, primary: true, icon: "plus", disabled: readonlyNativeDraft })}</div>` : ""}<div data-board-foot>${footHtml}</div></section><div data-board-preview>${artifactMarkup()}</div>`}`;
- boardRenderKey = nextRenderKey;
- rememberBoardView(content);
- boardRenderedSignature = JSON.stringify(cache.board);
- if (draftEditor) {
- const next = content.querySelector('[name="board-step-draft"]');
- if (next) {
- next.value = draftEditor.value;
- if (draftEditor.focused) next.focus?.({ preventScroll: true });
- if (typeof draftEditor.start === "number" && typeof draftEditor.end === "number") next.setSelectionRange?.(draftEditor.start, draftEditor.end, draftEditor.direction);
+ if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ if (!nativePlan && !mirroredPlan) throw new Error("remote plan unavailable");
+ const data = newestRemotePlan(nativePlan, mirroredPlan);
+ const recovered = !!errors.board;
+ cache.board = data; delete errors.board;
+ const signature = JSON.stringify(data);
+ if (recovered || signature !== boardSignature) { boardSignature = signature; renderLiveBoard(); renderChrome(); }
+ return true;
+ } catch (error) {
+ if (!disposed && version === boardVersion && scopeVer === boardScopeVersion && route === routeKey()) {
+ cache.board = { remote: true, environmentId, threadId, steps: [], artifacts: [], subagents: [] };
+ errors.board = new Error("remote plan unavailable"); boardRenderedSignature = ""; renderLiveBoard();
  }
- }
+ return false;
+ } finally { if (version === boardVersion) boardLoading = false; }
     }
     async function pollBoard({ fromUpdate = false } = {}) {
- if (disposed || document.hidden || !state.connected || boardLoading) return false;
+ if (disposed || document.hidden || boardLoading) return false;
+ const remoteEnvironmentId = remotePlanEnvironmentId();
+ if (remoteEnvironmentId) return pollRemotePlan(remoteEnvironmentId);
+ if (contextLoading) return false;
+ if (!state.connected) return false;
  if (boardMismatch()) { renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab(); return false; }
  boardLoading = true;
  let synced = false;
  const version = ++boardVersion, projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", scopeVer = boardScopeVersion;
  try {
- const data = await request("board:get", { projectRoot, threadId: threadId || undefined, strictThreadMatch: true, excludeSubagentInference: true });
+ const environmentId = state.context?.environmentId || state.context?.environment?.id || undefined;
+ const data = await request("board:get", { projectRoot, threadId: threadId || undefined, environmentId, strictThreadMatch: true, excludeSubagentInference: true });
  if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || projectRoot !== state.projectRoot || threadId !== state.threadId) return false;
  if (Object.hasOwn(data, "threadId") && String(data.threadId || "") !== threadId) {
  const error = new Error("board session mismatch"); error.code = "board_thread_mismatch"; throw error;
@@ -1860,6 +2067,7 @@
     }
     async function updateBoard(element, action, index) {
  if (boardMismatch() || errors.board?.code === "board_thread_mismatch") { toast(tr("会话未匹配，请刷新连接", "Session mismatch; refresh the connection"), true); return; }
+ if (cache.board?.remote === true || remotePlanEnvironmentId()) { toast(tr("Connect 当前计划为只读", "Connect plans are read-only"), true); return; }
  if (pending.has(`board-update:${state.threadId || "__NEW__"}`)) return;
  const current = boardData();
  const surface = element && (liveBoard?.contains(element) ? liveBoard : content.contains(element) ? content : null);
@@ -2173,249 +2381,6 @@
  if (!editor.closest('[data-slot="composer-shell"],[data-testid="chat-composer"],[data-testid="composer"],[data-composer],main,[role="main"]')) return null;
  return editor;
     }
-    function editableText(editor) {
- let value = ""; const segments = [], boundaries = new WeakMap(), block = /^(P|DIV|LI|PRE|BLOCKQUOTE|H[1-6])$/;
- const walk = (node) => {
- if (node.nodeType === 3) { const start = value.length; value += node.data; segments.push({ node, start, end: value.length }); return; }
- const offsets = []; boundaries.set(node, offsets);
- [...node.childNodes].forEach((child, index) => {
- if (child.nodeType === 1 && block.test(child.tagName) && value && !value.endsWith("\n")) value += "\n";
- offsets[index] = value.length;
- if (child.nodeName === "BR") value += "\n"; else walk(child);
- if (child.nodeType === 1 && block.test(child.tagName) && child.nextSibling && !block.test(child.nextSibling.nodeName) && !value.endsWith("\n")) value += "\n";
- offsets[index + 1] = value.length;
- });
- if (!offsets.length) offsets[0] = value.length;
- };
- walk(editor);
- const selection = window.getSelection();
- if (!selection?.rangeCount || !selection.isCollapsed || !editor.contains(selection.anchorNode)) return null;
- const caret = selection.anchorNode.nodeType === 3 ? segments.find((entry) => entry.node === selection.anchorNode)?.start + selection.anchorOffset : boundaries.get(selection.anchorNode)?.[selection.anchorOffset];
- if (!Number.isFinite(caret)) return null;
- return { value, caret, point: (offset) => { const segment = segments.find((entry) => offset >= entry.start && offset <= entry.end); return segment ? { node: segment.node, offset: offset - segment.start } : null; } };
-    }
-    function composerToken(editor) {
- const text = editor.tagName === "TEXTAREA" ? (editor.selectionStart !== editor.selectionEnd ? null : { value: editor.value, caret: editor.selectionStart }) : editableText(editor);
- if (!text) return null;
- const match = text.value.slice(0, text.caret).match(/(?:^|\s)([$￥])([^\s$￥/]*)$/u); if (!match) return null;
- const start = text.caret - match[2].length - 1, end = text.caret + (text.value.slice(text.caret).match(/^[^\s$￥/]*/u)?.[0].length || 0);
- return { ...text, start, end, query: match[2].toLowerCase(), raw: text.value.slice(start, end) };
-    }
-    function closeSlash() {
- slashVersion++; const session = slashSession; slashSession = null;
- if (palette) palette.hidden = true;
- if (session?.editor) for (const [name, value] of Object.entries(session.aria || {})) {
- const current = session.editor.getAttribute(name);
- if ((name === "aria-controls" && current !== "t3-hub-slash-list") || (name === "aria-activedescendant" && !current?.startsWith("t3-hub-slash-option-"))) continue;
- if (value === null) session.editor.removeAttribute(name); else session.editor.setAttribute(name, value);
- }
- positionConversationTools();
-    }
-    function invalidateSlashCache() { slashCache.clear(); closeSlash(); }
-    async function slashData(projectRoot) {
- const key = projectRoot || "__global__", existing = slashCache.get(key);
- if (existing && Date.now() - existing.at < 5000) return existing.promise;
- const entry = { at: Date.now(), promise: null };
- entry.promise = (async () => {
- const results = await Promise.allSettled([request("slash:list", { projectRoot }), request("skills:list", { projectRoot })]);
- const shortcuts = results[0].status === "fulfilled" ? results[0].value : {};
- const skills = items(shortcuts, ["skills"]).length ? items(shortcuts, ["skills"]) : results[1].status === "fulfilled" ? items(results[1].value, ["items", "skills"]) : [];
- if (results.every((result) => result.status === "rejected")) throw results[0].reason;
- return { ...shortcuts, projectRoot, skills };
- })().catch((error) => { if (slashCache.get(key) === entry) slashCache.delete(key); throw error; });
- slashCache.set(key, entry); return entry.promise;
-    }
-    function scopedSlashItems(data, projectRoot) {
- if (data.projectRoot != null && data.projectRoot !== projectRoot) return [];
- const rows = [...items(data, ["skills"]).map((item) => ({ ...item, type: "skill" })), ...items(data, ["subagents"]).map((item) => ({ ...item, type: "subagent" })),
- { id: "collaboration", name: "协作策略", description: "按当前角色路由分工，独立任务按需并行。", type: "mode", trigger: "按当前角色路由分工；独立任务按需并行。" },
- { id: "plan", name: "/plan 规划模式", description: "先厘清目标、依赖与验收标准，再开始执行。", type: "mode", trigger: "/plan " }];
- const seen = new Set();
- return rows.filter((item) => {
- item.id = String(item.id || item.name || "");
- if (!item.id || item.enabled === false || item.disabled === true || item.scope === "off" || item.installed === false) return false;
- if ((item.scope === "project" || item.scope === "worktree") && (!projectRoot || item.projectRoot && item.projectRoot !== projectRoot)) return false;
- const key = `${item.type}:${item.id}`; if (seen.has(key)) return false;
- seen.add(key); return true;
- });
-    }
-    function nativeSlashMenu(editor = visibleComposer()) {
- if (!editor) return null;
- const rect = (editor.closest('[data-slot="composer-shell"],[data-composer]') || editor).getBoundingClientRect();
- return [...document.querySelectorAll('[role="listbox"],[cmdk-list],[data-slot="command-list"]')].find((node) => {
- if (root.contains(node) || !node.getClientRects().length || getComputedStyle(node).visibility === "hidden") return false;
- const box = node.getBoundingClientRect();
- return box.width > 50 && box.height > 20 && box.width < 700 && box.bottom >= rect.top - 500 && box.top <= rect.bottom && box.left < rect.right && box.right > rect.left;
- }) || null;
-    }
-    function pickerToken(editor) {
- if (editor.tagName === "TEXTAREA") {
- const caret = editor.selectionStart ?? editor.value.length;
- return composerToken(editor) || { value: editor.value, caret, start: caret, end: editor.selectionEnd ?? caret, raw: editor.value.slice(caret, editor.selectionEnd ?? caret), query: "" };
- }
- const text = editableText(editor);
- return composerToken(editor) || (text ? { ...text, start: text.caret, end: text.caret, raw: "", query: "" } : { value: editor.textContent || "", caret: 0, start: 0, end: 0, raw: "", query: "" });
-    }
-    async function openPicker(editor = visibleComposer(), manual = true) {
- if (!editor || disposed || contextLoading || !state.connected) return;
- if (!manual && nativeSlashMenu(editor)) { closeSlash(); return; }
- if (manual && nativeSlashMenu(editor)) editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
- closeSlash(); editor.focus({ preventScroll: true });
- const token = pickerToken(editor), projectRoot = state.projectRoot, route = routeKey(), version = ++slashVersion, selection = window.getSelection();
- const range = editor.tagName !== "TEXTAREA" && selection?.rangeCount && editor.contains(selection.anchorNode) ? selection.getRangeAt(0).cloneRange() : null;
- const session = slashSession = { editor, token, range, projectRoot, route, manual, tab: "all", query: token.query || "", allRows: [], rows: [], active: 0, loading: true, aria: { "aria-controls": editor.getAttribute("aria-controls"), "aria-activedescendant": editor.getAttribute("aria-activedescendant") } };
- renderSlash();
- if (manual) palette.querySelector('[name="slash-query"]')?.focus({ preventScroll: true });
- try {
- const data = await slashData(projectRoot);
- if (disposed || version !== slashVersion || session !== slashSession || projectRoot !== state.projectRoot || route !== routeKey() || !editor.isConnected) return;
- if (!manual && nativeSlashMenu(editor)) { closeSlash(); return; }
- session.allRows = scopedSlashItems(data, projectRoot); filterSlashRows();
- } catch (error) { if (session === slashSession) session.error = errorText(error); }
- finally { if (!disposed && version === slashVersion && session === slashSession) { session.loading = false; renderSlash(); } }
-    }
-    function filterSlashRows() {
- const session = slashSession; if (!session) return;
- session.rows = session.allRows.filter((item) => (session.tab === "all" || session.tab === "modes" ? session.tab === "all" || ["mode", "subagent"].includes(item.type) : item.type === session.tab) && matchesSlash(item, session.query)).sort((a, b) => slashRank(a, session.query) - slashRank(b, session.query)).slice(0, 60);
- session.active = Math.min(session.active, Math.max(0, session.rows.length - 1));
-    }
-    function matchesSlash(item, query) {
- if (!query || [item.id, item.name, item.description, item.providerInstanceId, item.model].join(" ").toLowerCase().includes(query)) return true;
- if (query.length !== 2) return false;
- return [item.id, item.name || ""].some((value) => { let cursor = 0; const name = value.toLowerCase(); return [...query].every((char) => { const found = name.indexOf(char, cursor); cursor = found + 1; return found !== -1; }); });
-    }
-    function slashRank(item, query) {
- if (!query) return 0;
- const id = String(item.id).toLowerCase(), name = String(item.name || "").toLowerCase();
- return id === query || name === query ? 0 : id.startsWith(query) ? 1 : name.startsWith(query) ? 2 : id.includes(query) ? 3 : name.includes(query) ? 4 : 5;
-    }
-    async function onComposerInput(event) {
- if (disposed || composing || event.isComposing || slashInserting || root?.contains(event.target)) return;
- const editor = composerFor(event.target);
- if (!editor) return;
- lastComposer = editor; positionConversationTools();
- if (contextLoading || !state.connected || document.activeElement !== editor) { closeSlash(); return; }
- const token = composerToken(editor);
- if (!token || nativeSlashMenu(editor)) { if (!slashSession?.manual) closeSlash(); return; }
- if (slashSession?.editor === editor && slashSession.projectRoot === state.projectRoot && !slashSession.manual) {
- slashSession.token = token; slashSession.query = token.query; filterSlashRows(); renderSlash(); return;
- }
- await openPicker(editor, false);
-    }
-    function renderSlash() {
- const session = slashSession;
- if (!session || !palette) return;
- const focus = document.activeElement?.name === "slash-query", selection = focus ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
- const project = state.context?.projectName || state.projectRoot?.split(/[\\/]/).pop() || tr("全局", "Global");
- palette.innerHTML = `<div class="hub-slash-header"><span class="hub-slash-key">$ / ￥</span>${esc(tr("技能与编排", "Skills & modes"))}<span class="hub-slash-project">${esc(project)}</span></div><div class="hub-slash-search"><input class="hub-input" name="slash-query" value="${esc(session.query)}" placeholder="${esc(tr("搜索 Skills 或编排指令…", "Search skills or modes…"))}" aria-label="${esc(tr("搜索快捷指令", "Search shortcuts"))}"></div><div class="hub-slash-tabs" role="tablist">${[["all", tr("全部", "All")], ["skill", "Skills"], ["modes", tr("编排指令", "Modes")]].map(([tab, label]) => `<button type="button" role="tab" class="hub-pill ${session.tab === tab ? "is-active" : ""}" data-action="slash-tab" data-tab="${tab}" aria-selected="${session.tab === tab}">${esc(label)}</button>`).join("")}</div><div id="t3-hub-slash-list" class="hub-slash-list" role="listbox" aria-label="${esc(tr("可用快捷指令", "Available shortcuts"))}">${session.loading ? `<div class="hub-slash-empty">${spinner()} ${esc(tr("正在读取当前项目…", "Loading this project…"))}</div>` : session.error ? `<div class="hub-slash-empty" role="status">${esc(session.error)}</div>` : session.rows.length ? session.rows.map((item, index) => {
- const agent = item.type === "subagent", mode = item.type === "mode";
- const badge = agent ? tr("子代理", "Agent") : mode ? tr("模式", "Mode") : "Skill";
- const label = item.displayName || item.title || item.name || item.id;
- return `<div class="hub-slash-row ${index === session.active ? "is-active" : ""}" data-slash-index="${index}" data-slash-id="${esc(item.id)}"><button type="button" id="t3-hub-slash-option-${index}" class="hub-slash-select" role="option" aria-selected="${index === session.active}" data-action="slash-select" data-index="${index}"><span class="hub-slash-type">${icon(agent ? "hub" : mode ? "bolt" : "skill", 13)}</span><span class="hub-grow"><span class="hub-slash-label">${esc(label)}</span><span class="hub-slash-description">${esc(item.shortDescription || item.description || item.developerName || "")}</span></span><span class="hub-badge hub-slash-badge">${esc(badge)}</span></button>${agent ? `<button type="button" class="hub-slash-edit" data-action="slash-edit" data-index="${index}" aria-label="${esc(tr("编辑子代理", "Edit agent"))} ${esc(item.id)}">${icon("edit", 12)}</button>` : ""}</div>`;
- }).join("") : `<div class="hub-slash-empty" role="status">${esc(tr("没有匹配的快捷指令", "No matching shortcuts"))}</div>`}</div><div class="hub-slash-footer"><span>↑↓ · Enter ${esc(tr("插入", "insert"))}</span><span>⌘ / · Esc ${esc(tr("关闭", "close"))}</span></div>`;
- palette.hidden = false;
- if (innerWidth < 760) liveBoard.hidden = true;
- if (!session.aria["aria-controls"] || session.aria["aria-controls"] === "t3-hub-slash-list") {
- session.editor.setAttribute("aria-controls", "t3-hub-slash-list");
- if (session.rows.length) session.editor.setAttribute("aria-activedescendant", `t3-hub-slash-option-${session.active}`);
- }
- if (focus) { const input = palette.querySelector('[name="slash-query"]'); input.focus({ preventScroll: true }); input.setSelectionRange(...selection); }
- positionSlash();
-    }
-    function setSlashActive(index) {
- if (!slashSession?.rows.length) return;
- const next = (index + slashSession.rows.length) % slashSession.rows.length;
- slashSession.active = next;
- palette.querySelectorAll("[data-slash-index]").forEach((row, i) => { row.classList.toggle("is-active", i === next); row.querySelector('[role="option"]')?.setAttribute("aria-selected", String(i === next)); });
- if (slashSession.editor.getAttribute("aria-controls") === "t3-hub-slash-list") slashSession.editor.setAttribute("aria-activedescendant", `t3-hub-slash-option-${next}`);
-    }
-    function positionSlash() {
- if (!slashSession || !palette || palette.hidden || disposed) return;
- const editor = slashSession.editor;
- if (!editor.isConnected || !editor.getClientRects().length || root.classList.contains("is-occluded") || state.open) { closeSlash(); return; }
- if (!slashSession.manual && nativeSlashMenu(editor)) { closeSlash(); return; }
- const surfaceRect = composerSurface(editor).getBoundingClientRect();
- const left = Math.round(Math.max(12, surfaceRect.left));
- const bottom = Math.round(surfaceRect.top - 6);
- const available = bottom - 54;
- if (available < 100) { closeSlash(); return; }
- palette.style.width = `${Math.max(0, Math.min(370, innerWidth - left - 12, surfaceRect.width))}px`;
- palette.style.maxHeight = `${Math.min(460, available)}px`;
- palette.style.left = `${left}px`;
- palette.style.top = "auto";
- palette.style.bottom = `${Math.round(innerHeight - bottom)}px`;
-    }
-    function onComposerKeyup(event) { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && !event.altKey) onComposerInput(event); }
-    function onComposerKeydown(event) {
- if ((event.metaKey || event.ctrlKey) && event.key === "/" && !event.repeat) {
- event.preventDefault(); event.stopPropagation();
- if (slashSession) closeSlash(); else openPicker();
- return;
- }
- if (!slashSession || event.isComposing || composing) return;
- if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); const editor = slashSession.editor; closeSlash(); editor.focus({ preventScroll: true }); return; }
- const fromSearch = palette.contains(event.target), session = slashSession;
- if (event.ctrlKey || event.metaKey || !fromSearch && !composerFor(event.target)) return;
- if (["ArrowUp", "ArrowDown"].includes(event.key)) {
- event.preventDefault(); event.stopPropagation();
- setSlashActive(session.active + (event.key === "ArrowDown" ? 1 : -1));
- palette.querySelector(`#t3-hub-slash-option-${session.active}`)?.scrollIntoView({ block: "nearest" });
- } else if (event.key === "Enter" && session.rows.length) { event.preventDefault(); event.stopPropagation(); selectSlash(session.active); }
-    }
-    function selectSlash(index) {
- const session = slashSession, item = session?.rows[index];
- if (!item || contextLoading || session.projectRoot !== state.projectRoot || session.route !== routeKey()) { closeSlash(); return; }
- const editor = session.editor;
- const token = session.manual ? session.token : composerToken(editor);
- if (!token || !session.manual && (token.raw !== session.token.raw || token.start !== session.token.start)) { closeSlash(); return; }
- if (editor.tagName === "TEXTAREA" && editor.value !== token.value) { closeSlash(); return; }
- const trigger = item.promptTrigger || item.trigger || (typeof item.prompt === "string" ? item.prompt : "") || `${item.type === "subagent" ? "@" : "$"}${item.skillName || item.name || item.id}`;
- const insertion = /\s$/.test(trigger) ? trigger : `${trigger} `;
- slashInserting = true;
- closeSlash();
- try {
- editor.focus({ preventScroll: true });
- if (editor.tagName === "TEXTAREA") {
- const next = token.value.slice(0, token.start) + insertion + token.value.slice(token.end);
- Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(editor, next);
- editor.setSelectionRange(token.start + insertion.length, token.start + insertion.length);
- editor.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: insertion }));
- } else {
- let range;
- const start = token.point?.(token.start), end = token.point?.(token.end);
- if (start && end) { range = document.createRange(); range.setStart(start.node, start.offset); range.setEnd(end.node, end.offset); }
- else if (session.range && editor.contains(session.range.startContainer)) range = session.range;
- else { range = document.createRange(); range.selectNodeContents(editor); range.collapse(false); }
- const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
- let emitted = false;
- const observed = () => { emitted = true; };
- editor.addEventListener("input", observed);
- try {
- if (!document.execCommand("insertText", false, insertion)) {
- range.deleteContents(); const node = document.createTextNode(insertion); range.insertNode(node); range.setStartAfter(node); range.collapse(true); selection.removeAllRanges(); selection.addRange(range);
- }
- if (!emitted) editor.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: insertion }));
- } finally { editor.removeEventListener("input", observed); }
- }
- } catch (error) { toast(errorText(error), true); }
- finally { slashInserting = false; }
-    }
-    async function editSlashSubagent(index) {
- const session = slashSession, item = session?.rows[index];
- if (!item || contextLoading || session.projectRoot !== state.projectRoot || session.route !== routeKey()) { closeSlash(); return; }
- closeSlash();
- const projectRoot = state.projectRoot;
- state.subagentScope = item.scope === "project" ? "project" : "global";
- state.subagentExpanded[subagentKey(item.id)] = true;
- switchTab("subagents");
- setOpen(true, false);
- await loadTab();
- if (disposed || state.tab !== "subagents" || state.projectRoot !== projectRoot) return;
- const card = [...content.querySelectorAll("[data-subagent-card]")].find((node) => node.dataset.subagentCard === item.id);
- card?.scrollIntoView({ block: "nearest" });
- card?.querySelector('[name="subagent-systemPrompt"]')?.focus({ preventScroll: true });
-    }
-
     function findRouter() {
  if (window.__TSR_ROUTER__) return window.__TSR_ROUTER__;
  if (cachedRouter) return cachedRouter;
@@ -2508,7 +2473,8 @@
  return null;
     }
     function rawRouteHint() {
- return location.hash?.slice(1) || findRouter()?.state?.location?.pathname || location.pathname || "/";
+ const path = findRouter()?.state?.location?.pathname;
+ return path === "/" ? "__NEW__" : path || location.hash?.slice(1) || location.pathname || "/";
     }
     function routeHint() {
  const raw = rawRouteHint();
@@ -2561,6 +2527,7 @@
     }
     function currentThreadId() {
  const paths = [rawRouteHint(), location.pathname].filter(Boolean);
+ if (paths.includes("__NEW__")) return "__NEW__";
  for (const path of paths) {
  const promoted = resolvePromotedDraftRoute(path);
  if (promoted) { try { return decodeURIComponent(promoted.slice(promoted.lastIndexOf("/") + 1)); } catch { return "__ROUTE_invalid__"; } }
@@ -2582,25 +2549,31 @@
  for (const path of paths) { const m = path.match(new RegExp(`(?:^|\\/)(${UUID_RE})(?:[/?#]|$)`, "i")); if (m) return m[1]; }
  return state.context?.threadId || state.context?.thread?.id || "__NEW__";
     }
-    function syncThread(force = false) {
+ function syncThread(force = false) {
  const threadId = currentThreadId(); if (!force && threadId === state.threadId) return false;
+ state.planOpen = false; state.planPinned = false; state.planHovering = false; state.planActivationPointerType = "";
+ if (planHandle) planHandle.hidden = true;
+ if (liveBoard) liveBoard.hidden = true;
  state.threadId = threadId; boardScopeVersion++; artifactVersion++;
  occlusionBoardRect = null;
  cache.board = null; state.artifact = null; state.boardDraft = ""; delete errors.board;
  boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = "";
- renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab();
+ renderLiveBoard();
  return true;
     }
     function resetProjectData() {
  boardScopeVersion++; requestVersion++; memoryVersion++;
- for (const k of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[k] = null; delete errors[k]; }
- if (state.scope === "project" && !state.projectRoot) state.scope = "global";
+ for (const k of ["hooks", "skills", "plugins", "subagents", "orchestration", "mcp", "connections", "overview", "memory", "worktree", "dream", "health", "agents", "board", "settings"]) { cache[k] = null; delete errors[k]; }
+ state.scope = "project";
  state.importScope = defaultScope(); state.subagentScope = defaultScope(); state.agentsTarget = defaultScope();
- state.memoryProject = state.projectRoot && state.memoryScope !== "global" ? "current" : "global";
+ state.memoryProject = "current";
+ embedVersion++; embedProjectKey = "";
+ if (cache.embed) { const { vectorStats, vectorStatsError, ...serviceStatus } = cache.embed; cache.embed = serviceStatus; }
  state.artifact = null; state.boardDraft = ""; state.orchestrationDraft = null; state.settingsDirty = false; state.settingsDraft = {}; state.clearedHostFields.clear(); state.settingsRuleDirty = false; state.settingsRule = ""; settingsSelectionVersion++;
  boardVersion++; boardLoading = false; boardSignature = ""; boardRenderedSignature = ""; boardRenderKey = ""; renderLiveBoard();
  state.hookDraft = null; state.supersedeItems = []; state.selectedMemory = null;
- if (state.memoryProject === "current" && !state.projectRoot) state.memoryProject = "global";
+ if (drafts.__new && !drafts.__new.migratedFromGlobal && drafts.__new.projectRoot !== state.projectRoot) delete drafts.__new;
+ if (state.open && state.tab === "memory" && content) renderMemory();
     }
     function checkRoute() {
  const route = routeKey(), changed = route !== lastRoute, prevScope = lastBoardRoute, scopeChanged = boardScopeRoute() !== prevScope;
@@ -2641,7 +2614,6 @@
  return Boolean(v && v.route === startRoute && v.threadId === (beforeThread || "") && v.projectRoot === (before || "") && inp && (boardEditorActive() || boardEditorNeedsSync || inp.value || state.boardDraft));
  };
  const hadSameScopeBoardDraft = liveSameScopeDraft();
- if (!sameScopeRoute) contextLoading = true; closeSlash();
  try {
  if (unpromotedDraft) throw new Error(tr("草稿尚未创建会话，请先发送消息", "Send a message to create a conversation for this draft"));
  const rawRoute = rawRouteHint(), promotedRoute = resolvePromotedDraftRoute(rawRoute);
@@ -2678,22 +2650,21 @@
  if (before !== state.projectRoot) {
  resetProjectData();
  } else if (!state.projectRoot) {
- state.scope = state.subagentScope = state.agentsTarget = state.importScope = "global";
- if (state.memoryProject === "current") state.memoryProject = "global";
+ state.scope = "project"; state.subagentScope = state.agentsTarget = state.importScope = "global";
+ state.memoryProject = "current";
  }
  renderChrome();
  if (force && before === state.projectRoot && state.tab === "board" && content.querySelector('[name="board-step-draft"]')) boardEditorNeedsSync = true;
  const hadDraft = Boolean(before === state.projectRoot && state.tab === "board" && (boardEditorNeedsSync || content.querySelector('[name="board-step-draft"]')));
  const boardPoll = pollBoard(); positionConversationTools();
- if (document.activeElement) onComposerInput({ target: document.activeElement });
  if (state.open) {
  if (!state.connected) {
  if (keepDisconnectedDraft) {
  boardRenderedSignature = ""; boardTabRenderPending = true; if (force) boardEditorNeedsSync = true;
  toast(state.contextError || tr("连接失败，已保留草稿，等待自动同步或手动刷新重试", "Connection failed; draft preserved. Waiting for automatic sync or a manual refresh."), true);
  } else content.innerHTML = inlineError(state.contextError);
- } else if (hadDraft) { await boardPoll; if (isCurrent()) primeCatalogs(); }
- else { renderTab(); await loadTab(force); if (isCurrent()) primeCatalogs(); }
+ } else if (hadDraft) { await boardPoll; }
+ else { renderTab(); await loadTab(force); }
  }
     }
     async function readCatalog(key, action, payload) {
@@ -2702,22 +2673,6 @@
  if (key === "hooks" && /unknown action|not (?:yet )?(?:wired|implemented|supported)|unsupported|not found|尚未接入/i.test(errorText(error))) return { items: [], unavailable: true };
  throw error;
  }
-    }
-    const catalogInflight = new Set();
-    async function primeCatalogs() {
- const projectRoot = state.projectRoot, version = contextVersion, identity = contextIdentityToken();
- const domains = [["mcp", "mcp:list"], ["skills", "skills:list"], ["plugins", "plugins:list"], ["hooks", "hooks:list"], ["subagents", "subagents:list"], ["overview", "memory:overview"]];
- await Promise.all(domains.map(async ([key, action]) => {
- const token = `${version}:${key}`;
- if (cache[key] || catalogInflight.has(token)) return;
- catalogInflight.add(token);
- try {
- const data = await readCatalog(key, action, { projectRoot });
- if (disposed || version !== contextVersion || projectRoot !== state.projectRoot || contextIdentityToken() !== identity) return;
- cache[key] = data; delete errors[key]; renderChrome();
- if (state.open && (state.tab === key || state.tab === "agents")) renderTab();
- } catch {} finally { catalogInflight.delete(token); }
- }));
     }
     async function loadTab(force = false) {
  if (disposed || !state.open) return;
@@ -2738,35 +2693,41 @@
  if (isCurrent()) errors[key] = error;
  }
  };
- if (tab === "board") await pollBoard();
- if (tab === "hooks") await load("hooks", "hooks:list", { projectRoot });
- if (tab === "plugins") await load("plugins", "plugins:list", { projectRoot });
- if (tab === "skills") await Promise.all([load("skills", "skills:list", { projectRoot }), load("mcp", "mcp:list", { projectRoot })]);
- if (tab === "subagents") await Promise.all([load("subagents", "subagents:list", { projectRoot }), load("orchestration", "subagents:orchestration:get", { projectRoot }), load("hooks", "hooks:list", { projectRoot })]);
- if (tab === "mcp") await load("mcp", "mcp:list", { projectRoot });
- if (tab === "agents") await load("agents", "agentsMd:get", { projectRoot });
- if (tab === "settings") await loadSettings(force);
  if (tab === "memory") {
- await Promise.all([load("overview", "memory:overview", { projectRoot }), load("worktree", "memory:worktreeInfo", { projectRoot }), load("dream", "memory:dream:get", {}), load("health", "memory:health", { projectRoot }), refreshEmbed(false, force)]);
- if (isCurrent()) await loadMemories(false);
+ const confirmedRoot = memoryProjectReady() ? state.projectRoot : null;
+ const localStatus = [load("connections", "memory:connections", {}), refreshMemoryAgentAccess(force), refreshEmbed(false, force, confirmedRoot)];
+ if (confirmedRoot) {
+  localStatus.push(load("overview", "memory:overview", { projectRoot: confirmedRoot }), load("worktree", "memory:worktreeInfo", { projectRoot: confirmedRoot }));
+ } else {
+  for (const key of ["overview", "memory", "worktree", "health"]) { cache[key] = null; delete errors[key]; }
+ }
+ await Promise.all(localStatus);
+ if (isCurrent() && confirmedRoot && memoryProjectReady() && state.projectRoot === confirmedRoot) await loadMemories(false);
  }
  if (!isCurrent() || state.tab !== tab) return;
  if (tab === "board" && boardEditorActive()) boardTabRenderPending = true;
  else renderTab();
  renderChrome();
- if (tab === "memory") scheduleEmbedPoll();
+ if (tab === "memory") renderMemoryRuntime();
     }
     async function loadMemories(render = true) {
  const version = ++memoryVersion;
  delete errors.memory;
+ if (!memoryProjectReady()) {
+  cache.memory = null;
+  if (!disposed && render && state.tab === "memory") renderMemoryList();
+  return false;
+ }
  const payload = memoryPayload();
+ const projectRoot = payload.projectRoot, ctxVer = contextVersion, identity = contextIdentityToken();
  try {
- if (!payload.projectRoot && !payload.projectSlug) throw new Error(tr("请重新选择记忆所属项目", "Choose a memory project again"));
+ if (!projectRoot) return false;
  const data = await request(payload.query ? "memory:search" : "memory:list", payload);
- if (disposed || version !== memoryVersion) return;
+ if (disposed || version !== memoryVersion || ctxVer !== contextVersion || projectRoot !== state.projectRoot || !memoryProjectReady() || identity !== contextIdentityToken()) return false;
  cache.memory = data;
- } catch (error) { if (!disposed && version === memoryVersion) errors.memory = error; }
+ } catch (error) { if (!disposed && version === memoryVersion && ctxVer === contextVersion && projectRoot === state.projectRoot && memoryProjectReady()) errors.memory = error; }
  if (!disposed && render && state.tab === "memory") { renderMemoryList(); renderChrome(); }
+ return true;
     }
     function seedAgentDrafts(data, projectRoot) {
  for (const target of ["global", "project"]) {
@@ -2777,12 +2738,18 @@
  if (!old || old.content === old.saved) state.agentDrafts[key] = { content: value || "", saved: value || "", syncedTargets: target === "global" ? data.globalSyncedTargets || data.global?.syncedTargets || [] : data.projectExists ? ["project"] : [] };
  }
     }
-    async function refreshEmbed(render = true, force = false) {
- if (cache.embed && !force && !cache.embed.downloadJob?.active && !cache.embed.vectorStats?.reindexing) return;
+    async function refreshEmbed(render = true, force = false, projectRoot = memoryProjectReady() ? state.projectRoot : null) {
+ const scopedRoot = memoryProjectReady() && projectRoot === state.projectRoot ? projectRoot : null;
+ const projectKey = scopedRoot || "";
+ if (cache.embed && embedProjectKey === projectKey && !force && !cache.embed.downloadJob?.active && !cache.embed.vectorStats?.reindexing) return;
  const version = ++embedVersion;
+ const ctxVer = contextVersion, identity = contextIdentityToken();
  try {
- const data = await request("embed:status", {});
- if (disposed || version !== embedVersion) return;
+ const response = await request("embed:status", scopedRoot ? { projectRoot: scopedRoot } : {});
+ if (disposed || version !== embedVersion || ctxVer !== contextVersion || identity !== contextIdentityToken() || scopedRoot && (state.projectRoot !== scopedRoot || !memoryProjectReady())) return;
+ const data = { ...response };
+ if (!scopedRoot) { delete data.vectorStats; delete data.vectorStatsError; }
+ embedProjectKey = projectKey;
  const wasActive = cache.embed?.downloadJob?.active;
  const prevVs = cache.embed?.vectorStats;
  const prevMemory = [cache.embed?.activeMb, cache.embed?.ceilingMb, cache.embed?.cacheMb, cache.embed?.rssMb, prevVs?.activeMb, prevVs?.ceilingMb, prevVs?.cacheMb].join("/");
@@ -2791,6 +2758,7 @@
  const nextSig = data.vectorStats ? `${data.vectorStats.syncedVectors}/${data.vectorStats.totalMemories}:${data.vectorStats.reindexing}` : data.vectorStatsError || "";
  const wasWaiting = state.embedReadyDeadline > 0;
  cache.embed = data;
+ if (state.tab === "memory") renderMemoryRuntime();
  if (!state.embedInitialized) { state.useMirror = !!data.useMirror; state.embedInitialized = true; }
  if (data.downloadJob?.active) state.embedReadyDeadline = Date.now() + 60000;
  if (data.vectorStats?.reindexing) state.embedReadyDeadline = Date.now() + 300000;
@@ -2799,7 +2767,6 @@
  if ((ready === true || keyword) && !data.vectorStats?.reindexing) state.embedReadyDeadline = 0;
  delete errors.embed;
  if (render && state.tab === "memory") {
- if (prevSig !== nextSig && !root.querySelector("#t3-hub-dream")?.contains(document.activeElement)) renderDream();
  if (!!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
  else renderDownloadProgress();
  }
@@ -2813,7 +2780,7 @@
  toast(tr("模型尚未就绪，请刷新状态后重试", "The model is not ready yet. Refresh its status to retry."), true);
  }
  } catch (error) {
- if (!disposed && version === embedVersion) { errors.embed = error; if (render && state.tab === "memory") toast(errorText(error), true); }
+ if (!disposed && version === embedVersion) { errors.embed = error; if (state.tab === "memory") renderMemoryRuntime(); if (render && state.tab === "memory") toast(errorText(error), true); }
  }
     }
     function scheduleEmbedPoll() {
@@ -2835,17 +2802,16 @@
     }
     function setOpen(open, focus = true) {
  state.open = !!open;
- if (state.open) closeSlash();
  if (!root || disposed) return;
  if (state.open && focus) focusReturn = document.activeElement;
  root.classList.toggle("is-open", state.open);
- handle.setAttribute("aria-expanded", String(state.open));
+ handle?.setAttribute("aria-expanded", String(state.open));
  drawer.setAttribute("aria-hidden", String(!state.open));
  drawer.inert = !state.open;
  positionConversationTools();
  if (state.open) {
  renderTab();
- if (state.context) { loadTab(); primeCatalogs(); }
+ if (state.context) loadTab();
  else if (state.contextError) content.innerHTML = inlineError(state.contextError);
  if (focus) later(() => (root.querySelector(`[data-tab="${state.tab}"]`) || content)?.focus({ preventScroll: true }), 50);
  } else {
@@ -2874,7 +2840,6 @@
  state.lang = lang;
  renderChrome(); renderLiveBoard();
  if (state.open) renderTab();
- if (slashSession) renderSlash();
  }
     }
     function syncOcclusion() {
@@ -2889,11 +2854,13 @@
  return true;
  };
  const editor = visibleComposer(), composer = editor && composerSurface(editor);
- const surfaces = [composer, handle, planHandle, liveBoard, palette, ...(state.open ? [drawer] : [])].filter((element) => element && !element.hidden && element.getClientRects().length);
+
  const wasOccluded = root.classList.contains("is-occluded");
+ const surfaces = [root, handle, planHandle, liveBoard].filter(visible);
  if (liveBoard && !liveBoard.hidden && liveBoard.getClientRects().length) occlusionBoardRect = liveBoard.getBoundingClientRect();
  else if (!wasOccluded || state.open) occlusionBoardRect = null;
  const surfaceRects = surfaces.map((surface) => surface.getBoundingClientRect());
+ if (composer) surfaceRects.push(composer.getBoundingClientRect());
  if (wasOccluded && occlusionBoardRect) surfaceRects.push(occlusionBoardRect);
  const overlaps = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
  const nativeDialog = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].some((element) => {
@@ -2906,37 +2873,8 @@
  root.classList.toggle("is-occluded", nativeDialog);
     }
     function positionHandle() {
- if (!handle) return;
- const saved = Number(storageGet("t3-hub-handle-y"));
- const y = saved > 0 ? saved * innerHeight : innerHeight * .42;
- const top = Math.max(70, Math.min(innerHeight - 70, y));
- handle.style.top = `${top}px`;
- placePlanHandle(top);
+ positionConversationTools();
     }
-    function placePlanHandle(top) {
- if (planHandle) planHandle.style.top = `${top + 54 <= innerHeight - 36 ? top + 54 : Math.max(8, top - 82)}px`;
-    }
-    function onDragStart(event) {
- if (event.button !== 0) return;
- drag = { pointerId: event.pointerId, startY: event.clientY, top: handle.getBoundingClientRect().top + handle.offsetHeight / 2, moved: false };
- handle.setPointerCapture?.(event.pointerId);
-    }
-    function onDragMove(event) {
- if (!drag || drag.pointerId !== event.pointerId) return;
- const delta = event.clientY - drag.startY;
- if (Math.abs(delta) > 4) drag.moved = true;
- if (drag.moved) { event.preventDefault(); const top = Math.max(70, Math.min(innerHeight - 70, drag.top + delta)); handle.style.top = `${top}px`; placePlanHandle(top); }
-    }
-    function onDragEnd(event) {
- if (!drag || drag.pointerId !== event.pointerId) return;
- suppressClick = drag.moved;
- if (drag.moved) storageSet("t3-hub-handle-y", parseFloat(handle.style.top) / innerHeight);
- handle.releasePointerCapture?.(event.pointerId);
- drag = null;
- if (suppressClick) later(() => { suppressClick = false; }, 80);
-    }
-    function onDragCancel() { drag = null; suppressClick = false; }
-
     function startBoardDrag(event) {
  if (event.button !== 0 || !event.target.closest?.("[data-board-drag]")) return;
  const rect = liveBoard.getBoundingClientRect();
@@ -2970,18 +2908,16 @@
     }
 
     function onClick(event) {
- const target = event.target.closest("[data-action],#t3-hub-handle");
+ const target = event.target.closest("[data-action]");
  if (!target || (!root.contains(target) && !liveBoard?.contains(target)) || target.disabled) return;
- if (target === handle) { if (!suppressClick) setOpen(!state.open); return; }
  const action = target.dataset.action;
  const id = target.dataset.id;
- if (action === "set-theme") setTheme(target.dataset.theme);
+ if (action === "open-memory") openMemoryFromTitle();
+ else if (action === "set-theme") setTheme(target.dataset.theme);
  else if (action === "open-board-studio") { switchTab("board"); setOpen(true); }
  else if (action === "dashboard-tab") { switchTab(target.dataset.tab); setOpen(true); }
  else if (action === "reset-dashboard-position") { boardPosition = null; storageSet("t3-hub-dashboard-position-v1", "null"); positionConversationTools(); }
  else if (action === "set-width") setWidth(target.dataset.width);
- else if (action === "open-picker") { if (slashSession) closeSlash(); else openPicker(); }
- else if (action === "slash-tab") { if (slashSession) { slashSession.tab = target.dataset.tab; slashSession.active = 0; filterSlashRows(); renderSlash(); } }
  else if (action === "library-view") { state.libraryView = target.dataset.view; renderTab(); loadTab(); }
  else if (action === "mcp-filter") { state.mcpFilter = target.dataset.filter; renderMcpList(); }
  else if (action === "hooks-fold") { state.hooksOpen = !state.hooksOpen; }
@@ -3000,14 +2936,8 @@
  else if (action === "artifact-folder") revealArtifact(target, "folder");
  else if (action === "close-artifact") { artifactVersion++; state.artifact = null; renderBoardTab(); }
  else if (action === "memory-scope-filter") setMemoryScope(target.dataset.scope);
- else if (action === "open-memory-folder") busy("memory-folder", target, () => request("memory:openFolder", memoryPayload()));
+ else if (action === "open-memory-folder" && memoryWriteReady()) busy("memory-folder", target, () => request("memory:openFolder", { projectRoot: selectedMemoryRoot() }));
  else if (action === "promote-memory") promoteMemory(id, target);
- else if (action === "dream-fold") return; // Native <details> toggles; its toggle event persists the final state.
- else if (action === "toggle-dream") saveDream({ enabled: !dreamConfig().enabled });
- else if (action === "save-dream-engine") saveDreamEngine();
- else if (action === "cancel-dream-engine") { state.dreamEngineDraft = null; renderDream(); }
- else if (action === "run-dream") runDream();
- else if (action === "import-host-memories") importHostMemories(target);
  else if (action === "trim-embed") trimEmbedCache(target);
  else if (action === "disable-legacy-orchestration") disableLegacyOrchestration(target);
  else if (action === "toggle-t3-prompt-suggestions") toggleT3PromptSuggestions(target);
@@ -3080,8 +3010,6 @@
  else toast(tr("请填写模型 ID", "Enter a model ID"), true);
  }
  else if (action === "cancel-subagent-model") { delete state.subagentCustom[subagentKey(id)]; renderSubagents(); }
- else if (action === "slash-select") selectSlash(Number(target.dataset.index));
- else if (action === "slash-edit") editSlashSubagent(Number(target.dataset.index));
  else if (action === "toggle-mcp-add") { state.mcpAddOpen = !state.mcpAddOpen; target.setAttribute("aria-expanded", String(state.mcpAddOpen)); renderMcpForm(); }
  else if (action === "mcp-form-kind") { state.mcpForm.kind = target.dataset.kind; renderMcpForm(); }
  else if (action === "save-mcp") saveMcp(target);
@@ -3090,12 +3018,19 @@
  else if (action === "refresh-embed") { refreshEmbed(true, true).then(() => { if (!disposed) renderEngine(); }); }
  else if (action === "memory-module") { state.memoryModule = target.dataset.module; state.selectedMemory = null; cache.memory = null; renderMemoryList(); loadMemories(); }
  else if (action === "refresh-memory") loadMemories();
+ else if (action === "refresh-memory-connections") { cache.connections = null; loadTab(true); }
+ else if (action === "memory-access-setup") runMemorySetup();
+ else if (action === "memory-access-copy-prompt") copyMemorySetupPrompt();
+ else if (action === "memory-access-refresh") refreshMemoryAgentAccess(true);
+ else if (action === "copy-memory-mcp-config") copyMemoryMcpConfig();
+ else if (action === "test-memory-vector") runMemoryVectorTest();
+ else if (action === "refresh-memory-runtime") refreshEmbed(true, true);
  else if (action === "open-memory") { state.selectedMemory = state.selectedMemory === id ? null : id; renderMemoryList(); }
  else if (action === "new-memory") openNewMemory();
  else if (action === "cancel-new-memory") { if (drafts.__new) drafts.__new.open = false; renderNewMemory(); }
  else if (action === "create-memory") saveMemory(null, target);
  else if (action === "save-memory") saveMemory(id, target);
- else if (action === "pin-memory" && memoryWriteReady()) busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot: selectedMemoryRoot() }); if (!disposed) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } });
+ else if (action === "pin-memory" && memoryWriteReady()) { const projectRoot = selectedMemoryRoot(), selection = memorySelection(); busy(`pin:${id}`, target, async () => { const result = await request("memory:pinToAgentsMd", { id, projectRoot }); if (!disposed && selection === memorySelection()) { cache.agents = null; toast(result.message || tr("已置顶到项目 AGENTS.md", "Pinned to project AGENTS.md")); } }); }
  else if (action === "delete-memory") target.closest(".hub-memory-detail").querySelector("[data-delete-confirm]").hidden = false;
  else if (action === "cancel-delete-memory") target.closest("[data-delete-confirm]").hidden = true;
  else if (action === "confirm-delete-memory") deleteMemory(id, target);
@@ -3109,16 +3044,7 @@
     function onInput(event) {
  const input = event.target;
  const name = input.name;
- if (name === "slash-query" && slashSession) { slashSession.query = input.value.toLowerCase(); slashSession.active = 0; filterSlashRows(); renderSlash(); return; }
  if (name === "board-step-draft") { state.boardDraft = input.value; boardDraftEditSeq++; return; }
- if (name === "dream-model") {
- state.dreamEngineDraft = { ...dreamEngineDraft(), model: input.value };
- const preset = root.querySelector('[name="dream-preset"]'); if (preset) preset.innerHTML = dreamPresetOptions();
- const save = root.querySelector('[data-action="save-dream-engine"]'); if (save) save.disabled = false;
- const cancel = root.querySelector('[data-action="cancel-dream-engine"]'); if (cancel) cancel.disabled = false;
- const run = root.querySelector('[data-action="run-dream"]'); if (run) run.disabled = true;
- return;
- }
  if (name === "native-setting") {
  const key = input.dataset.settingsKey;
  if (!editableSettingKeys().includes(key)) return;
@@ -3157,31 +3083,7 @@
     function onChange(event) {
  const input = event.target;
  const name = input.name;
- if (name === "dream-preset") {
- const preset = dreamPresets().find((item) => item.id === input.value);
- if (!preset || state.dreamSaving || state.dreamRunning || dreamProviderAvailability(preset.providerInstanceId).blocked) return;
- state.dreamEngineDraft = dreamPresetDraft(preset);
- renderDream();
- return;
- }
- if (name === "dream-provider") {
- const provider = input.value, available = cache.dream?.runtime?.providers || [], entry = available.find((item) => item.id === provider);
- if (!["local", "muse", "codex", "claude", "pi"].includes(provider) || ["missing", "unsupported"].includes(entry?.status) || available.length && !entry) return;
- const preset = dreamPresets().find((item) => item.providerInstanceId === provider);
- const efforts = entry?.efforts || ["low", "medium", "high"], old = dreamEngineDraft();
- state.dreamEngineDraft = { providerInstanceId: provider, model: provider === "local" ? "mlx-vector-only" : preset?.model || "", reasoningEffort: efforts.includes(old.reasoningEffort) ? old.reasoningEffort : efforts.includes("medium") ? "medium" : efforts[0] || "medium" };
- renderDream();
- return;
- }
- if (name === "dream-effort") {
- const entry = cache.dream?.runtime?.providers?.find((item) => item.id === dreamEngineDraft().providerInstanceId);
- const allowed = entry?.efforts || ["low", "medium", "high"];
- if (allowed.includes(input.value)) state.dreamEngineDraft = { ...dreamEngineDraft(), reasoningEffort: input.value };
- renderDream();
- return;
- }
- if (name === "dream-time") { saveDream({ dreamTime: input.value }); return; }
- if (name === "dream-catch-up") { saveDream({ catchUpOnWake: input.checked }); return; }
+ if (name === "memoryAgentAccess") { setMemoryAgentAccess(!!input.checked); return; }
  if (name === "resource-status") { resourceFilter(input.dataset.domain).status = input.value; renderTab(); return; }
  if (name === "mcp-mode-scope") {
  if (!["project", "global"].includes(input.value)) return;
@@ -3224,7 +3126,7 @@
  return;
  }
  if (name === "hub-scope") setScope(input.value);
- else if (name === "new-memory-scope") { drafts.__new ||= {}; drafts.__new.scope = input.value; }
+ else if (name === "new-memory-scope") { drafts.__new ||= {}; drafts.__new.scope = ["project", "worktree"].includes(input.value) ? input.value : "project"; }
  else if (name?.startsWith("hook-") && state.hookDraft) state.hookDraft[name.slice(5)] = input.value;
  else if (name === "new-memory-supersedes") { drafts.__new ||= {}; drafts.__new.supersedes = input.value; }
  else if (name === "importScope") state.importScope = input.value;
@@ -3232,7 +3134,7 @@
  else if (name === "embed-model") { state.modelChoice = input.value; renderEngine(); }
  else if (name === "useMirror") state.useMirror = input.checked;
  else if (name === "memoryProject") {
- state.memoryProject = input.value;
+ state.memoryProject = "current";
  if (drafts.__new) drafts.__new.supersedes = "";
  state.supersedeItems = [];
  state.supersedeLoading = false;
@@ -3241,12 +3143,13 @@
  cache.memory = null;
  memoryVersion++;
  renderMemoryList();
- loadMemories();
- if (drafts.__new?.open) openNewMemory();
+ if (memoryProjectReady()) loadMemories();
+ if (drafts.__new?.open && memoryProjectReady()) openNewMemory();
  } else if (name === "new-memory-module") { drafts.__new ||= {}; drafts.__new.module = input.value; }
     }
     function onKeydown(event) {
  const key = event.key.toLowerCase();
+ if (key === "escape" && state.planOpen) { event.preventDefault(); setPlanPopover(false); return; }
  if (((event.metaKey || event.ctrlKey) && event.shiftKey && key === "k") || (event.altKey && !event.metaKey && !event.ctrlKey && key === "h")) {
  if (event.repeat) return;
  event.preventDefault();
@@ -3382,7 +3285,7 @@
  toast(tr("自定义 MCP 已移除", "Custom MCP removed"));
  });
     }
-    function memorySelection() { const payload = memoryPayload(); return JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]); }
+    function memorySelection() { return JSON.stringify([state.memoryProject, selectedMemoryRoot(), contextVersion, contextIdentityToken()]); }
     async function consolidateMemory(element) {
  if (!memoryWriteReady()) return;
  const projectRoot = selectedMemoryRoot(), selection = memorySelection();
@@ -3404,6 +3307,7 @@
  if (!Number.isInteger(targetVersion) || targetVersion < 1) return;
  if (typeof memoryWriteReady === "function" && !memoryWriteReady()) return;
  const selection = memorySelection(), projectRoot = selectedMemoryRoot(), key = memoryDraftKey(id);
+ if (!projectRoot) return;
  if (drafts[key]) { toast(tr("请先保存这条记忆的修改，再回滚", "Save your memory edits before restoring a version"), true); return; }
  await busy(`rollback:${id}`, element, async () => {
  await request("memory:rollback", { projectRoot, id, targetVersion, revisionId: revisionId || undefined });
@@ -3488,24 +3392,25 @@
  });
     }
     async function saveMemory(id, element) {
+ if (!memoryWriteReady()) return;
  const payload = memoryPayload();
- const selection = JSON.stringify([state.memoryProject, payload.projectRoot, payload.projectSlug]);
+ const selection = memorySelection();
+ if (!payload.projectRoot) return;
  const record = memoryRecords().find((item) => memoryId(item) === id);
  const draft = id == null ? { ...drafts.__new } : { title: record?.title || record?.name || "", content: memoryBody(record || {}), ...drafts[memoryDraftKey(id)] };
  if (!draft.title?.trim() || !draft.content?.trim()) { toast(tr("请填写标题和记忆内容", "Enter a title and memory content"), true); return; }
  const key = id == null ? null : memoryDraftKey(id);
  await busy(`memory-save:${id || "new"}`, element, async () => {
- const saveScope = id == null ? draft.scope || (state.memoryScope === "worktree" ? "worktree" : payload.scope) : record?.scope || payload.scope;
+ const requestedScope = id == null ? draft.scope || (state.memoryScope === "worktree" ? "worktree" : payload.scope) : record?.scope || payload.scope;
+ const saveScope = requestedScope === "worktree" ? "worktree" : "project";
  if (!memoryWriteReady(saveScope)) return;
- const result = await request("memory:save", { ...payload, ...(saveScope === "global" ? { projectRoot: null, projectSlug: "_global" } : {}), scope: saveScope, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
+ const result = await request("memory:save", { ...payload, scope: saveScope, id: id || undefined, title: draft.title.trim(), content: draft.content, module: draft.module || record?.module || record?.category || "topics", ...(id == null && draft.supersedes ? { supersedesId: draft.supersedes } : {}) });
  if (disposed) return;
- if (id == null) delete drafts.__new;
+ if (id == null && drafts.__new?.projectRoot === payload.projectRoot) delete drafts.__new;
  else if (drafts[key]?.content === draft.content) delete drafts[key];
- const now = memoryPayload();
- if (selection === JSON.stringify([state.memoryProject, now.projectRoot, now.projectSlug])) {
+ if (selection === memorySelection()) {
  state.selectedMemory = result.item?.id || result.memory?.id || result.id || id;
- if (id == null && saveScope === "global") { state.memoryScope = "global"; state.memoryProject = "global"; }
- else if (id == null && saveScope === "worktree") state.memoryScope = "worktree";
+ if (id == null && saveScope === "worktree") state.memoryScope = "worktree";
  else if (id == null && state.memoryScope === "worktree") state.memoryScope = "project";
  if (state.tab === "memory") { renderMemory(); await refreshMemoryOverview(); await loadMemories(); }
  }
@@ -3515,18 +3420,21 @@
     async function deleteMemory(id, element) {
  if (!memoryWriteReady()) return;
  const payload = memoryPayload();
+ const selection = memorySelection();
+ if (!payload.projectRoot) return;
  const key = memoryDraftKey(id);
  await busy(`memory-delete:${id}`, element, async () => {
  await request("memory:delete", { id, projectRoot: payload.projectRoot, scope: payload.scope });
- if (!disposed) { delete drafts[key]; if (state.selectedMemory === id) state.selectedMemory = null; if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); } toast(tr("记忆已删除", "Memory deleted")); }
+ if (!disposed && selection === memorySelection()) { delete drafts[key]; if (state.selectedMemory === id) state.selectedMemory = null; if (state.tab === "memory") { await refreshMemoryOverview(); await loadMemories(); } toast(tr("记忆已删除", "Memory deleted")); }
  });
     }
     async function refreshMemoryOverview() {
- const projectRoot = state.projectRoot;
+ if (!memoryProjectReady()) { cache.overview = null; return; }
+ const projectRoot = state.projectRoot, ctxVer = contextVersion, identity = contextIdentityToken();
  try {
  const data = await request("memory:overview", { projectRoot });
- if (!disposed && state.projectRoot === projectRoot) { cache.overview = data; delete errors.overview; if (state.tab === "memory") { renderMemoryNav(); renderDream(); } }
- } catch (error) { if (!disposed && state.projectRoot === projectRoot) { errors.overview = error; if (state.tab === "memory") { renderMemoryNav(); renderDream(); } } }
+ if (!disposed && ctxVer === contextVersion && identity === contextIdentityToken() && memoryProjectReady() && state.projectRoot === projectRoot) { cache.overview = data; delete errors.overview; if (state.tab === "memory") renderMemoryNav(); }
+ } catch (error) { if (!disposed && ctxVer === contextVersion && identity === contextIdentityToken() && memoryProjectReady() && state.projectRoot === projectRoot) { errors.overview = error; if (state.tab === "memory") renderMemoryNav(); } }
     }
     async function saveAgents(element) {
  const draft = agentDraft();
@@ -3587,18 +3495,18 @@
 
     const api = {
  options: opts, open: () => setOpen(true), close: () => setOpen(false), toggle: () => setOpen(!state.open), refresh, selectTab: (tab) => switchTab(tab),
- snapshot: () => ({ dreamOpen: state.dreamOpen, boardBackground: state.boardBackground, boardDraft: state.boardDraft, dreamEngineDraft: state.dreamEngineDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
+ snapshot: () => ({ boardBackground: state.boardBackground, boardDraft: state.boardDraft, orchestrationDraft: state.orchestrationDraft, settingsHost: state.settingsHost, settingsRule: state.settingsRule, settingsRuleDirty: state.settingsRuleDirty, settingsDraft: state.settingsDraft, settingsDirty: state.settingsDirty, clearedHostFields: [...state.clearedHostFields], width: state.width, resourceFilters: state.resourceFilters, memoryScope: state.memoryScope, boardExpanded: state.boardExpanded, scope: state.scope, historyExpanded: state.historyExpanded, open: state.open, tab: state.tab, skillQuery: state.skillQuery, skillFilter: state.skillFilter, mcpFilter: state.mcpFilter, importRepo: state.importRepo, memoryProject: state.memoryProject, memoryModule: state.memoryModule, memoryQuery: state.memoryQuery, selectedMemory: state.selectedMemory, agentsTarget: state.agentsTarget, agentDrafts: state.agentDrafts, subagentScope: state.subagentScope, subagentDrafts: state.subagentDrafts, subagentExpanded: state.subagentExpanded, subagentCustom: state.subagentCustom, drafts }),
  destroy: () => {
  if (disposed) return;
- closeSlash(); slashCache.clear(); disposed = true;
- contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; embedVersion++; boardVersion++;
+ disposed = true;
+ contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; embedVersion++; boardVersion++;
  clearInterval(routeTimer); timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();
  if (updateFrame) cancelAnimationFrame(updateFrame);
  try { unsubscribeRouter?.(); } catch {}
  unsubscribeRouter = null; cachedRouter = null;
  disposers.splice(0).forEach((dispose) => { try { dispose(); } catch {} });
- liveBoard?.remove(); root?.remove(); style?.remove();
+ liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); root?.remove(); style?.remove();
  if (window.__t3SidecarHub === api) delete window.__t3SidecarHub;
  if (window.__t3SidecarHubCleanup === api.destroy) delete window.__t3SidecarHubCleanup;
  },

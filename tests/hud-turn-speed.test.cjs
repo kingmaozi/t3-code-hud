@@ -162,12 +162,14 @@ test("live speed ignores growth in an old assistant message after a new user mes
   assert.equal(getAssistantStreamSnapshot(chatCol).messageId, "assistant-new", "sampling resumes only after a new assistant message appears");
 });
 
-test("topbar uses per-turn speed while the existing hover panel keeps the session average", () => {
+test("topbar displays session average or same-chat last turn while hover retains detailed speeds", () => {
   const topbar = rendererSource.match(/  function renderTopbarStats\([\s\S]*?\n  \}/)?.[0] || "";
   assert.match(topbar, /resolveHudTurnSpeed\(/);
-  assert.match(topbar, /formatHudTurnSpeed\(/);
-  assert.doesNotMatch(topbar, /resolveModelAvgSpeed\(/, "the topbar cannot fall back to the session average");
-  assert.match(topbar, /stats\.cache\.turnRate/, "the main cache chip reads the latest user-turn aggregate");
+  assert.match(topbar, /resolveHudSessionSpeed\(/, "topbar must use the same-chat session-speed resolver");
+  assert.match(topbar, /sessionSpeed\.value/, "topbar prints the selected actual value");
+  assert.doesNotMatch(topbar, /t\("waitingForOutput"\)/, "topbar must not replace a rate with a waiting message");
+  assert.match(topbar, /resolveHudCacheDisplay\(stats\)/, "the main cache chip uses the validated turn-first resolver");
+  assert.match(rendererSource, /const turnRate = stats\.cache\?\.turnRate/, "current-turn cache remains the preferred source");
   assert.doesNotMatch(topbar, /stats\.cache\.displayRate/, "the main chip never falls back to a cumulative cache rate");
   assert.match(rendererSource, /\$\{escapeHtml\(t\("avgDecodeSpeed"\)\)\}/, "the hover details retain their session-average row");
   assert.match(rendererSource, /\$\{escapeHtml\(t\("lastTurnSpeed"\)\)\}/, "the hover details retain their last-turn row");

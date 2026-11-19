@@ -261,10 +261,11 @@ test('项目级覆盖：全局 ON + 项目A OFF + 项目B inherit，AGENTS/state
   const routeB = f.mgr.resolveSubagentRoute({ idOrTitle: 'worker', role: 'implementation', projectRoot: f.projectB });
   assert.equal(routeB.orchestration.swarmMode, 'on');
   assert.equal(routeB.orchestration.source, 'global');
-  // guard additionalContext 附带来源
-  const outA = hook(f, { title: 'worker', role: 'implementation', target: {}, task: 'do A' });
-  assert.ok(outA, 'guard 应返回输出');
-  assert.match(outA.additionalContext, /project|项目/);
+  // A project-level off override is a true no-op for delegation routing.
+  const offInput = { title: 'worker', role: 'implementation', target: {}, task: 'do A' };
+  const outA = hook(f, offInput);
+  assert.equal(outA, null, 'effective off mode must preserve host-native delegation unchanged');
+  assert.deepEqual(offInput, { title: 'worker', role: 'implementation', target: {}, task: 'do A' });
   // 清除为 inherit 后私有正文完好
   const rInherit = f.mgr.updateOrchestrationConfig({ swarmMode: 'inherit', expectedRevision: stateA.projectModeRevision }, { projectRoot: f.projectA });
   assert.equal(rInherit.ok, true, JSON.stringify(rInherit));

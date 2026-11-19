@@ -795,6 +795,7 @@ function createEmbedManager(opts = {}) {
   let restartAttempts = [];
   let lastError = null;
   let closed = false;
+  let embeddingTestInFlight = null;
   const readyTimers = new Set();
   const killTimers = new Map();
 
@@ -1034,6 +1035,99 @@ function createEmbedManager(opts = {}) {
     } catch {
       return null;
     }
+  }
+  async function runEmbeddingTest() {
+    const started = Date.now();
+    const config = readConfig();
+    const ftsMode = config.mode === "fts5" || config.mode === "fts5-only" || config.modelId === FTS_ID || config.modelId === "fts5-only";
+    let modelId = null;
+    let stage = "health";
+    const controller = new AbortController();
+    const timeoutMs = Number.isFinite(opts._probeTimeoutMs) ? Math.max(1, Math.min(30000, opts._probeTimeoutMs)) : 12000;
+    const probeFetch = typeof opts._fetch === "function" ? opts._fetch : (...args) => globalThis.fetch(...args);
+    const failure = (error) => {
+      const messages = {
+        fts_unavailable: "当前为全文搜索模式，且本机没有运行中的向量服务。",
+        service_unavailable: "本机向量服务不可用或尚未就绪。",
+        invalid_response: "向量服务返回了无效结果。",
+        model_changed: "测试期间向量模型发生变化，请重试。",
+        timeout: "向量连通性测试超时。",
+        manager_closed: "向量管理器已关闭。",
+      };
+      return { ok: false, modelId, dimensions: null, latencyMs: Math.max(0, Date.now() - started), error, message: messages[error] };
+    };
+    const fail = (code) => { const err = new Error(code); err.probeCode = code; throw err; };
+    const readProbeJson = async (response) => {
+      const maxBytes = 2 * 1024 * 1024;
+      const declared = Number(response.headers?.get?.("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) fail("invalid_response");
+      if (!response.body || typeof response.body[Symbol.asyncIterator] !== "function") return response.json();
+      const chunks = [];
+      let length = 0;
+      for await (const chunk of response.body) {
+        length += chunk.length;
+        if (length > maxBytes) fail("invalid_response");
+        chunks.push(Buffer.from(chunk));
+      }
+      return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    };
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        const error = new Error("timeout");
+        error.probeCode = "timeout";
+        reject(error);
+      }, timeoutMs);
+    });
+    try {
+      if (closed) return failure("manager_closed");
+      return await Promise.race([deadline, (async () => {
+        const base = `http://127.0.0.1:${port}`;
+        const healthResponse = await probeFetch(`${base}/health`, { signal: controller.signal });
+        if (controller.signal.aborted) fail("timeout");
+        if (!healthResponse?.ok) fail(ftsMode ? "fts_unavailable" : "service_unavailable");
+        const health = await readProbeJson(healthResponse);
+        if (controller.signal.aborted) fail("timeout");
+        if (!health || (health.ok !== true && health.status !== "ok")) fail(ftsMode ? "fts_unavailable" : "service_unavailable");
+        const liveId = health.modelId || health.model_id;
+        if (typeof liveId !== "string" || !liveId.trim() || liveId === FTS_ID) fail("invalid_response");
+        modelId = liveId.trim();
+        if (closed) fail("manager_closed");
+        stage = "embedding";
+        const response = await probeFetch(`${base}/v1/embeddings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: ["T3 Hub embedding connectivity test."], input_type: "query" }),
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) fail("timeout");
+        if (!response?.ok) fail("service_unavailable");
+        const data = await readProbeJson(response);
+        if (controller.signal.aborted) fail("timeout");
+        if (!data || typeof data.model !== "string" || !data.model.trim() || !Array.isArray(data.data) || data.data.length !== 1) fail("invalid_response");
+        const servedName = health.servedName || health.served_name || health.model;
+        if (typeof servedName === "string" && servedName && data.model !== servedName) fail("model_changed");
+        const item = data.data[0];
+        const vec = item?.embedding;
+        if ((item?.index != null && item.index !== 0) || !Array.isArray(vec) || vec.length === 0 || vec.length > 65536 || !vec.every((x) => typeof x === "number" && Number.isFinite(x)) || !vec.some((x) => x !== 0)) fail("invalid_response");
+        if (Number.isInteger(health.dim) && health.dim > 0 && vec.length !== health.dim) fail("invalid_response");
+        return { ok: true, modelId, dimensions: vec.length, latencyMs: Math.max(0, Date.now() - started) };
+      })()]);
+    } catch (err) {
+      if (controller.signal.aborted || err?.probeCode === "timeout") return failure("timeout");
+      if (err?.probeCode) return failure(err.probeCode);
+      return failure(stage === "health" ? (ftsMode ? "fts_unavailable" : "service_unavailable") : (err instanceof SyntaxError ? "invalid_response" : "service_unavailable"));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  function testEmbedding() {
+    if (embeddingTestInFlight) return embeddingTestInFlight;
+    const current = runEmbeddingTest();
+    embeddingTestInFlight = current;
+    current.finally(() => { if (embeddingTestInFlight === current) embeddingTestInFlight = null; });
+    return current;
   }
   function stopServer() {
     invalidateWork();
@@ -1457,6 +1551,7 @@ function createEmbedManager(opts = {}) {
     port,
     launchAgentPlistPath,
     getStatus,
+    testEmbedding,
     stopServer,
     close,
     switchModel,
@@ -1473,6 +1568,9 @@ function getDefaultEmbedManager() {
 function getStatus() {
   return getDefaultEmbedManager().getStatus();
 }
+function testEmbedding() {
+  return getDefaultEmbedManager().testEmbedding();
+}
 function switchModel(a) {
   return getDefaultEmbedManager().switchModel(a || {});
 }
@@ -1480,6 +1578,7 @@ module.exports = {
   createEmbedManager,
   getDefaultEmbedManager,
   getStatus,
+  testEmbedding,
   switchModel,
   validateModelId,
   detectHardwareProfile,

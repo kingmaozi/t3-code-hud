@@ -39,7 +39,13 @@ function fixture(t) {
     mcpRouter: { autoSyncHosts() {}, listMcpServers: () => ({ items: [] }) },
     hubPlugins: { listPlugins: () => ({ items: [] }) }, hubHooks: { listHooks: () => ({ items: [] }) },
     hubSkills: { listAssets: () => ({ items: [] }) }, hubSubagents: { listSubagents: () => ({ effectiveItems: [] }) },
-    memoryVault: { getOverview: () => ({ projects: [] }) }, require: () => ({ slugFromProjectRoot: (root) => path.basename(root) }) };
+    memoryVault: {
+      getOverview: () => ({ projects: [] }),
+      resolveSessionProjectRoot: ({ projectRoot, worktreePath }) => {
+        if (worktreePath && (!path.isAbsolute(worktreePath) || !fs.existsSync(worktreePath))) throw new Error("worktree unavailable");
+        return worktreePath || projectRoot;
+      },
+    }, require: () => ({ slugFromProjectRoot: (root) => path.basename(root) }) };
   vm.runInNewContext(`${extract}\n${context}\nthis.resolve = resolveHubContext;`, sandbox);
   sandbox.resolve.dbFile = dbFile;
   return sandbox.resolve;
@@ -154,6 +160,28 @@ test("an unknown or unscoped draft must not inherit a recent project's context",
     assert.notEqual(context.projectId, PROJECT_A);
     assert.notEqual(context.projectRoot, "/tmp/fixture-project-a");
   }
+});
+
+test("missing active context never selects the most recently updated thread", (t) => {
+  const resolve = fixture(t);
+  for (const args of [{}, { routeHint: "/" }, { routeHint: "/settings" }]) {
+    assert.equal(resolve(args).ok, false);
+  }
+});
+
+test("memory context uses the exact current thread worktree and rejects a missing one", (t) => {
+  const resolve = fixture(t);
+  const root = path.join(path.dirname(resolve.dbFile), "worktree", "selected-subproject");
+  fs.mkdirSync(root, { recursive: true });
+  const db = new DatabaseSync(resolve.dbFile);
+  try {
+    db.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?").run(JSON.stringify({ worktreePath: root }), THREAD_A);
+    assert.equal(resolve({ routeHint: `/${ENVIRONMENT}/${THREAD_A}` }).projectRoot, root);
+    fs.rmdirSync(root);
+    const missing = resolve({ routeHint: `/${ENVIRONMENT}/${THREAD_A}` });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.projectRoot, undefined);
+  } finally { db.close(); }
 });
 
 test("real Hub RPC keeps two projects' drafts isolated across get, update and clear", (t) => {

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the command stable in both a checkout and the installed ~/.t3/bin.
+t3_memory_bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+t3_memory_script="$t3_memory_bin_dir/memory-setup.mjs"
+if [[ ! -f "$t3_memory_script" ]]; then
+  t3_memory_script="$t3_memory_bin_dir/../scripts/memory-setup.mjs"
+fi
+if [[ ! -f "$t3_memory_script" ]]; then
+  echo "T3 Hub 记忆接入组件尚未安装，请先更新 Hub。" >&2
+  exit 1
+fi
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
+t3_memory_node="$(command -v node || true)"
+if [[ -z "$t3_memory_node" ]]; then
+  echo "未找到 Node.js，无法检查 T3 Hub 记忆接入。" >&2
+  exit 1
+fi
+exec env -u NODE_OPTIONS "$t3_memory_node" "$t3_memory_script" "$@"

@@ -162,9 +162,9 @@ test("P1: topbar renderer preserves live sample on started tick", () => {
   assert.match(topbar, /liveStreamTps/, "renderTopbarStats must consider liveStreamTps before clearing");
   assert.doesNotMatch(topbar, /if \(speedView\.routeChanged \|\| \(speedView\.started && stats\?\.isRunning\)\) \{\s*resetLiveStreamSampler/, "unconditional clear on started is forbidden after fix");
   assert.match(topbar, /resolveHudTurnSpeed\(/, "topbar must use resolveHudTurnSpeed");
-  assert.match(topbar, /formatHudTurnSpeed\(/, "topbar must use formatHudTurnSpeed");
-  assert.doesNotMatch(topbar, /resolveModelAvgSpeed\(/, "topbar must never fall back to session average");
-  assert.match(topbar, /stats\.cache\.turnRate/, "topbar cache reads turnRate only");
+  assert.match(topbar, /resolveHudSessionSpeed\(/, "topbar keeps an actual same-chat session speed");
+  assert.doesNotMatch(topbar, /t\("waitingForOutput"\)/, "the displayed speed is never replaced by waiting text");
+  assert.match(topbar, /resolveHudCacheDisplay\(stats\)/, "topbar cache uses the validated turn-first resolver");
   assert.doesNotMatch(topbar, /stats\.cache\.displayRate/, "topbar never falls back to displayRate");
 });
 
@@ -180,26 +180,21 @@ test("P1: streamWatchTimer fast-path refreshes when new assistant appears before
   assert.match(rendererSource, /canSampleHudStream\(latestStats, assistantSnapshot\)/, "live estimation still requires authoritative running");
 });
 
-// 9. cache pending: topbar shows 待上报/Pending when running and turnRate null, not --%
-test("P1: cache pending display in topbar and popover distinguished", () => {
-  // i18n keys exist
-  assert.match(rendererSource, /cachePendingShort/, "cachePendingShort i18n key missing");
-  assert.match(rendererSource, /cachePendingTitle/, "cachePendingTitle missing");
-  assert.match(rendererSource, /cachePendingPopover/, "popover pending text missing");
-  // zh/en values
-  assert.match(rendererSource, /待上报/, "zh pending short missing");
-  assert.match(rendererSource, /Pending/, "en pending short missing");
-  // topbar logic: isRunning && turnRate null => pending
+// 9. Missing current-turn cache shows an explicitly labelled session rate when available.
+test("P1: cache display labels turn vs session values and never says pending", () => {
+  assert.match(rendererSource, /function resolveHudCacheDisplay\(/, "cache display resolver missing");
+  assert.match(rendererSource, /cacheSessionShort:\s*"累计缓存"/, "zh cumulative label missing");
+  assert.match(rendererSource, /cacheSessionShort:\s*"Session cache"/, "en cumulative label missing");
+  assert.match(rendererSource, /cacheUnknownTitle:\s*"暂无缓存数据"/, "zh unknown label missing");
+  assert.match(rendererSource, /cacheUnknownTitle:\s*"No cache data"/, "en unknown label missing");
+  assert.doesNotMatch(rendererSource, /cachePending|待上报/, "cache must not show a pending-report label");
   const topbar = rendererSource.match(/  function renderTopbarStats\([\s\S]*?\n  \}/)?.[0] || "";
-  assert.match(topbar, /isRunning/, "topbar must branch on isRunning for cache");
-  assert.match(topbar, /cachePending/, "topbar must render pending instead of --% when running");
-  // popover: turnCache pending row
+  assert.match(topbar, /resolveHudCacheDisplay\(stats\)/, "topbar must use the validated cache display");
+  assert.match(topbar, /cacheLblEl\.textContent\s*=\s*nextCacheLabel/, "topbar label must identify cumulative fallback");
   const popover = rendererSource.match(/  function renderStatsPopover\([\s\S]*?\n  \}/)?.[0] || "";
-  assert.match(popover, /cachePendingPopover/, "popover must show waiting report");
+  assert.match(popover, /turnCacheUnavailableNote/, "popover must explain current-turn unknown");
   assert.match(popover, /turnCacheRate/, "popover retains turnCacheRate row");
-  // ensure no fallback to lastCallRate/sessionRate for topbar
-  assert.doesNotMatch(topbar, /lastCallRate/, "topbar cache must never fallback to lastCallRate");
-  assert.doesNotMatch(topbar, /sessionRate/, "topbar cache must never fallback to sessionRate");
+  assert.match(rendererSource, /typeof rate === "number" && Number\.isFinite\(rate\) && rate >= 0 && rate <= 1/, "cache rates must reject nonnumeric, nonfinite, or out-of-range values");
 });
 
 // 10. Backend: running with no usage returns null, with usage returns rate immediately
@@ -362,15 +357,14 @@ test("P1: route switch and late stats never leak prior session speed/cache", () 
   assert.equal(isCurrentStatsSnapshot(1,2,"thread-b","thread-b"), false, "late packet with old id rejected");
 });
 
-// 15. Topbar only this-turn, mean only in popover
-test("P1: topbar never shows session average, popover retains it", () => {
+// 15. Topbar shows stable session average; details keep turn metrics
+test("P1: topbar shows the same-chat session speed and popover retains both details", () => {
   const topbar = rendererSource.match(/  function renderTopbarStats\([\s\S]*?\n  \}/)?.[0] || "";
   const popover = rendererSource.match(/  function renderStatsPopover\([\s\S]*?\n  \}/)?.[0] || "";
-  assert.doesNotMatch(topbar, /resolveModelAvgSpeed/, "topbar must not use average");
+  assert.match(topbar, /resolveHudSessionSpeed\(/, "topbar resolves the current chat average");
   assert.match(popover, /avgDecodeSpeed/, "popover keeps session average row");
   assert.match(popover, /lastTurnSpeed/, "popover keeps last-turn row");
-  // topbar must not contain tokPerSec fallback
-  assert.doesNotMatch(topbar, /tokPerSec/, "topbar cannot fallback to session mean tokPerSec");
+  assert.doesNotMatch(topbar, /t\("waitingForOutput"\)/, "the speed slot never becomes waiting text");
 });
 
 // 16. i18n and format: estimated shows approx, waiting shows generating

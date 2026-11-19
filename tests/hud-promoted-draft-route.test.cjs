@@ -10,16 +10,17 @@ function fn(name) {
   assert.ok(match, `missing ${name}`);
   return match[0];
 }
-function fixture({ stored, fiber, fiberKey = "__reactContainer$test", storageError = false, hash = "#/draft/draft-a", routerPath = "/" } = {}) {
+function fixture({ stored, fiber, fiberKey = "__reactContainer$test", storageError = false, hash = "#/draft/draft-a", routerPath = null } = {}) {
   const root = fiber ? { [fiberKey]: fiber } : null;
+  const router = { state: { location: { pathname: routerPath } } };
   const ctx = vm.createContext({
     window: { location: { hash, pathname: "/" } },
     localStorage: { getItem(key) { assert.equal(key, "t3code:composer-drafts:v1"); if (storageError) throw Error("denied"); return stored === undefined ? null : typeof stored === "string" ? stored : JSON.stringify(stored); } },
     document: { getElementById: () => root },
-    findTanStackRouter: () => ({}), getRouterPathname: () => routerPath,
+    findTanStackRouter: () => router, getRouterPathname: value => value?.state?.location?.pathname || null,
   });
   vm.runInContext(fn("resolvePromotedDraftRoute") + "\n" + fn("getRouteHint"), ctx);
-  return { ctx, resolve: route => ctx.resolvePromotedDraftRoute(route), route: () => ctx.getRouteHint() };
+  return { ctx, router, setRouterPath: pathname => { router.state.location.pathname = pathname; }, resolve: route => ctx.resolvePromotedDraftRoute(route), route: () => ctx.getRouteHint() };
 }
 const ref = { environmentId: "env-a", threadId: "thread:server-a" };
 for (const sourceKey of ["promotedDraftRedirects", "drafts", "draftThreadsByThreadKey"]) {
@@ -73,6 +74,27 @@ for (const shape of ["cycle", "depth limit"]) test(`unresolved Fiber ancestry fa
   if (shape === "cycle") last.return = stale;
   else last.stateNode = { current: {} };
   assert.equal(fixture({ fiber: stale, fiberKey: "__reactFiber$test" }).route(), "__NEW__");
+});
+test("router route takes precedence over a stale draft hash", () => {
+  const routerPath = "/11111111-1111-4111-8111-111111111111/thread%3Aactive";
+  const f = fixture({ hash: "#/draft/draft-a", routerPath });
+  assert.equal(f.route(), routerPath);
+});
+test("resolved home route prevents a stale hash from selecting an older chat", () => {
+  const f = fixture({ hash: "#/draft/draft-a", routerPath: "/" });
+  assert.equal(f.route(), "__NEW__");
+});
+test("router chat changes with an unchanged hash trigger a fresh HUD poll", () => {
+  const first = "/11111111-1111-4111-8111-111111111111/thread:first";
+  const next = "/11111111-1111-4111-8111-111111111111/thread:next";
+  const f = fixture({ hash: "#/draft/old-draft", routerPath: first }), calls = [];
+  Object.assign(f.ctx, { currentPathHint: f.route(), scheduleLayoutSync() {}, refreshStats: changed => calls.push(changed) });
+  vm.runInContext(fn("onRouteMaybeChanged"), f.ctx);
+  f.setRouterPath(next);
+  assert.equal(f.ctx.onRouteMaybeChanged(), true);
+  assert.equal(f.ctx.currentPathHint, next);
+  assert.deepEqual(Array.from(calls), [true]);
+  assert.equal(f.ctx.window.location.hash, "#/draft/old-draft");
 });
 test("router and pathname fallbacks also resolve promoted drafts", () => {
   const f = fixture({ hash: "", routerPath: "/draft/draft-a", stored: { promotedDraftRedirects: { "draft-a": ref } } });

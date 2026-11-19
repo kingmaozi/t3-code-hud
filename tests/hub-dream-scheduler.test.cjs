@@ -144,7 +144,7 @@ test("disabled scheduler creates no timer and reports that it is not running", (
   assert.equal(scheduler.getStatus().started, false);
 });
 
-test("reading the vault does not start a second process scheduler", t => {
+test("legacy ensureDreamScheduler stops timers and reports status without restarting", t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "hub-dream-getter-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const backendPath = path.resolve(__dirname, "../src/backend.cjs");
@@ -159,8 +159,14 @@ test("reading the vault does not start a second process scheduler", t => {
     assert.ok(backend.getMemoryVault());
     assert.equal(created.length, 0, 'the vault getter must not create a process-local scheduler');
     assert.equal(backend.getDreamSchedulerStatus().started, false);
-    assert.equal(backend.ensureDreamScheduler(), true, 'the owning bridge may explicitly start it');
+    const scheduler = globalThis[Symbol.for('t3.hud.memory.dream-scheduler.v1')];
+    assert.equal(scheduler.start(), true, 'simulate a legacy scheduler without real timers or Dream execution');
     assert.equal(created.length, 2);
+    const compatibilityStatus = backend.ensureDreamScheduler();
+    assert.deepEqual(compatibilityStatus, backend.getDreamSchedulerStatus());
+    assert.equal(compatibilityStatus.started, false, 'legacy ensure must report the scheduler stopped');
+    assert.equal(created.length, 2, 'ensure must not create replacement timers');
+    assert.equal(cleared.length, 2, 'ensure must clear timers from an older scheduler');
     backend.stopDreamScheduler();
     assert.equal(cleared.length, 2);
   `;

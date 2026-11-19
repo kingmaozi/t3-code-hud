@@ -33,6 +33,7 @@ function run(f, script, payload, env = {}) {
 }
 const hookManager = f => require("../src/hub-hooks.cjs").createHooksManager(f);
 const managed = (doc, event) => (doc.hooks?.[event] || []).filter(x => x._t3HubHookId);
+const setGlobalOrchestration = (f, swarmMode) => write(path.join(f.hubDir, "orchestration-config.json"), { policyVersion: 2, orchestratorMode: "off", swarmMode });
 
 test("hooks: defaults synchronize losslessly, expose LCU read-only, back up once", t => {
   const f = fixture(t), claude = path.join(f.homeDir, ".claude/settings.json"), codex = path.join(f.homeDir, ".codex/hooks.json");
@@ -133,9 +134,11 @@ test("hooks: composite plugin hooks substitute install roots, update idempotentl
 
 test("hooks: generated commands execute with the configured Hub and flattened bin install", t => {
   const f = fixture(t), binDir = path.join(f.dir, "installed bin"); fs.mkdirSync(binDir);
+  setGlobalOrchestration(f, "on");
   for (const script of ["subagent-route-guard.mjs", "memory-stop-hook.mjs"]) fs.copyFileSync(path.join(root, "scripts", script), path.join(binDir, script));
-  fs.copyFileSync(path.join(root, "src/hub-subagents.cjs"), path.join(binDir, "hub-subagents.cjs"));
-  fs.copyFileSync(path.join(root, "src/memory-vault.cjs"), path.join(binDir, "memory-vault.cjs"));
+  for (const module of ["hub-subagents.cjs", "memory-vault.cjs", "hub-memory-access.cjs", "hub-host-settings.cjs", "mcp-router.cjs"]) {
+    fs.copyFileSync(path.join(root, "src", module), path.join(binDir, module));
+  }
   const mgr = hookManager({ ...f, binDir }); mgr.toggleHook({ id: "memory-stop-guard", scope: "global" });
   mgr.toggleHook({ id: "subagent-route-guard", scope: "global" });
   const doc = read(path.join(f.homeDir, ".codex/hooks.json"));
@@ -150,11 +153,11 @@ test("hooks: generated commands execute with the configured Hub and flattened bi
   write(path.join(f.hubDir, "subagents.json"), [agent("worker", { effort: "max" })]);
   assert.equal(call().options.reasoningEffort, "max");
   // Reproduce install.sh's real split layout as well as the flat fixture above.
-  fs.unlinkSync(path.join(binDir, "hub-subagents.cjs"));
-  fs.unlinkSync(path.join(binDir, "memory-vault.cjs"));
+  for (const module of ["hub-subagents.cjs", "memory-vault.cjs", "hub-memory-access.cjs", "hub-host-settings.cjs", "mcp-router.cjs"]) fs.unlinkSync(path.join(binDir, module));
   fs.mkdirSync(path.join(f.homeDir, ".t3/hud-plugin"), { recursive: true });
-  fs.copyFileSync(path.join(root, "src/hub-subagents.cjs"), path.join(f.homeDir, ".t3/hud-plugin/hub-subagents.cjs"));
-  fs.copyFileSync(path.join(root, "src/memory-vault.cjs"), path.join(f.homeDir, ".t3/hud-plugin/memory-vault.cjs"));
+  for (const module of ["hub-subagents.cjs", "memory-vault.cjs", "hub-memory-access.cjs", "hub-host-settings.cjs", "mcp-router.cjs"]) {
+    fs.copyFileSync(path.join(root, "src", module), path.join(f.homeDir, ".t3/hud-plugin", module));
+  }
   assert.equal(call().options.reasoningEffort, "max");
   write(path.join(f.projectRoot, "file with spaces.js"), "let a = 1;");
   const stopped = spawnSync("/bin/sh", ["-c", managed(doc, "Stop")[0].hooks[0].command], { input: JSON.stringify({ cwd: f.projectRoot, session_id: "injected-command" }), env, encoding: "utf8", timeout: 3000 });
@@ -166,7 +169,7 @@ test("stop: dirty code blocks once; active hook and clean repo pass", t => {
   assert.equal(run(f, "memory-stop-hook.mjs", p), null);
   write(path.join(f.projectRoot, "change.js"), "const x = 1;");
   assert.equal(run(f, "memory-stop-hook.mjs", { ...p, stop_hook_active: true }), null);
-  const first = run(f, "memory-stop-hook.mjs", p); assert.equal(first.decision, "block"); assert.match(first.reason, /T3 再记忆收尾检查/);
+  const first = run(f, "memory-stop-hook.mjs", p); assert.equal(first.decision, "block"); assert.match(first.reason, /T3 自动化记忆提醒/); assert.match(first.reason, /不是用户新请求或授权/); assert.match(first.reason, /当前项目.*不读取或写入全局及其他项目/); assert.match(first.reason, /shared 仅表示本项目 worktree 共享/); assert.match(first.reason, /当前任务允许.*memory_write/); assert.match(first.reason, /只读.*off.*禁止写入/); assert.match(first.reason, /没有已核实的非平凡结论.*直接结束/); assert.match(first.reason, /不得覆盖.*派单限制/);
   assert.equal(run(f, "memory-stop-hook.mjs", p), null);
   const stamp = path.join(f.hubDir, "run", fs.readdirSync(path.join(f.hubDir, "run"))[0]);
   fs.utimesSync(stamp, new Date(0), new Date(0));
@@ -208,7 +211,7 @@ test("scripts: malformed and absent input exit quietly without waiting for EOF",
 
 function agent(id, patch = {}) { return { id, name: id, role: "implementation", providerInstanceId: "codex", model: "gpt-6.1-sol", effort: "high", enabled: true, ...patch }; }
 test("route: old sessions get current provider/model/effort and reread disk next call", t => {
-  const f = fixture(t), config = path.join(f.hubDir, "subagents.json"); write(config, [agent("worker"), agent("worker-pro", { model: "pro" })]);
+  const f = fixture(t), config = path.join(f.hubDir, "subagents.json"); setGlobalOrchestration(f, "on"); write(config, [agent("worker"), agent("worker-pro", { model: "pro" })]);
   const input = { title: "worker · 修复问题", task: "keep task", target: { providerInstanceId: "muse", model: "old", options: { reasoningEffort: "medium" } } };
   const payload = { tool_name: "mcp__t3_code__delegate_task", tool_input: input, cwd: f.projectRoot };
   const first = run(f, "subagent-route-guard.mjs", payload).hookSpecificOutput;
@@ -222,7 +225,7 @@ test("route: old sessions get current provider/model/effort and reread disk next
 });
 
 test("route: project overrides, nested cwd, wrapper, custom id, disabled and ambiguous routes", t => {
-  const f = fixture(t); write(path.join(f.hubDir, "subagents.json"), [agent("worker"), agent("worker-pro"), agent("custom"), agent("disabled", { enabled: false })]);
+  const f = fixture(t); setGlobalOrchestration(f, "on"); write(path.join(f.hubDir, "subagents.json"), [agent("worker"), agent("worker-pro"), agent("custom"), agent("disabled", { enabled: false })]);
   write(projectRoutePath(f), [agent("worker-pro", { model: "project-model", overridesGlobal: true })]);
   const subdir = path.join(f.projectRoot, "src"); fs.mkdirSync(subdir);
   const wrapper = { ToolName: "delegate_task", Arguments: { title: "worker-pro · task", target: {}, task: "preserve" } };
@@ -237,7 +240,7 @@ test("route: project overrides, nested cwd, wrapper, custom id, disabled and amb
 });
 
 test("route: provider effort mappings, role lookup, partial project overrides and no hook writes", t => {
-  const f = fixture(t), file = path.join(f.hubDir, "subagents.json"), projectFile = projectRoutePath(f);
+  const f = fixture(t), file = path.join(f.hubDir, "subagents.json"), projectFile = projectRoutePath(f); setGlobalOrchestration(f, "on");
   for (const [providerInstanceId, effort, options] of [["muse", "high", { reasoningEffort: "high" }], ["pi", "max", { thinking: "max" }], ["claudeAgent", "ultrathink", { effort: "ultrathink" }]]) {
     write(file, { items: [agent("helper", { providerInstanceId, effort })] });
     const out = run(f, "subagent-route-guard.mjs", { tool_name: "mcp__t3_code__delegate_task", tool_input: { role: "implementation", target: {} }, cwd: f.projectRoot });
@@ -289,17 +292,25 @@ test("subagents: explicit extra sync targets, default no AGY writes, memory inst
 
 test("stop: other project writes cannot suppress current Git root reminder", t => {
   const f = fixture(t);
-  const { slugFromProjectRoot } = require("../src/memory-vault.cjs");
+  const { createMemoryVault } = require("../src/memory-vault.cjs");
   const nested = path.join(f.projectRoot, "src");
   fs.mkdirSync(nested);
   write(path.join(nested, "change.js"), "const changed = true;");
-  write(path.join(f.hubDir, "memory/projects/project-a/constraints.md"), "recent A memory");
-  write(path.join(f.hubDir, "memory/index.sqlite"), "recent shared index");
+  const otherRoot = path.join(f.dir, "other-project");
+  fs.mkdirSync(otherRoot, { recursive: true });
+  spawnSync("git", ["init", "-q", otherRoot]);
+  const vault = createMemoryVault({ vaultDir: path.join(f.hubDir, "memory"), homeDir: f.homeDir, hubDir: f.hubDir, _embedFn: () => null });
+  assert.equal(vault.saveMemory({ projectRoot: otherRoot, title: "Other project", content: "recent memory elsewhere", autoEvolve: false }).ok, true);
   assert.equal(run(f, "memory-stop-hook.mjs", { cwd: nested, session_id: "project-b" }).decision, "block");
-  const slug = slugFromProjectRoot(f.projectRoot);
-  write(path.join(f.hubDir, "memory/projects", slug, "_meta.json"), { projectRoot: f.projectRoot });
-  write(path.join(f.hubDir, "memory/projects", slug, "constraints.md"), "recent B memory");
+  assert.equal(vault.saveMemory({ projectRoot: nested, title: "Current project", content: "recent current memory", autoEvolve: false }).ok, true);
   assert.equal(run(f, "memory-stop-hook.mjs", { cwd: nested, session_id: "project-b-with-memory" }), null);
+});
+
+test("stop: a corrupt isolated memory index fails closed without a nudge", t => {
+  const f = fixture(t);
+  write(path.join(f.projectRoot, "change.js"), "const changed = true;");
+  write(path.join(f.hubDir, "memory", "index.sqlite"), "not a sqlite database");
+  assert.equal(run(f, "memory-stop-hook.mjs", { cwd: f.projectRoot, session_id: "corrupt-memory-index" }), null);
 });
 
 
