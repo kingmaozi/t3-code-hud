@@ -1266,6 +1266,22 @@
     ]);
     const bridge = window.__t3HubSidecarBridge;
     const normalizedPayload = payload || {};
+    if (action === "hub:update:apply") {
+      // A lost response can follow a successful update. Never resend through another transport.
+      const config = window.__t3HudHttpConfig;
+      if (typeof config?.url !== "string" || !/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(config.url) ||
+          typeof config.token !== "string" || !config.token) {
+        return { ok: false, code: "HUD_UNAVAILABLE" };
+      }
+      const response = await fetch(config.url + "/rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-T3-Hud-Token": config.token },
+        body: JSON.stringify({ method: "hubCall", args: [action, normalizedPayload] }),
+        redirect: "error",
+      });
+      if (!response.ok) throw new Error("HUD update response unavailable");
+      return response.json();
+    }
     const scheduleTimer = typeof setTimeout === "function" ? setTimeout : null;
     const cancelTimer = typeof clearTimeout === "function" ? clearTimeout : null;
     if (typeof action === "string" && action.startsWith("memory:dream:")) {
@@ -1488,7 +1504,29 @@
       currentEngineQuota: "当前引擎额度剩余",
       resetIn: "重置倒计时",
       otherEngineQuota: "其他引擎额度速览",
+      hudStatsDetails: "HUD 统计详情",
       hudVersion: "HUD 版本",
+      hudUpdateCheck: "检查更新",
+      hudUpdateChecking: "正在检查更新…",
+      hudUpdateCurrent: "已是最新版本",
+      hudUpdateAvailable: "有可用更新",
+      hudUpdateApply: "更新至 {version}",
+      hudUpdateApplying: "正在安装更新…",
+      hudUpdateDone: "已更新至 {version}",
+      hudUpdateInterrupted: "上次更新中断。",
+      hudUpdateRecover: "恢复上次更新",
+      hudUpdateRecovering: "正在恢复更新…",
+      hudUpdateRecovered: "已恢复上次更新。",
+      hudUpdateUnsupported: "此版本暂无可用热更新包。",
+      hudUpdateReleases: "查看发布页",
+      hudUpdateCheckFailed: "无法检查更新，请稍后再试。",
+      hudUpdateConnectionFailed: "无法连接更新服务，请稍后再试。",
+      hudUpdateFailed: "更新失败，请重新检查后再试。",
+      hudUpdateUnconfirmed: "更新结果暂未确认，请重新检查已安装版本。",
+      hudUpdateBusy: "另一个更新正在进行，请稍后检查。",
+      hudUpdateChanged: "可用版本已变更，请重新检查更新。",
+      hudUpdateInvalid: "更新包未通过验证，请重新检查更新。",
+      hudUpdateUnavailable: "暂时无法更新 HUD，请稍后重试。",
       remaining: "剩余",
       engineModel: "引擎 / 模型",
       streamSpeed: "流式估算速度",
@@ -1567,7 +1605,29 @@
       currentEngineQuota: "Current engine quota",
       resetIn: "Resets in",
       otherEngineQuota: "Other engines at a glance",
+      hudStatsDetails: "HUD statistics details",
       hudVersion: "HUD version",
+      hudUpdateCheck: "Check for updates",
+      hudUpdateChecking: "Checking for updates…",
+      hudUpdateCurrent: "Up to date",
+      hudUpdateAvailable: "Update available",
+      hudUpdateApply: "Update to {version}",
+      hudUpdateApplying: "Installing update…",
+      hudUpdateDone: "Updated to {version}",
+      hudUpdateInterrupted: "The previous update was interrupted.",
+      hudUpdateRecover: "Recover interrupted update",
+      hudUpdateRecovering: "Recovering update…",
+      hudUpdateRecovered: "The interrupted update was recovered.",
+      hudUpdateUnsupported: "This release has no compatible update package.",
+      hudUpdateReleases: "View releases",
+      hudUpdateCheckFailed: "Could not check for updates. Try again later.",
+      hudUpdateConnectionFailed: "Could not reach the update service. Try again later.",
+      hudUpdateFailed: "Update failed. Check for updates again before retrying.",
+      hudUpdateUnconfirmed: "Update result unconfirmed. Check the installed version again.",
+      hudUpdateBusy: "Another update is in progress. Check again shortly.",
+      hudUpdateChanged: "The available version changed. Check for updates again.",
+      hudUpdateInvalid: "The update package could not be verified. Check for updates again.",
+      hudUpdateUnavailable: "HUD updates are currently unavailable. Try again later.",
       remaining: "Left",
       engineModel: "Engine / Model",
       streamSpeed: "Estimated live speed",
@@ -1855,6 +1915,18 @@
       cursor: default;
       transition: background 0.12s ease;
     }
+    .t3-hud-metric[data-hud-stats-trigger] {
+      border: 0;
+      background: transparent;
+      font: inherit;
+      cursor: pointer;
+    }
+    .t3-hud-metric[data-hud-stats-trigger]:focus-visible,
+    .t3-hud-update-button:focus-visible,
+    .t3-hud-update-release:focus-visible {
+      outline: 2px solid var(--hud-fg);
+      outline-offset: 1px;
+    }
     .t3-hud-ring-svg {
       width: 14px;
       height: 14px;
@@ -2014,12 +2086,15 @@
       font-size: 11.5px;
       line-height: 1.5;
       opacity: 0;
+      visibility: hidden;
+      overflow-y: auto;
       transform: translateY(3px);
       transition: opacity 0.12s ease, transform 0.12s ease;
       z-index: 60;
     }
     #t3-hud-popover.visible {
       opacity: 1;
+      visibility: visible;
       transform: translateY(0);
       pointer-events: auto;
     }
@@ -2035,6 +2110,25 @@
       justify-content: space-between;
       align-items: center;
     }
+    .t3-hud-version-actions, .t3-hud-update-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .t3-hud-version-actions { font-variant-numeric: tabular-nums; }
+    .t3-hud-update-info {
+      justify-content: space-between;
+      color: var(--hud-muted);
+      font-size: 10.5px;
+    }
+    .t3-hud-update-info > :not(:empty):not([hidden]) { margin-top: 3px; }
+    .t3-hud-update-release {
+      color: var(--hud-fg);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      white-space: nowrap;
+    }
+    .t3-hud-update-button[aria-disabled="true"] { cursor: default; opacity: 0.6; }
     .t3-quota-row {
       display: grid;
       grid-template-columns: minmax(0, 1.35fr) minmax(48px, 0.8fr) auto;
@@ -2100,7 +2194,7 @@
     .t3-pop-row span:last-child {
       font-weight: 500;
     }
-    .t3-lang-switch {
+    .t3-lang-switch, .t3-hud-update-button {
       border: 1px solid var(--hud-border);
       background: var(--hud-surface);
       color: var(--hud-fg);
@@ -2114,7 +2208,7 @@
       line-height: 1.2;
       transition: background 0.12s ease;
     }
-    .t3-lang-switch:hover {
+    .t3-lang-switch:hover, .t3-hud-update-button:not([aria-disabled="true"]):hover {
       background: var(--hud-hover);
     }
 
@@ -2561,10 +2655,10 @@
 
   root.innerHTML = `
     <div id="t3-hud-topbar" class="is-hidden">
-      <div class="t3-hud-metric" data-hud-hover="stats">
+      <button class="t3-hud-metric" data-hud-hover="stats" data-hud-stats-trigger type="button" aria-controls="t3-hud-popover" title="${escapeHtml(t("hudStatsDetails"))}">
         <span id="t3-hud-dot" class="t3-hud-dot"></span>
         <span id="t3-hud-speed" class="val">-- tok/s</span>
-      </div>
+      </button>
       <span class="t3-hud-sep"></span>
       <div id="t3-hud-cache-item" class="t3-hud-metric" data-hud-hover="stats">
         <span class="lbl" id="t3-hud-cache-lbl">本轮缓存</span>
@@ -2669,6 +2763,7 @@
   const dirtyBadge = document.getElementById("t3-hud-dirty");
   const gitBtn = document.getElementById("t3-hud-git-btn");
   const popover = document.getElementById("t3-hud-popover");
+  const statsTrigger = root.querySelector("[data-hud-stats-trigger]");
   const gitLangBtn = document.getElementById("t3-git-lang");
 
   const drawer = document.getElementById("t3-hud-git-drawer");
@@ -2697,6 +2792,7 @@
   let spacedComposerStack = null;
   let currentPopoverMode = "stats";
   let popoverHideTimer = null;
+  let hudUpdateState = {};
 
   function createHudTurnSpeedState(routeKey) {
     return {
@@ -3432,13 +3528,16 @@
   function refreshHudStatsPopover(popoverElement, mode, activeElement, renderStats) {
     if (mode !== "stats" || !popoverElement?.classList?.contains("visible")) return false;
     if (typeof renderStats !== "function") return false;
+    const selector = activeElement?.tagName === "A" ? "a" : "button";
     const controls = popoverElement.contains?.(activeElement)
-      ? Array.from(popoverElement.querySelectorAll?.("button") || [])
+      ? Array.from(popoverElement.querySelectorAll?.(selector) || [])
       : [];
     const focusIndex = controls.indexOf(activeElement);
+    const scrollTop = popoverElement.scrollTop;
     renderStats();
+    popoverElement.scrollTop = scrollTop;
     if (focusIndex >= 0) {
-      const nextControl = popoverElement.querySelectorAll?.("button")?.[focusIndex];
+      const nextControl = popoverElement.querySelectorAll?.(selector)?.[focusIndex];
       try { nextControl?.focus?.({ preventScroll: true }); }
       catch { try { nextControl?.focus?.(); } catch {} }
     }
@@ -3655,6 +3754,7 @@
 
   function applyLangToDom() {
     if (cacheLblEl) cacheLblEl.textContent = t("cache");
+    statsTrigger.title = t("hudStatsDetails");
     if (gitBtn) gitBtn.title = t("overlay");
     gitBtn.setAttribute("aria-label", t("gitGraph"));
     repoTitleEl.textContent = t("gitGraph");
@@ -3743,11 +3843,106 @@
     return stats.speed.tokPerSec ?? stats.speed.lastDecodeTps ?? null;
   }
 
+  function syncHudUpdateFooter() {
+    const check = popover.querySelector('[data-t3-hud-update="check"]');
+    if (!check) return;
+    const apply = popover.querySelector('[data-t3-hud-update="apply"]');
+    const status = popover.querySelector("[data-t3-hud-update-status]");
+    const releases = popover.querySelector("[data-t3-hud-update-release]");
+    const { busy, availableVersion, installedVersion, recoverable, message } = hudUpdateState;
+    check.setAttribute("aria-disabled", String(Boolean(busy)));
+    apply.setAttribute("aria-disabled", String(Boolean(busy)));
+    if (!availableVersion && document.activeElement === apply && popover.classList.contains("visible")) {
+      check.focus({ preventScroll: true });
+    }
+    apply.hidden = !availableVersion;
+    const applyLabel = recoverable ? "hudUpdateRecover" : "hudUpdateApply";
+    apply.textContent = availableVersion ? t(applyLabel).replace("{version}", `v${availableVersion}`) : "";
+    status.textContent = message ? t(message).replace("{version}", `v${installedVersion || ""}`) : "";
+    releases.hidden = message !== "hudUpdateUnsupported";
+  }
+
+  function hudUpdateResult(result, expectedVersion, recovering) {
+    if (result?.ok === true) {
+      if (expectedVersion && result.currentVersion === expectedVersion) {
+        if (result.status === "updated") return { message: "hudUpdateDone", installedVersion: expectedVersion };
+        if (result.status === "current") return { message: recovering ? "hudUpdateRecovered" : "hudUpdateCurrent" };
+      }
+      if (!expectedVersion) {
+        if (result.status === "current") return { message: "hudUpdateCurrent" };
+        if (result.status === "unsupported") return { message: "hudUpdateUnsupported" };
+        const recoverable = result.status === "recoverable";
+        if ((recoverable || result.status === "available") && typeof result.availableVersion === "string" &&
+            /^(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})$/.test(result.availableVersion)) {
+          return {
+            message: recoverable ? "hudUpdateInterrupted" : "hudUpdateAvailable",
+            availableVersion: result.availableVersion,
+            recoverable,
+          };
+        }
+      }
+    }
+    if (result?.ok === false) {
+      switch (result.code) {
+        case "UPDATE_BUSY": return { message: "hudUpdateBusy" };
+        case "UPDATE_CHANGED": return { message: "hudUpdateChanged" };
+        case "UPDATE_INVALID": return { message: "hudUpdateInvalid" };
+        case "HUD_UNAVAILABLE":
+        case "UPDATE_UNAVAILABLE": return { message: "hudUpdateUnavailable" };
+        default: return { message: expectedVersion ? "hudUpdateFailed" : "hudUpdateCheckFailed" };
+      }
+    }
+    return { message: expectedVersion ? "hudUpdateUnconfirmed" : "hudUpdateCheckFailed" };
+  }
+
+  async function onHudUpdateClick(event) {
+    const button = event.target.closest?.("[data-t3-hud-update]");
+    if (!button || currentPopoverMode !== "stats" || !popover.classList.contains("visible")) return;
+    event.stopPropagation();
+    if (hudUpdateState.busy) return;
+    const apply = button.getAttribute("data-t3-hud-update") === "apply";
+    const expectedVersion = apply ? hudUpdateState.availableVersion : null;
+    if (apply && !expectedVersion) return;
+    const recovering = apply && hudUpdateState.recoverable;
+    const applyMessage = recovering ? "hudUpdateRecovering" : "hudUpdateApplying";
+    hudUpdateState = {
+      busy: true,
+      availableVersion: expectedVersion,
+      recoverable: recovering,
+      message: apply ? applyMessage : "hudUpdateChecking",
+    };
+    syncHudUpdateFooter();
+    const action = apply ? "hub:update:apply" : "hub:update:check";
+    let next;
+    try {
+      const result = await window.__t3HubRpc(action, apply ? { expectedVersion } : {});
+      next = hudUpdateResult(result, expectedVersion, recovering);
+    } catch {
+      next = { message: apply ? "hudUpdateUnconfirmed" : "hudUpdateConnectionFailed" };
+    }
+    if (disposed) return;
+    hudUpdateState = next;
+    syncHudUpdateFooter();
+  }
+
   function renderStatsPopover() {
     popover.style.width = "324px";
     const version = window.__t3HudReleaseVersion;
     const versionHtml = typeof version === "string" && version
-      ? `<div class="t3-pop-sec-hdr" data-t3-hud-version><span>${escapeHtml(t("hudVersion"))}</span><span>v${escapeHtml(version)}</span></div>`
+      ? `<div data-t3-hud-version>
+          <div class="t3-pop-sec-hdr">
+            <span>${escapeHtml(t("hudVersion"))}</span>
+            <span class="t3-hud-version-actions">
+              <span>v${escapeHtml(version)}</span>
+              <button class="t3-hud-update-button" type="button" data-t3-hud-update="check">${escapeHtml(t("hudUpdateCheck"))}</button>
+            </span>
+          </div>
+          <div class="t3-hud-update-info">
+            <button class="t3-hud-update-button" type="button" data-t3-hud-update="apply" hidden></button>
+            <span data-t3-hud-update-status role="status"></span>
+            <a class="t3-hud-update-release" data-t3-hud-update-release href="https://github.com/kingmaozi/t3-code-hud/releases" target="_blank" rel="noopener noreferrer" hidden>${escapeHtml(t("hudUpdateReleases"))}</a>
+          </div>
+        </div>`
       : "";
     const qInfo = computeQuotaAndContext(latestStats);
     const allQuotasHtml =
@@ -3773,6 +3968,7 @@
         <div style="color:var(--hud-muted)">${escapeHtml(t("newSessionDesc"))}</div>
         ${allQuotasHtml}
         ${versionHtml}`;
+      syncHudUpdateFooter();
       popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
         e.stopPropagation();
         switchLang(langSwitchTarget());
@@ -3848,6 +4044,7 @@
       ${allQuotasHtml}
       ${versionHtml}
     `;
+    syncHudUpdateFooter();
     popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
       e.stopPropagation();
       switchLang(langSwitchTarget());
@@ -3866,9 +4063,11 @@
     if (anchorRect.top > 260) {
       popover.style.top = "auto";
       popover.style.bottom = `${Math.round(window.innerHeight - anchorRect.top + 8)}px`;
+      popover.style.maxHeight = `${Math.floor(anchorRect.top - 20)}px`;
     } else {
       popover.style.bottom = "auto";
       popover.style.top = `${Math.round(anchorRect.bottom + 6)}px`;
+      popover.style.maxHeight = `${Math.max(0, Math.floor(window.innerHeight - anchorRect.bottom - 18))}px`;
     }
     popover.classList.add("visible");
     window.dispatchEvent(new CustomEvent("t3-hud-popover-change", { detail: { visible: true } }));
@@ -3920,6 +4119,12 @@
   popover.addEventListener("mouseleave", () => hidePopoverDelayed());
   popover.addEventListener("focusin", () => clearTimeout(popoverHideTimer));
   popover.addEventListener("focusout", () => hidePopoverDelayed());
+  popover.addEventListener("click", onHudUpdateClick);
+  statsTrigger.addEventListener("click", () => {
+    showPopoverAbove(statsTrigger, "stats");
+    const control = popover.querySelector('[data-t3-hud-update="check"]') || popover.querySelector(".t3-lang-switch");
+    control?.focus();
+  });
 
   gitLangBtn?.addEventListener("click", () => switchLang(langSwitchTarget()));
 

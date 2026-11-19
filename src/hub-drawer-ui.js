@@ -1734,13 +1734,26 @@
   return { environmentId, threadId, projectRoot };
  } catch { return null; }
     }
+    function isRemotePlanContext() {
+ return state.context?.remote === true || state.context?.isRemote === true || state.context?.environment?.remote === true;
+    }
+    function verifiedLocalPlanContext({ environmentId, threadId } = activePlanRouteIdentity()) {
+ const context = state.context, localEnvironmentId = context?.environmentId || context?.environment?.id;
+ return !!(state.connected && !contextLoading && !isRemotePlanContext() && environmentId &&
+ String(localEnvironmentId || "").toLowerCase() === environmentId.toLowerCase() &&
+ threadId === state.threadId && threadId === (context?.threadId || context?.thread?.id) &&
+ state.projectRoot && state.projectRoot === context?.projectRoot);
+    }
     function remotePlanEnvironmentId() {
  if (!state.threadId || state.threadId === "__NEW__") return "";
  const routeIdentity = activePlanRouteIdentity(), environmentId = routeIdentity.environmentId;
  if (!environmentId || routeIdentity.threadId !== String(state.threadId)) return "";
- if (remotePlanProject(environmentId, routeIdentity.threadId)) return environmentId;
- const explicitRemote = state.context?.remote === true || state.context?.isRemote === true || state.context?.environment?.remote === true;
+ // The native renderer can resolve a project's path on both local and Connect routes.
+ // The local Hub context verifies its environment against the local state store.
+ if (verifiedLocalPlanContext(routeIdentity)) return "";
+ const explicitRemote = isRemotePlanContext();
  if (contextLoading && !explicitRemote) return "";
+ if (remotePlanProject(environmentId, routeIdentity.threadId)) return environmentId;
  if (explicitRemote || !state.context && !!state.contextError) return environmentId;
  return "";
     }
@@ -1974,6 +1987,8 @@
  const threadId = currentThreadId();
  if (!threadId || threadId === "__NEW__" || threadId.startsWith("__ROUTE_")) return false;
  const route = routeKey(), scopeVer = boardScopeVersion, version = ++boardVersion;
+ const isCurrent = () => !disposed && version === boardVersion && scopeVer === boardScopeVersion &&
+ route === routeKey() && environmentId === remotePlanEnvironmentId() && threadId === currentThreadId();
  boardLoading = true;
  if (cache.board && (cache.board.remote !== true || String(cache.board.environmentId || "").toLowerCase() !== environmentId.toLowerCase() || String(cache.board.threadId || "") !== threadId)) {
  cache.board = null; boardSignature = ""; boardRenderedSignature = ""; state.planOpen = false; state.planPinned = false; state.planHovering = false;
@@ -1982,7 +1997,7 @@
  try {
  if (typeof window.__t3HudRemoteRpc !== "function") throw new Error("remote plan unavailable");
  const response = await window.__t3HudRemoteRpc(environmentId, "orchestration.getThreadProjection", { threadId }, 4500);
- if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ if (!isCurrent()) return false;
  let nativePlan = null;
  if (response?.ok && response.value) {
  try { nativePlan = normalizeRemoteThreadPlan(response.value, environmentId, threadId); } catch {}
@@ -1992,7 +2007,7 @@
  if (projectRoot) {
  try {
  const relativePath = await planMirrorRelativePath(threadId);
- if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ if (!isCurrent()) return false;
  const mirrorResponse = await window.__t3HudRemoteRpc(environmentId, "projects.readFile", { cwd: projectRoot, relativePath, allowMissing: true }, 4500);
  if (!mirrorResponse?.ok) throw new Error("remote plan unavailable");
  const mirrorValue = mirrorResponse.value ?? mirrorResponse.data ?? mirrorResponse;
@@ -2000,7 +2015,7 @@
  mirroredPlan = normalizeRemotePlanMirror(typeof contents === "string" ? contents : "", environmentId, threadId, projectRoot);
  } catch {}
  }
- if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || route !== routeKey() || environmentId !== remotePlanEnvironmentId() || threadId !== currentThreadId()) return false;
+ if (!isCurrent()) return false;
  if (!nativePlan && !mirroredPlan) throw new Error("remote plan unavailable");
  const data = newestRemotePlan(nativePlan, mirroredPlan);
  const recovered = !!errors.board;
@@ -2009,7 +2024,7 @@
  if (recovered || signature !== boardSignature) { boardSignature = signature; renderLiveBoard(); renderChrome(); }
  return true;
  } catch (error) {
- if (!disposed && version === boardVersion && scopeVer === boardScopeVersion && route === routeKey()) {
+ if (isCurrent()) {
  cache.board = { remote: true, environmentId, threadId, steps: [], artifacts: [], subagents: [] };
  errors.board = new Error("remote plan unavailable"); boardRenderedSignature = ""; renderLiveBoard();
  }
@@ -2022,15 +2037,21 @@
  if (remoteEnvironmentId) return pollRemotePlan(remoteEnvironmentId);
  if (contextLoading) return false;
  if (!state.connected) return false;
+ if (cache.board?.remote === true && verifiedLocalPlanContext()) {
+ cache.board = null; delete errors.board; boardSignature = ""; renderLiveBoard();
+ }
  if (boardMismatch()) { renderLiveBoard(); if (state.open && state.tab === "board") renderBoardTab(); return false; }
  boardLoading = true;
  let synced = false;
- const version = ++boardVersion, projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", scopeVer = boardScopeVersion;
+ const version = ++boardVersion, projectRoot = state.projectRoot, threadId = state.threadId || "__NEW__", scopeVer = boardScopeVersion, route = routeKey();
+ const isCurrent = () => !disposed && version === boardVersion && scopeVer === boardScopeVersion &&
+ route === routeKey() && projectRoot === state.projectRoot && threadId === state.threadId && !remotePlanEnvironmentId();
  try {
  const environmentId = state.context?.environmentId || state.context?.environment?.id || undefined;
  const data = await request("board:get", { projectRoot, threadId: threadId || undefined, environmentId, strictThreadMatch: true, excludeSubagentInference: true });
- if (disposed || version !== boardVersion || scopeVer !== boardScopeVersion || projectRoot !== state.projectRoot || threadId !== state.threadId) return false;
- if (Object.hasOwn(data, "threadId") && String(data.threadId || "") !== threadId) {
+ if (!isCurrent()) return false;
+ if ((Object.hasOwn(data, "threadId") && String(data.threadId || "") !== threadId) ||
+ (Object.hasOwn(data, "projectRoot") && data.projectRoot !== projectRoot)) {
  const error = new Error("board session mismatch"); error.code = "board_thread_mismatch"; throw error;
  }
  const recovered = !!errors.board;
@@ -2050,7 +2071,7 @@
  }
  return synced;
  } catch (error) {
- if (!disposed && version === boardVersion && scopeVer === boardScopeVersion) {
+ if (isCurrent()) {
  errors.board = error; boardRenderedSignature = ""; renderLiveBoard();
  if (state.open && state.tab === "board") {
  if (preserveBoardEditorOnReadError()) return false;

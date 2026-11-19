@@ -19,9 +19,12 @@ const hubMemoryConnections = require("./hub-memory-connections.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
+const { createHudUpdater, sha256 } = require("./hub-update.cjs");
 const { createDreamScheduler, beginDreamRun } = require("./hub-dream-scheduler.cjs");
 
 const execFileAsync = promisify(execFile);
+const loadedBackendHash = sha256(fs.readFileSync(__filename));
+const hudUpdater = createHudUpdater({ installLock: path.join(os.homedir(), ".t3", "hud-install.lock") });
 
 // Hub v3 engines (lazy singletons respecting process.env.HOME for tests)
 let _taskBoardInstance = null;
@@ -1030,10 +1033,11 @@ function getCodexSessionIndex() {
 
 function findCodexSessionJsonl(nativeId) {
   if (!nativeId || !fs.existsSync(CODEX_SESSIONS_ROOT)) return null;
+  const basename = `${nativeId}.jsonl`;
   for (const dayDir of dateDirsFromUuidV7(nativeId, CODEX_SESSIONS_ROOT)) {
     if (!fs.existsSync(dayDir)) continue;
     try {
-      const hit = fs.readdirSync(dayDir).find((f) => f.includes(nativeId) && f.endsWith(".jsonl"));
+      const hit = fs.readdirSync(dayDir).find((f) => f === basename || f.endsWith(`-${basename}`));
       if (hit) return path.join(dayDir, hit);
     } catch {}
   }
@@ -1064,11 +1068,13 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
   let lastE2eSec = null;
   let lastStepCacheRate = null;
   let lastContextPrompt = null;
+  let lastContextPromptEventMs = null;
   let lastEventMs = null;
   let lastUsageEventMs = null;
   let lastSpeedEventMs = null;
   let hasPendingUnfinishedCallAfterLastUsage = false;
   let codexContextMax = null;
+  let contextMaxEventMs = null;
   let latestModel = fallbackModel || null;
   let stepCount = 0;
 
@@ -1100,8 +1106,12 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     } else if (typeof p?.model === "string") {
       latestModel = p.model;
     }
-    if (rec.type === "event_msg" && p?.type === "token_count" && Number(p?.info?.model_context_window) > 0) {
-      codexContextMax = Number(p.info.model_context_window);
+    if (rec.type === "event_msg" && p?.type === "token_count") {
+      const reportedMax = Number(p?.info?.model_context_window);
+      if (Number.isFinite(reportedMax) && reportedMax > 0) {
+        codexContextMax = reportedMax;
+        contextMaxEventMs = eventMs;
+      }
     }
 
     if (
@@ -1161,6 +1171,7 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
       if (inp > 0) {
         lastStepCacheRate = cr / inp;
         lastContextPrompt = inp + out;
+        lastContextPromptEventMs = eventMs;
       }
 
       if (tsMs && stepInputReadyMs && tsMs > stepInputReadyMs + 50 && out > 0) {
@@ -1200,7 +1211,9 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
     savedUsd: sumSavedUsd,
     lastStepCacheRate,
     lastContextPrompt,
+    lastContextPromptEventMs,
     contextMax: codexContextMax,
+    contextMaxEventMs,
     contextMaxSource: codexContextMax != null ? "reported" : null,
     tokPerSec: avgDecodeTps ?? lastDecodeTps ?? avgE2eTps,
     lastDecodeTps,
@@ -1217,6 +1230,37 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
 
   lruSet(fileParseCache, jsonlPath, { sig, data });
   return data;
+}
+
+function resolveCodexSessionContext(parts, report, activeProviderThreadId) {
+  let part;
+  if (activeProviderThreadId) {
+    part = report?.isActive ? parts.find((candidate) => candidate.nativeId === report.nativeId) : null;
+  } else {
+    // Older projections omit the active ID. Prefer context events, then file
+    // order for sessions that have no timestamps in their usage records.
+    const eventTime = (candidate) => Math.max(candidate.lastContextPromptEventMs ?? 0, candidate.contextMaxEventMs ?? 0);
+    for (const candidate of parts) {
+      if (!part || eventTime(candidate) > eventTime(part) ||
+          (eventTime(candidate) === eventTime(part) && candidate.mtimeMs >= part.mtimeMs)) {
+        part = candidate;
+      }
+    }
+  }
+
+  const resolveField = (nativeValue, nativeEventMs, reportedValue) => {
+    if (nativeValue == null) return reportedValue ?? null;
+    if (reportedValue == null) return nativeValue;
+    const nativeMs = nativeEventMs ?? (activeProviderThreadId ? null : part.mtimeMs);
+    if (Number.isFinite(nativeMs) && nativeMs > report.updatedMs) return nativeValue;
+    return reportedValue;
+  };
+
+  return {
+    used: resolveField(part?.lastContextPrompt, part?.lastContextPromptEventMs, report?.used),
+    max: resolveField(part?.contextMax, part?.contextMaxEventMs, report?.max),
+    model: part?.model ?? null,
+  };
 }
 
 // ============================================================================
@@ -1607,7 +1651,13 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     const previous = contextsByDriver.get(pt.driver);
     // An old sibling can have a higher rowid even after the active branch reports new usage.
     if (isActive || (!previous?.isActive && (!Number.isFinite(previous?.updatedMs) || updatedMs >= previous.updatedMs))) {
-      contextsByDriver.set(pt.driver, { used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null, max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null, updatedMs, isActive });
+      contextsByDriver.set(pt.driver, {
+        used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null,
+        max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null,
+        updatedMs,
+        isActive,
+        nativeId: p?.nativeThreadRef?.nativeId,
+      });
     }
     const current = contextsByDriver.get(pt.driver);
     contextUsed = current?.used ?? null;
@@ -1672,6 +1722,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 
   // Collect native provider files for all sessions bound to this thread & sort chronologically!
   const nativeParts = [];
+  const codexContextParts = [];
   for (const mid of museNativeIds) {
     const fp = findMuseSessionJsonl(mid);
     if (fp) {
@@ -1694,11 +1745,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     const fp = findCodexSessionJsonl(xid);
     if (fp) {
       const d = readCodexSessionFile(fp, latestModel);
-      if (d && d.stepCount > 0) {
-        nativeParts.push({ ...d, driver: "codex", nativeId: xid, mtimeMs: getLatestMtimeMs(fp) });
+      if (d) {
+        const part = { ...d, driver: "codex", nativeId: xid, mtimeMs: getLatestMtimeMs(fp) };
+        if (d.stepCount > 0) nativeParts.push(part);
+        if (d.lastContextPrompt != null || d.contextMax != null) codexContextParts.push(part);
       }
     }
   }
+  const codexContext = resolveCodexSessionContext(codexContextParts, contextsByDriver.get("codex"), activeProviderThreadId);
 
   // statev2 provider turns are the only reliable source for cache across all
   // model calls in one user turn. Native logs remain per-call/session sources.
@@ -1858,7 +1912,10 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     }
     const useOverride = Boolean(overrideDriver) && ((overrideDriver === latestTurnDriver && !Number.isFinite(latestTurn?.stamp)) || overrideMs > (lastPart.mtimeMs || 0));
     const effDriver = useOverride ? overrideDriver : lastPart.driver || latestDriver;
-    const effModel = useOverride ? overrideModel || statev2Model : lastPart.model || latestModel;
+    let effModel = useOverride ? overrideModel || statev2Model : lastPart.model || latestModel;
+    if (!useOverride && effDriver === "codex" && activeProviderThreadId) {
+      effModel = codexContext.model || statev2Model;
+    }
     const completedDriverTurns = turnRows.reduce((cnt, tr) => {
       const p = safeJsonParse(tr.payload_json);
       if (p?.nativeTurnRef?.driver !== effDriver) return cnt;
@@ -1964,30 +2021,31 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     // Current active turn estimate is a separate channel; never pollute lastDecodeTps.
     const currentTurnEstimateTps = isRunning ? currentTurnEstimateTpsNative : null;
 
-    // Prefer host/T3 reported values, then the local model catalog, then an
-    // explicit model-family estimate. The HUD does not infer product compaction.
-    let resolvedContextMax = null;
-    let resolvedContextMaxSource = null;
     const currentContext = contextsByDriver.get(effDriver);
     contextUsed = currentContext?.used ?? null;
     contextMax = currentContext?.max ?? null;
-    contextMaxSource = contextMax != null ? "reported" : null;
     const preferCurrentReport = contextMax != null && (useOverride || lastPart.contextMax == null || (Number.isFinite(currentContext?.updatedMs) && currentContext.updatedMs >= (lastPart.mtimeMs || 0)));
-    if (preferCurrentReport) {
-      if (contextMax != null) {
-        resolvedContextMax = contextMax;
-        resolvedContextMaxSource = contextMaxSource || "reported";
+    let resolvedContextUsed = contextUsed;
+    let resolvedContextMax = contextMax;
+    let resolvedContextMaxSource = contextMax != null ? "reported" : null;
+    if (effDriver === "codex") {
+      resolvedContextUsed = codexContext.used;
+      resolvedContextMax = codexContext.max;
+      resolvedContextMaxSource = codexContext.max != null ? "reported" : null;
+    } else if (!useOverride) {
+      resolvedContextUsed = preferCurrentReport || !lastPartCoversLatestTurn
+        ? contextUsed ?? lastPart.lastContextPrompt
+        : lastPart.lastContextPrompt ?? contextUsed;
+      if (!preferCurrentReport && lastPart.driver === effDriver && lastPart.contextMax != null) {
+        resolvedContextMax = lastPart.contextMax;
+        resolvedContextMaxSource = lastPart.contextMaxSource || "reported";
       }
-    } else if (!useOverride && lastPart.driver === effDriver && lastPart.contextMax != null) {
-      resolvedContextMax = lastPart.contextMax;
-      resolvedContextMaxSource = lastPart.contextMaxSource || "reported";
-    } else if (contextMax != null) {
-      resolvedContextMax = contextMax;
-      resolvedContextMaxSource = contextMaxSource || "reported";
     }
+    // Capacity without a reported value can come from the local model
+    // catalog or an explicit model-family estimate.
     if (resolvedContextMax == null) {
       const drv = effDriver || latestDriver;
-      const mdl = effModel || latestModel;
+      const mdl = effDriver === "codex" && activeProviderThreadId ? effModel : effModel || latestModel;
       const catalogMax = lookupCatalogContextMax(mdl, drv);
       if (catalogMax != null) {
         resolvedContextMax = catalogMax;
@@ -2038,7 +2096,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       currentTurnEstimateTps: runningWithoutActiveTurn ? null : currentTurnEstimateTps,
       e2eTokPerSec: lastPart.e2eTokPerSec,
       durationSec: runningWithoutActiveTurn ? null : !currentTurnSpeedKnown ? null : useOverride && !coveredDrivers.has(overrideDriver) ? latestUncoveredDurationSec : !lastPartCoversLatestTurn || staleBySpeedTime ? latestSameDriverFallbackDurationSec : lastPart.durationSec,
-      contextUsed: useOverride ? contextUsed : preferCurrentReport || !lastPartCoversLatestTurn ? contextUsed ?? lastPart.lastContextPrompt : lastPart.lastContextPrompt ?? contextUsed,
+      contextUsed: resolvedContextUsed,
       contextMax: resolvedContextMax,
       contextMaxSource: resolvedContextMaxSource,
     });
@@ -2122,6 +2180,11 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   const currentTurnEstimateTpsFallback = computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver: latestDriver, isRunning });
   const fallbackLatestActive = isDbTurnStaticallyActive(latestTurn, latestDriver);
   const fallbackRunningWithoutActive = Boolean(isRunning && !fallbackLatestActive);
+  if (latestDriver === "codex") {
+    contextUsed = codexContext.used;
+    contextMax = codexContext.max;
+    contextMaxSource = contextMax != null ? "reported" : null;
+  }
   let effectiveMax = contextMax ?? null;
   let effectiveMaxSource = effectiveMax != null ? contextMaxSource || "reported" : null;
   if (effectiveMax == null) {
@@ -3337,6 +3400,9 @@ async function hubCall(action, payload = {}) {
   try {
     if (PROJECT_MEMORY_ACTIONS.has(action)) payload = projectMemoryPayload(payload);
     switch (action) {
+      case "hub:update:check": return await hudUpdater.check();
+      case "hub:update:apply": return await hudUpdater.apply(payload?.expectedVersion);
+      case "hub:update:runtime": return { ok: true, backendHash: loadedBackendHash };
       case "hub:getDrawerScript": {
         const code = fs.readFileSync(path.join(__dirname, "hub-drawer-ui.js"), "utf8");
         return { ok: true, code };

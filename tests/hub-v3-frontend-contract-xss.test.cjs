@@ -556,6 +556,106 @@ test("Connect never borrows the stale context or local project when its strict p
   assert.equal(ui.root.querySelector("#t3-hub-plan-handle").hidden, true);
 });
 
+test("the title pill reads a verified local Codex child directly and discards its plan after navigating away", async () => {
+  const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const threadId = "thread:delegated-task:command%3Afixture", parentId = "parent-thread";
+  const projectRoot = "/fixture/project", route = (env, tid) => `/${env}/${encodeURIComponent(tid)}`;
+  const router = { state: { location: { pathname: route(environmentId, threadId) } } };
+  const context = (tid) => ({ threadId: tid, projectRoot, environmentId });
+  const plan = { threadId, projectRoot, source: "t3-native", progress: { completed: 2, total: 5 }, steps: [
+    { text: "First checked step", status: "completed" },
+    { text: "Second checked step", status: "completed" },
+    { text: "Current child step", status: "in_progress" },
+    { text: "Child step four", status: "pending" },
+    { text: "Child step five", status: "pending" },
+  ] };
+  const calls = [];
+  let finishChildRead;
+  const heading = {
+    ...node(), textContent: "Current child chat",
+    getBoundingClientRect: () => ({ left: 40, right: 220, top: 18, bottom: 44, width: 180, height: 26 }),
+    after(element) { element.parentElement = {}; element.previousElementSibling = this; },
+  };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:getContext") return context(parentId);
+    assert.equal(action, "board:get");
+    if (payload.threadId === parentId) return { ...context(parentId), steps: [] };
+    assert.equal(payload.threadId, threadId);
+    if (calls.length === 1) return plan;
+    return new Promise((resolve) => { finishChildRead = resolve; });
+  }, {
+    document: { querySelectorAll: (selector) => selector.includes("thread-actions") ? [heading] : [] },
+    window: {
+      __TSR_ROUTER__: router,
+      // Native local chat components expose the same workspace props as Connect.
+      __t3HudRemoteProject: (identity) => ({ ...identity, projectRoot }),
+      __t3HudRemoteRpc: async (env, tag) => {
+        calls.push({ action: tag, env });
+        return { ok: false, error: "projection unavailable" };
+      },
+    },
+  });
+  ui.ready();
+  Object.assign(ui.state, { threadId, projectRoot, connected: true, context: context(threadId) });
+  ui.setCurrentRoute();
+  assert.equal(await ui.pollBoard(), true);
+  assert.deepEqual(calls.map(({ action }) => action), ["board:get"]);
+  assert.equal(calls[0].payload.environmentId, environmentId);
+  assert.equal(calls[0].payload.projectRoot, projectRoot);
+  assert.equal(ui.planStepProgress().completed, 2);
+  assert.equal(ui.planStepProgress().total, 5);
+  const pill = ui.root.querySelector("#t3-hub-plan-handle");
+  const popover = ui.root.querySelector("#t3-hub-live-board");
+  assert.equal(pill.hidden, false);
+  assert.match(pill.innerHTML, /第 3 \/ 5 步/);
+  ui.setPlanPopover(true);
+  assert.equal(popover.hidden, false);
+  assert.match(popover.innerHTML, /Current child step/);
+  assert.match(popover.innerHTML, /已完成 2 项/);
+  const oldRead = ui.pollBoard();
+  router.state.location.pathname = route(environmentId, parentId);
+  finishChildRead(plan);
+  assert.equal(await oldRead, false, "a child response after the route changes is stale before the route observer runs");
+  ui.positionConversationTools();
+  assert.equal(pill.hidden, true);
+  ui.checkRoute();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ui.cache.board.threadId, parentId);
+  assert.equal(pill.hidden, true, "a parent without its own plan does not display the child's steps");
+  assert.doesNotMatch(popover.innerHTML, /Current child step/);
+});
+
+test("a Connect child reusing a local thread and workspace is read only from its active environment", async () => {
+  const local = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", remote = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const threadId = "thread:delegated-task:command%3Afixture", projectRoot = "/fixture/project";
+  const route = `/${remote}/${encodeURIComponent(threadId)}`;
+  const calls = [];
+  const ui = harness(async (action) => { calls.push({ action }); return {}; }, {
+    window: {
+      __TSR_ROUTER__: { state: { location: { pathname: route } } },
+      __t3HudRemoteProject: (identity) => ({ ...identity, projectRoot }),
+      __t3HudRemoteRpc: async (environmentId, tag, payload) => {
+        calls.push({ environmentId, tag, payload });
+        if (tag === "projects.readFile") return { ok: true, value: { contents: "" } };
+        return { ok: true, value: { thread: { id: threadId }, plans: [
+          { id: "child-plan", threadId, kind: "proposed_plan", markdown: "Exact remote child plan" },
+          { id: "parent-plan", threadId: "parent-thread", kind: "proposed_plan", markdown: "Parent plan" },
+        ], turnItems: [
+          { threadId, type: "proposed_plan", planId: "child-plan", updatedAt: "2026-11-17T10:00:00Z" },
+          { threadId: "parent-thread", type: "proposed_plan", planId: "parent-plan", updatedAt: "2026-11-17T11:00:00Z" },
+        ] } };
+      },
+    },
+  });
+  ui.ready();
+  Object.assign(ui.state, { threadId, projectRoot, connected: true, context: { threadId, projectRoot, environmentId: local } });
+  assert.equal(await ui.pollBoard(), true);
+  assert.equal(ui.cache.board.planMarkdown, "Exact remote child plan");
+  assert.ok(calls.every((call) => call.environmentId === remote));
+  assert.equal(calls[0].payload.threadId, threadId);
+});
+
 test("Hub plan mirror path is a stable UUID and cannot inject a path segment", async () => {
   const ui = harness();
   const first = await ui.planMirrorRelativePath("main-thread:local"), second = await ui.planMirrorRelativePath("main-thread:local");

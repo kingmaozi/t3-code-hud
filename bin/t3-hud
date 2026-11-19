@@ -116,6 +116,7 @@ do_reload() {
   ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
     const fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process");
     const [pluginDir, rpcFile, expectedPid] = process.argv.slice(1);
+    const { assembleRenderer, readInstalledVersion } = require(path.resolve(pluginDir, "hud-release.cjs"));
     (async () => {
       const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
       if (cfg.pid !== Number(expectedPid)) throw new Error("HUD RPC PID mismatch");
@@ -150,24 +151,19 @@ do_reload() {
           }
         } catch {}
       }
-      if (bridge) {
-        const ruiPath = path.join(pluginDir, "renderer-ui.js");
-        const basePath = path.join(pluginDir, "renderer-base.js");
-        let base;
-        if (fs.existsSync(basePath)) {
-          base = fs.readFileSync(basePath, "utf8");
-        } else {
-          let raw = fs.readFileSync(ruiPath, "utf8");
-          raw = raw.replace(/^window\.__t3HubSidecarBridge = [^\n]+\n/, "");
-          raw = raw.replace(/^window\.__t3HubDrawerEmbedded = [^\n]+\n/, "");
-          raw = raw.replace(/;\/\* __T3_HUB_DRAWER_EMBED_START__ \*\/[\s\S]*?\/\* __T3_HUB_DRAWER_EMBED_END__ \*\/\s*$/, "");
-          base = raw;
-        }
-        const bridgeHeader = "window.__t3HubSidecarBridge = " + JSON.stringify({ url: bridge.url, token: bridge.token }) + ";\nwindow.__t3HubDrawerEmbedded = true;\n";
-        let drawerCode = "";
-        try { drawerCode = fs.readFileSync(path.join(pluginDir, "hub-drawer-ui.js"), "utf8"); } catch {}
-        const assembled = bridgeHeader + base + (base.endsWith("\n") ? "" : "\n") + ";/* __T3_HUB_DRAWER_EMBED_START__ */\n" + drawerCode + "\n/* __T3_HUB_DRAWER_EMBED_END__ */\n";
-        fs.writeFileSync(ruiPath, assembled, { encoding: "utf8", mode: 0o600 }); try { fs.chmodSync(ruiPath, 0o600); } catch {}
+      const ruiPath = path.join(pluginDir, "renderer-ui.js");
+      const basePath = path.join(pluginDir, "renderer-base.js");
+      const base = fs.readFileSync(fs.existsSync(basePath) ? basePath : ruiPath, "utf8");
+      let drawer = "";
+      try { drawer = fs.readFileSync(path.join(pluginDir, "hub-drawer-ui.js"), "utf8"); } catch {}
+      const assembled = assembleRenderer(base, drawer, { version: readInstalledVersion(pluginDir), bridge });
+      const tempDir = fs.mkdtempSync(path.join(pluginDir, ".t3-hud-reload-"));
+      try {
+        const temporary = path.join(tempDir, "renderer-ui.js");
+        fs.writeFileSync(temporary, assembled, { mode: 0o600 });
+        fs.renameSync(temporary, ruiPath);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
       }
       const j = await fetch(cfg.url + "/admin/reload-ui", {
         method: "POST",
