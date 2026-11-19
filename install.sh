@@ -22,6 +22,12 @@ if [[ -z "$SCRIPT_DIR" || ! -d "$SCRIPT_DIR/src" ]]; then
   SCRIPT_DIR="$TMP_CLONE"
 fi
 
+hud_release_version="$(/usr/bin/plutil -extract version raw -o - "$SCRIPT_DIR/package.json")"
+if [[ ! "$hud_release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.+-]+)?$ ]]; then
+  echo "[t3-hud] package.json 中的 HUD 版本无效。" >&2
+  exit 1
+fi
+
 DEST_DIR="$HOME/.t3/hud-plugin"
 BIN_DIR="$HOME/.t3/bin"
 RUN_DIR="$DEST_DIR/run"
@@ -943,7 +949,10 @@ fi
 # CSP-free embedded bundle: base + drawer in the same executeJavaScript payload,
 # so renderer-ui never needs (0, eval) which script-src blocks in t3code://app.
 if [[ -f "$DEST_DIR/renderer-ui.js" && -f "$DEST_DIR/hub-drawer-ui.js" ]]; then
-  cp "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js"
+  {
+    printf 'window.__t3HudReleaseVersion = "%s";\n' "$hud_release_version"
+    cat "$DEST_DIR/renderer-ui.js"
+  } > "$DEST_DIR/renderer-base.js"
   {
     printf 'window.__t3HubDrawerEmbedded = true;\n'
     cat "$DEST_DIR/renderer-base.js"
