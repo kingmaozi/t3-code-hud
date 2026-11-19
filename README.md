@@ -59,6 +59,8 @@ curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/install.
 
 > Installs to `~/.t3/hud-plugin`, symlinks `t3-hud` into your `PATH`, and creates `~/Applications/T3 Code HUD.app` (drag to Dock or launch via Spotlight).
 
+Hub Memory is optional. Turn off agent access next to the chat title to keep using an independently configured PowerContext MCP or CLI. Hub Memory's own MCP and CLI require a Node.js installation with `node:sqlite`.
+
 Or clone and install:
 
 ```bash

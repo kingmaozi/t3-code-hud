@@ -5,8 +5,11 @@ const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
 
-// Exact shipped legacy template only. Never replace a user's edited skill.
-const LEGACY_SHA256 = "d3d77e8c0a8c7e477a606dce3506d7f7aceddf959607c461f179ca58ae84859e";
+// Upgrade exact shipped templates and preserve independently maintained skills.
+const LEGACY_SHA256 = new Set([
+  "d3d77e8c0a8c7e477a606dce3506d7f7aceddf959607c461f179ca58ae84859e",
+  "2018d85bf42ecce5cbe6fe3c7d9e0d447b433cfd88fc8b4c3f6fd8633f17f9d0",
+]);
 const sha = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 
 function hasLinkedPath(file, homeDir) {
@@ -44,7 +47,7 @@ function installLocked({ homeDir, destination, template }) {
   try { previous = fs.readFileSync(destination); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
   if (previous && sha(previous) === sha(template)) return { status: "current" };
-  if (previous && sha(previous) !== LEGACY_SHA256) return { status: "preserved", reason: "custom_skill" };
+  if (previous && !LEGACY_SHA256.has(sha(previous))) return { status: "preserved", reason: "custom_skill" };
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
   let backup;
   if (previous) {

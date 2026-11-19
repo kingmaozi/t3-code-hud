@@ -57,6 +57,8 @@
 curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/install.sh | bash
 ```
 
+Hub 记忆可选。关闭标题旁的 Agent 记忆开关后，可以继续使用自己已接入的 PowerContext MCP 或 CLI。Hub 自带的记忆 MCP 和 CLI 需要支持 `node:sqlite` 的 Node.js。
+
 或克隆安装：
 
 ```bash
