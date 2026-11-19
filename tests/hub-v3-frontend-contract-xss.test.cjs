@@ -1656,7 +1656,7 @@ test("narrow inspector can be found without accepting an unscoped left-side titl
 function issue8BoardFixture(t) {
   const { DatabaseSync } = require("node:sqlite");
   const { createTaskBoard } = require("../src/hub-task-board.cjs");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "t3-issue8-"));
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "t3-issue8-")));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const root = path.join(home, ".gemini/antigravity/brain"), session = path.join(root, "thread-a"), sibling = path.join(root, "thread-b");
   for (const dir of [session, sibling]) {

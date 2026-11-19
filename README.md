@@ -6,7 +6,7 @@
 
 Project handoff: [engineering notes](docs/HANDOFF.md) · [development setup](docs/DEVELOPMENT.zh-CN.md) · [requirements and experiments (Chinese)](docs/REQUIREMENTS-AND-EXPERIMENTS.zh-CN.md) · [T3 takeover prompt (Chinese)](docs/T3-HUB-TAKEOVER-PROMPT.zh-CN.md) · [T3 self-test prompt (Chinese)](docs/T3-HUB-SELFTEST-PROMPT.zh-CN.md)
 
-Non-invasive real-time telemetry HUD, billion-token subagent & cost tracker, true context ring, quota monitor, and interactive Git Graph floating window for **T3 Code / T3 Code (Beta)**.
+Desktop telemetry, project Memory, current-chat plans, and an interactive Git Graph for **T3 Code / T3 Code (Beta)**.
 
 > Zero modification to `app.asar`, no signature breakage, survives T3 auto-updates. Precise fixes for stock T3 telemetry bugs across **Antigravity / Muse / Codex / Claude** engines: speed misreporting, cache double-counting, context-capacity inflation, and billion-token subagent undercounting.
 
@@ -33,13 +33,14 @@ Additional telemetry correctness:
 
 ## Features
 
-- **Minimal hover capsule above the composer** (auto-spaced, never blocks the message stream, Light/Dark aware):
-  - ⚡ The topbar shows the current turn: an approximate visible-text rate (`≈XX.X tok/s`) while text streams, `Streaming...` before the first token, and the completed turn's sample when ready. If fresh turn data is not ready, it shows `-- tok/s` rather than reusing the previous turn or session average. Hover keeps **Avg Decode Speed** and **Last Turn Speed**; the session average is shown there.
-  - ♻️ Real session cache hit rate.
+- **Composer telemetry** (Light/Dark aware):
+  - ⚡ Session-average decode speed with the same chat's last measured turn as a fallback. Live estimates are marked `≈`.
+  - ♻️ Measured current-turn cache hit rate, with the session aggregate labeled when used.
   - 🧮 Full-tree token total including recursive subagents (supports `B` billions, e.g. `2.34B tok`, warm query `< 8 ms`).
   - 💰 Official-rate equivalent cost with subagent breakdown (`$XX.XX (+N sub)`).
-  - 🔋 Weekly quota remaining (`Wk 67%`) — auto-switches Gemini ↔ Claude/GPT when you switch models *without sending a message*; hover to see all engines' `5-hour / Session / Weekly` bars.
   - ◔ Context ring — true usage % with hover card (`Context Capacity`, progress bar, `Avg Cache Hit Rate`).
+- **Header quotas and current-chat plan** — the outer quota ring shows the weekly window and the inner ring shows a verified five-hour window when available. Open the plan next to the title to see the current chat's steps.
+- **Project Memory** — open the workspace from the chat title to search and manage memories, test the configured local embedding service, and control local agent access. The Memory MCP can bind automatically to a confirmed T3 project or worktree. See the [Hub guide (Chinese)](docs/HUB-GUIDE.zh-CN.md).
 - **Zero-overlap layout** — `isChatComposerVisibleAndUncovered()` hides the HUD on Settings, `/usage`, `/pair`, dialogs/modals, and occluded composers; topbar `z-index: 30` stays below native modals (`50`).
 - **Draggable Git Graph floating window** (`Option+G` / `Esc`) — centered 920 × 600 maximum, monochrome vector icon, compact search and repo/status pill. A sticky five-column table shows **Graph / Description / Date / Author / Commit** with orange HEAD rings, separate HEAD/branch pills and `MM/DD HH:mm` timestamps. Click a commit for a bottom split pane with file `+added / -deleted` stats and highlighted unified diff. Below 680px the author column is hidden and date/hash columns compact; narrow capsules keep token/quota details in the hover card. Settings closes the window; native dialogs temporarily hide it. Automatically filters T3-internal `refs/t3/*` snapshot noise.
 - **Bilingual auto-detected UI** (`中文` / `English`) with one-click switch — see [i18n guide](#i18n-guide).
