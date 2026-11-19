@@ -1553,10 +1553,10 @@ function normalizeT3RouteHint(hint) {
   return route.split(/[?#]/, 1)[0];
 }
 
-function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackProvider) {
+function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackProvider, activeProviderThreadId) {
   const pThreadRows = db
     .prepare(
-      "SELECT driver, updated_at, payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ? ORDER BY rowid ASC"
+      "SELECT provider_thread_id, driver, updated_at, payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ? ORDER BY rowid ASC"
     )
     .all(threadId);
 
@@ -1602,11 +1602,17 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   for (const pt of pThreadRows) {
     const p = safeJsonParse(pt.payload_json);
     if (pt.driver) latestDriver = pt.driver;
-    const current = { used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null, max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null, updatedMs: Date.parse(pt.updated_at || "") };
-    contextsByDriver.set(pt.driver, current);
-    contextUsed = current.used;
-    contextMax = current.max;
-    contextMaxSource = current.max != null ? "reported" : null;
+    const updatedMs = Date.parse(pt.updated_at || "");
+    const isActive = Boolean(activeProviderThreadId && pt.provider_thread_id === activeProviderThreadId);
+    const previous = contextsByDriver.get(pt.driver);
+    // An old sibling can have a higher rowid even after the active branch reports new usage.
+    if (isActive || (!previous?.isActive && (!Number.isFinite(previous?.updatedMs) || updatedMs >= previous.updatedMs))) {
+      contextsByDriver.set(pt.driver, { used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null, max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null, updatedMs, isActive });
+    }
+    const current = contextsByDriver.get(pt.driver);
+    contextUsed = current?.used ?? null;
+    contextMax = current?.max ?? null;
+    contextMaxSource = contextMax != null ? "reported" : null;
   }
   const providerChanged = Boolean(fallbackProvider && (latestTurnDriver || latestDriver) && fallbackProvider !== (latestTurnDriver || latestDriver));
   isRunning = !providerChanged && isDbTurnStaticallyActive(latestTurn, fallbackProvider || latestTurnDriver);
@@ -2195,7 +2201,8 @@ function getCachedChildTelemetry(db, childThreadId, fallbackModel, fallbackProvi
     db,
     childThreadId,
     cPayload?.modelSelection?.model || fallbackModel,
-    cPayload?.modelSelection?.provider || cRow?.default_provider || fallbackProvider
+    cPayload?.modelSelection?.provider || cRow?.default_provider || fallbackProvider,
+    cPayload?.activeProviderThreadId
   );
   if (sig && !cTel.isRunning) {
     lruSet(childSubagentCache, childThreadId, { sig, data: cTel });
@@ -2328,7 +2335,7 @@ function getThreadStats(threadHint) {
     const baseModel = selectionWins || modelSelectionWins ? selectedModel : effectivePsRow?.model || selectedModel;
     const baseProvider = selectionWins ? selectedProvider : psProvider || null;
 
-    const mainTel = aggregateSingleThreadTelemetry(db, threadId, baseModel, baseProvider);
+    const mainTel = aggregateSingleThreadTelemetry(db, threadId, baseModel, baseProvider, threadPayload.activeProviderThreadId);
 
     // Recursively aggregate ALL child & grandchild subagents (both app_owned delegate_task & provider_native)
     const subStmt = db.prepare(

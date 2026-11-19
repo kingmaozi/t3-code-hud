@@ -1488,6 +1488,7 @@
       currentEngineQuota: "当前引擎额度剩余",
       resetIn: "重置倒计时",
       otherEngineQuota: "其他引擎额度速览",
+      hudVersion: "HUD 版本",
       remaining: "剩余",
       engineModel: "引擎 / 模型",
       streamSpeed: "流式估算速度",
@@ -1566,6 +1567,7 @@
       currentEngineQuota: "Current engine quota",
       resetIn: "Resets in",
       otherEngineQuota: "Other engines at a glance",
+      hudVersion: "HUD version",
       remaining: "Left",
       engineModel: "Engine / Model",
       streamSpeed: "Estimated live speed",
@@ -3743,6 +3745,10 @@
 
   function renderStatsPopover() {
     popover.style.width = "324px";
+    const version = window.__t3HudReleaseVersion;
+    const versionHtml = typeof version === "string" && version
+      ? `<div class="t3-pop-sec-hdr" data-t3-hud-version><span>${escapeHtml(t("hudVersion"))}</span><span>v${escapeHtml(version)}</span></div>`
+      : "";
     const qInfo = computeQuotaAndContext(latestStats);
     const allQuotasHtml =
       qInfo.currentWindows.length || qInfo.otherWindows.length
@@ -3765,7 +3771,8 @@
     if (!latestStats || !latestStats.ok) {
       popover.innerHTML = `<div class="t3-pop-title"><span>${escapeHtml(t("newSessionTitle"))}</span><button class="t3-lang-switch" type="button">${escapeHtml(langSwitchLabel())}</button></div>
         <div style="color:var(--hud-muted)">${escapeHtml(t("newSessionDesc"))}</div>
-        ${allQuotasHtml}`;
+        ${allQuotasHtml}
+        ${versionHtml}`;
       popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
         e.stopPropagation();
         switchLang(langSwitchTarget());
@@ -3839,6 +3846,7 @@
           : ""
       }
       ${allQuotasHtml}
+      ${versionHtml}
     `;
     popover.querySelector(".t3-lang-switch")?.addEventListener("click", (e) => {
       e.stopPropagation();
