@@ -57,7 +57,7 @@ cat > "$DEST_DIR/embed-server.py" <<'T3_EMBED_SERVER_PY_EOF'
 #!/usr/bin/env python3
 """T3 Hub local MLX embedding server (FastAPI) with dynamic memory ceiling.
 
-Self-contained server compatible with /Users/longxiaking/powercontext-embed-eg2/.venv/bin/python.
+Self-contained server for a Python environment with the local MLX dependencies.
 Listens on 127.0.0.1:8001. Supports hot model switching without dropping the port.
 
 Five guards keep Metal VRAM strictly tracking the selected model weights:
@@ -877,61 +877,66 @@ LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.t3tools.powercontext-embed.plist"
 # Preserve an explicit zero-memory choice across upgrades. This block does not
 # bootstrap/kickstart launchd: installation alone must not start a stopped job.
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$LAUNCHD_PLIST" "$HOME/.t3/hub/embed-config.json" "$DEST_DIR/embed-server.py" <<'T3_EMBED_PLIST_PY_EOF'
+  if ! python3 - "$LAUNCHD_PLIST" "$HOME/.t3/hub/embed-config.json" "$DEST_DIR/embed-server.py" <<'T3_EMBED_PLIST_PY_EOF'
 import json
 import os
 import pathlib
 import plistlib
 import sys
+import tempfile
 
 plist_path, config_path, server_path = map(pathlib.Path, sys.argv[1:])
-existed = plist_path.exists()
-# Fail closed on an unreadable existing preference rather than overwriting it.
+# The launchd label predates HUD and can belong to a standalone PowerContext.
+# Only upgrade an existing regular plist that already runs HUD's own server.
+if plist_path.is_symlink() or not plist_path.is_file():
+    sys.exit(0)
 try:
-    plist = plistlib.loads(plist_path.read_bytes()) if existed else {}
-except Exception as exc:
-    raise SystemExit("[t3-hud] cannot read embed launchd plist: " + str(exc))
+    previous = plist_path.read_bytes()
+    plist = plistlib.loads(previous)
+except (OSError, ValueError, plistlib.InvalidFileException):
+    sys.exit(0)
+if not isinstance(plist, dict) or plist.get("Label") != "com.t3tools.powercontext-embed":
+    sys.exit(0)
+args = plist.get("ProgramArguments", [])
+if not isinstance(args, list) or len(args) < 2 or args[1] != str(server_path):
+    sys.exit(0)
 try:
     config = json.loads(config_path.read_text())
 except FileNotFoundError:
     config = {}
-except Exception as exc:
-    raise SystemExit("[t3-hud] cannot read embed config: " + str(exc))
-fts_ids = {"fts5", "fts5-only", "fts5-zero-ram"}
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(config, dict):
+    sys.exit(0)
+fts_ids = ("fts5", "fts5-only", "fts5-zero-ram")
 zero_memory = config.get("mode") in fts_ids or config.get("modelId") in fts_ids
 keep_alive = not zero_memory and plist.get("KeepAlive") is not False
-args = plist.get("ProgramArguments", [])
-# Existing custom venv wins; never replace a working interpreter on upgrade.
-python = args[0] if args and os.access(args[0], os.X_OK) else None
-if not python:
-    for candidate in (pathlib.Path.home() / "powercontext-embed/.venv/bin/python",
-                      pathlib.Path.home() / "powercontext-embed-eg2/.venv/bin/python",
-                      pathlib.Path.home() / ".t3/powercontext-venv/bin/python"):
-        if os.access(candidate, os.X_OK):
-            python = str(candidate)
-            break
-if existed or python:
-    plist.setdefault("Label", "com.t3tools.powercontext-embed")
-    if python and not args:
-        plist["ProgramArguments"] = [python, str(server_path)]
-    elif python and args[0] != python:
-        plist["ProgramArguments"] = [python, *args[1:]]
-    plist["KeepAlive"] = keep_alive
-    # RunAtLoad would also wake an explicitly stopped zero-memory job on login.
-    if not keep_alive:
-        plist["RunAtLoad"] = False
-    env = plist.setdefault("EnvironmentVariables", {})
-    env["HF_HUB_DISABLE_XET"] = "1"
-    if config.get("mode") == "mlx" and config.get("modelId"):
-        env["EMBED_MODEL"] = config["modelId"]
-        env["EMBED_NAME"] = config["modelId"].rsplit("/", 1)[-1]
-    data = plistlib.dumps(plist)
-    if not existed or data != plist_path.read_bytes():
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = plist_path.with_suffix(".plist.tmp")
-        temporary.write_bytes(data)
-        temporary.replace(plist_path)
+plist["KeepAlive"] = keep_alive
+# RunAtLoad would also wake an explicitly stopped zero-memory job on login.
+if not keep_alive:
+    plist["RunAtLoad"] = False
+env = plist.setdefault("EnvironmentVariables", {})
+if not isinstance(env, dict):
+    sys.exit(0)
+env["HF_HUB_DISABLE_XET"] = "1"
+if config.get("mode") == "mlx" and isinstance(config.get("modelId"), str) and config["modelId"]:
+    env["EMBED_MODEL"] = config["modelId"]
+    env["EMBED_NAME"] = config["modelId"].rsplit("/", 1)[-1]
+data = plistlib.dumps(plist)
+if data != previous:
+    fd, name = tempfile.mkstemp(dir=plist_path.parent, prefix=".t3-hud-embed-")
+    temporary = pathlib.Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        if not plist_path.is_symlink() and plist_path.read_bytes() == previous:
+            temporary.replace(plist_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 T3_EMBED_PLIST_PY_EOF
+  then
+    echo "[t3-hud] Existing Hub embedding job setup skipped. HUD installation will continue." >&2
+  fi
 fi
 # T3_EMBED_LAUNCHD_UPGRADE_END
 
@@ -968,22 +973,44 @@ if [[ -f "$SCRIPT_DIR/bin/t3-memory-setup" ]]; then
     chmod +x "$BIN_DIR/t3-memory-setup"
   fi
 fi
-if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$BIN_DIR/pc-lite.mjs"; chmod +x "$BIN_DIR/pc-lite.mjs"; fi
-if [[ -f "$SCRIPT_DIR/scripts/pc-lite.mjs" ]]; then mkdir -p "$HOME/.t3/hub/bin"; cp "$SCRIPT_DIR/scripts/pc-lite.mjs" "$HOME/.t3/hub/bin/pc-lite.mjs"; chmod +x "$HOME/.t3/hub/bin/pc-lite.mjs"; fi
 for hs in pc-lite.mjs memory-setup.mjs memory-stop-hook.mjs subagent-route-guard.mjs; do
   if [[ -f "$SCRIPT_DIR/scripts/$hs" ]]; then
     mkdir -p "$BIN_DIR" "$HOME/.t3/hub/bin" "$DEST_DIR/scripts" 2>/dev/null || true
-    cp "$SCRIPT_DIR/scripts/$hs" "$BIN_DIR/$hs"
-    cp "$SCRIPT_DIR/scripts/$hs" "$HOME/.t3/hub/bin/$hs"
-    cp "$SCRIPT_DIR/scripts/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
-    chmod +x "$BIN_DIR/$hs" "$HOME/.t3/hub/bin/$hs" "$DEST_DIR/scripts/$hs" 2>/dev/null || true
+    # A standalone PowerContext may own the shared pc-lite command.
+    if [[ "$hs" != pc-lite.mjs ]] || { [[ ! -L "$BIN_DIR/$hs" ]] &&
+       { [[ ! -e "$BIN_DIR/$hs" ]] || cmp -s "$BIN_DIR/$hs" "$DEST_DIR/scripts/$hs"; }; }; then
+      cp "$SCRIPT_DIR/scripts/$hs" "$BIN_DIR/$hs"
+      chmod +x "$BIN_DIR/$hs"
+    fi
+    for hud_script_dir in "$HOME/.t3/hub/bin" "$DEST_DIR/scripts"; do
+      if [[ ! -L "$hud_script_dir" && ! -L "$hud_script_dir/$hs" ]]; then
+        cp "$SCRIPT_DIR/scripts/$hs" "$hud_script_dir/$hs"
+        chmod +x "$hud_script_dir/$hs"
+      fi
+    done
   fi
 done
 
+JS_RUNNER=""
+for cand in "${T3_APP_PATH:-}" "/Applications/T3 Code (Beta).app" "/Applications/T3 Code.app" "/Applications/T3 Code (Nightly).app" "$HOME/Applications/T3 Code (Beta).app" "$HOME/Applications/T3 Code.app" "$HOME/Applications/T3 Code (Nightly).app"; do
+  if [[ -n "$cand" && -d "$cand/Contents/MacOS" ]]; then
+    T3_CAND_BIN="$(find "$cand/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
+    if [[ -n "$T3_CAND_BIN" && -x "$T3_CAND_BIN" ]]; then
+      JS_RUNNER="$T3_CAND_BIN"
+      break
+    fi
+  fi
+done
+if [[ -z "$JS_RUNNER" ]] && command -v node >/dev/null 2>&1; then
+  JS_RUNNER="$(command -v node)"
+fi
+
 # Install only a new skill or the exact known legacy template; preserve custom
 # instructions and symlinks. This does not start a host, model, or MCP process.
-if [[ -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
-  node "$SCRIPT_DIR/scripts/install-memory-skill.cjs"
+if [[ -n "$JS_RUNNER" && -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
+  if ! env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" "$SCRIPT_DIR/scripts/install-memory-skill.cjs"; then
+    echo "[t3-hud] Memory skill setup skipped. HUD installation will continue." >&2
+  fi
 fi
 
 if [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
@@ -1144,20 +1171,6 @@ else
 fi
 
 mkdir -p "$DEST_DIR"
-JS_RUNNER=""
-for cand in "${T3_APP_PATH:-}" "/Applications/T3 Code (Beta).app" "/Applications/T3 Code.app" "/Applications/T3 Code (Nightly).app" "$HOME/Applications/T3 Code (Beta).app" "$HOME/Applications/T3 Code.app" "$HOME/Applications/T3 Code (Nightly).app"; do
-  if [[ -n "$cand" && -d "$cand/Contents/MacOS" ]]; then
-    T3_CAND_BIN="$(find "$cand/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
-    if [[ -n "$T3_CAND_BIN" && -x "$T3_CAND_BIN" ]]; then
-      JS_RUNNER="$T3_CAND_BIN"
-      break
-    fi
-  fi
-done
-if [[ -z "$JS_RUNNER" ]] && command -v node >/dev/null 2>&1; then
-  JS_RUNNER="$(command -v node)"
-fi
-
 if [[ -n "$JS_RUNNER" && -x "$JS_RUNNER" ]]; then
   ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" -e '
     const fs = require("node:fs");

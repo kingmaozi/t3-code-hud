@@ -97,6 +97,32 @@ test("setup adds memory-only router to supported enabled Muse provider and prese
   assert.equal(result.setupSummary.configured, 1);
 });
 
+test("toggling Hub Memory preserves an independently configured PowerContext MCP", (t) => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { muse: { driver: "muse", enabled: true } });
+  const target = path.join(f.homeDir, ".config", "muse", "settings.json");
+  const powerContext = { command: "/fixtures/powercontext", args: ["mcp"], env: { MEMORY_DIR: "/fixtures/pc-data" } };
+  const original = { mcpServers: { powercontext: powerContext } };
+  write(target, original);
+  const access = manager(f);
+
+  assert.equal(access.setAgentAccess({ enabled: false }).state, "disabled");
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf8")), original);
+  assert.equal(access.setAgentAccess({ enabled: true }).state, "enabled");
+  const connected = fs.readFileSync(target, "utf8");
+  assert.deepEqual(JSON.parse(connected).mcpServers, {
+    powercontext: powerContext,
+    t3_hub: { command: f.routerBin, args: ["--memory-only"] },
+  });
+  assert.equal(access.setAgentAccess({ enabled: false }).state, "disabled");
+  const response = routerRequest(f, ["--memory-only"], { jsonrpc: "2.0", id: 1, method: "tools/list" });
+  assert.deepEqual(response.result.tools.map((tool) => tool.name).sort(), ["memory_status", "plan_update"]);
+  assert.equal(fs.readFileSync(target, "utf8"), connected);
+  assert.equal(access.setAgentAccess({ enabled: true }).state, "enabled");
+  assert.equal(fs.readFileSync(target, "utf8"), connected);
+});
+
 test("Magpie-managed Codex is reported pending and never rewritten by Hub setup", (t) => {
   const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
   settings(f, {}, { fallbackModelSelection: { instanceId: "codex" } });
@@ -191,7 +217,7 @@ test("persisted opt-in watches T3 provider settings once and stops watching afte
   assert.equal(access.setup().enabled, true);
   assert.equal(access.startWatching().started, true);
   settings(f, { muse: { driver: "muse", enabled: true } });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(await waitFor(() => Boolean(JSON.parse(fs.readFileSync(museConfig, "utf8")).mcpServers.t3_hub)), true);
   assert.deepEqual(JSON.parse(fs.readFileSync(museConfig, "utf8")).mcpServers.t3_hub, { command: f.routerBin, args: ["--memory-only"] });
   assert.equal(access.setAgentAccess({ enabled: false }).state, "disabled");
   const codexConfig = path.join(f.homeDir, ".codex", "config.toml");
@@ -212,7 +238,7 @@ test("provider watcher reconnects an AGY profile that appears after the provider
   const profile = crypto.createHash("sha256").update("agyLater").digest("hex");
   const config = path.join(f.userDataDir, "providers", "antigravity", profile, "config", "mcp_config.json");
   write(config, { mcpServers: { existing: { command: "known", args: [] } } });
-  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.equal(await waitFor(() => Boolean(JSON.parse(fs.readFileSync(config, "utf8")).mcpServers.t3_hub)), true);
   assert.deepEqual(JSON.parse(fs.readFileSync(config, "utf8")).mcpServers.t3_hub, { command: f.routerBin, args: ["--memory-only"] });
 });
 

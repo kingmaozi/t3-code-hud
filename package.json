@@ -1,6 +1,6 @@
 {
   "name": "t3-code-hud",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Non-invasive real-time telemetry HUD, subagent billion-token & cost tracker, true context ring, quota monitor, and interactive Git Graph drawer for T3 Code.",
   "license": "MIT",
   "bin": {

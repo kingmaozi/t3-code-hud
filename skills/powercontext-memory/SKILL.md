@@ -22,7 +22,7 @@ If the status is disabled, unbound, ambiguous, or belongs to another project, do
 When MCP is unavailable, the installed CLI can resolve the same T3 project from its actual workspace or worktree directory:
 
 ```bash
-node ~/.t3/bin/pc-lite.mjs recall --query "本轮任务或排障关键词"
+node ~/.t3/hub/bin/pc-lite.mjs recall --query "本轮任务或排障关键词"
 ```
 
 ## Save verified findings
@@ -44,9 +44,9 @@ Use `scope: "worktree"` only for a finding specific to the current worktree. `sh
 CLI alternatives from that project's directory:
 
 ```bash
-node ~/.t3/bin/pc-lite.mjs experience \
+node ~/.t3/hub/bin/pc-lite.mjs experience \
   --cue "触发关键词" --symptom "表面现象" --situation "触发条件" \
   --action "已验证修复" --outcome "实际结果" \
   --condition "验证方法" --lesson "可复用结论"
-node ~/.t3/bin/pc-lite.mjs rule --kind constraint --text "已确认的项目约束"
+node ~/.t3/hub/bin/pc-lite.mjs rule --kind constraint --text "已确认的项目约束"
 ```
