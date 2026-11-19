@@ -8,12 +8,68 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
 fi
 
 TMP_CLONE=""
+TMP_RENDERER=""
+TMP_LAUNCHER=""
+INSTALL_LOCK="$HOME/.t3/hud-install.lock"
+INSTALL_LOCK_ACQUIRED=0
+INSTALL_OWNER=""
 cleanup() {
-  if [[ -n "$TMP_CLONE" && -d "$TMP_CLONE" ]]; then
-    rm -rf "$TMP_CLONE"
+  local temp_dir
+  for temp_dir in "$TMP_LAUNCHER" "$TMP_RENDERER" "$TMP_CLONE"; do
+    if [[ -n "$temp_dir" ]]; then rm -rf -- "$temp_dir" || true; fi
+  done
+  if [[ "$INSTALL_LOCK_ACQUIRED" == 1 ]] &&
+     { [[ -z "$INSTALL_OWNER" ]] || rm -- "$INSTALL_OWNER" 2>/dev/null; }; then
+    rmdir "$INSTALL_LOCK" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+is_live_pid() {
+  kill -0 "$1" 2>/dev/null || ps -p "$1" -o pid= >/dev/null 2>&1
+}
+
+acquire_install_lock() {
+  local owner deadline=$((SECONDS + 20))
+  mkdir -p "$HOME/.t3"
+  until mkdir -m 700 "$INSTALL_LOCK" 2>/dev/null; do
+    if [[ -d "$INSTALL_LOCK" && ! -L "$INSTALL_LOCK" ]]; then
+      for owner in "$INSTALL_LOCK"/owner-*; do
+        # A failed unlink means another waiter already claimed that stale marker.
+        if [[ -f "$owner" && ! -L "$owner" && "${owner##*/}" =~ ^owner-([1-9][0-9]*)\.[A-Za-z0-9]{6}$ ]] &&
+           ! is_live_pid "${BASH_REMATCH[1]}" && rm -- "$owner" 2>/dev/null; then
+          rmdir "$INSTALL_LOCK" 2>/dev/null || true
+          break
+        fi
+      done
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "[t3-hud] Timed out waiting for the HUD install lock at $INSTALL_LOCK." >&2
+      return 1
+    fi
+    sleep 0.25
+  done
+  INSTALL_LOCK_ACQUIRED=1
+  INSTALL_OWNER="$(mktemp "$INSTALL_LOCK/owner-$$.XXXXXX")"
+}
+
+check_update_lock() {
+  local owner
+  if [[ -e "$RUN_DIR/hud-update-pending.json" || -L "$RUN_DIR/hud-update-pending.json" ]]; then
+    echo "[t3-hud] An interrupted HUD update needs recovery. Run the update from the HUD before reinstalling." >&2
+    return 1
+  fi
+  for owner in "$RUN_DIR/hud-update.lock"/owner-*; do
+    if [[ -f "$owner" && "${owner##*/}" =~ ^owner-([1-9][0-9]*)-[a-f0-9-]{36}$ ]] &&
+       is_live_pid "${BASH_REMATCH[1]}"; then
+      echo "[t3-hud] A HUD update is running. Try installing again after it finishes." >&2
+      return 1
+    fi
+  done
+}
 
 if [[ -z "$SCRIPT_DIR" || ! -d "$SCRIPT_DIR/src" ]]; then
   echo "[t3-hud] 正在拉取最新 t3-code-hud 仓库..."
@@ -32,6 +88,8 @@ DEST_DIR="$HOME/.t3/hud-plugin"
 BIN_DIR="$HOME/.t3/bin"
 RUN_DIR="$DEST_DIR/run"
 CONFIG_FILE="$DEST_DIR/config.json"
+acquire_install_lock
+check_update_lock
 mkdir -p "$BIN_DIR"
 
 if [[ -L "$DEST_DIR" ]]; then
@@ -39,13 +97,15 @@ if [[ -L "$DEST_DIR" ]]; then
 fi
 mkdir -p "$DEST_DIR"
 
-cp "$SCRIPT_DIR/src/"*.cjs "$SCRIPT_DIR/src/"*.js "$SCRIPT_DIR/src/"*.py "$DEST_DIR/" 2>/dev/null || \
+cp "$SCRIPT_DIR/src/"*.cjs "$SCRIPT_DIR/src/"*.py "$SCRIPT_DIR/src/hub-drawer-ui.js" "$DEST_DIR/" 2>/dev/null || \
 cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/main-hook.cjs" \
    "$SCRIPT_DIR/src/preload-bridge.cjs" \
    "$SCRIPT_DIR/src/bootstrap.cjs" \
    "$SCRIPT_DIR/src/hud-health.cjs" \
-   "$SCRIPT_DIR/src/renderer-ui.js" \
+   "$SCRIPT_DIR/src/hud-release.cjs" \
+   "$SCRIPT_DIR/src/hub-update.cjs" \
+   "$SCRIPT_DIR/src/hub-drawer-ui.js" \
    "$DEST_DIR/"
 
 # Ensure sidecar modules present (explicit list for older clones)
@@ -946,24 +1006,6 @@ T3_EMBED_PLIST_PY_EOF
 fi
 # T3_EMBED_LAUNCHD_UPGRADE_END
 
-# CSP-free embedded bundle: base + drawer in the same executeJavaScript payload,
-# so renderer-ui never needs (0, eval) which script-src blocks in t3code://app.
-if [[ -f "$DEST_DIR/renderer-ui.js" && -f "$DEST_DIR/hub-drawer-ui.js" ]]; then
-  {
-    printf 'window.__t3HudReleaseVersion = "%s";\n' "$hud_release_version"
-    cat "$DEST_DIR/renderer-ui.js"
-  } > "$DEST_DIR/renderer-base.js"
-  {
-    printf 'window.__t3HubDrawerEmbedded = true;\n'
-    cat "$DEST_DIR/renderer-base.js"
-    printf '\n'
-    printf ';/* __T3_HUB_DRAWER_EMBED_START__ */\n'
-    cat "$DEST_DIR/hub-drawer-ui.js"
-    printf '\n/* __T3_HUB_DRAWER_EMBED_END__ */\n'
-  } > "$DEST_DIR/renderer-ui.js"
-  chmod 0600 "$DEST_DIR/renderer-ui.js" "$DEST_DIR/renderer-base.js" 2>/dev/null || true
-fi
-
 # Remove symlink hijack at BIN_DIR before copy: previous installs may have
 # left ~/.t3/bin/t3-hud as a symlink to ~/.t3/userdata/attachments/... .
 # cp to a symlink would follow it and update the stale userdata copy, leaving
@@ -1014,6 +1056,37 @@ if [[ -z "$JS_RUNNER" ]] && command -v node >/dev/null 2>&1; then
   JS_RUNNER="$(command -v node)"
 fi
 
+# Keep the release stamp in independent metadata so a later raw base copy
+# cannot erase it. Stage the complete bundle before exposing it to a live T3.
+# Embedding the drawer keeps it in the same CSP-safe executeJavaScript payload.
+TMP_RENDERER="$(mktemp -d "$DEST_DIR/.t3-hud-renderer.XXXXXX")"
+cp "$SCRIPT_DIR/src/renderer-ui.js" "$TMP_RENDERER/renderer-base.js"
+printf '{"version":"%s"}\n' "$hud_release_version" > "$TMP_RENDERER/hud-release.json"
+if [[ -n "$JS_RUNNER" ]]; then
+  env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" -e '
+    const fs = require("node:fs"), path = require("node:path");
+    const [pluginDir, stageDir, version] = process.argv.slice(1);
+    const { assembleRenderer } = require(path.resolve(pluginDir, "hud-release.cjs"));
+    const base = fs.readFileSync(path.join(stageDir, "renderer-base.js"), "utf8");
+    const drawer = fs.readFileSync(path.join(pluginDir, "hub-drawer-ui.js"), "utf8");
+    process.stdout.write(assembleRenderer(base, drawer, { version }));
+  ' "$DEST_DIR" "$TMP_RENDERER" "$hud_release_version" > "$TMP_RENDERER/renderer-ui.js"
+else
+  # Allow installation before either T3 Code or Node is available. Both files
+  # come straight from the source tree, so there are no old headers to remove.
+  {
+    printf 'window.__t3HubDrawerEmbedded = true;\nwindow.__t3HudReleaseVersion = "%s";\n' "$hud_release_version"
+    cat "$TMP_RENDERER/renderer-base.js"
+    printf '\n;/* __T3_HUB_DRAWER_EMBED_START__ */\n'
+    cat "$DEST_DIR/hub-drawer-ui.js"
+    printf '\n/* __T3_HUB_DRAWER_EMBED_END__ */\n'
+  } > "$TMP_RENDERER/renderer-ui.js"
+fi
+chmod 0600 "$TMP_RENDERER/renderer-ui.js" "$TMP_RENDERER/renderer-base.js" "$TMP_RENDERER/hud-release.json"
+for renderer_file in renderer-base.js hud-release.json renderer-ui.js; do
+  mv -f "$TMP_RENDERER/$renderer_file" "$DEST_DIR/$renderer_file"
+done
+
 # Install only a new skill or the exact known legacy template; preserve custom
 # instructions and symlinks. This does not start a host, model, or MCP process.
 if [[ -n "$JS_RUNNER" && -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
@@ -1037,7 +1110,8 @@ mkdir -p "$APP_WRAPPER/Contents/MacOS" "$APP_WRAPPER/Contents/Resources"
 
 LAUNCHER_BIN="$APP_WRAPPER/Contents/MacOS/T3 Code HUD"
 if command -v clang >/dev/null 2>&1; then
-  LAUNCHER_SRC="$(mktemp /tmp/t3-hud-launcher.XXXXXX.c)"
+  TMP_LAUNCHER="$(mktemp -d "${TMPDIR:-/tmp}/t3-hud-launcher.XXXXXX")"
+  LAUNCHER_SRC="$TMP_LAUNCHER/launcher.c"
   cat > "$LAUNCHER_SRC" <<'EOF'
 #include <unistd.h>
 #include <stdint.h>
@@ -1053,9 +1127,9 @@ int main(void) {
   return 1;
 }
 EOF
-  if clang -arch arm64 -arch x86_64 -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
+  if TMPDIR="$TMP_LAUNCHER" clang -arch arm64 -arch x86_64 -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
     : # universal Mach-O launcher ready
-  elif clang -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
+  elif TMPDIR="$TMP_LAUNCHER" clang -O2 -o "$LAUNCHER_BIN" "$LAUNCHER_SRC" >/dev/null 2>&1; then
     : # single-arch fallback ready
   else
     cat > "$LAUNCHER_BIN" <<'EOF2'
@@ -1063,7 +1137,6 @@ EOF
 exec "$HOME/.t3/bin/t3-hud" start
 EOF2
   fi
-  rm -f "$LAUNCHER_SRC"
 else
   cat > "$LAUNCHER_BIN" <<'EOF'
 #!/usr/bin/env bash

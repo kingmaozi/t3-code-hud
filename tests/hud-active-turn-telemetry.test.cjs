@@ -713,6 +713,69 @@ test("local context follows the active provider thread, then report time", () =>
   }
 });
 
+test("local Codex context follows the active session's usage events instead of sibling file mtimes", () => {
+  const id = "thread:codex-active-native-context";
+  const provider = "codex";
+  const reportMs = Date.parse("2026-11-16T12:00:00Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  const stamp = reportMs.toString(16).padStart(12, "0");
+  const activeNativeId = `${stamp.slice(0, 8)}-${stamp.slice(8)}-7000-8000-000000001101`;
+  const oldNativeId = `${stamp.slice(0, 8)}-${stamp.slice(8)}-7000-8000-000000001102`;
+  const missingNativeId = `${stamp.slice(0, 8)}-${stamp.slice(8)}-7000-8000-000000001103`;
+  const sessionDir = path.join(process.env.CODEX_HOME, "sessions", "2026", "11", "16");
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const activeFile = path.join(sessionDir, `rollout-${activeNativeId}.jsonl`);
+  const oldFile = path.join(sessionDir, `rollout-${oldNativeId}.jsonl`);
+  const nativeRecords = (ms, used, max, cached) => [
+    { timestamp: iso(ms - 1), type: "event_msg", payload: { type: "token_count", info: { model_context_window: max } } },
+    { timestamp: iso(ms), type: "token_usage_record", payload: { usage: { input_tokens: used - 100, cached_input_tokens: cached, output_tokens: 100 } } },
+  ].map(JSON.stringify).join("\n") + "\n";
+  const setMtime = (file, ms) => fs.utimesSync(file, new Date(ms), new Date(ms));
+  fs.writeFileSync(oldFile, nativeRecords(reportMs - 60000, 99000, 200000, 1000));
+  fs.writeFileSync(activeFile, nativeRecords(reportMs - 1000, 20000, 300000, 2000));
+  setMtime(oldFile, reportMs + 60000);
+  setMtime(activeFile, reportMs + 1000);
+
+  const db = regressionDb(id, provider);
+  const threadPayload = (activeProviderThreadId) => JSON.stringify({ activeProviderThreadId, modelSelection: { provider, model: "fixture" } });
+  const providerPayload = (nativeId, usedTokens, maxTokens) => JSON.stringify({ nativeThreadRef: { nativeId }, contextUsage: { usedTokens, maxTokens } });
+  db.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?").run(threadPayload("active"), id);
+  const insert = db.prepare("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?,?,?,?,?)");
+  insert.run("active", id, provider, iso(reportMs), providerPayload(activeNativeId, 24000, 400000));
+  insert.run("old", id, provider, iso(reportMs - 60000), providerPayload(oldNativeId, 99000, 200000));
+  db.close();
+
+  const expectContext = (used, max, cached) => {
+    const stats = backend.getThreadStats(id);
+    assert.equal(stats.ok, true, stats.error);
+    assert.equal(stats.telemetrySource, "native");
+    assert.equal(stats.tokens.contextUsed, used);
+    assert.equal(stats.tokens.contextMax, max);
+    assert.equal(stats.tokens.contextMaxSource, "reported");
+    assert.equal(stats.cache.mainCachedTokens, cached, "both sessions still contribute historical cache");
+    return stats;
+  };
+  assert.equal(expectContext(24000, 400000, 3000).tokens.mainTotal, 119000);
+
+  fs.appendFileSync(activeFile, nativeRecords(reportMs + 2000, 30000, 420000, 3000));
+  setMtime(activeFile, reportMs - 100);
+  assert.equal(expectContext(30000, 420000, 6000).tokens.mainTotal, 149000);
+
+  const updatedDb = new DatabaseSync(path.join(process.env.T3CODE_HOME, "statev2.sqlite"));
+  updatedDb.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?").run(threadPayload(undefined), id);
+  assert.equal(expectContext(30000, 420000, 6000).tokens.mainTotal, 149000);
+
+  updatedDb.prepare("UPDATE orchestration_v2_projection_threads SET payload_json=? WHERE thread_id=?").run(threadPayload("active"), id);
+  fs.appendFileSync(oldFile, nativeRecords(reportMs + 3000, 99000, 200000, 4000));
+  setMtime(oldFile, reportMs + 60000);
+  assert.equal(expectContext(30000, 420000, 10000).tokens.mainTotal, 248000);
+
+  updatedDb.prepare("UPDATE orchestration_v2_projection_provider_threads SET payload_json=? WHERE provider_thread_id=?")
+    .run(providerPayload(missingNativeId, 24000, 400000), "active");
+  updatedDb.close();
+  assert.equal(expectContext(24000, 400000, 5000).tokens.mainTotal, 198000);
+});
+
 test("R54: new turn start cannot refresh a prior turn's two native calls or its 90% per-call cache", async (t) => {
   const varint = value => {
     let n = BigInt(value); const bytes = [];

@@ -36,4 +36,8 @@ node --test tests/hub-autodream-runtime.test.cjs
 
 实现代码和安装中的副本分开存在。若获准窄范围热更新，先确认正在运行的是哪个 T3 主 PID 和 Hub sidecar，再逐个备份目标、只复制所属模块、核对源码/目标 SHA-256；`src/renderer-ui.js` 的安装基底是 `~/.t3/hud-plugin/renderer-base.js`，随后需使用受支持的 `t3-hud reload` 重新组装当前 renderer。最后分别查看 `t3-hud status`、per-PID RPC 的 mounted/window mounted 与实际界面。不要把热更新写成重启；不要结束仍在处理任务的 sidecar 或 ACP 子进程。
 
+`~/.t3/hud-plugin/hud-release.json` 记录安装版本，取值来自发布源码的 `package.json`。维护时可将 `src/renderer-ui.js` 原样复制为 `renderer-base.js`。`t3-hud reload` 会读取安装版本并将其与 drawer 一起写入完整的 `renderer-ui.js`。发布升级时需要配套更新版本记录、`hud-release.cjs` 和安装的 `t3-hud`。尚无版本记录的旧安装会沿用原有 bundle 里的有效版本章。
+
+界面里的检查更新只查询本仓库的正式发布。对于只改动热加载模块的兼容版本，从待发布提交运行 `node scripts/build-hud-update.cjs /path/to/t3-hub-update.json`，将产物随正式版上传。热更新包覆盖遥测后端、渲染基底和更新组件。启动器、drawer、独立后台或安装配置有改动且依赖新版时，使用发布页的安装流程。
+
 没有用户明确授权时，不重启 T3、不改 AGY、不做真实模型请求、不更新账号认证、不安装未经审查的文件。回滚只恢复此次备份且经确认归属本次改动的文件。
