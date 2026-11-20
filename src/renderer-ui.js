@@ -3363,6 +3363,15 @@
     };
   }
 
+  function findHudLayoutAnchors(header, composer, footer) {
+    // T3 v0.1.11 translates the control labels. The icon and chevron survive a language change.
+    const title = header?.querySelector("[data-thread-title-chevron]")?.closest('button[aria-haspopup="menu"]') ||
+      header?.querySelector('[aria-label^="Thread actions for"], h1, h2');
+    const attach = (footer || composer)?.querySelector("svg.lucide-paperclip")?.closest("button") ||
+      composer?.querySelector('button[aria-label="Attach files"]');
+    return { title, attach };
+  }
+
   // Anchor to the native title/composer controls without altering them.
   function updateLayoutPosition() {
     if (document.hidden) return;
@@ -3383,10 +3392,9 @@
     if (!syncUiVisibility()) return;
 
     setComposerTopSpacing(null);
-    const title = header?.querySelector('[aria-label^="Thread actions for"], h1, h2');
-    const attach = composer?.querySelector('button[aria-label="Attach files"]');
     const model = composer?.querySelector('[data-chat-provider-model-picker]');
     const footer = composer?.querySelector('[data-chat-composer-footer="true"]');
+    const { title, attach } = findHudLayoutAnchors(header, composer, footer);
     const hRect = visibleHudRect(header), titleRect = visibleHudRect(title);
     const modelRect = visibleHudRect(model), attachRect = visibleHudRect(attach);
     const headerObstacles = [...(header?.querySelectorAll('button, [role="button"]') || [])]

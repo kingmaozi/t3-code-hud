@@ -13,6 +13,7 @@ function chunk(start, end) {
 const layoutContext = vm.createContext({});
 vm.runInContext(`${chunk("hudFreeIntervals", "visibleHudRect")}\nthis.layout=calculateHudLayout;`, layoutContext);
 const layout = value => JSON.parse(JSON.stringify(layoutContext.layout(value)));
+const findAnchors = vm.runInNewContext(`${chunk("findHudLayoutAnchors", "updateLayoutPosition")}\nfindHudLayoutAnchors`, {});
 const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
 const base = {
   header: rect(277, 0, 1083, 52), title: rect(350, 15, 260, 22),
@@ -20,6 +21,26 @@ const base = {
   attach: rect(314, 905, 28, 28), model: rect(820, 905, 136, 28),
   footerObstacles: [rect(960, 905, 28, 28)], viewportWidth: 1360,
 };
+test("T3 v0.1.11 uses the full localized title button and native attachment icon as layout anchors", () => {
+  const title = { label: "示例会话 的会话操作" };
+  const attach = { label: "添加附件" };
+  const scope = nodes => ({ querySelector: selector => nodes[selector] ?? null });
+  const header = scope({
+    "[data-thread-title-chevron]": { closest: selector => selector === 'button[aria-haspopup="menu"]' ? title : null },
+  });
+  const footer = scope({ "svg.lucide-paperclip": { closest: selector => selector === "button" ? attach : null } });
+  const anchors = findAnchors(header, scope({}), footer);
+  assert.equal(anchors.title, title);
+  assert.equal(anchors.attach, attach);
+  assert.ok(layout({ ...base, title: anchors.title && base.title, attach: anchors.attach && base.attach }).stats);
+});
+test("keeps the English attachment and title selectors for older T3 markup", () => {
+  const header = { querySelector: selector => selector.includes("Thread actions for") ? base.title : null };
+  const composer = { querySelector: selector => selector === 'button[aria-label="Attach files"]' ? base.attach : null };
+  const anchors = findAnchors(header, composer, null);
+  assert.equal(anchors.title, base.title);
+  assert.equal(anchors.attach, base.attach);
+});
 test("desktop positions quota and graph by title and telemetry between attachment and model", () => {
   const out = layout(base);
   assert.ok(out.header && out.context && out.stats);
