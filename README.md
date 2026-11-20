@@ -168,6 +168,8 @@ See [`src/main-hook.cjs`](src/main-hook.cjs), [`src/bootstrap.cjs`](src/bootstra
 
 `start` never restarts an existing unmounted T3. Use `restart` only when active tasks can be interrupted. `status` checks the recorded PID against the authenticated loopback RPC; installing files alone does not activate the current window. Launch from **T3 Code HUD.app** for future sessions. Opening the original app directly does not load the HUD.
 
+T3 Code v0.1.11 translates native controls. HUD v1.0.10 locates the attachment and title buttons through their UI structure, so the statistics strip remains available in localized desktops. If the T3 updater opens a new unmounted process, reopen through **T3 Code HUD.app** once your tasks can be interrupted.
+
 For the macOS ARM64 Antigravity wrapper shutdown issue, the optional `scripts/agy-acp-wrapper-install.py` installs the canonical sibling wrapper, with backups. Run with `--check` first. It requires an executable Homebrew Python at `/opt/homebrew/bin/python3`. It does not change provider settings or restart existing processes. Newly spawned wrappers use the repaired code; already-running wrappers keep their previous code. Keep any existing custom wrapper backup for rollback.
 
 Runtime RPC records are now stored per process (`run/rpc-<pid>.json`). Legacy `rpc.json` is accepted for explicit hot reload only; its older status response cannot prove window readiness, so `status` remains unconfirmed until a restart loads the new hook.
