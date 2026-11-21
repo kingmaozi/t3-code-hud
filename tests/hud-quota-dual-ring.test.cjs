@@ -114,3 +114,87 @@ test("burn rate only estimates after >=5 min span and positive delta, and flags 
   assert.equal(reset.justReset, true);
   assert.equal(reset.burnShort, null);
 });
+
+test("single-ring quota popover card renders only that ring's own windows with outer/inner labels and preserves Muse window duration", () => {
+  const ctx = vm.createContext({
+    escapeHtml: (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;"),
+    hudLang: "zh",
+  });
+  vm.runInContext(
+    `${sliceBetween("  function renderQuotaRingCardHtml(", "  function renderQuotaRingPopover(")}\nthis.card = renderQuotaRingCardHtml;`,
+    ctx
+  );
+
+  const claudeHtml = ctx.card({
+    instanceId: "antigravity:claude",
+    providerInstanceId: "antigravity",
+    driver: "antigravity-claude",
+    logoKey: "antigravity-claude",
+    name: "AGY · Claude",
+    weekly: { remainingPct: 42, tone: "mid", reset: "4d 6h", burnShort: "~14.5h", justReset: false },
+    fiveHour: { remainingPct: 31, tone: "err", reset: "2h 18m", burnShort: "~1.2h", justReset: false },
+  });
+  assert.match(claudeHtml, /Antigravity · Claude \/ 3P/);
+  assert.match(claudeHtml, /双标独立池/);
+  assert.match(claudeHtml, /周额度（外圈）/);
+  assert.match(claudeHtml, /5 小时（内圈）/);
+  assert.match(claudeHtml, /42%/);
+  assert.match(claudeHtml, /31%/);
+  assert.match(claudeHtml, /偏快 · 约 1\.2h 触顶/);
+  assert.match(claudeHtml, /4d 6h 重置/);
+  assert.doesNotMatch(claudeHtml, /Codex|Muse|HUD 版本/);
+
+  const museHtml = ctx.card({
+    instanceId: "muse",
+    driver: "muse",
+    name: "Muse",
+    weekly: { remainingPct: 35, tone: "mid", reset: "35h", burnShort: null, justReset: false },
+    fiveHour: { label: "Session", windowDurationMins: 180, remainingPct: 98, tone: "ok", reset: "8m", burnShort: null, justReset: false },
+  });
+  assert.match(museHtml, /3 小时（内圈）/, "Preserves Muse reported window duration");
+});
+
+test("OpenCode Go uses geometric square-frame logo and Devin non-weekly/ACU windows are retained instead of dropped", () => {
+  const ctx = vm.createContext({
+    readLiveT3State: () => ctx.live,
+    formatResetShort: (v) => v || null,
+    escapeHtml: (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;"),
+    hudLang: "zh",
+  });
+  vm.runInContext(
+    `${sliceBetween("  const quotaBurnSamples = new Map();", "  function formatContextPair(")}\n` +
+    `${sliceBetween("  const HUD_PROVIDER_LOGOS = ", "  let lastQuotaRingsSig = ")}\n` +
+    `this.compute = computeQuotaAndContext; this.markup = hudQuotaRingMarkup;`,
+    ctx
+  );
+
+  ctx.live = {
+    selectedProvider: "opencode",
+    selectedModel: "opencode-go/beam-free",
+    usage: {
+      providers: [
+        {
+          instanceId: "opencode-go",
+          driver: "opencode",
+          usageLimits: { windows: [{ id: "wk", kind: "weekly", label: "Weekly", usedPercent: 20, resetsAt: "3d" }] },
+        },
+        {
+          instanceId: "acpRegistry_devin",
+          driver: "acpRegistry",
+          usageLimits: { windows: [{ id: "acu", kind: "monthly", label: "Monthly ACUs", windowDurationMins: 43200, usedPercent: 30, resetsAt: "18d" }] },
+        },
+      ],
+    },
+  };
+
+  const out = JSON.parse(JSON.stringify(ctx.compute({ ok: true, provider: "opencode", tokens: {}, cache: {} })));
+  assert.equal(out.providerQuotas.length, 2, "Both OpenCode Go and Devin non-weekly window must appear");
+  const oc = out.providerQuotas.find((p) => p.instanceId === "opencode-go");
+  const devin = out.providerQuotas.find((p) => p.instanceId === "acpRegistry_devin");
+  assert.equal(oc.logoKey, "opencode");
+  assert.equal(devin.logoKey, "devin");
+  assert.equal(devin.name, "Devin");
+  assert.equal(devin.weekly.remainingPct, 70);
+  assert.match(ctx.markup(oc), /fill-opacity="0\.3"/, "OpenCode Go uses geometric frame logo SVG");
+  assert.match(ctx.markup(devin), /#0ea5e9/, "Devin uses dedicated Devin logo SVG");
+});

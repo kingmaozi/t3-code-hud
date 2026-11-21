@@ -1899,6 +1899,23 @@
     .t3-hud-provider-logo.is-dual { width: 15px; height: 15px; }
     .t3-hud-provider-logo svg { width: 100%; height: 100%; }
     .t3-hud-quota-ring .quota-arc { transition: stroke-dashoffset .25s ease; }
+    .t3-qcard-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+    .t3-qcard-title { font-size: 13px; font-weight: 650; color: var(--hud-fg); letter-spacing: -0.01em; }
+    .t3-qcard-badge { flex: none; padding: 2px 8px; border-radius: 999px; background: color-mix(in srgb, var(--hud-fg) 7%, transparent); color: var(--hud-muted); font-size: 10.5px; font-weight: 500; }
+    .t3-qcard-win { margin-bottom: 12px; }
+    .t3-qcard-win:last-child { margin-bottom: 0; }
+    .t3-qcard-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+    .t3-qcard-lbl { color: var(--hud-fg); font-weight: 500; }
+    .t3-qcard-pct { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 12.5px; }
+    .t3-qcard-pct.ok { color: #10a37f; }
+    .t3-qcard-pct.mid { color: #d97706; }
+    .t3-qcard-pct.err { color: #dc2626; }
+    .t3-qcard-track { height: 5px; border-radius: 999px; background: color-mix(in srgb, var(--hud-fg) 10%, transparent); overflow: hidden; }
+    .t3-qcard-fill { height: 100%; border-radius: 999px; transition: width .22s ease; }
+    .t3-qcard-fill.ok { background: #10a37f; }
+    .t3-qcard-fill.mid { background: #d97706; }
+    .t3-qcard-fill.err { background: #dc2626; }
+    .t3-qcard-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 11px; color: var(--hud-muted); font-variant-numeric: tabular-nums; }
     #t3-hud-topbar.is-hidden {
       display: none !important;
     }
@@ -2792,6 +2809,7 @@
   let customDrawerPos = null;
   let spacedComposerStack = null;
   let currentPopoverMode = "stats";
+  let currentPopoverProvider = null;
   let popoverHideTimer = null;
   let hudUpdateState = {};
 
@@ -3734,12 +3752,40 @@
 
     const otherWindows = [];
     const providerQuotas = [];
-    const provDisplayName = { muse: "Muse", codex: "Codex", openai: "Codex", antigravity: "AGY", claudeagent: "Claude", claude: "Claude" };
+    const provDisplayName = {
+      muse: "Muse",
+      codex: "Codex",
+      openai: "Codex",
+      antigravity: "AGY",
+      claudeagent: "Claude",
+      claude: "Claude",
+      opencode: "OpenCode",
+      "opencode-go": "OpenCode Go",
+      devin: "Devin",
+      acpregistry_devin: "Devin",
+    };
+    const resolveLogoKey = (instanceId, driver) => {
+      const idLow = String(instanceId || "").toLowerCase();
+      const drvLow = String(driver || "").toLowerCase();
+      if (idLow.includes("opencode") || drvLow.includes("opencode")) return "opencode";
+      if (idLow.includes("devin") || drvLow.includes("devin")) return "devin";
+      return drvLow || idLow;
+    };
+    const resolveDisplayName = (instanceId, driver) => {
+      const idLow = String(instanceId || "").toLowerCase();
+      const drvLow = String(driver || "").toLowerCase();
+      if (provDisplayName[idLow]) return provDisplayName[idLow];
+      if (idLow.includes("opencode-go") || idLow.includes("opencode_go")) return "OpenCode Go";
+      if (idLow.includes("opencode") || drvLow === "opencode") return "OpenCode";
+      if (idLow.includes("devin") || drvLow.includes("devin")) return "Devin";
+      return provDisplayName[drvLow] || instanceId || "Provider";
+    };
     for (const p of live.providers) {
       if (!p.usageLimits?.windows?.length) continue;
       const instanceId = String(p.instanceId || p.driver || "");
       const driver = String(p.driver || p.instanceId || "").toLowerCase();
-      const pName = provDisplayName[driver] || provDisplayName[instanceId.toLowerCase()] || instanceId || "Provider";
+      const pName = resolveDisplayName(instanceId, driver);
+      const logoKey = resolveLogoKey(instanceId, driver);
       const scopeKey = instanceId.toLowerCase() || driver;
       const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w, "", scopeKey)).filter(Boolean);
       if (driver === "antigravity") {
@@ -3772,9 +3818,19 @@
           });
         }
       } else {
-        const weekly = p === activeProv ? primaryWeekly : windows.find(isWeeklyWindow) || null;
-        const fiveHour = selectHudFiveHourWindow(windows);
-        if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, name: pName, weekly, fiveHour });
+        let weekly = p === activeProv ? primaryWeekly : windows.find(isWeeklyWindow) || null;
+        let fiveHour = selectHudFiveHourWindow(windows);
+        if (!weekly && !fiveHour && windows.length) {
+          const isExplicitBudgetWindow = (w) =>
+            ["monthly", "daily", "credits", "acu"].includes(String(w.kind || "").toLowerCase()) ||
+            /monthly|month|daily|acu|credit|月/i.test(`${w.id || ""} ${w.label || ""}`);
+          const budgetWindows = windows
+            .filter(isExplicitBudgetWindow)
+            .sort((a, b) => (Number(b.windowDurationMins) || 0) - (Number(a.windowDurationMins) || 0));
+          weekly = budgetWindows[0] || null;
+          fiveHour = budgetWindows[1] || null;
+        }
+        if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, logoKey, name: pName, weekly, fiveHour });
       }
       if (p !== activeProv) {
         for (const w of p.usageLimits.windows) {
@@ -4143,11 +4199,109 @@
     });
   }
 
-  function showPopoverAbove(anchorEl, mode) {
+  function renderQuotaRingCardHtml(provider) {
+    if (!provider) {
+      return `<div class="t3-qcard-hdr"><span class="t3-qcard-title">${escapeHtml(hudLang === "zh" ? "引擎额度" : "Provider Quota")}</span></div><div style="color:var(--hud-muted);font-size:11px">${escapeHtml(hudLang === "zh" ? "暂无额度数据" : "No quota data yet")}</div>`;
+    }
+    const isDualClaude = provider.logoKey === "antigravity-claude" || provider.driver === "antigravity-claude";
+    const isAgyGemini = provider.instanceId === `${provider.providerInstanceId || "antigravity"}:gemini`;
+    const title = isDualClaude
+      ? "Antigravity · Claude / 3P"
+      : isAgyGemini
+        ? "Antigravity · Gemini"
+        : (provider.name || provider.instanceId || "Quota");
+    const badge = isDualClaude
+      ? (hudLang === "zh" ? "双标独立池" : "Dual Pool")
+      : isAgyGemini
+        ? (hudLang === "zh" ? "Gemini 独立池" : "Gemini Pool")
+        : (provider.weekly && provider.fiveHour
+            ? (hudLang === "zh" ? "双环额度" : "Dual Ring")
+            : (hudLang === "zh" ? "额度" : "Quota"));
+
+    const outerLabelFor = (q) => {
+      const raw = String(q.label || "").trim();
+      if (!raw || q.kind === "weekly" || /weekly|周/i.test(raw)) {
+        return hudLang === "zh" ? "周额度（外圈）" : "Weekly (outer)";
+      }
+      return hudLang === "zh" ? `${raw}（外圈）` : `${raw} (outer)`;
+    };
+
+    const innerLabelFor = (q) => {
+      if (provider.driver === "muse" || (q.kind !== "fiveHour" && !/5\s*[-_ ]?\s*h|five\s*[-_ ]?\s*hour/i.test(String(q.label || "")))) {
+        const mins = Number(q.windowDurationMins);
+        if (Number.isFinite(mins) && mins > 0) {
+          const hrs = mins % 60 === 0 ? `${mins / 60}` : (mins / 60).toFixed(1);
+          return hudLang === "zh" ? `${hrs} 小时（内圈）` : `${hrs}h (inner)`;
+        }
+        const raw = String(q.label || "").trim();
+        if (raw) return hudLang === "zh" ? `${raw}（内圈）` : `${raw} (inner)`;
+      }
+      return hudLang === "zh" ? "5 小时（内圈）" : "5-hour (inner)";
+    };
+
+    const renderWin = (q, label) => {
+      const pct = Math.max(0, Math.min(100, Math.round(Number(q.remainingPct) || 0)));
+      const tone = q.tone === "err" ? "err" : q.tone === "mid" ? "mid" : "ok";
+      let leftMeta = "";
+      if (q.justReset) {
+        leftMeta = hudLang === "zh" ? "已重置" : "Just reset";
+      } else if (q.burnShort) {
+        const dur = String(q.burnShort).replace(/^~/, "");
+        leftMeta = hudLang === "zh"
+          ? (tone === "err" ? `偏快 · 约 ${dur} 触顶` : `约 ${dur} 用完`)
+          : (tone === "err" ? `Fast · ~${dur} to cap` : `~${dur} left`);
+      }
+      const rightMeta = q.reset
+        ? (hudLang === "zh" ? `${q.reset} 重置` : `Resets in ${q.reset}`)
+        : "";
+      const metaRow = (leftMeta || rightMeta)
+        ? `<div class="t3-qcard-meta"><span>${escapeHtml(leftMeta)}</span><span>${escapeHtml(rightMeta)}</span></div>`
+        : "";
+      return `
+        <div class="t3-qcard-win">
+          <div class="t3-qcard-row">
+            <span class="t3-qcard-lbl">${escapeHtml(label)}</span>
+            <span class="t3-qcard-pct ${tone}">${pct}%</span>
+          </div>
+          <div class="t3-qcard-track"><div class="t3-qcard-fill ${tone}" style="width:${pct}%"></div></div>
+          ${metaRow}
+        </div>
+      `;
+    };
+
+    const sections = [];
+    if (provider.weekly) {
+      sections.push(renderWin(provider.weekly, outerLabelFor(provider.weekly)));
+    }
+    if (provider.fiveHour) {
+      sections.push(renderWin(provider.fiveHour, innerLabelFor(provider.fiveHour)));
+    }
+    return `
+      <div class="t3-qcard-hdr">
+        <span class="t3-qcard-title">${escapeHtml(title)}</span>
+        <span class="t3-qcard-badge">${escapeHtml(badge)}</span>
+      </div>
+      ${sections.length ? sections.join("") : `<div style="color:var(--hud-muted);font-size:11px">${escapeHtml(hudLang === "zh" ? "暂无额度数据" : "No quota data yet")}</div>`}
+    `;
+  }
+
+  function renderQuotaRingPopover(providerId) {
+    popover.style.width = "276px";
+    const qInfo = computeQuotaAndContext(latestStats);
+    const list = Array.isArray(qInfo.providerQuotas) ? qInfo.providerQuotas : [];
+    const target = list.find((p) => p.instanceId === providerId)
+      || list.find((p) => p.providerInstanceId === providerId)
+      || null;
+    popover.innerHTML = renderQuotaRingCardHtml(target);
+  }
+
+  function showPopoverAbove(anchorEl, mode, providerId = null) {
     currentPopoverMode = mode;
+    currentPopoverProvider = mode === "quota" ? providerId : null;
     if (mode === "context") renderContextRingPopover();
+    else if (mode === "quota") renderQuotaRingPopover(providerId);
     else renderStatsPopover();
-    const popW = mode === "context" ? 268 : 324;
+    const popW = mode === "context" ? 268 : mode === "quota" ? 276 : 324;
     const anchorRect = anchorEl.getBoundingClientRect();
     const centerX = anchorRect.left + anchorRect.width / 2;
     const leftPos = Math.max(12, Math.min(window.innerWidth - popW - 14, Math.round(centerX - popW / 2)));
@@ -4191,7 +4345,7 @@
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (!button || button.contains(event.relatedTarget)) return;
     clearTimeout(popoverHideTimer);
-    showPopoverAbove(button, "stats");
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   quotaRings.addEventListener("mouseout", (event) => {
     const button = event.target.closest?.(".t3-hud-quota-ring");
@@ -4201,11 +4355,17 @@
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (!button) return;
     clearTimeout(popoverHideTimer);
-    showPopoverAbove(button, "stats");
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   quotaRings.addEventListener("focusout", (event) => {
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (button && !button.contains(event.relatedTarget)) hidePopoverDelayed();
+  });
+  quotaRings.addEventListener("click", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (!button) return;
+    clearTimeout(popoverHideTimer);
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   popover.addEventListener("mouseenter", () => clearTimeout(popoverHideTimer));
   popover.addEventListener("mouseleave", () => hidePopoverDelayed());
@@ -4225,9 +4385,16 @@
 
   const HUD_CLAUDE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><g transform=\"translate(12 12)\" stroke=\"#d97757\" stroke-width=\"2.1\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-7.5\" x2=\"0\" y2=\"7.5\"/><line x1=\"-7.5\" y1=\"0\" x2=\"7.5\" y2=\"0\"/><line x1=\"-5.3\" y1=\"-5.3\" x2=\"5.3\" y2=\"5.3\"/><line x1=\"-5.3\" y1=\"5.3\" x2=\"5.3\" y2=\"-5.3\"/></g></svg>";
   const HUD_AGY_CLAUDE_DUAL_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><defs><linearGradient id=\"t3-agy-dual\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0%\" stop-color=\"#ea4335\"/><stop offset=\"48%\" stop-color=\"#fbbc05\"/><stop offset=\"100%\" stop-color=\"#4285f4\"/></linearGradient></defs><path d=\"M2.4 14.8C5.1 13.8 6.9 4.8 8.9 4.8s3.3 9 5.6 10\" stroke=\"url(#t3-agy-dual)\" stroke-width=\"2.5\" stroke-linecap=\"round\"/><circle cx=\"15.8\" cy=\"14.8\" r=\"5.8\" fill=\"var(--hud-bg, #ffffff)\"/><g transform=\"translate(15.8 14.8)\" stroke=\"#d97757\" stroke-width=\"1.7\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-4.4\" x2=\"0\" y2=\"4.4\"/><line x1=\"-4.4\" y1=\"0\" x2=\"4.4\" y2=\"0\"/><line x1=\"-3.1\" y1=\"-3.1\" x2=\"3.1\" y2=\"3.1\"/><line x1=\"-3.1\" y1=\"3.1\" x2=\"3.1\" y2=\"-3.1\"/></g></svg>";
+  const HUD_OPENCODE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M4.5 2h15v20h-15V2zm3.8 3.8v12.4h7.4V5.8H8.3z\" fill=\"currentColor\"/><rect x=\"8.3\" y=\"11.4\" width=\"7.4\" height=\"6.8\" fill=\"currentColor\" fill-opacity=\"0.3\"/></svg>";
+  const HUD_DEVIN_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"M5.5 4.5h6.2c4.4 0 7.3 3 7.3 7.5s-2.9 7.5-7.3 7.5H5.5V4.5zm3.4 3.1v8.8h2.7c2.4 0 4-1.7 4-4.4s-1.6-4.4-4-4.4H8.9z\" fill=\"#0ea5e9\"/></svg>";
   HUD_PROVIDER_LOGOS.claude = HUD_CLAUDE_LOGO;
   HUD_PROVIDER_LOGOS.claudeagent = HUD_CLAUDE_LOGO;
   HUD_PROVIDER_LOGOS["antigravity-claude"] = HUD_AGY_CLAUDE_DUAL_LOGO;
+  HUD_PROVIDER_LOGOS.opencode = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS["opencode-go"] = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS.opencodego = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS.devin = HUD_DEVIN_LOGO;
+  HUD_PROVIDER_LOGOS.acpregistry_devin = HUD_DEVIN_LOGO;
 
   function hudQuotaRingMarkup(provider) {
     const description = (quota, label) => quota && `${label}: ${quota.remainingPct}% ${hudLang === "zh" ? "剩余" : "remaining"}${quota.reset ? ` · ${quota.reset}` : ""}`;
@@ -4383,7 +4550,11 @@
     }
 
     updateLayoutPosition();
-    refreshHudStatsPopover(popover, currentPopoverMode, document.activeElement, renderStatsPopover);
+    if (popover.classList.contains("visible") && currentPopoverMode === "quota" && currentPopoverProvider) {
+      renderQuotaRingPopover(currentPopoverProvider);
+    } else {
+      refreshHudStatsPopover(popover, currentPopoverMode, document.activeElement, renderStatsPopover);
+    }
   }
 
   function graphLaneCount(maxLanes) {

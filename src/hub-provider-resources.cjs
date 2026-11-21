@@ -16,9 +16,63 @@ const PROVIDERS = [
   { id: "antigravity", label: "Antigravity" },
   { id: "claude", label: "Claude Code" },
   { id: "muse", label: "Muse" },
+  { id: "opencode", label: "OpenCode" },
+  { id: "devin", label: "Devin" },
 ];
 
 const DISABLED_SKILLS_DIRNAME = ".disabled-skills";
+
+function redactSummary(raw) {
+  return String(raw || "")
+    .replace(/(\/\/)[^@\s/:]+:[^@\s/]+@/g, "$1***:***@")
+    .replace(/(--?(?:api[-_]?key|token|secret|password)[=\s]+)([^\s"']+)/gi, "$1***")
+    .replace(/\b((?:sk|ctx7sk|ghp|gho|Bearer)[-_A-Za-z0-9]{10,})\b/g, "***")
+    .slice(0, 90);
+}
+
+function stripJsonc(raw) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') { inStr = true; out += ch; i += 1; continue; }
+    if (ch === "/" && next === "/") {
+      while (i < raw.length && raw[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < raw.length && !(raw[i] === "*" && raw[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
+function readJsoncSafe(p) {
+  const text = readTextIfFile(p);
+  if (text == null) return null;
+  try {
+    const obj = JSON.parse(stripJsonc(text));
+    return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
+  } catch {
+    return null;
+  }
+}
 
 function safeStat(p) {
   try { return fs.statSync(p); } catch { return null; }
@@ -135,7 +189,7 @@ function parseTomlTables(text, prefix) {
     for (let j = sec.start + 1; j < sec.end; j++) {
       const um = lines[j].match(/^\s*(?:url|command)\s*=\s*"([^"]+)"/);
       if (um) {
-        summary = um[1].replace(/(\/\/)[^@\s/:]+:[^@\s/]+@/g, "$1***:***@").slice(0, 90);
+        summary = redactSummary(um[1]);
         break;
       }
     }
@@ -166,7 +220,16 @@ function toggleTomlTableEnabled(filePath, prefix, key, nextEnabled) {
   return { ok: true, enabled: Boolean(nextEnabled) };
 }
 
-function discoverProviderPaths(homeDir) {
+function discoverProviderPaths(homeDir, opts = {}) {
+  const defaultHome = os.homedir();
+  const xdgConfig = opts.xdgConfigHome
+    || (path.resolve(homeDir) === path.resolve(defaultHome) && process.env.XDG_CONFIG_HOME
+      ? path.resolve(process.env.XDG_CONFIG_HOME)
+      : path.join(homeDir, ".config"));
+  const xdgData = opts.xdgDataHome
+    || (path.resolve(homeDir) === path.resolve(defaultHome) && process.env.XDG_DATA_HOME
+      ? path.resolve(process.env.XDG_DATA_HOME)
+      : path.join(homeDir, ".local", "share"));
   const t3Providers = path.join(homeDir, ".t3", "userdata", "providers");
   const t3Instances = (driver) => listSubdirs(path.join(t3Providers, driver)).map((d) => d.fullPath);
 
@@ -188,23 +251,74 @@ function discoverProviderPaths(homeDir) {
   agyMcpFiles.push(path.join(homeDir, ".gemini", "antigravity", "mcp_config.json"));
   agySkillDirs.push(path.join(homeDir, ".gemini", "antigravity", "skills"));
 
-  // Claude Code: ~/.claude.json + ~/.claude/settings.json + ~/.claude/skills
-  const claudeMcpFiles = [path.join(homeDir, ".claude.json"), path.join(homeDir, ".claude", "settings.json")];
+  // Claude Code: ~/.claude/mcp.json + ~/.claude.json + ~/.claude/settings.json + ~/.claude/skills
+  const claudeMcpFiles = [
+    path.join(homeDir, ".claude", "mcp.json"),
+    path.join(homeDir, ".claude.json"),
+    path.join(homeDir, ".claude", "settings.json"),
+  ];
   const claudeSettingsFiles = [path.join(homeDir, ".claude", "settings.json")];
   const claudeSkillDirs = [path.join(homeDir, ".claude", "skills")];
   for (const inst of t3Instances("claudeAgent")) {
-    claudeMcpFiles.push(path.join(inst, ".claude.json"), path.join(inst, "settings.json"));
+    claudeMcpFiles.push(path.join(inst, "mcp.json"), path.join(inst, ".claude.json"), path.join(inst, "settings.json"));
     claudeSettingsFiles.push(path.join(inst, "settings.json"));
     claudeSkillDirs.push(path.join(inst, "skills"));
   }
 
-  // Muse: ~/.muse + T3 muse instances
-  const museMcpFiles = [path.join(homeDir, ".muse", "mcp.json"), path.join(homeDir, ".muse", "settings.json")];
-  const museSkillDirs = [path.join(homeDir, ".muse", "skills")];
+  // Muse Code: XDG ~/.config/muse + ~/.local/share/muse/plugins + shared ~/.agents/skills + legacy ~/.muse + T3 muse instances
+  const museMcpFiles = [
+    path.join(xdgConfig, "muse", "settings.json"),
+    path.join(xdgConfig, "muse", "mcp.json"),
+    path.join(homeDir, ".muse", "mcp.json"),
+    path.join(homeDir, ".muse", "settings.json"),
+  ];
+  const museSkillDirs = [
+    path.join(xdgConfig, "muse", "skills"),
+    path.join(homeDir, ".agents", "skills"),
+    path.join(homeDir, ".muse", "skills"),
+  ];
+  const musePluginFiles = [
+    path.join(xdgData, "muse", "plugins", "installed.json"),
+    path.join(homeDir, ".muse", "plugins", "installed.json"),
+  ];
   for (const inst of t3Instances("muse")) {
-    museMcpFiles.push(path.join(inst, "mcp.json"), path.join(inst, "settings.json"));
+    museMcpFiles.push(path.join(inst, "settings.json"), path.join(inst, "mcp.json"));
     museSkillDirs.push(path.join(inst, "skills"));
+    musePluginFiles.push(path.join(inst, "plugins", "installed.json"));
   }
+
+  // OpenCode: XDG ~/.config/opencode + ~/.opencode
+  const opencodeConfigFiles = [
+    path.join(xdgConfig, "opencode", "opencode.json"),
+    path.join(xdgConfig, "opencode", "opencode.jsonc"),
+    path.join(homeDir, ".opencode", "opencode.json"),
+  ];
+  const opencodeSkillDirs = [
+    path.join(xdgConfig, "opencode", "skills"),
+    path.join(homeDir, ".opencode", "skills"),
+  ];
+
+  // Devin: XDG ~/.config/devin + ~/.local/share/devin + shared ~/.agents/skills
+  const devinMcpFiles = [
+    path.join(xdgConfig, "devin", "mcp_config.json"),
+    path.join(homeDir, ".devin", "mcp_config.json"),
+  ];
+  const devinSkillDirs = [
+    path.join(xdgConfig, "devin", "skills"),
+    path.join(homeDir, ".devin", "skills"),
+    path.join(xdgData, "devin", "skills"),
+    path.join(homeDir, ".agents", "skills"),
+  ];
+  const devinReadonlySkillDirs = [];
+  const devinPluginCacheRoot = path.join(xdgData, "devin", "cli", "plugins", "cache");
+  for (const pkgDir of listSubdirs(devinPluginCacheRoot)) {
+    for (const verDir of listSubdirs(pkgDir.fullPath)) {
+      devinReadonlySkillDirs.push(path.join(verDir.fullPath, "skills"));
+    }
+  }
+  const devinPluginFiles = [
+    path.join(xdgData, "devin", "cli", "plugins", "lock.json"),
+  ];
 
   const dedupeExisting = (arr, isDir = false) => {
     const seen = new Set();
@@ -224,7 +338,9 @@ function discoverProviderPaths(homeDir) {
     codex: { tomls: dedupeExisting(codexTomls, false), skillDirs: dedupeExisting(codexSkillDirs, true) },
     antigravity: { mcpFiles: dedupeExisting(agyMcpFiles, false), skillDirs: dedupeExisting(agySkillDirs, true) },
     claude: { mcpFiles: dedupeExisting(claudeMcpFiles, false), settingsFiles: dedupeExisting(claudeSettingsFiles, false), skillDirs: dedupeExisting(claudeSkillDirs, true) },
-    muse: { mcpFiles: dedupeExisting(museMcpFiles, false), skillDirs: dedupeExisting(museSkillDirs, true) },
+    muse: { mcpFiles: dedupeExisting(museMcpFiles, false), skillDirs: dedupeExisting(museSkillDirs, true), pluginFiles: dedupeExisting(musePluginFiles, false) },
+    opencode: { configFiles: dedupeExisting(opencodeConfigFiles, false), skillDirs: dedupeExisting(opencodeSkillDirs, true) },
+    devin: { mcpFiles: dedupeExisting(devinMcpFiles, false), skillDirs: dedupeExisting(devinSkillDirs, true), readonlySkillDirs: dedupeExisting(devinReadonlySkillDirs, true), pluginFiles: dedupeExisting(devinPluginFiles, false) },
   };
 }
 
@@ -289,8 +405,8 @@ function collectJsonMcpServers(files, providerId) {
       seen.add(dedupeKey);
       const enabled = cfg.disabled === true || cfg.enabled === false || disabledSet.has(name) ? false : true;
       const summary = typeof cfg.url === "string"
-        ? cfg.url.replace(/(\/\/)[^@\s/:]+:[^@\s/]+@/g, "$1***:***@").slice(0, 90)
-        : [cfg.command, ...(Array.isArray(cfg.args) ? cfg.args.slice(0, 2) : [])].filter(Boolean).join(" ").slice(0, 90);
+        ? redactSummary(cfg.url)
+        : redactSummary([cfg.command, ...(Array.isArray(cfg.args) ? cfg.args.slice(0, 2) : [])].filter(Boolean).join(" "));
       items.push({
         id: name,
         name,
@@ -306,9 +422,10 @@ function collectJsonMcpServers(files, providerId) {
   return items;
 }
 
-function createProviderResourcesManager({ homeDir = os.homedir() } = {}) {
+function createProviderResourcesManager({ homeDir = os.homedir(), xdgConfigHome, xdgDataHome } = {}) {
+  const pathOpts = { xdgConfigHome, xdgDataHome };
   function listProviderResources() {
-    const paths = discoverProviderPaths(homeDir);
+    const paths = discoverProviderPaths(homeDir, pathOpts);
     const result = {};
 
     // Codex
@@ -367,12 +484,133 @@ function createProviderResourcesManager({ homeDir = os.homedir() } = {}) {
     };
 
     // Muse
+    const musePlugins = [];
+    const seenMusePlugins = new Set();
+    for (const file of paths.muse.pluginFiles || []) {
+      const obj = readJsonSafe(file);
+      const map = obj?.plugins && typeof obj.plugins === "object" && !Array.isArray(obj.plugins) ? obj.plugins : null;
+      if (!map) continue;
+      for (const [key, entry] of Object.entries(map)) {
+        if (!entry || typeof entry !== "object") continue;
+        const dedupeKey = `${file}::${key}`;
+        if (seenMusePlugins.has(dedupeKey)) continue;
+        seenMusePlugins.add(dedupeKey);
+        const name = typeof entry.display_name === "string" && entry.display_name.trim() ? entry.display_name.trim() : key;
+        const desc = typeof entry.description === "string" && entry.description.trim()
+          ? entry.description.trim().slice(0, 140)
+          : (entry.version ? `v${entry.version}` : "");
+        musePlugins.push({
+          id: key,
+          name,
+          description: desc,
+          enabled: entry.enabled !== false,
+          provider: "muse",
+          kind: "plugins",
+          sourceFile: file,
+        });
+      }
+    }
+    musePlugins.sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.name.localeCompare(b.name));
     result.muse = {
       id: "muse",
       label: "Muse",
       mcp: collectJsonMcpServers(paths.muse.mcpFiles, "muse"),
       skills: collectSkillsForDirs(paths.muse.skillDirs, "muse"),
-      plugins: [],
+      plugins: musePlugins,
+    };
+
+    // OpenCode
+    const opencodeMcp = [];
+    const opencodePlugins = [];
+    const seenOcMcp = new Set();
+    const seenOcPlug = new Set();
+    for (const file of paths.opencode.configFiles || []) {
+      const obj = file.endsWith(".jsonc") ? readJsoncSafe(file) : readJsonSafe(file);
+      if (!obj) continue;
+      const mcpMap = obj.mcp && typeof obj.mcp === "object" && !Array.isArray(obj.mcp) ? obj.mcp : null;
+      if (mcpMap) {
+        for (const [name, cfg] of Object.entries(mcpMap)) {
+          if (!cfg || typeof cfg !== "object") continue;
+          const k = `${file}::${name}`;
+          if (seenOcMcp.has(k)) continue;
+          seenOcMcp.add(k);
+          const cmdStr = Array.isArray(cfg.command) ? cfg.command.join(" ") : (typeof cfg.command === "string" ? cfg.command : "");
+          const summary = typeof cfg.url === "string" ? redactSummary(cfg.url) : redactSummary(cmdStr);
+          opencodeMcp.push({
+            id: name,
+            name,
+            description: summary,
+            enabled: cfg.enabled !== false && cfg.disabled !== true,
+            readonly: file.endsWith(".jsonc"),
+            provider: "opencode",
+            kind: "mcp",
+            sourceFile: file,
+          });
+        }
+      }
+      const plugArr = Array.isArray(obj.plugin) ? obj.plugin : (Array.isArray(obj.plugins) ? obj.plugins : []);
+      for (const rawEntry of plugArr) {
+        const entryStr = typeof rawEntry === "string" ? rawEntry.trim() : "";
+        if (!entryStr || seenOcPlug.has(entryStr)) continue;
+        seenOcPlug.add(entryStr);
+        const shortName = entryStr.split("@")[0] || entryStr;
+        const sourceDesc = entryStr.includes("@") ? entryStr.slice(shortName.length + 1) : "";
+        opencodePlugins.push({
+          id: entryStr,
+          name: shortName,
+          description: redactSummary(sourceDesc),
+          enabled: true,
+          readonly: true,
+          provider: "opencode",
+          kind: "plugins",
+          sourceFile: file,
+        });
+      }
+    }
+    opencodeMcp.sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.name.localeCompare(b.name));
+    opencodePlugins.sort((a, b) => a.name.localeCompare(b.name));
+    result.opencode = {
+      id: "opencode",
+      label: "OpenCode",
+      mcp: opencodeMcp,
+      skills: collectSkillsForDirs(paths.opencode.skillDirs, "opencode"),
+      plugins: opencodePlugins,
+    };
+
+    // Devin
+    const devinPlugins = [];
+    const seenDevinPlug = new Set();
+    for (const file of paths.devin.pluginFiles || []) {
+      const obj = readJsonSafe(file);
+      const resolved = Array.isArray(obj?.resolved) ? obj.resolved : [];
+      for (const item of resolved) {
+        const name = typeof item?.name === "string" ? item.name.trim() : "";
+        if (!name || seenDevinPlug.has(name)) continue;
+        seenDevinPlug.add(name);
+        const desc = [item?.spec?.source, item?.version_dir ? `v${item.version_dir}` : ""].filter(Boolean).join(" · ");
+        devinPlugins.push({
+          id: name,
+          name,
+          description: desc,
+          enabled: true,
+          readonly: true,
+          provider: "devin",
+          kind: "plugins",
+          sourceFile: file,
+        });
+      }
+    }
+    const devinSkills = [
+      ...collectSkillsForDirs(paths.devin.skillDirs, "devin"),
+      ...collectSkillsForDirs(paths.devin.readonlySkillDirs || [], "devin").map((s) => ({ ...s, readonly: true })),
+    ];
+    devinSkills.sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.name.localeCompare(b.name));
+    result.devin = {
+      id: "devin",
+      label: "Devin",
+      mcp: collectJsonMcpServers(paths.devin.mcpFiles, "devin"),
+      skills: devinSkills,
+      plugins: devinPlugins,
     };
 
     return {
@@ -396,7 +634,7 @@ function createProviderResourcesManager({ homeDir = os.homedir() } = {}) {
     if (!["mcp", "skills", "plugins"].includes(kind)) throw new Error("不支持的资源类型: " + kind);
     if (!id || id.includes("\0") || id.includes("..")) throw new Error("无效的资源标识");
 
-    const paths = discoverProviderPaths(homeDir);
+    const paths = discoverProviderPaths(homeDir, pathOpts);
 
     if (kind === "skills") {
       if (id.includes("/") || id.includes("\\")) throw new Error("无效的技能名称");
@@ -432,6 +670,19 @@ function createProviderResourcesManager({ homeDir = os.homedir() } = {}) {
       return toggleTomlTableEnabled(targetFile, prefix, id, enabled);
     }
 
+    if (kind === "mcp" && provider === "opencode") {
+      const allowedFiles = (paths.opencode.configFiles || []).filter((f) => f.endsWith(".json"));
+      const requestedFile = payload.sourceFile ? path.resolve(payload.sourceFile) : null;
+      const targetFile = requestedFile ? allowedFiles.find((f) => f === requestedFile) : allowedFiles[0];
+      if (!targetFile) throw new Error("OpenCode JSONC 暂仅支持只读查看，请直接编辑 opencode.json");
+      const obj = readJsonSafe(targetFile);
+      if (!obj || !obj.mcp || !obj.mcp[id] || typeof obj.mcp[id] !== "object") throw new Error(`未找到 MCP 条目: ${id}`);
+      const next = { ...obj, mcp: { ...obj.mcp, [id]: { ...obj.mcp[id], enabled } } };
+      if (enabled) delete next.mcp[id].disabled;
+      writeTextAtomic(targetFile, JSON.stringify(next, null, 2) + "\n");
+      return { ok: true, enabled };
+    }
+
     if (kind === "mcp") {
       const allowedFiles = paths[provider]?.mcpFiles || [];
       const requestedFile = payload.sourceFile ? path.resolve(payload.sourceFile) : null;
@@ -461,6 +712,20 @@ function createProviderResourcesManager({ homeDir = os.homedir() } = {}) {
       const obj = readJsonSafe(targetFile);
       if (!obj || !obj.enabledPlugins || !(id in obj.enabledPlugins)) throw new Error(`未找到插件条目: ${id}`);
       const next = { ...obj, enabledPlugins: { ...obj.enabledPlugins, [id]: enabled } };
+      writeTextAtomic(targetFile, JSON.stringify(next, null, 2) + "\n");
+      return { ok: true, enabled };
+    }
+
+    if (kind === "plugins" && provider === "muse") {
+      const allowedFiles = paths.muse.pluginFiles || [];
+      const requestedFile = payload.sourceFile ? path.resolve(payload.sourceFile) : null;
+      const targetFile = requestedFile ? allowedFiles.find((f) => f === requestedFile) : allowedFiles[0];
+      if (!targetFile) throw new Error("未找到 Muse 插件配置文件");
+      const obj = readJsonSafe(targetFile);
+      if (!obj || !obj.plugins || !obj.plugins[id] || typeof obj.plugins[id] !== "object") {
+        throw new Error(`未找到插件条目: ${id}`);
+      }
+      const next = { ...obj, plugins: { ...obj.plugins, [id]: { ...obj.plugins[id], enabled } } };
       writeTextAtomic(targetFile, JSON.stringify(next, null, 2) + "\n");
       return { ok: true, enabled };
     }

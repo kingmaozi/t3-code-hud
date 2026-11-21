@@ -100,8 +100,8 @@ function createUiHarness(rpcHandler) {
   return { ui, storage, nodes, settingsPanel, artifactDock, settingsHandle, content };
 }
 
-test("Memory drawer mounts #t3-hub-engine with model selector and download controls", () => {
-  const { ui, content, nodes } = createUiHarness(async () => ({ ok: true }));
+test("Memory settings migrate into Settings panel while Memory drawer stays clean with shortcut", () => {
+  const { ui, content, nodes, settingsPanel } = createUiHarness(async () => ({ ok: true }));
   ui.cache.embed = {
     running: true,
     ready: true,
@@ -115,7 +115,12 @@ test("Memory drawer mounts #t3-hub-engine with model selector and download contr
     ],
   };
   ui.renderMemory();
-  assert.match(content.innerHTML, /id="t3-hub-engine"/);
+  assert.match(content.innerHTML, /data-action="open-hub-memory-settings"/, "Memory drawer provides quick shortcut to Settings");
+  assert.doesNotMatch(content.innerHTML, /id="t3-hub-engine"/, "Vector engine settings moved out of Memory drawer into Settings");
+  assert.match(drawerSource, /id="t3-hub-settings-memory-pane"[\s\S]*id="t3-hub-engine"/, "Settings panel hosts memory & vector settings");
+  assert.match(drawerSource, /class="hub-memory-combo"[\s\S]*id="t3-hub-memory-handle"[\s\S]*id="t3-hub-memory-toggle"/, "Memory and on/off toggle joined in one combo pill");
+  ui.setHubSettingsOpen(true, "memory");
+  assert.equal(settingsPanel.querySelector("#t3-hub-settings-memory-pane").hidden, false);
   const engineHtml = nodes.get("#t3-hub-engine").innerHTML;
   assert.match(engineHtml, /name="embed-model"/);
   assert.match(engineHtml, /data-action="switch-embed"/);
@@ -151,11 +156,14 @@ test("Settings panel lazily loads standalone provider resources & guardian with 
   await new Promise((r) => setImmediate(r));
   assert.ok(calls.some((c) => c.action === "providerResources:list"));
   assert.ok(calls.some((c) => c.action === "guardian:status"));
-  assert.match(settingsPanel.innerHTML, /T3 Hub 设置/);
-  assert.match(settingsPanel.innerHTML, /右侧圆弧产物悬浮窗/);
-  assert.match(settingsPanel.innerHTML, /T3 升级自动防掉线守护/);
-  assert.match(settingsPanel.innerHTML, /codegraph/);
-  assert.doesNotMatch(settingsPanel.innerHTML, /magpie/i, "Settings UI must be 100% Magpie-free");
+  const chromeHtml = settingsPanel.querySelector("#t3-hub-settings-chrome").innerHTML;
+  const generalHtml = settingsPanel.querySelector("#t3-hub-settings-general-pane").innerHTML;
+  assert.match(chromeHtml, /T3 Hub 设置/);
+  assert.match(chromeHtml, /记忆与向量/);
+  assert.match(generalHtml, /右侧圆弧产物悬浮窗/);
+  assert.match(generalHtml, /T3 升级自动防掉线守护/);
+  assert.match(generalHtml, /codegraph/);
+  assert.doesNotMatch(chromeHtml + generalHtml, /magpie/i, "Settings UI must be 100% Magpie-free");
 });
 
 test("Right-edge curved artifact dock expands, lists apps, previews escaped Markdown, and respects Settings toggle", async () => {

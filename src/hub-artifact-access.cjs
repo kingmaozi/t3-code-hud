@@ -160,7 +160,7 @@ function assertArtifactIdentity(identity, file) {
     if (!identity || JSON.stringify(captureArtifactIdentity(identity.root, file, identity.anchor || null)) !== JSON.stringify(identity)) throw new Error("changed");
   } catch { throw new Error("产物会话或文件实体已变化，请刷新产物列表后重试"); }
 }
-async function revealWithIdentity(identity, target, validate, open, homeDir) {
+async function revealWithIdentity(identity, target, validate, open, homeDir, { relaxAncestorCtime = false } = {}) {
   // Bind the whole chain from the trusted home anchor through provider/root
   // parents, every session directory and the leaf, then pin Finder's reveal
   // target to an APFS/CoreFoundation inode fileReferenceURL (file:///.file/id=...)
@@ -172,7 +172,8 @@ async function revealWithIdentity(identity, target, validate, open, homeDir) {
   const held = [];
   const changed = () => new Error("产物会话或文件实体已变化，请刷新产物列表后重试");
   const same = (entry, stat) => !stat.isSymbolicLink() && stat.isDirectory() === entry.directory &&
-    (entry.directory || stat.isFile()) && stat.dev === entry.dev && stat.ino === entry.ino && stat.ctimeNs === entry.ctimeNs;
+    (entry.directory || stat.isFile()) && stat.dev === entry.dev && stat.ino === entry.ino &&
+    (relaxAncestorCtime && entry.directory ? true : stat.ctimeNs === entry.ctimeNs);
   try {
     const entries = paths.map((file, index) => {
       const stat = fs.lstatSync(file, { bigint: true });
@@ -204,7 +205,7 @@ async function revealWithIdentity(identity, target, validate, open, homeDir) {
       directory: leafHeld.entry.directory,
       fileReferenceUrl,
     });
-    recheck();
+    if (!relaxAncestorCtime) recheck();
   } finally {
     for (const { fd } of held.reverse()) { try { fs.closeSync(fd); } catch {} }
   }
@@ -292,13 +293,16 @@ async function openOnDesktop(mode, target, pinned) {
     throw new Error("无法安全绑定产物实体，请刷新后重试");
   }
   if (mode === "open-default") {
-    await new Promise((resolve, reject) => execFile("/usr/bin/open", ["-u", refUrl], (error) => error ? reject(error) : resolve()));
+    // Use the inode-verified POSIX path with `--` so both native Cocoa and
+    // Electron apps (MarkText, VS Code, Cursor, etc.) open the file reliably;
+    // Electron apps silently drop `file:///.file/id=...` URLs passed via `-u`.
+    await new Promise((resolve, reject) => execFile("/usr/bin/open", ["--", target], (error) => error ? reject(error) : resolve()));
     return;
   }
   if (mode === "open-with") {
     const appPath = pinned?.appPath;
     if (typeof appPath !== "string" || !appPath) throw new Error("缺少目标应用路径");
-    await new Promise((resolve, reject) => execFile("/usr/bin/open", ["-a", appPath, "-u", refUrl], (error) => error ? reject(error) : resolve()));
+    await new Promise((resolve, reject) => execFile("/usr/bin/open", ["-a", appPath, "--", target], (error) => error ? reject(error) : resolve()));
     return;
   }
   // Pass only the inode-pinned fileReferenceURL (-u) with -R so Finder neither
@@ -348,7 +352,7 @@ function createArtifactAccess({ board, homeDir = os.homedir(), open = openOnDesk
       let apps = [];
       await revealWithIdentity(identity, actual, validate, async (_m, _t, pinned) => {
         apps = await listApps(pinned?.fileReferenceUrl, homeDir);
-      }, homeDir);
+      }, homeDir, { relaxAncestorCtime: true });
       return { ok: true, kind: "apps", path: absolute, isExecutable: isDangerousExecutable(actual, stat), apps: Array.isArray(apps) ? apps : [] };
     }
 
@@ -359,7 +363,7 @@ function createArtifactAccess({ board, homeDir = os.homedir(), open = openOnDesk
         await revealWithIdentity(identity, actual, validate, async (_m, targetPath, pinned) => {
           if (degradeToEditor) await open("open-with", targetPath, { ...pinned, appPath: textEdit });
           else await open("reveal", targetPath, pinned);
-        }, homeDir);
+        }, homeDir, { relaxAncestorCtime: true });
         return {
           ok: true,
           kind: stat.isDirectory() ? "revealed" : "safe-degraded",
@@ -370,7 +374,7 @@ function createArtifactAccess({ board, homeDir = os.homedir(), open = openOnDesk
       }
       await revealWithIdentity(identity, actual, validate, async (_m, targetPath, pinned) => {
         await open("open-default", targetPath, pinned);
-      }, homeDir);
+      }, homeDir, { relaxAncestorCtime: true });
       return { ok: true, kind: "opened", path: absolute };
     }
 
@@ -385,7 +389,7 @@ function createArtifactAccess({ board, homeDir = os.homedir(), open = openOnDesk
       }
       await revealWithIdentity(identity, actual, validate, async (_m, targetPath, pinned) => {
         await open("open-with", targetPath, { ...pinned, appPath: verifiedApp });
-      }, homeDir);
+      }, homeDir, { relaxAncestorCtime: true });
       return { ok: true, kind: "opened-with", path: absolute, appPath: verifiedApp, appName: path.basename(verifiedApp, ".app") };
     }
 
