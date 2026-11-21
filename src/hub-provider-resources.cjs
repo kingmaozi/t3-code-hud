@@ -644,21 +644,61 @@ function createProviderResourcesManager({ homeDir = os.homedir(), xdgConfigHome,
         return safeLstat(path.join(d, id)) || safeLstat(path.join(d, DISABLED_SKILLS_DIRNAME, id));
       });
       if (!targetDir) throw new Error("未找到该提供方的技能目录或条目");
-      const activePath = path.join(targetDir, id);
-      const disabledRoot = path.join(targetDir, DISABLED_SKILLS_DIRNAME);
-      const disabledPath = path.join(disabledRoot, id);
-      if (enabled) {
-        if (safeLstat(activePath)) return { ok: true, enabled: true };
-        if (!safeLstat(disabledPath)) throw new Error("未找到已停用的技能目录");
-        fs.renameSync(disabledPath, activePath);
-        return { ok: true, enabled: true };
-      } else {
-        if (safeLstat(disabledPath)) return { ok: true, enabled: false };
-        if (!safeLstat(activePath)) throw new Error("未找到该技能目录");
-        fs.mkdirSync(disabledRoot, { recursive: true, mode: 0o700 });
-        fs.renameSync(activePath, disabledPath);
-        return { ok: true, enabled: false };
+
+      const toggleSkillInDir = (dir) => {
+        const activePath = path.join(dir, id);
+        const disabledRoot = path.join(dir, DISABLED_SKILLS_DIRNAME);
+        const disabledPath = path.join(disabledRoot, id);
+        if (enabled) {
+          if (safeLstat(activePath)) return true;
+          if (!safeLstat(disabledPath)) return false;
+          fs.renameSync(disabledPath, activePath);
+          return true;
+        } else {
+          if (safeLstat(disabledPath)) return true;
+          if (!safeLstat(activePath)) return false;
+          fs.mkdirSync(disabledRoot, { recursive: true, mode: 0o700 });
+          fs.renameSync(activePath, disabledPath);
+          return true;
+        }
+      };
+
+      const toggledPrimary = toggleSkillInDir(targetDir);
+      if (!toggledPrimary) {
+        throw new Error(enabled ? "未找到已停用的技能目录" : "未找到该技能目录");
       }
+
+      if (payload.syncAllProviders !== true) {
+        return { ok: true, enabled };
+      }
+
+      const dirToProviders = new Map();
+      for (const p of PROVIDERS) {
+        for (const dir of paths[p.id]?.skillDirs || []) {
+          const resolvedDir = path.resolve(dir);
+          if (!dirToProviders.has(resolvedDir)) dirToProviders.set(resolvedDir, []);
+          dirToProviders.get(resolvedDir).push(p.label);
+        }
+      }
+
+      const syncedSet = new Set();
+      const primaryMeta = PROVIDERS.find((p) => p.id === provider);
+      if (primaryMeta) syncedSet.add(primaryMeta.label);
+      for (const lbl of dirToProviders.get(path.resolve(targetDir)) || []) syncedSet.add(lbl);
+
+      for (const [resolvedDir, labels] of dirToProviders.entries()) {
+        if (resolvedDir === path.resolve(targetDir)) continue;
+        const hasSkill = Boolean(
+          safeLstat(path.join(resolvedDir, id)) ||
+          safeLstat(path.join(resolvedDir, DISABLED_SKILLS_DIRNAME, id))
+        );
+        if (!hasSkill) continue;
+        if (toggleSkillInDir(resolvedDir)) {
+          for (const lbl of labels) syncedSet.add(lbl);
+        }
+      }
+
+      return { ok: true, enabled, syncedProviders: [...syncedSet] };
     }
 
     if (provider === "codex") {

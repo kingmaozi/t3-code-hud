@@ -92,7 +92,7 @@ function createUiHarness(rpcHandler) {
     clearInterval() {},
     console,
   };
-  const expose = `if (opts.__testHarness) { root=opts.root; content=opts.content; drawer=root.querySelector('#drawer'); settingsHandle=root.querySelector('#t3-hub-settings-handle'); settingsPanel=root.querySelector('#t3-hub-settings-panel'); artifactDock=root.querySelector('#t3-hub-artifact-dock'); liveBoard=root.querySelector('#t3-hub-live-board'); planHandle=root.querySelector('#t3-hub-plan-handle'); contextLoading=false; return { state, cache, storage: opts.storage, settingsPanel, artifactDock, settingsHandle, content, onClick, renderMemory, renderEngine, renderArtifactDock, renderHubSettingsPanel, setHubSettingsOpen, setArtifactDockEnabled, loadProviderResources, dockToggleMenu, dockOpenDefault, dockOpenWith, dockPreviewMarkdown }; }`;
+  const expose = `if (opts.__testHarness) { root=opts.root; content=opts.content; drawer=root.querySelector('#drawer'); settingsHandle=root.querySelector('#t3-hub-settings-handle'); settingsPanel=root.querySelector('#t3-hub-settings-panel'); artifactDock=root.querySelector('#t3-hub-artifact-dock'); liveBoard=root.querySelector('#t3-hub-live-board'); planHandle=root.querySelector('#t3-hub-plan-handle'); contextLoading=false; return { state, cache, storage: opts.storage, settingsPanel, artifactDock, settingsHandle, content, onClick, renderMemory, renderMemoryAgentAccess, renderEngine, renderArtifactDock, renderHubSettingsPanel, setHubSettingsOpen, setArtifactDockEnabled, loadProviderResources, toggleProviderResourceItem, providerMemorySetupPrompt, copyProviderMemorySetupPrompt, dockToggleMenu, dockOpenDefault, dockOpenWith, dockPreviewMarkdown }; }`;
   const instrumented = drawerSource.replace("    const api = {", expose + "\n    const api = {");
   assert.notEqual(instrumented, drawerSource);
   vm.runInNewContext(instrumented, sandbox);
@@ -215,6 +215,76 @@ test("Right-edge curved artifact dock expands, lists apps, previews escaped Mark
   ui.setArtifactDockEnabled(false);
   assert.equal(artifactDock.hidden, true);
   assert.equal(storage.get("t3-hub-artifact-dock-v1"), "false");
+});
+
+test("Unsupported memory agents expose tailored setup prompts, Settings memory tab has history quickbar, and Skills sync switch passes syncAllProviders", async () => {
+  const calls = [];
+  const { ui, nodes, settingsPanel } = createUiHarness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "providerResources:toggle") return { ok: true, enabled: payload.enabled, syncedProviders: ["Codex", "OpenCode"] };
+    if (action === "providerResources:list") return { ok: true, providers: [] };
+    return { ok: true };
+  });
+
+  // 1. Unsupported agents (OpenCode / Devin) show tailored setup prompt buttons & generated prompts
+  ui.cache.agentAccess = {
+    enabled: true,
+    setupSummary: {
+      configured: 1,
+      unsupported: 2,
+      providers: [
+        { instanceId: "codex", displayName: "Codex", status: "configured" },
+        { instanceId: "opencode", displayName: "OpenCode", status: "unsupported", reason: "unsupported_driver" },
+        { instanceId: "acpRegistry_devin", displayName: "Devin", status: "unsupported", reason: "unsupported_driver" },
+      ],
+    },
+  };
+  ui.renderMemoryAgentAccess();
+  const accessHtml = nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.match(accessHtml, /data-action="copy-provider-memory-prompt"[^>]*data-provider-id="opencode"/);
+  assert.match(accessHtml, /data-action="copy-provider-memory-prompt"[^>]*data-provider-id="acpRegistry_devin"/);
+  assert.match(accessHtml, /自动写入暂不支持，可复制专属接入提示词/);
+
+  const ocPrompt = ui.providerMemorySetupPrompt("opencode", "OpenCode");
+  assert.match(ocPrompt, /~\/\.config\/opencode\/opencode\.json/);
+  assert.match(ocPrompt, /t3-mcp-router\\" --memory-only/);
+  assert.doesNotMatch(ocPrompt, /magpie/i);
+
+  const devinPrompt = ui.providerMemorySetupPrompt("acpRegistry_devin", "Devin");
+  assert.match(devinPrompt, /~\/\.config\/devin\/mcp_config\.json/);
+  assert.match(devinPrompt, /mcpServers/);
+  assert.doesNotMatch(devinPrompt, /magpie/i);
+
+  await ui.copyProviderMemorySetupPrompt("opencode", "OpenCode");
+  assert.match(nodes.get("#t3-hub-memory-access").innerHTML, /OpenCode 专属接入提示词/);
+
+  // 2. Settings -> Memory tab shows quickbar to Memory Workspace & local folder
+  ui.setHubSettingsOpen(true, "memory");
+  const quickbarHtml = settingsPanel.querySelector("#t3-hub-settings-memory-quickbar").innerHTML;
+  assert.match(quickbarHtml, /data-action="open-memory-from-settings"/);
+  assert.match(quickbarHtml, /data-action="open-memory-folder"/);
+
+  // 3. Skills tab shows cross-provider sync toggle & passes syncAllProviders: true
+  ui.state.hubSettingsTab = "general";
+  ui.state.providerResKind = "skills";
+  ui.state.skillSyncAllProviders = true;
+  ui.renderHubSettingsPanel();
+  const generalHtml = settingsPanel.querySelector("#t3-hub-settings-general-pane").innerHTML;
+  assert.match(generalHtml, /同名 Skill 跨端同步开关/);
+  assert.match(generalHtml, /data-action="toggle-skill-sync-all"/);
+
+  const fakeToggleBtn = {
+    dataset: { provider: "codex", kind: "skills", id: "cdp-inject", sourceDir: "/fake/.codex/skills" },
+    getAttribute: (k) => (k === "aria-checked" ? "true" : null),
+    classList: { add() {}, remove() {} },
+    isConnected: true,
+    tagName: "BUTTON",
+    innerHTML: "",
+  };
+  await ui.toggleProviderResourceItem(fakeToggleBtn);
+  const toggleCall = calls.find((c) => c.action === "providerResources:toggle");
+  assert.ok(toggleCall, "providerResources:toggle called");
+  assert.equal(toggleCall.payload.syncAllProviders, true);
 });
 
 test("project-github-benchmark skill has valid YAML frontmatter", () => {

@@ -34,7 +34,7 @@
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
  planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
  artifactDockEnabled: storageGet("t3-hub-artifact-dock-v1") !== "false", artifactDockOpen: false, artifactMenuIndex: null, artifactApps: {}, artifactMenuLoading: false, dockPreview: null,
- hubSettingsOpen: false, hubSettingsTab: "general", providerResProvider: "codex", providerResKind: "mcp", providerResLoading: false, guardianLoading: false, guardianUpdating: false,
+ hubSettingsOpen: false, hubSettingsTab: "general", providerResProvider: "codex", providerResKind: "mcp", providerResLoading: false, guardianLoading: false, guardianUpdating: false, skillSyncAllProviders: storageGet("t3-hub-skill-sync-all-v1") === "true", providerMemoryPrompt: null,
  memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
@@ -267,7 +267,7 @@
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
  handle = null;
@@ -1049,7 +1049,77 @@
  return ["missing", "conflict", "unsupported", "unknown", "pending"].some((key) => Number(summary[key]) > 0);
     }
     function memoryAccessIssueText(reason) {
- return ({ managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"), agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"), entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"), unknown: tr("状态无法确认", "Status could not be confirmed") })[String(reason || "")] || tr("需要进一步检查", "Needs review");
+ return ({
+  managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"),
+  agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"),
+  unsupported_driver: tr("自动写入暂不支持，可复制专属接入提示词交由该 Agent 配置", "Auto-write not supported; copy the tailored setup prompt for this Agent"),
+  entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"),
+  unknown: tr("状态无法确认", "Status could not be confirmed"),
+ })[String(reason || "")] || tr("需要进一步检查", "Needs review");
+    }
+    function providerMemorySetupPrompt(providerId, displayName) {
+ const idLow = String(providerId || "").toLowerCase();
+ const name = String(displayName || providerId || "Agent").trim();
+ if (idLow.includes("opencode")) {
+  return [
+   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   "1. 打开 `~/.config/opencode/opencode.json`（先备份原文件），在顶层 `mcp` 对象下仅新增或更新 `t3_hub` 条目：",
+   '```json',
+   '{',
+   '  "mcp": {',
+   '    "t3_hub": {',
+   '      "type": "local",',
+   '      "command": ["/bin/sh", "-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"],',
+   '      "enabled": true',
+   '    }',
+   '  }',
+   '}',
+   '```',
+   "2. 保留文件中所有其他字段、已有 MCP、模型与插件配置，不要重启 T3。",
+   "3. 在新会话或重新加载 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
+  ].join("\n");
+ }
+ if (idLow.includes("devin")) {
+  return [
+   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   "1. 打开 `~/.config/devin/mcp_config.json`（先备份原文件），在顶层 `mcpServers` 对象下仅新增或更新 `t3_hub` 条目：",
+   '```json',
+   '{',
+   '  "mcpServers": {',
+   '    "t3_hub": {',
+   '      "command": "/bin/sh",',
+   '      "args": ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]',
+   '    }',
+   '  }',
+   '}',
+   '```',
+   "2. 保留文件中所有其他 MCP 与本机配置，不要重启 T3。",
+   "3. 在新会话或重连 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
+  ].join("\n");
+ }
+ return [
+  `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型与其他 MCP）：`,
+  `1. 检查 ${name} 的本机原生 MCP 配置文件并先做好备份。`,
+  "2. 仅新增或更新名为 `t3_hub` 的本机 stdio MCP 服务，启动命令为：",
+  '   `command: "/bin/sh"`, `args: ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]`',
+  "3. 保留原有所有 MCP、模型、认证与路由设置，不要重启 T3。",
+  "4. 配置完成后调用 `memory_status` 核验当前项目记忆是否就绪；若当前会话尚未加载新 MCP，请提示在新会话中再核验。",
+ ].join("\n");
+    }
+    async function copyProviderMemorySetupPrompt(providerId, displayName) {
+ const label = String(displayName || providerId || "Agent").trim();
+ const text = providerMemorySetupPrompt(providerId, label);
+ state.providerMemoryPrompt = { id: String(providerId || label), label, text };
+ try {
+  const clipboard = window.navigator?.clipboard;
+  if (typeof clipboard?.writeText !== "function") throw new Error("clipboard_unavailable");
+  await clipboard.writeText(text);
+  renderMemoryAgentAccess();
+  toast(tr(`已复制 ${label} 专属接入提示词`, `Copied setup prompt for ${label}`));
+ } catch {
+  renderMemoryAgentAccess();
+  toast(tr(`无法自动复制；已展开 ${label} 专属接入提示词供手动复制`, `Clipboard unavailable; showing ${label} setup prompt to copy`), true);
+ }
     }
     async function refreshMemoryAgentAccess(force = false) {
  if (disposed || cache.agentAccess && !force) return cache.agentAccess;
@@ -1102,12 +1172,18 @@
   const stateName = ["configured", "missing", "conflict", "unsupported", "unknown", "pending"].includes(provider?.status) ? provider.status : "unknown";
   const label = provider?.displayName || provider?.instanceId || tr("Agent", "Agent");
   const detail = stateName === "configured" ? tr("已找到 Hub MCP 配置", "Hub MCP configuration found") : memoryAccessIssueText(provider?.reason);
-  return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small></div>`;
+  const promptBtn = stateName !== "configured"
+   ? `<div style="margin-top:6px"><button type="button" class="hub-arc-btn" data-action="copy-provider-memory-prompt" data-provider-id="${esc(provider?.instanceId || label)}" data-provider-name="${esc(label)}">${esc(tr("复制接入提示词", "Copy setup prompt"))}</button></div>`
+   : "";
+  return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small>${promptBtn}</div>`;
  }).join("");
+ const providerPromptArea = state.providerMemoryPrompt
+  ? `<div style="margin-top:10px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)"><div class="hub-row" style="margin-bottom:6px"><strong style="font-size:11px">${esc(tr(`${state.providerMemoryPrompt.label} 专属接入提示词`, `${state.providerMemoryPrompt.label} setup prompt`))}</strong><span class="hub-grow"></span><button type="button" class="hub-arc-btn" data-action="close-provider-memory-prompt">${esc(tr("收起", "Hide"))}</button></div><textarea class="hub-input hub-memory-access-prompt" style="margin-top:0" readonly spellcheck="false">${esc(state.providerMemoryPrompt.text)}</textarea></div>`
+  : "";
  const errorHtml = errors.agentAccess ? `<p class="hub-hint" role="status">${esc(tr("暂时无法核验本机 T3 Agent 的记忆接入状态。", "Could not verify local T3 Agent memory access."))}</p>`
   : state.memorySetupNotice === "incomplete" ? `<p class="hub-hint" role="status">${esc(tr("接入检查未完成，仍有 Agent 待处理或无法确认；请勿将其视为已全部接入。", "Setup is incomplete. Some agents remain pending or unverified; access is not confirmed for all agents."))}</p>`
   : state.memorySetupNotice === "checked" ? `<p class="hub-hint" role="status">${esc(tr("本机配置检查完成；当前会话是否已加载仍未验证。", "Local configuration was checked; current session loading remains unverified."))}</p>` : "";
- node.innerHTML = `<section class="hub-card hub-memory-access"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryAgentAccess" aria-label="${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}" aria-checked="${access.enabled == null ? "mixed" : String(enabled)}" ${enabled ? "checked" : ""} ${updating ? "disabled" : ""}><span>${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${errors.agentAccess || access.enabled == null ? "unknown" : state.memorySetupNotice === "incomplete" || enabled && memoryAccessIssues(summary) ? "pending" : enabled ? "configured" : "missing"}">${esc(status)}</span></div><p class="hub-card-description">${esc(tr("这是本机设置，不用于 Connect 远端会话。关闭访问会保留记忆内容和手工配置。开关会即时控制 Hub MCP 接入；已加载 MCP 的旧会话需自然重连后更新，不会由这里强制结束。当前会话可用 memory_status 验证。", "This is a local setting and does not apply to Connect remote chats. Disabling access keeps saved memories and manual configuration. The switch immediately controls Hub MCP access; an existing session that already loaded the MCP updates after it naturally reconnects. This does not force that session to close. Verify the current session with memory_status."))}</p><div class="hub-memory-access-actions">${button("memory-access-setup", tr("检查并接入", "Check and set up"), { primary: true, small: true, icon: "check", disabled: updating })}${button("memory-access-copy-prompt", tr("复制首次接入提示词", "Copy setup prompt"), { small: true, disabled: updating })}${button("memory-access-refresh", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh", disabled: updating })}</div>${counts ? `<div class="hub-memory-access-summary">${counts}</div>` : ""}${providerHtml ? `<div class="hub-memory-access-providers">${providerHtml}</div>` : ""}${errorHtml}${state.memorySetupPromptVisible ? `<label class="hub-field" style="margin-top:10px">${esc(tr("首次接入提示词（可手动复制）", "First setup prompt (copy manually)"))}<textarea class="hub-input hub-memory-access-prompt" readonly spellcheck="false">${esc(memorySetupPrompt)}</textarea></label>` : ""}</section>`;
+ node.innerHTML = `<section class="hub-card hub-memory-access"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryAgentAccess" aria-label="${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}" aria-checked="${access.enabled == null ? "mixed" : String(enabled)}" ${enabled ? "checked" : ""} ${updating ? "disabled" : ""}><span>${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${errors.agentAccess || access.enabled == null ? "unknown" : state.memorySetupNotice === "incomplete" || enabled && memoryAccessIssues(summary) ? "pending" : enabled ? "configured" : "missing"}">${esc(status)}</span></div><p class="hub-card-description">${esc(tr("这是本机设置，不用于 Connect 远端会话。关闭访问会保留记忆内容和手工配置。开关会即时控制 Hub MCP 接入；已加载 MCP 的旧会话需自然重连后更新，不会由这里强制结束。当前会话可用 memory_status 验证。", "This is a local setting and does not apply to Connect remote chats. Disabling access keeps saved memories and manual configuration. The switch immediately controls Hub MCP access; an existing session that already loaded the MCP updates after it naturally reconnects. This does not force that session to close. Verify the current session with memory_status."))}</p><div class="hub-memory-access-actions">${button("memory-access-setup", tr("检查并接入", "Check and set up"), { primary: true, small: true, icon: "check", disabled: updating })}${button("memory-access-copy-prompt", tr("复制首次接入提示词", "Copy setup prompt"), { small: true, disabled: updating })}${button("memory-access-refresh", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh", disabled: updating })}</div>${counts ? `<div class="hub-memory-access-summary">${counts}</div>` : ""}${providerHtml ? `<div class="hub-memory-access-providers">${providerHtml}</div>` : ""}${providerPromptArea}${errorHtml}${state.memorySetupPromptVisible ? `<label class="hub-field" style="margin-top:10px">${esc(tr("首次接入提示词（可手动复制）", "First setup prompt (copy manually)"))}<textarea class="hub-input hub-memory-access-prompt" readonly spellcheck="false">${esc(memorySetupPrompt)}</textarea></label>` : ""}</section>`;
  renderMemoryTitleControls();
  renderMemoryRuntime();
     }
@@ -2011,11 +2087,17 @@
  const sourceFile = element.dataset.sourceFile || undefined, sourceDir = element.dataset.sourceDir || undefined;
  const currentEnabled = element.getAttribute("aria-checked") === "true";
  const nextEnabled = !currentEnabled;
+ const syncAllProviders = kind === "skills" && state.skillSyncAllProviders === true;
  await busy(`prov-res:${provider}:${kind}:${id}`, element, async () => {
-  await request("providerResources:toggle", { provider, kind, id, enabled: nextEnabled, sourceFile, sourceDir });
+  const res = await request("providerResources:toggle", { provider, kind, id, enabled: nextEnabled, sourceFile, sourceDir, syncAllProviders });
   if (disposed) return;
   await loadProviderResources(true);
-  toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"}`, `${id} ${nextEnabled ? "enabled" : "disabled"}`));
+  const synced = Array.isArray(res?.syncedProviders) ? res.syncedProviders : [];
+  if (syncAllProviders && synced.length > 1) {
+   toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"} · 已同步 ${synced.length} 端 (${synced.join("、")})`, `${id} ${nextEnabled ? "enabled" : "disabled"} · synced across ${synced.length} providers (${synced.join(", ")})`));
+  } else {
+   toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"}`, `${id} ${nextEnabled ? "enabled" : "disabled"}`));
+  }
  });
     }
     async function loadGuardianStatus() {
@@ -2066,9 +2148,12 @@
   : !activeList.length
   ? `<p class="hub-hint">${esc(tr("当前提供方暂无此类型配置条目。", "No configured items for this provider and category."))}</p>`
   : activeList.map((item) => `<div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(item.name || item.id)}</strong>${item.description ? `<small>${esc(item.description)}</small>` : ""}</div>${item.readonly ? `<span class="hub-badge">${esc(tr("只读", "Read-only"))}</span>` : `<button type="button" role="switch" class="hub-switch" data-action="toggle-provider-resource" data-provider="${esc(item.provider)}" data-kind="${esc(item.kind)}" data-id="${esc(item.id)}" ${item.sourceFile ? `data-source-file="${esc(item.sourceFile)}"` : ""} ${item.sourceDir ? `data-source-dir="${esc(item.sourceDir)}"` : ""} aria-checked="${item.enabled === true}" aria-label="${esc(item.name || item.id)}"><span></span></button>`}</div>`).join("");
+ const skillSyncRowHtml = state.providerResKind === "skills"
+  ? `<div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("同名 Skill 跨端同步开关", "Sync same-name skills across providers"))}</strong><small>${esc(tr("开启后，切换任一技能时会同步更新 Codex / OpenCode / Antigravity / Claude / Muse / Devin 中已安装的同名技能（未安装的端不新建文件）", "When on, toggling a skill syncs existing same-name copies across Codex, OpenCode, Antigravity, Claude, Muse, and Devin"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-skill-sync-all" aria-checked="${state.skillSyncAllProviders === true}" aria-label="${esc(tr("同名 Skill 跨端同步开关", "Sync same-name skills across providers"))}"><span></span></button></div>`
+  : "";
  const isMemTab = state.hubSettingsTab === "memory";
  const chromeHtml = `<div class="hub-set-head"><strong>${esc(tr("T3 Hub 设置", "T3 Hub Settings"))}</strong><div style="display:flex;align-items:center;gap:6px"><button type="button" class="hub-set-pill ${!isMemTab ? "is-active" : ""}" data-action="hub-settings-tab" data-tab="general">${esc(tr("常规与提供方", "General & Providers"))}</button><button type="button" class="hub-set-pill ${isMemTab ? "is-active" : ""}" data-action="hub-settings-tab" data-tab="memory">${esc(tr("记忆与向量", "Memory & Vector"))}</button><button type="button" class="hub-arc-btn" data-action="close-hub-settings">${esc(tr("关闭", "Close"))}</button></div></div>`;
- const generalHtml = `<section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("桌面控件与升级守护", "Desktop controls & upgrade guardian"))}</span></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}</strong><small>${esc(tr("在窗口右侧边缘显示当前会话产物，支持直接打开与选择打开方式", "Show current session artifacts on the right edge with Open & Open With"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-artifact-dock-setting" aria-checked="${state.artifactDockEnabled === true}" aria-label="${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}"><span></span></button></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}</strong><small>${esc(tr("零 CPU 监听 T3 升级，仅冷启动且无活跃任务时自动重挂 HUD，绝不中断对话", "Zero-CPU WatchPaths guard; auto-reattaches only on idle cold boot"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-guardian" aria-checked="${guardianOn}" ${state.guardianUpdating ? "disabled" : ""} aria-label="${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}"><span></span></button></div></section><section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("提供方资源（只查看与开关）", "Provider resources (view & toggle)"))}</span><button type="button" class="hub-arc-btn" data-action="refresh-provider-resources">${esc(tr("刷新", "Refresh"))}</button></div><p class="hub-hint" style="margin:0">${esc(tr("独立读取各提供方原生配置，仅控制启停，不负责新增或删除。", "Reads each provider's native local config directly; toggle on/off only."))}</p><div class="hub-set-pills">${providers.map((p) => { const total = (p.counts?.mcp || 0) + (p.counts?.skills || 0) + (p.counts?.plugins || 0); return `<button type="button" class="hub-set-pill ${p.id === state.providerResProvider ? "is-active" : ""}" data-action="provider-res-tab" data-provider="${esc(p.id)}">${esc(p.label)} (${total})</button>`; }).join("")}</div><div class="hub-set-pills">${kinds.map(([k, lbl]) => { const c = activeProv?.counts?.[k] ?? 0; return `<button type="button" class="hub-set-pill ${k === state.providerResKind ? "is-active" : ""}" data-action="provider-res-kind" data-kind="${esc(k)}">${esc(lbl)} (${c})</button>`; }).join("")}</div><div style="display:flex;flex-direction:column;gap:6px">${resListHtml}</div></section>`;
+ const generalHtml = `<section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("桌面控件与升级守护", "Desktop controls & upgrade guardian"))}</span></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}</strong><small>${esc(tr("在窗口右侧边缘显示当前会话产物，支持直接打开与选择打开方式", "Show current session artifacts on the right edge with Open & Open With"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-artifact-dock-setting" aria-checked="${state.artifactDockEnabled === true}" aria-label="${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}"><span></span></button></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}</strong><small>${esc(tr("零 CPU 监听 T3 升级，仅冷启动且无活跃任务时自动重挂 HUD，绝不中断对话", "Zero-CPU WatchPaths guard; auto-reattaches only on idle cold boot"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-guardian" aria-checked="${guardianOn}" ${state.guardianUpdating ? "disabled" : ""} aria-label="${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}"><span></span></button></div></section><section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("提供方资源（只查看与开关）", "Provider resources (view & toggle)"))}</span><button type="button" class="hub-arc-btn" data-action="refresh-provider-resources">${esc(tr("刷新", "Refresh"))}</button></div><p class="hub-hint" style="margin:0">${esc(tr("独立读取各提供方原生配置，仅控制启停，不负责新增或删除。", "Reads each provider's native local config directly; toggle on/off only."))}</p><div class="hub-set-pills">${providers.map((p) => { const total = (p.counts?.mcp || 0) + (p.counts?.skills || 0) + (p.counts?.plugins || 0); return `<button type="button" class="hub-set-pill ${p.id === state.providerResProvider ? "is-active" : ""}" data-action="provider-res-tab" data-provider="${esc(p.id)}">${esc(p.label)} (${total})</button>`; }).join("")}</div><div class="hub-set-pills">${kinds.map(([k, lbl]) => { const c = activeProv?.counts?.[k] ?? 0; return `<button type="button" class="hub-set-pill ${k === state.providerResKind ? "is-active" : ""}" data-action="provider-res-kind" data-kind="${esc(k)}">${esc(lbl)} (${c})</button>`; }).join("")}</div>${skillSyncRowHtml}<div style="display:flex;flex-direction:column;gap:6px">${resListHtml}</div></section>`;
  const chromeNode = settingsPanel.querySelector?.("#t3-hub-settings-chrome");
  const generalPane = settingsPanel.querySelector?.("#t3-hub-settings-general-pane");
  const memoryPane = settingsPanel.querySelector?.("#t3-hub-settings-memory-pane");
@@ -2077,6 +2162,11 @@
   generalPane.innerHTML = generalHtml;
   generalPane.hidden = isMemTab;
   memoryPane.hidden = !isMemTab;
+  const quickbar = settingsPanel.querySelector?.("#t3-hub-settings-memory-quickbar");
+  if (quickbar) {
+   const ready = memoryProjectReady();
+   quickbar.innerHTML = `<section class="hub-set-sec" style="margin-bottom:2px"><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("项目记忆与演进历史文件", "Project memories & version history files"))}</strong><small>${esc(tr("浏览、搜索、编辑与回滚记忆版本请打开「记忆工作台」，或直接在 Finder 中打开本地 Markdown 历史文件夹。", "Open Memory Workspace to browse/rollback history, or reveal the local Markdown memory folder in Finder."))}</small></div><div style="display:flex;gap:6px;flex:none"><button type="button" class="hub-arc-btn is-primary" data-action="open-memory-from-settings">${esc(tr("查看记忆与历史", "Memory & History"))}</button><button type="button" class="hub-arc-btn" data-action="open-memory-folder" ${ready ? "" : "disabled"}>${esc(tr("打开记忆文件夹", "Open folder"))}</button></div></div></section>`;
+  }
   if (isMemTab) {
    renderMemoryAgentAccess();
    renderMemoryRuntime();
@@ -3186,8 +3276,12 @@
  if (action === "open-memory") openMemoryFromTitle();
  else if (action === "open-hub-settings") setHubSettingsOpen(!state.hubSettingsOpen);
  else if (action === "open-hub-memory-settings") setHubSettingsOpen(true, "memory");
+ else if (action === "open-memory-from-settings") { setHubSettingsOpen(false); openMemoryFromTitle(); }
  else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); }
  else if (action === "close-hub-settings") setHubSettingsOpen(false);
+ else if (action === "copy-provider-memory-prompt") copyProviderMemorySetupPrompt(target.dataset.providerId, target.dataset.providerName);
+ else if (action === "close-provider-memory-prompt") { state.providerMemoryPrompt = null; renderMemoryAgentAccess(); }
+ else if (action === "toggle-skill-sync-all") { state.skillSyncAllProviders = !state.skillSyncAllProviders; storageSet("t3-hub-skill-sync-all-v1", state.skillSyncAllProviders ? "true" : "false"); renderHubSettingsPanel(); }
  else if (action === "toggle-artifact-dock-setting") setArtifactDockEnabled(!state.artifactDockEnabled);
  else if (action === "toggle-guardian") toggleGuardian(target);
  else if (action === "refresh-provider-resources") loadProviderResources(true);

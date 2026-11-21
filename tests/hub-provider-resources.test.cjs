@@ -201,3 +201,59 @@ test("OpenCode and Devin resources are discovered, secrets redacted, and editabl
   const devinAfter = JSON.parse(fs.readFileSync(devinMcp, "utf8"));
   assert.equal(devinAfter.mcpServers.t3_hub.disabled, true);
 });
+
+test("syncAllProviders toggles same-name skills across Codex, OpenCode, AGY, Claude, Muse, and shared dirs without creating missing copies", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "t3-prov-sync-skills-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const mkSkill = (baseDir, name) => {
+    const dir = path.join(baseDir, name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: test ${name}\n---\n`);
+  };
+
+  const codexSkills = path.join(home, ".codex", "skills");
+  const ocSkills = path.join(home, ".config", "opencode", "skills");
+  const agySkills = path.join(home, ".t3", "userdata", "providers", "antigravity", "inst-1", "config", "skills");
+  const claudeSkills = path.join(home, ".claude", "skills");
+  const sharedSkills = path.join(home, ".agents", "skills");
+  const devinCacheSkills = path.join(home, ".local", "share", "devin", "cli", "plugins", "cache", "pkg", "0.1.0", "skills");
+
+  mkSkill(codexSkills, "cdp-inject");
+  mkSkill(ocSkills, "cdp-inject");
+  mkSkill(agySkills, "cdp-inject");
+  mkSkill(sharedSkills, "cdp-inject"); // shared by Codex, Muse, Devin
+  mkSkill(devinCacheSkills, "cdp-inject"); // readonly cache must NOT be moved
+  fs.mkdirSync(claudeSkills, { recursive: true }); // Claude does NOT have cdp-inject
+
+  const mgr = createProviderResourcesManager({ homeDir: home });
+
+  // 1. Default (syncAllProviders=false) toggles ONLY target dir
+  mgr.toggleProviderResource({ provider: "codex", kind: "skills", id: "cdp-inject", enabled: false, sourceDir: codexSkills });
+  assert.ok(fs.existsSync(path.join(codexSkills, DISABLED_SKILLS_DIRNAME, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(ocSkills, "cdp-inject")), "OpenCode untouched when syncAllProviders is false");
+  // Restore Codex first
+  mgr.toggleProviderResource({ provider: "codex", kind: "skills", id: "cdp-inject", enabled: true, sourceDir: codexSkills });
+
+  // 2. syncAllProviders=true syncs OFF across Codex, OpenCode, AGY, and shared dir (Muse/Devin) without touching Claude or readonly cache
+  const offRes = mgr.toggleProviderResource({ provider: "codex", kind: "skills", id: "cdp-inject", enabled: false, sourceDir: codexSkills, syncAllProviders: true });
+  assert.equal(offRes.ok, true);
+  assert.equal(offRes.enabled, false);
+  assert.ok(offRes.syncedProviders.includes("Codex"));
+  assert.ok(offRes.syncedProviders.includes("OpenCode"));
+  assert.ok(offRes.syncedProviders.includes("Antigravity"));
+  assert.ok(offRes.syncedProviders.includes("Muse"));
+  assert.ok(!offRes.syncedProviders.includes("Claude Code"), "Provider without this skill is not listed");
+  assert.ok(fs.existsSync(path.join(ocSkills, DISABLED_SKILLS_DIRNAME, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(agySkills, DISABLED_SKILLS_DIRNAME, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(sharedSkills, DISABLED_SKILLS_DIRNAME, "cdp-inject")));
+  assert.ok(!fs.existsSync(path.join(claudeSkills, "cdp-inject")) && !fs.existsSync(path.join(claudeSkills, DISABLED_SKILLS_DIRNAME, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(devinCacheSkills, "cdp-inject")), "Readonly plugin cache untouched");
+
+  // 3. syncAllProviders=true syncs ON back across all matching writable providers
+  const onRes = mgr.toggleProviderResource({ provider: "codex", kind: "skills", id: "cdp-inject", enabled: true, sourceDir: codexSkills, syncAllProviders: true });
+  assert.equal(onRes.enabled, true);
+  assert.ok(fs.existsSync(path.join(ocSkills, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(agySkills, "cdp-inject")));
+  assert.ok(fs.existsSync(path.join(sharedSkills, "cdp-inject")));
+});
