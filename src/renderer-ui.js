@@ -1201,7 +1201,7 @@
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
       "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
-      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
     const isHubTunnel = method === "getGitGraph" && args[0] === "__HUB_RPC__";
     const hubAction = isHubTunnel ? String(args[1] || "") : "";
@@ -1262,7 +1262,7 @@
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
       "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
-      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
     const bridge = window.__t3HubSidecarBridge;
     const normalizedPayload = payload || {};
@@ -2812,6 +2812,32 @@
   let currentPopoverProvider = null;
   let popoverHideTimer = null;
   let hudUpdateState = {};
+  let externalQuotaProviders = [];
+  let externalQuotaFetchedAt = 0;
+  let externalQuotaInFlight = false;
+  function refreshExternalQuotas(force = false) {
+    if (disposed || document.hidden || externalQuotaInFlight) return;
+    const now = Date.now();
+    if (!force && now - externalQuotaFetchedAt < 115_000) return;
+    if (typeof window.__t3HubRpc !== "function") return;
+    externalQuotaInFlight = true;
+    window.__t3HubRpc("quota:external", force ? { force: true } : {})
+      .then((res) => {
+        if (disposed) return;
+        externalQuotaFetchedAt = Date.now();
+        if (res && res.ok && Array.isArray(res.providers)) {
+          externalQuotaProviders = res.providers;
+          if (latestStats) renderTopbarStats(latestStats);
+          else renderQuotaRing(computeQuotaAndContext(null).providerQuotas);
+        }
+      })
+      .catch(() => {
+        externalQuotaFetchedAt = Date.now();
+      })
+      .finally(() => {
+        externalQuotaInFlight = false;
+      });
+  }
 
   function createHudTurnSpeedState(routeKey) {
     return {
@@ -3683,7 +3709,20 @@
         ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
     }
 
-    if (!live || !Array.isArray(live.providers)) {
+    const extProviders = typeof externalQuotaProviders !== "undefined" && Array.isArray(externalQuotaProviders) ? externalQuotaProviders : [];
+    const baseProviders = live && Array.isArray(live.providers) ? live.providers : [];
+    const mergedProviders = [...baseProviders];
+    for (const ep of extProviders) {
+      if (!ep?.usageLimits?.windows?.length) continue;
+      const epId = String(ep.instanceId || ep.driver || "").toLowerCase();
+      const alreadyHas = baseProviders.some((bp) => {
+        const bpId = String(bp.instanceId || bp.driver || "").toLowerCase();
+        return (bpId === epId || (epId.includes("devin") && bpId.includes("devin"))) && bp.usageLimits?.windows?.length;
+      });
+      if (!alreadyHas) mergedProviders.push(ep);
+    }
+
+    if (!mergedProviders.length) {
       return {
         primaryWeekly: null,
         primaryFiveHour: null,
@@ -3700,10 +3739,10 @@
     }
 
     const activeProv =
-      live.providers.find(
+      mergedProviders.find(
         (p) => p.instanceId?.toLowerCase() === activeProviderRaw && p.usageLimits?.windows?.length
       ) ||
-      live.providers.find(
+      mergedProviders.find(
         (p) => p.driver?.toLowerCase() === activeProviderRaw && p.usageLimits?.windows?.length
       ) ||
       null;
@@ -3780,11 +3819,11 @@
       if (idLow.includes("devin") || drvLow.includes("devin")) return "Devin";
       return provDisplayName[drvLow] || instanceId || "Provider";
     };
-    for (const p of live.providers) {
+    for (const p of mergedProviders) {
       if (!p.usageLimits?.windows?.length) continue;
       const instanceId = String(p.instanceId || p.driver || "");
       const driver = String(p.driver || p.instanceId || "").toLowerCase();
-      const pName = resolveDisplayName(instanceId, driver);
+      const pName = typeof p.displayName === "string" && p.displayName.trim() ? p.displayName.trim() : resolveDisplayName(instanceId, driver);
       const logoKey = resolveLogoKey(instanceId, driver);
       const scopeKey = instanceId.toLowerCase() || driver;
       const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w, "", scopeKey)).filter(Boolean);
@@ -3820,6 +3859,9 @@
       } else {
         let weekly = p === activeProv ? primaryWeekly : windows.find(isWeeklyWindow) || null;
         let fiveHour = selectHudFiveHourWindow(windows);
+        if (!fiveHour && logoKey === "devin") {
+          fiveHour = windows.find((w) => String(w.kind || "").toLowerCase() === "daily" || w.windowDurationMins === 1440) || null;
+        }
         if (!weekly && !fiveHour && windows.length) {
           const isExplicitBudgetWindow = (w) =>
             ["monthly", "daily", "credits", "acu"].includes(String(w.kind || "").toLowerCase()) ||
@@ -4227,6 +4269,9 @@
     };
 
     const innerLabelFor = (q) => {
+      if (String(q.kind || "").toLowerCase() === "daily" || Number(q.windowDurationMins) === 1440) {
+        return hudLang === "zh" ? "日额度（内圈）" : "Daily (inner)";
+      }
       if (provider.driver === "muse" || (q.kind !== "fiveHour" && !/5\s*[-_ ]?\s*h|five\s*[-_ ]?\s*hour/i.test(String(q.label || "")))) {
         const mins = Number(q.windowDurationMins);
         if (Number.isFinite(mins) && mins > 0) {
@@ -4485,6 +4530,7 @@
     const qInfo = computeQuotaAndContext(stats);
     const sessionSpeed = resolveHudSessionSpeed(sessionSpeedState, stats, currentPathHint);
     renderQuotaRing(qInfo.providerQuotas);
+    refreshExternalQuotas();
 
     let nextDotClass;
     let nextSpeed;

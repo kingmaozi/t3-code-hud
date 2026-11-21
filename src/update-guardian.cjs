@@ -198,7 +198,12 @@ function createGuardianManager({ homeDir = os.homedir(), pluginDir = path.join(o
   function getWatchPaths() {
     const apps = resolveT3AppBundles(homeDir);
     const list = apps.length ? apps : ["/Applications/T3 Code.app", "/Applications/T3 Code (Beta).app"];
-    return list.map((app) => path.join(app, "Contents", "Info.plist"));
+    const paths = list.map((app) => path.join(app, "Contents", "Info.plist"));
+    const appSupportDir = path.join(homeDir, "Library", "Application Support", "t3code-v2");
+    if (fs.existsSync(appSupportDir)) {
+      paths.push(path.join(appSupportDir, "SingletonLock"));
+    }
+    return paths;
   }
 
   function resolveNodeRuntime() {

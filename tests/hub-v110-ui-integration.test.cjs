@@ -285,6 +285,19 @@ test("Unsupported memory agents expose tailored setup prompts, Settings memory t
   const toggleCall = calls.find((c) => c.action === "providerResources:toggle");
   assert.ok(toggleCall, "providerResources:toggle called");
   assert.equal(toggleCall.payload.syncAllProviders, true);
+
+  // 4. Clicking a memory card (data-action="open-memory" WITH data-id) selects & expands it instead of being shadowed by title openMemoryFromTitle
+  ui.state.tab = "memory";
+  ui.state.selectedMemory = null;
+  const fakeMemCardBtn = {
+    dataset: { action: "open-memory", id: "mem-42" },
+    disabled: false,
+    closest(sel) { return sel === "[data-action]" ? this : null; },
+  };
+  ui.onClick({ target: fakeMemCardBtn });
+  assert.equal(ui.state.selectedMemory, "mem-42", "Clicking memory card expands it rather than invoking title openMemoryFromTitle");
+  assert.match(drawerSource, /#t3-hub-drawer\.is-single-tab\{grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(drawerSource, /#t3-hub-settings-panel\{[^}]*width:min\(740px,92vw\)/);
 });
 
 test("project-github-benchmark skill has valid YAML frontmatter", () => {

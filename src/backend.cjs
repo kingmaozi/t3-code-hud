@@ -19,6 +19,7 @@ const hubMemoryConnections = require("./hub-memory-connections.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
 const { createProviderResourcesManager } = require("./hub-provider-resources.cjs");
+const { createDevinQuotaReader } = require("./hub-devin-quota.cjs");
 const { createGuardianManager } = require("./update-guardian.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
 const { createHudUpdater, sha256 } = require("./hub-update.cjs");
@@ -33,6 +34,15 @@ let _taskBoardInstance = null;
 let _taskBoardHome = null;
 let _hostSettingsInstance = null;
 let _hostSettingsHome = null;
+let _devinQuotaInstance = null;
+let _devinQuotaHome = null;
+function getDevinQuotaReader() {
+  const curHome = process.env.HOME || os.homedir();
+  if (_devinQuotaInstance && _devinQuotaHome === curHome) return _devinQuotaInstance;
+  _devinQuotaInstance = createDevinQuotaReader({ homeDir: curHome });
+  _devinQuotaHome = curHome;
+  return _devinQuotaInstance;
+}
 function getTaskBoard() {
   const curHome = process.env.HOME || os.homedir();
   if (_taskBoardInstance && _taskBoardHome === curHome) return _taskBoardInstance;
@@ -3794,6 +3804,12 @@ async function hubCall(action, payload = {}) {
         const pluginDir = process.env.T3_HUD_DIR || path.join(homeDir, ".t3", "hud-plugin");
         const mgr = createGuardianManager({ homeDir, pluginDir });
         return payload?.enabled === true ? mgr.enable() : mgr.disable();
+      }
+      case "quota:external": {
+        const devin = await getDevinQuotaReader().readDevinQuota({ force: payload?.force === true });
+        const providers = [];
+        if (devin?.available && devin.provider) providers.push(devin.provider);
+        return { ok: true, providers };
       }
       case "settings:get": {
         let t3EnvironmentId = null;

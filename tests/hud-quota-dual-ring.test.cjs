@@ -198,3 +198,41 @@ test("OpenCode Go uses geometric square-frame logo and Devin non-weekly/ACU wind
   assert.match(ctx.markup(oc), /fill-opacity="0\.3"/, "OpenCode Go uses geometric frame logo SVG");
   assert.match(ctx.markup(devin), /#0ea5e9/, "Devin uses dedicated Devin logo SVG");
 });
+
+test("externalQuotaProviders merges Devin weekly+daily rings and renders Daily (inner) card label", () => {
+  const ctx = vm.createContext({
+    readLiveT3State: () => ctx.live,
+    formatResetShort: (v) => v || null,
+    escapeHtml: (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;"),
+    hudLang: "zh",
+    externalQuotaProviders: [
+      {
+        instanceId: "acpRegistry_devin",
+        driver: "devin",
+        displayName: "Devin · Pro",
+        usageLimits: {
+          windows: [
+            { id: "devin-weekly", kind: "weekly", label: "Weekly", windowDurationMins: 10080, usedPercent: 21, resetsAt: "4d" },
+            { id: "devin-daily", kind: "daily", label: "Daily", windowDurationMins: 1440, usedPercent: 10, resetsAt: "8h" },
+          ],
+        },
+      },
+    ],
+  });
+  vm.runInContext(
+    `${sliceBetween("  const quotaBurnSamples = new Map();", "  function formatContextPair(")}\n` +
+    `${sliceBetween("  function renderQuotaRingCardHtml(", "  function renderQuotaRingPopover(")}\n` +
+    `this.compute = computeQuotaAndContext; this.card = renderQuotaRingCardHtml;`,
+    ctx
+  );
+  ctx.live = { selectedProvider: "antigravity", selectedModel: "gemini-4-neon", usage: { providers: [] } };
+  const out = JSON.parse(JSON.stringify(ctx.compute({ ok: true, provider: "antigravity", tokens: {}, cache: {} })));
+  assert.equal(out.providerQuotas.length, 1);
+  assert.equal(out.providerQuotas[0].name, "Devin · Pro");
+  assert.equal(out.providerQuotas[0].weekly.remainingPct, 79);
+  assert.equal(out.providerQuotas[0].fiveHour.remainingPct, 90);
+  const html = ctx.card(out.providerQuotas[0]);
+  assert.match(html, /Devin · Pro/);
+  assert.match(html, /周额度（外圈）/);
+  assert.match(html, /日额度（内圈）/);
+});
