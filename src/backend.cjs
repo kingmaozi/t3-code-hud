@@ -18,6 +18,8 @@ const hubHooks = require("./hub-hooks.cjs");
 const hubMemoryConnections = require("./hub-memory-connections.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
+const { createProviderResourcesManager } = require("./hub-provider-resources.cjs");
+const { createGuardianManager } = require("./update-guardian.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
 const { createHudUpdater, sha256 } = require("./hub-update.cjs");
 const { createDreamScheduler, beginDreamRun } = require("./hub-dream-scheduler.cjs");
@@ -3771,6 +3773,27 @@ async function hubCall(action, payload = {}) {
       case "board:readArtifact": {
         const rawPath = payload?.path || payload?.file || payload?.artifactPath || payload?.filePath || "";
         return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...payload, path: rawPath, operation: "preview" });
+      }
+      case "artifact:listApps":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "list-apps" });
+      case "artifact:openDefault":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "open-default" });
+      case "artifact:openWith":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "open-with" });
+      case "providerResources:list":
+        return createProviderResourcesManager({ homeDir: process.env.HOME || os.homedir() }).listProviderResources();
+      case "providerResources:toggle":
+        return createProviderResourcesManager({ homeDir: process.env.HOME || os.homedir() }).toggleProviderResource(payload || {});
+      case "guardian:status": {
+        const homeDir = process.env.HOME || os.homedir();
+        const pluginDir = process.env.T3_HUD_DIR || path.join(homeDir, ".t3", "hud-plugin");
+        return createGuardianManager({ homeDir, pluginDir }).getStatus();
+      }
+      case "guardian:set": {
+        const homeDir = process.env.HOME || os.homedir();
+        const pluginDir = process.env.T3_HUD_DIR || path.join(homeDir, ".t3", "hud-plugin");
+        const mgr = createGuardianManager({ homeDir, pluginDir });
+        return payload?.enabled === true ? mgr.enable() : mgr.disable();
       }
       case "settings:get": {
         let t3EnvironmentId = null;

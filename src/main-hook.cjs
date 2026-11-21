@@ -511,6 +511,47 @@ function attachWindowHooks(win) {
 }
 
 if (electron.app) {
+  let upgradeHandoffSpawned = false;
+  let initialBundleInfo = null;
+  function resolveOwnBundlePath() {
+    const exe = String(process.execPath || "");
+    const idx = exe.indexOf(".app/Contents/");
+    return idx > 0 ? exe.slice(0, idx + 4) : null;
+  }
+  function spawnUpgradeHandoff() {
+    if (upgradeHandoffSpawned) return;
+    upgradeHandoffSpawned = true;
+    try {
+      const guardianPath = path.join(__dirname, "update-guardian.cjs");
+      if (!fs.existsSync(guardianPath)) return;
+      const child = spawn(process.execPath, [guardianPath, "--mode=upgrade-handoff", `--prev-pid=${process.pid}`], {
+        env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: __dirname },
+        detached: true,
+        stdio: "ignore",
+      });
+      child.on("error", () => {});
+      child.unref();
+    } catch {}
+  }
+  try {
+    const guardian = require(path.join(__dirname, "update-guardian.cjs"));
+    const ownBundle = resolveOwnBundlePath();
+    if (ownBundle) initialBundleInfo = guardian.readBundleVersion(ownBundle);
+    if (electron.autoUpdater && typeof electron.autoUpdater.on === "function") {
+      electron.autoUpdater.on("before-quit-for-update", () => spawnUpgradeHandoff());
+    }
+    electron.app.on("before-quit", () => {
+      try {
+        const b = resolveOwnBundlePath();
+        if (!b || !initialBundleInfo) return;
+        const now = guardian.readBundleVersion(b);
+        if (now && (now.shortVersion !== initialBundleInfo.shortVersion || now.buildVersion !== initialBundleInfo.buildVersion || now.mtimeMs !== initialBundleInfo.mtimeMs)) {
+          spawnUpgradeHandoff();
+        }
+      } catch {}
+    });
+  } catch {}
+
   electron.app.on("browser-window-created", (_event, win) => {
     attachWindowHooks(win);
   });

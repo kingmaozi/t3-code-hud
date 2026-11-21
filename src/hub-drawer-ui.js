@@ -13,7 +13,7 @@
     const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
     let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, style, liveBoard, occlusionBoardRect = null;
+    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, settingsHandle, settingsPanel, artifactDock, style, liveBoard, occlusionBoardRect = null;
     let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
@@ -25,7 +25,7 @@
     const storedTab = initial?.tab || storageGet("t3-hub-tab") || "memory";
     const restoredSubView = initial?.settingsSubView || (storedTab === "agents" ? "agents" : "native");
     const normalizedTab = tabAliases[storedTab] || storedTab;
-    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
+    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null, providerResources: null, guardian: null };
     const errors = {}, drafts = initial?.drafts || {};
     const state = {
  open: initial?.open ?? false, tab: normalizedTab, settingsSubView: restoredSubView === "agents" ? "agents" : "native", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
@@ -33,6 +33,8 @@
  boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
  planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
+ artifactDockEnabled: storageGet("t3-hub-artifact-dock-v1") !== "false", artifactDockOpen: false, artifactMenuIndex: null, artifactApps: {}, artifactMenuLoading: false, dockPreview: null,
+ hubSettingsOpen: false, providerResProvider: "codex", providerResKind: "mcp", providerResLoading: false, guardianLoading: false, guardianUpdating: false,
  memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
@@ -261,16 +263,20 @@
       style.textContent += `#t3-hub-plan-handle{position:relative!important;right:auto!important;top:auto!important;padding:3px 7px!important;border-radius:7px!important;border-right:1px solid var(--hub-border)!important;background:var(--hub-bg)!important}#t3-hub-live-board{display:block;flex:none;min-height:0;padding:0;border-radius:11px;overflow:auto}#t3-hub-live-board[hidden]{display:none!important}.hub-connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:8px;margin:12px 0}.hub-connection-agent{min-width:0;padding:10px 12px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg)}.hub-connection-agent h3{margin:0 0 8px;font-size:11px}.hub-connection-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.hub-connection-cell{min-width:0;padding:7px;border-radius:7px;background:var(--hub-bg-subtle)}.hub-connection-cell>span,.hub-connection-cell>strong,.hub-connection-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-connection-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-connection-cell>strong{margin-top:2px;font-size:9px}.hub-connection-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:8px;line-height:1.45}.hub-connection-cell>strong[data-status="configured"]{color:#047857}.hub-connection-cell>strong[data-status="missing"]{color:var(--hub-secondary)}.hub-connection-cell>strong[data-status="unsupported"]{color:var(--hub-muted)}.hub-connection-cell>strong[data-status="unknown"]{color:#b45309}.hub-connection-note{align-items:center;flex-wrap:wrap}.hub-connection-error{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border:1px solid var(--hub-border);border-radius:8px;color:var(--hub-secondary);font-size:10px}@media(max-width:639px){.hub-connection-grid{grid-template-columns:minmax(0,1fr)}.hub-connection-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
       style.textContent += `#t3-hub-plan-handle{justify-content:flex-start!important;gap:7px!important;width:auto!important;min-width:0!important;height:27px!important;padding:4px 10px!important;border:1px solid #dbe4f0!important;border-radius:999px!important;background:#f8fafc!important;color:#253247!important;box-shadow:0 1px 4px #0f172a12!important;font-size:10px!important;font-weight:550!important;line-height:1!important;white-space:nowrap!important}#t3-hub-plan-handle:hover,#t3-hub-plan-handle:focus-visible{background:#f1f6ff!important;border-color:#c8dcff!important}.hub-plan-indicator{gap:7px!important;white-space:nowrap}.hub-plan-ring{display:block;flex:none;width:15px;height:15px;transform:rotate(-90deg)}.hub-plan-ring-track{fill:none;stroke:#dbeafe;stroke-width:2.4}.hub-plan-ring-progress{fill:none;stroke:#3980f6;stroke-width:2.4;stroke-linecap:round;transition:stroke-dashoffset .18s ease}.hub-plan-label{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-memory-access-switch{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;font-weight:550;color:var(--hub-ink)}.hub-memory-access-switch input{flex:none;width:15px;height:15px;accent-color:#3980f6}.hub-memory-access-state{font-size:10px;color:var(--hub-secondary);white-space:normal;text-align:right}.hub-memory-access-actions{flex-wrap:wrap;margin-top:10px}.hub-memory-access-summary{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hub-memory-access-summary>span{padding:2px 7px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary)}.hub-memory-access-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:6px;margin-top:9px}.hub-memory-access-provider{min-width:0;padding:7px 9px;border:1px solid var(--hub-border);border-radius:8px;font-size:9px}.hub-memory-access-provider strong,.hub-memory-access-provider small{display:block;overflow-wrap:anywhere}.hub-memory-access-provider small{margin-top:2px;color:var(--hub-secondary)}.hub-memory-access-prompt{margin-top:10px;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:120px;resize:vertical;white-space:pre-wrap}@media(max-width:639px){.hub-memory-access-switch{align-items:flex-start}.hub-memory-access-state{text-align:left}}`;
       style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
+      style.textContent += "\n#t3-hub-settings-handle[aria-expanded=\"true\"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}\n#t3-hub-artifact-dock{position:fixed;right:0;top:44%;transform:translateY(-50%);z-index:2147482990;display:flex;align-items:center;pointer-events:auto;font:12px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-app-region:no-drag}\n#t3-hub-artifact-dock[hidden]{display:none!important}\n#t3-sidecar-hub-root.is-occluded #t3-hub-artifact-dock,#t3-sidecar-hub-root.is-occluded #t3-hub-settings-panel{visibility:hidden!important;pointer-events:none!important}\n.hub-arc-tab{width:26px;height:72px;padding:0 0 0 3px;border:1px solid var(--hub-border);border-right:0;border-radius:24px 0 0 24px;background:var(--hub-bg);color:var(--hub-secondary);box-shadow:-2px 4px 14px #0f172a14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer}\n.hub-arc-tab:hover{color:var(--hub-ink);border-color:var(--hub-ink)}\n.hub-arc-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}\n.hub-arc-sheet{width:296px;max-height:62vh;overflow:auto;border:1px solid var(--hub-border);border-right:0;border-radius:16px 0 0 16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:-8px 12px 32px #0f172a1c;padding:12px;display:flex;flex-direction:column;gap:8px}\n.hub-arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-arc-item{padding:8px 10px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:6px}\n.hub-arc-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}\n.hub-arc-name{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:550;color:var(--hub-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.hub-arc-meta{font-size:10px;color:var(--hub-secondary);flex:none}\n.hub-arc-actions{display:flex;gap:5px;flex-wrap:wrap}\n.hub-arc-btn{height:23px;padding:0 8px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg);color:var(--hub-ink);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-arc-btn:hover{background:var(--hud-hover)}\n.hub-arc-btn.is-primary{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:600}\n.hub-arc-menu{margin-top:3px;padding:4px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);display:flex;flex-direction:column;gap:2px}\n.hub-arc-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:5px;background:transparent;padding:5px 7px;text-align:left;font-size:11px!important;color:var(--hub-ink);cursor:pointer}\n.hub-arc-opt:hover{background:var(--hud-hover)}\n.hub-arc-opt small{color:var(--hub-secondary);font-size:10px}\n.hub-arc-preview{margin-top:4px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg);max-height:240px;overflow:auto}\n.hub-arc-preview pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:10.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-ink)}\n#t3-hub-settings-panel{position:fixed;right:12px;top:12px;bottom:12px;width:min(460px,92vw);max-height:calc(100dvh - 24px);z-index:2147482995;display:flex;flex-direction:column;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}\n#t3-hub-settings-panel[hidden]{display:none!important}\n.hub-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--hub-border)}\n.hub-set-head strong{font-size:14px;font-weight:620}\n.hub-set-body{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}\n.hub-set-sec{border:1px solid var(--hub-border);border-radius:11px;padding:12px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:9px}\n.hub-set-sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg)}\n.hub-set-meta{min-width:0;flex:1}\n.hub-set-meta strong{display:block;font-size:11.5px;font-weight:600;overflow-wrap:anywhere}\n.hub-set-meta small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:2px;overflow-wrap:anywhere}\n.hub-set-pills{display:flex;gap:5px;flex-wrap:wrap}\n.hub-set-pill{height:25px;padding:0 9px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg);color:var(--hub-secondary);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-set-pill.is-active{background:var(--hub-active);color:var(--hub-on-active);border-color:var(--hub-active);font-weight:600}\n";
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
  handle = null;
  titleControls = root.querySelector("#t3-hub-title-controls");
  memoryHandle = root.querySelector("#t3-hub-memory-handle");
  memoryToggle = root.querySelector("#t3-hub-memory-toggle");
+ settingsHandle = root.querySelector("#t3-hub-settings-handle");
+ settingsPanel = root.querySelector("#t3-hub-settings-panel");
+ artifactDock = root.querySelector("#t3-hub-artifact-dock");
  planHandle = root.querySelector("#t3-hub-plan-handle");
  content = root.querySelector(".hub-content");
  liveBoard = root.querySelector("#t3-hub-live-board");
@@ -302,6 +308,7 @@
  });
  listen(memoryHandle, "click", openMemoryFromTitle);
  listen(memoryToggle, "click", toggleMemoryAccessFromTitle);
+ if (settingsHandle) listen(settingsHandle, "click", () => setHubSettingsOpen(!state.hubSettingsOpen));
  listen(window, "keydown", onKeydown);
  listen(window, "resize", positionHandle);
  listen(window, "resize", () => { applyWidth(); positionConversationTools(); });
@@ -1016,9 +1023,10 @@
  return ({ constraint: "constraints", rule: "constraints", rules: "constraints", pitfall: "pitfalls", experience: "pitfalls", topic: "topics", "topic-memory": "topics", memory: "constraints" })[module] || module || "topics";
     }
  function renderMemory() {
- content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签。本机接入状态不代表当前会话已加载。", "Read and maintain shared knowledge and worktree notes for the currently confirmed project only. Local access status does not prove the current session loaded it."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
+ content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签。本机接入状态不代表当前会话已加载。", "Read and maintain shared knowledge and worktree notes for the currently confirmed project only. Local access status does not prove the current session loaded it."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
  renderMemoryAgentAccess();
  renderMemoryRuntime();
+ renderEngine();
  renderMemoryConnections();
  renderWorktreeScopes();
  renderMemoryNav();
@@ -1619,6 +1627,7 @@
  const top = anchor.bottom + estimatedHeight + 12 <= innerHeight ? anchor.bottom + 8 : Math.max(8, anchor.top - estimatedHeight - 8);
  Object.assign(liveBoard.style, { left: `${left}px`, width: `${width}px`, top: `${top}px`, maxHeight: `${Math.max(100, innerHeight - top - 8)}px` });
  }
+ renderArtifactDock();
     }
     function boardMismatch() {
  const remoteEnv = remotePlanEnvironmentId();
@@ -1930,6 +1939,202 @@
  const hasPlan = hasActualPlan(board);
  return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${escIdentity(step.id)}" data-step-text="${escIdentity(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!compact ? subagentSummary(board, true) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
+
+    function formatArtifactBytes(bytes) {
+ if (bytes == null || !Number.isFinite(Number(bytes))) return "";
+ const n = Number(bytes);
+ if (n < 1024) return n + " B";
+ if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+ return (n / 1048576).toFixed(1) + " MB";
+    }
+    function setArtifactDockEnabled(enabled) {
+ state.artifactDockEnabled = Boolean(enabled);
+ storageSet("t3-hub-artifact-dock-v1", state.artifactDockEnabled ? "true" : "false");
+ if (!state.artifactDockEnabled) { state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; }
+ renderArtifactDock();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+    }
+    function setHubSettingsOpen(open) {
+ state.hubSettingsOpen = Boolean(open);
+ if (state.hubSettingsOpen && state.open) setOpen(false, false);
+ if (settingsHandle) settingsHandle.setAttribute("aria-expanded", String(state.hubSettingsOpen));
+ if (settingsPanel) settingsPanel.hidden = !state.hubSettingsOpen;
+ renderArtifactDock();
+ if (state.hubSettingsOpen) {
+  renderHubSettingsPanel();
+  if (!cache.providerResources && !state.providerResLoading) loadProviderResources();
+  if (!cache.guardian && !state.guardianLoading) loadGuardianStatus();
+ }
+    }
+    async function loadProviderResources(force = false) {
+ if (disposed || (state.providerResLoading && !force)) return;
+ state.providerResLoading = true;
+ delete errors.providerResources;
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ try {
+  const data = await request("providerResources:list", {});
+  if (disposed) return;
+  cache.providerResources = data;
+  delete errors.providerResources;
+ } catch (error) {
+  if (!disposed) errors.providerResources = error;
+ } finally {
+  state.providerResLoading = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    async function toggleProviderResourceItem(element) {
+ const provider = element.dataset.provider, kind = element.dataset.kind, id = element.dataset.id;
+ const sourceFile = element.dataset.sourceFile || undefined, sourceDir = element.dataset.sourceDir || undefined;
+ const currentEnabled = element.getAttribute("aria-checked") === "true";
+ const nextEnabled = !currentEnabled;
+ await busy(`prov-res:${provider}:${kind}:${id}`, element, async () => {
+  await request("providerResources:toggle", { provider, kind, id, enabled: nextEnabled, sourceFile, sourceDir });
+  if (disposed) return;
+  await loadProviderResources(true);
+  toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"}`, `${id} ${nextEnabled ? "enabled" : "disabled"}`));
+ });
+    }
+    async function loadGuardianStatus() {
+ if (disposed || state.guardianLoading) return;
+ state.guardianLoading = true;
+ try {
+  const data = await request("guardian:status", {});
+  if (!disposed) { cache.guardian = data; delete errors.guardian; }
+ } catch (error) {
+  if (!disposed) errors.guardian = error;
+ } finally {
+  state.guardianLoading = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    async function toggleGuardian(element) {
+ if (disposed || state.guardianUpdating) return;
+ const nextEnabled = cache.guardian?.enabled !== true;
+ state.guardianUpdating = true;
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ try {
+  const res = await request("guardian:set", { enabled: nextEnabled });
+  if (!disposed) {
+   cache.guardian = res;
+   toast(nextEnabled ? tr("T3 升级自动防掉线守护已开启", "Upgrade anti-drop guardian enabled") : tr("T3 升级防掉线守护已关闭", "Upgrade anti-drop guardian disabled"));
+  }
+ } catch (error) {
+  if (!disposed) toast(errorText(error), true);
+ } finally {
+  state.guardianUpdating = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    function renderHubSettingsPanel() {
+ if (!settingsPanel || disposed) return;
+ settingsPanel.hidden = !state.hubSettingsOpen;
+ if (!state.hubSettingsOpen) return;
+ const providers = Array.isArray(cache.providerResources?.providers) ? cache.providerResources.providers : [];
+ const activeProv = providers.find((p) => p.id === state.providerResProvider) || providers[0] || null;
+ if (activeProv && activeProv.id !== state.providerResProvider) state.providerResProvider = activeProv.id;
+ const kinds = [["mcp", "MCP"], ["skills", "Skills"], ["plugins", tr("插件", "Plugins")]];
+ const activeList = activeProv && Array.isArray(activeProv[state.providerResKind]) ? activeProv[state.providerResKind] : [];
+ const guardianOn = cache.guardian?.enabled === true;
+ const resListHtml = state.providerResLoading && !providers.length
+  ? `<p class="hub-hint">${esc(tr("正在读取本机提供方配置…", "Reading local provider configs…"))}</p>`
+  : errors.providerResources
+  ? `<p class="hub-hint">${esc(errorText(errors.providerResources))} ${button("refresh-provider-resources", tr("重试", "Retry"), { small: true })}</p>`
+  : !activeList.length
+  ? `<p class="hub-hint">${esc(tr("当前提供方暂无此类型配置条目。", "No configured items for this provider and category."))}</p>`
+  : activeList.map((item) => `<div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(item.name || item.id)}</strong>${item.description ? `<small>${esc(item.description)}</small>` : ""}</div><button type="button" role="switch" class="hub-switch" data-action="toggle-provider-resource" data-provider="${esc(item.provider)}" data-kind="${esc(item.kind)}" data-id="${esc(item.id)}" ${item.sourceFile ? `data-source-file="${esc(item.sourceFile)}"` : ""} ${item.sourceDir ? `data-source-dir="${esc(item.sourceDir)}"` : ""} aria-checked="${item.enabled === true}" aria-label="${esc(item.name || item.id)}"><span></span></button></div>`).join("");
+ settingsPanel.innerHTML = `<div class="hub-set-head"><strong>${esc(tr("T3 Hub 设置", "T3 Hub Settings"))}</strong><button type="button" class="hub-arc-btn" data-action="close-hub-settings">${esc(tr("关闭", "Close"))}</button></div><div class="hub-set-body"><section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("桌面控件与升级守护", "Desktop controls & upgrade guardian"))}</span></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}</strong><small>${esc(tr("在窗口右侧边缘显示当前会话产物，支持直接打开与选择打开方式", "Show current session artifacts on the right edge with Open & Open With"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-artifact-dock-setting" aria-checked="${state.artifactDockEnabled === true}" aria-label="${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}"><span></span></button></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}</strong><small>${esc(tr("零 CPU 监听 T3 升级，仅冷启动且无活跃任务时自动重挂 HUD，绝不中断对话", "Zero-CPU WatchPaths guard; auto-reattaches only on idle cold boot"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-guardian" aria-checked="${guardianOn}" ${state.guardianUpdating ? "disabled" : ""} aria-label="${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}"><span></span></button></div></section><section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("提供方资源（只查看与开关）", "Provider resources (view & toggle)"))}</span><button type="button" class="hub-arc-btn" data-action="refresh-provider-resources">${esc(tr("刷新", "Refresh"))}</button></div><p class="hub-hint" style="margin:0">${esc(tr("独立读取各提供方原生配置，仅控制启停，不负责新增或删除。", "Reads each provider's native local config directly; toggle on/off only."))}</p><div class="hub-set-pills">${providers.map((p) => { const total = (p.counts?.mcp || 0) + (p.counts?.skills || 0) + (p.counts?.plugins || 0); return `<button type="button" class="hub-set-pill ${p.id === state.providerResProvider ? "is-active" : ""}" data-action="provider-res-tab" data-provider="${esc(p.id)}">${esc(p.label)} (${total})</button>`; }).join("")}</div><div class="hub-set-pills">${kinds.map(([k, lbl]) => { const c = activeProv?.counts?.[k] ?? 0; return `<button type="button" class="hub-set-pill ${k === state.providerResKind ? "is-active" : ""}" data-action="provider-res-kind" data-kind="${esc(k)}">${esc(lbl)} (${c})</button>`; }).join("")}</div><div style="display:flex;flex-direction:column;gap:6px">${resListHtml}</div></section></div>`;
+    }
+    function dockArtifacts() {
+ if (!state.connected || boardProblem() || boardMismatch()) return [];
+ const board = boardData();
+ return Array.isArray(board.artifacts) ? board.artifacts : [];
+    }
+    function renderArtifactDock() {
+ if (!artifactDock || disposed) return;
+ const show = state.artifactDockEnabled && !state.open && !state.hubSettingsOpen && !root.classList.contains("is-occluded") && Boolean(state.threadId && state.threadId !== "__NEW__");
+ artifactDock.hidden = !show;
+ if (!show) return;
+ const list = dockArtifacts();
+ const count = list.length;
+ if (!state.artifactDockOpen) {
+  artifactDock.innerHTML = `<button type="button" class="hub-arc-tab" data-action="dock-toggle" title="${esc(tr(`当前会话产物 (${count})`, `Session artifacts (${count})`))}" aria-label="${esc(tr("展开右侧产物悬浮框", "Expand artifacts dock"))}">${icon("file", 13)}<span class="hub-arc-badge">${count}</span></button>`;
+  return;
+ }
+ const previewHtml = state.dockPreview ? `<div class="hub-arc-preview"><div class="hub-arc-row"><strong class="hub-arc-name">${esc(state.dockPreview.name)}</strong><button type="button" class="hub-arc-btn" data-action="dock-close-preview">${esc(tr("关闭预览", "Close"))}</button></div><pre>${esc(state.dockPreview.content)}</pre></div>` : "";
+ const itemsHtml = !count
+  ? `<p class="hub-hint" style="margin:6px 0">${esc(tr("当前会话暂无可打开的产物。", "No artifacts in this session yet."))}</p>`
+  : list.map((art, index) => {
+   const name = art.name || String(art.path || "").split(/[\\/]/).pop() || tr("产物", "Artifact");
+   const sizeTxt = formatArtifactBytes(art.sizeBytes);
+   const isMd = /\.md$/i.test(name);
+   const menuOpen = state.artifactMenuIndex === index;
+   const appInfo = state.artifactApps[art.path] || null;
+   const menuHtml = menuOpen ? `<div class="hub-arc-menu">${isMd ? `<button type="button" class="hub-arc-opt" data-action="dock-preview-artifact" data-index="${index}"><span>${esc(tr("T3 内置预览", "T3 inline preview"))}</span><small>${esc(tr("内置", "Built-in"))}</small></button>` : ""}${state.artifactMenuLoading && !appInfo ? `<span class="hub-hint" style="padding:4px 6px">${esc(tr("正在读取本机应用…", "Loading apps…"))}</span>` : (appInfo?.apps || []).slice(0, 8).map((app) => `<button type="button" class="hub-arc-opt" data-action="dock-open-with-app" data-index="${index}" data-app-path="${esc(app.path)}"><span>${esc(app.name)}</span>${app.isDefault ? `<small>${esc(tr("默认", "Default"))}</small>` : ""}</button>`).join("")}<button type="button" class="hub-arc-opt" data-action="dock-choose-app" data-index="${index}"><span>${esc(tr("选择其他应用…", "Choose other app…"))}</span></button></div>` : "";
+   return `<div class="hub-arc-item"><div class="hub-arc-row"><span class="hub-arc-name" title="${esc(art.path || name)}">${esc(name)}</span>${sizeTxt ? `<span class="hub-arc-meta">${esc(sizeTxt)}</span>` : ""}</div><div class="hub-arc-actions"><button type="button" class="hub-arc-btn is-primary" data-action="dock-open-default" data-index="${index}">${esc(tr("打开", "Open"))}</button><button type="button" class="hub-arc-btn" data-action="dock-toggle-menu" data-index="${index}">${esc(tr("打开方式 ▾", "Open With ▾"))}</button><button type="button" class="hub-arc-btn" data-action="dock-reveal" data-index="${index}">Finder</button></div>${menuHtml}</div>`;
+  }).join("");
+ artifactDock.innerHTML = `<button type="button" class="hub-arc-tab" data-action="dock-toggle" title="${esc(tr("收起产物悬浮框", "Collapse artifacts dock"))}" aria-label="${esc(tr("收起产物悬浮框", "Collapse artifacts dock"))}">${icon("file", 13)}<span class="hub-arc-badge">${count}</span></button><div class="hub-arc-sheet"><div class="hub-arc-head"><span>${esc(tr(`会话产物 (${count})`, `Artifacts (${count})`))}</span><div style="display:flex;gap:4px"><button type="button" class="hub-arc-btn" data-action="dock-refresh">${esc(tr("刷新", "Refresh"))}</button><button type="button" class="hub-arc-btn" data-action="dock-toggle">${esc(tr("收起", "Hide"))}</button></div></div>${itemsHtml}${previewHtml}</div>`;
+    }
+    async function dockOpenDefault(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-open:${index}`, element, async () => {
+  const res = await request("artifact:openDefault", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path });
+  if (disposed) return;
+  if (res?.kind === "safe-degraded") toast(tr(`脚本安全保护：已用 ${res.openedWith || "Finder"} 打开（未执行）`, `Executable guard: opened safely with ${res.openedWith || "Finder"}`));
+  else toast(tr("已打开产物", "Artifact opened"));
+ });
+    }
+    async function dockToggleMenu(index) {
+ if (state.artifactMenuIndex === index) { state.artifactMenuIndex = null; renderArtifactDock(); return; }
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ state.artifactMenuIndex = index;
+ state.artifactMenuLoading = true;
+ renderArtifactDock();
+ try {
+  const res = await request("artifact:listApps", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path });
+  if (!disposed) state.artifactApps[art.path] = res;
+ } catch (error) {
+  if (!disposed) toast(errorText(error), true);
+ } finally {
+  state.artifactMenuLoading = false;
+  if (!disposed) renderArtifactDock();
+ }
+    }
+    async function dockOpenWith(index, appPath, chooseApp, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-open-with:${index}`, element, async () => {
+  const res = await request("artifact:openWith", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, appPath, chooseApp });
+  if (disposed) return;
+  state.artifactMenuIndex = null;
+  renderArtifactDock();
+  if (res?.kind === "opened-with") toast(tr(`已用 ${res.appName || "所选应用"} 打开`, `Opened with ${res.appName || "selected app"}`));
+ });
+    }
+    async function dockPreviewMarkdown(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-preview:${index}`, element, async () => {
+  const res = await request("board:openArtifact", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, operation: "preview" });
+  if (disposed) return;
+  if (res?.kind === "markdown") {
+   state.dockPreview = { name: res.name || art.name, content: res.content || "" };
+   state.artifactMenuIndex = null;
+   renderArtifactDock();
+  }
+ });
+    }
+    async function dockReveal(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-reveal:${index}`, element, async () => {
+  await request("board:openArtifact", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, operation: "reveal" });
+  if (!disposed) toast(tr("已在 Finder 中显示", "Revealed in Finder"));
+ });
+    }
+
     function renderLiveBoard() {
  if (!liveBoard || disposed) return;
  const board = boardData(), hasPlan = (state.connected || remotePlanContextReady()) && !boardProblem() && !boardMismatch() && hasActualPlan(board);
@@ -1939,6 +2144,7 @@
  planHandle.setAttribute("aria-label", planProgress.total ? tr(`当前会话计划：${planProgress.label}`, `Current conversation plan: ${planProgress.label}`) : tr("查看当前会话计划", "View current conversation plan"));
  planHandle.title = planProgress.label;
  planHandle.setAttribute("aria-expanded", String(!!state.planOpen));
+ renderArtifactDock();
  liveBoard.innerHTML = `<div class="hub-plan-popover" role="region" aria-label="${esc(tr("当前会话计划进度", "Current conversation plan progress"))}">${planProgress.total ? `<div class="hub-plan-summary"><strong>${esc(planProgress.label)}</strong><span>${planProgress.done ? esc(tr("已完成", "Complete")) : esc(tr(`已完成 ${planProgress.completed} 项`, `${planProgress.completed} completed`))}</span></div>` : ""}${board.steps.length ? `<ol class="hub-plan-steps">${board.steps.map((step) => `<li class="hub-board-step is-${esc(step.status)}"><span class="hub-step-icon" aria-hidden="true">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "•" : ""}</span><span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : `<div class="hub-plan-document">${esc(String(board.planMarkdown || "").trim().slice(0, 1800))}</div>`}</div>`;
  positionConversationTools();
  applyTheme();
@@ -2771,6 +2977,7 @@
  const data = { ...response };
  if (!scopedRoot) { delete data.vectorStats; delete data.vectorStatsError; }
  embedProjectKey = projectKey;
+ const hadEmbed = Boolean(cache.embed);
  const wasActive = cache.embed?.downloadJob?.active;
  const prevVs = cache.embed?.vectorStats;
  const prevMemory = [cache.embed?.activeMb, cache.embed?.ceilingMb, cache.embed?.cacheMb, cache.embed?.rssMb, prevVs?.activeMb, prevVs?.ceilingMb, prevVs?.cacheMb].join("/");
@@ -2788,7 +2995,7 @@
  if ((ready === true || keyword) && !data.vectorStats?.reindexing) state.embedReadyDeadline = 0;
  delete errors.embed;
  if (render && state.tab === "memory") {
- if (!!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
+ if (!hadEmbed || !!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
  else renderDownloadProgress();
  }
  if ((wasActive || wasWaiting) && ready === true && !data.downloadJob?.active && !data.downloadJob?.error) {
@@ -2824,6 +3031,7 @@
     function setOpen(open, focus = true) {
  state.open = !!open;
  if (!root || disposed) return;
+ if (state.open && state.hubSettingsOpen) setHubSettingsOpen(false);
  if (state.open && focus) focusReturn = document.activeElement;
  root.classList.toggle("is-open", state.open);
  handle?.setAttribute("aria-expanded", String(state.open));
@@ -2934,6 +3142,23 @@
  const action = target.dataset.action;
  const id = target.dataset.id;
  if (action === "open-memory") openMemoryFromTitle();
+ else if (action === "open-hub-settings") setHubSettingsOpen(!state.hubSettingsOpen);
+ else if (action === "close-hub-settings") setHubSettingsOpen(false);
+ else if (action === "toggle-artifact-dock-setting") setArtifactDockEnabled(!state.artifactDockEnabled);
+ else if (action === "toggle-guardian") toggleGuardian(target);
+ else if (action === "refresh-provider-resources") loadProviderResources(true);
+ else if (action === "provider-res-tab") { state.providerResProvider = target.dataset.provider; renderHubSettingsPanel(); }
+ else if (action === "provider-res-kind") { state.providerResKind = target.dataset.kind; renderHubSettingsPanel(); }
+ else if (action === "toggle-provider-resource") toggleProviderResourceItem(target);
+ else if (action === "dock-toggle") { state.artifactDockOpen = !state.artifactDockOpen; if (!state.artifactDockOpen) { state.artifactMenuIndex = null; state.dockPreview = null; } renderArtifactDock(); }
+ else if (action === "dock-refresh") { pollBoard(true).then(() => { if (!disposed) renderArtifactDock(); }); }
+ else if (action === "dock-open-default") dockOpenDefault(Number(target.dataset.index), target);
+ else if (action === "dock-toggle-menu") dockToggleMenu(Number(target.dataset.index));
+ else if (action === "dock-open-with-app") dockOpenWith(Number(target.dataset.index), target.dataset.appPath, false, target);
+ else if (action === "dock-choose-app") dockOpenWith(Number(target.dataset.index), null, true, target);
+ else if (action === "dock-preview-artifact") dockPreviewMarkdown(Number(target.dataset.index), target);
+ else if (action === "dock-close-preview") { state.dockPreview = null; renderArtifactDock(); }
+ else if (action === "dock-reveal") dockReveal(Number(target.dataset.index), target);
  else if (action === "set-theme") setTheme(target.dataset.theme);
  else if (action === "open-board-studio") { switchTab("board"); setOpen(true); }
  else if (action === "dashboard-tab") { switchTab(target.dataset.tab); setOpen(true); }
@@ -3170,6 +3395,8 @@
     }
     function onKeydown(event) {
  const key = event.key.toLowerCase();
+ if (key === "escape" && state.hubSettingsOpen) { event.preventDefault(); setHubSettingsOpen(false); return; }
+ if (key === "escape" && state.artifactDockOpen) { event.preventDefault(); state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; renderArtifactDock(); return; }
  if (key === "escape" && state.planOpen) { event.preventDefault(); setPlanPopover(false); return; }
  if (((event.metaKey || event.ctrlKey) && event.shiftKey && key === "k") || (event.altKey && !event.metaKey && !event.ctrlKey && key === "h")) {
  if (event.repeat) return;
@@ -3527,7 +3754,7 @@
  try { unsubscribeRouter?.(); } catch {}
  unsubscribeRouter = null; cachedRouter = null;
  disposers.splice(0).forEach((dispose) => { try { dispose(); } catch {} });
- liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); root?.remove(); style?.remove();
+ liveBoard?.remove(); settingsPanel?.remove(); artifactDock?.remove(); titleControls?.remove(); planHandle?.remove(); root?.remove(); style?.remove();
  if (window.__t3SidecarHub === api) delete window.__t3SidecarHub;
  if (window.__t3SidecarHubCleanup === api.destroy) delete window.__t3SidecarHubCleanup;
  },
