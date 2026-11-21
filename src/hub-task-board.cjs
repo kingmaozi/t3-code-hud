@@ -937,7 +937,14 @@ function collectArtifacts(session) {
       const accessIdentity = captureArtifactIdentity(session.dir, artifact.path, session.anchorDir || null);
       const rootEntry = accessIdentity.entries.find((e) => e.path === resolvedSessionDir);
       if (accessIdentity.realRoot !== session.realPath || !rootEntry || rootEntry.dev !== session.dev || rootEntry.ino !== session.ino) return [];
-      return [{ ...artifact, accessIdentity }];
+      let sizeBytes = null;
+      let isDirectory = false;
+      try {
+        const st = fs.lstatSync(artifact.path);
+        isDirectory = st.isDirectory();
+        if (st.isFile()) sizeBytes = st.size;
+      } catch {}
+      return [{ ...artifact, sizeBytes, isDirectory, ext: path.extname(artifact.name || artifact.path || "").toLowerCase(), accessIdentity }];
     } catch { return []; }
   });
   return sameBrainSession(session) ? bound : [];

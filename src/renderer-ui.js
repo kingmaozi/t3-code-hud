@@ -358,14 +358,27 @@
       p.thread?.providerInstanceId ||
       ""
     );
+    const normalizeProjDriver = (driver, providerOrInstance) => {
+      const d = String(driver || "").trim();
+      const pId = String(providerOrInstance || "").trim();
+      if (d === "acpRegistry" && pId.startsWith("acpRegistry_")) return pId;
+      return d || pId;
+    };
+    const driversMatch = (a, b) => {
+      const la = String(a || "").trim().toLowerCase();
+      const lb = String(b || "").trim().toLowerCase();
+      if (!la || !lb) return false;
+      if (la === lb) return true;
+      return (la === "acpregistry" && lb.startsWith("acpregistry_")) || (lb === "acpregistry" && la.startsWith("acpregistry_"));
+    };
     let lastUsage = null;
     let driverUsage = null;
     for (const pt of ctxList) {
       if (!pt || !pt.contextUsage) continue;
-      const drv = String(pt.driver || pt.providerThreadRef?.driver || pt.provider || "");
+      const drv = normalizeProjDriver(pt.driver || pt.providerThreadRef?.driver, pt.providerInstanceId || pt.provider);
       if (!drv) lastUsage = pt.contextUsage;
       if (activeDriver) {
-        if (drv === activeDriver) driverUsage = pt.contextUsage;
+        if (driversMatch(drv, activeDriver)) driverUsage = pt.contextUsage;
       } else {
         lastUsage = pt.contextUsage;
       }
@@ -373,14 +386,14 @@
     const contextUsage = activeDriver ? driverUsage : lastUsage;
     const isRunningStatus = (st) => st === "running" || st === "starting" || st === "in_progress";
     const isActiveTurnStatus = (st) => st === "running" || st === "pending" || st === "starting" || st === "in_progress";
-    const sessionDriverOf = (s) => String(s?.driver || s?.provider || s?.providerInstanceId || "").trim();
+    const sessionDriverOf = (s) => normalizeProjDriver(s?.driver, s?.providerInstanceId || s?.provider);
     const linkedSessionDriverOf = (pt) => {
       const sid = pt?.providerSessionId ?? pt?.sessionId ?? null;
       if (sid == null || String(sid) === "") return "";
       const sess = (p.providerSessions || []).find((s) => String(s?.id ?? s?.providerSessionId ?? "") === String(sid));
       return sess ? sessionDriverOf(sess) : "";
     };
-    const turnDriverOf = (pt) => String(pt?.nativeTurnRef?.driver || pt?.driver || pt?.provider || linkedSessionDriverOf(pt) || "").trim();
+    const turnDriverOf = (pt) => normalizeProjDriver(pt?.nativeTurnRef?.driver || pt?.driver, pt?.providerInstanceId || pt?.provider || linkedSessionDriverOf(pt));
     const itemDriverOf = (it) => {
       const drivers = new Set();
       const add = (v) => { if (v != null && String(v).trim() !== "") drivers.add(String(v).trim()); };
@@ -417,10 +430,10 @@
       return best;
     };
     const latestDriverSession = activeDriver
-      ? pickLatestRecord(p.providerSessions, (s) => sessionDriverOf(s) === activeDriver)
+      ? pickLatestRecord(p.providerSessions, (s) => driversMatch(sessionDriverOf(s), activeDriver))
       : pickLatestRecord(p.providerSessions, Boolean);
     const latestDriverTurn = activeDriver
-      ? pickLatestRecord(p.providerTurns, (pt) => turnDriverOf(pt) === activeDriver)
+      ? pickLatestRecord(p.providerTurns, (pt) => driversMatch(turnDriverOf(pt), activeDriver))
       : pickLatestRecord(p.providerTurns, Boolean);
     const latestSessionRunning = (() => {
       if (!latestDriverSession || !isRunningStatus(String(latestDriverSession.status || ""))) return false;
@@ -449,7 +462,7 @@
     const latestRelevantRun = activeDriver
       ? pickLatestRecord(p.runs, (r) => {
           const d = resolveRunDriver(r);
-          return d ? d === activeDriver : hasActiveDriverWork;
+          return d ? driversMatch(d, activeDriver) : hasActiveDriverWork;
         })
       : pickLatestRecord(p.runs, Boolean);
     const latestRunRunning = Boolean(latestRelevantRun && isRunningStatus(String(latestRelevantRun.status || "")));
@@ -1055,6 +1068,10 @@
       contextMax = 1007997;
       contextMaxSource = "estimated";
     }
+    if (contextMax == null && effDriver === "acpRegistry_devin" && /swe-2/i.test(String(effModel || ""))) {
+      contextMax = 262000;
+      contextMaxSource = "estimated";
+    }
     if (pricedTurns === 0 && Number.isFinite(contextUsed) && contextUsed > 0) {
       promptTotal = contextUsed;
       uncachedOut = contextUsed;
@@ -1201,7 +1218,7 @@
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
       "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
-      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
     const isHubTunnel = method === "getGitGraph" && args[0] === "__HUB_RPC__";
     const hubAction = isHubTunnel ? String(args[1] || "") : "";
@@ -1262,7 +1279,7 @@
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
       "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
-      "board:get", "board:readArtifact", "settings:get", "settings:getRule",
+      "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
     const bridge = window.__t3HubSidecarBridge;
     const normalizedPayload = payload || {};
@@ -1896,8 +1913,26 @@
     .t3-hud-quota-ring:hover, .t3-hud-quota-ring:focus-visible, #t3-hud-context-control:hover, #t3-hud-context-control:focus-visible { background: var(--hud-hover); outline: 2px solid transparent; }
     .t3-hud-quota-ring > svg { width: 32px; height: 32px; transform: rotate(-90deg); }
     .t3-hud-provider-logo { position: absolute; display: inline-flex; align-items: center; justify-content: center; width: 12px; height: 12px; font-size: 9px; font-weight: 700; line-height: 1; }
+    .t3-hud-provider-logo.is-dual { width: 15px; height: 15px; }
     .t3-hud-provider-logo svg { width: 100%; height: 100%; }
     .t3-hud-quota-ring .quota-arc { transition: stroke-dashoffset .25s ease; }
+    .t3-qcard-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+    .t3-qcard-title { font-size: 13px; font-weight: 650; color: var(--hud-fg); letter-spacing: -0.01em; }
+    .t3-qcard-badge { flex: none; padding: 2px 8px; border-radius: 999px; background: color-mix(in srgb, var(--hud-fg) 7%, transparent); color: var(--hud-muted); font-size: 10.5px; font-weight: 500; }
+    .t3-qcard-win { margin-bottom: 12px; }
+    .t3-qcard-win:last-child { margin-bottom: 0; }
+    .t3-qcard-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+    .t3-qcard-lbl { color: var(--hud-fg); font-weight: 500; }
+    .t3-qcard-pct { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 12.5px; }
+    .t3-qcard-pct.ok { color: #10a37f; }
+    .t3-qcard-pct.mid { color: #d97706; }
+    .t3-qcard-pct.err { color: #dc2626; }
+    .t3-qcard-track { height: 5px; border-radius: 999px; background: color-mix(in srgb, var(--hud-fg) 10%, transparent); overflow: hidden; }
+    .t3-qcard-fill { height: 100%; border-radius: 999px; transition: width .22s ease; }
+    .t3-qcard-fill.ok { background: #10a37f; }
+    .t3-qcard-fill.mid { background: #d97706; }
+    .t3-qcard-fill.err { background: #dc2626; }
+    .t3-qcard-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 11px; color: var(--hud-muted); font-variant-numeric: tabular-nums; }
     #t3-hud-topbar.is-hidden {
       display: none !important;
     }
@@ -2791,8 +2826,35 @@
   let customDrawerPos = null;
   let spacedComposerStack = null;
   let currentPopoverMode = "stats";
+  let currentPopoverProvider = null;
   let popoverHideTimer = null;
   let hudUpdateState = {};
+  let externalQuotaProviders = [];
+  let externalQuotaFetchedAt = 0;
+  let externalQuotaInFlight = false;
+  function refreshExternalQuotas(force = false) {
+    if (disposed || document.hidden || externalQuotaInFlight) return;
+    const now = Date.now();
+    if (!force && now - externalQuotaFetchedAt < 115_000) return;
+    if (typeof window.__t3HubRpc !== "function") return;
+    externalQuotaInFlight = true;
+    window.__t3HubRpc("quota:external", force ? { force: true } : {})
+      .then((res) => {
+        if (disposed) return;
+        externalQuotaFetchedAt = Date.now();
+        if (res && res.ok && Array.isArray(res.providers)) {
+          externalQuotaProviders = res.providers;
+          if (latestStats) renderTopbarStats(latestStats);
+          else renderQuotaRing(computeQuotaAndContext(null).providerQuotas);
+        }
+      })
+      .catch(() => {
+        externalQuotaFetchedAt = Date.now();
+      })
+      .finally(() => {
+        externalQuotaInFlight = false;
+      });
+  }
 
   function createHudTurnSpeedState(routeKey) {
     return {
@@ -3554,6 +3616,49 @@
 
   function cacheColor() { return "var(--hud-fg)"; }
 
+  const quotaBurnSamples = new Map();
+  const QUOTA_BURN_WINDOW_MS = 60 * 60 * 1000;
+  const QUOTA_BURN_MIN_SPAN_MS = 5 * 60 * 1000;
+
+  function recordQuotaBurnEstimate(sampleKey, usedPercent, nowMs = Date.now()) {
+    if (!sampleKey || typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) return { burnShort: null, justReset: false };
+    const clamped = Math.max(0, Math.min(100, usedPercent));
+    let list = quotaBurnSamples.get(sampleKey);
+    if (!Array.isArray(list)) {
+      list = [];
+      quotaBurnSamples.set(sampleKey, list);
+    }
+    const prev = list.length ? list[list.length - 1] : null;
+    let justReset = false;
+    if (prev && prev.usedPercent - clamped >= 40) {
+      justReset = true;
+      list.length = 0;
+    }
+    if (!prev || nowMs - prev.ts >= 30_000 || Math.abs(clamped - prev.usedPercent) >= 0.5) {
+      list.push({ ts: nowMs, usedPercent: clamped });
+    }
+    const cutoff = nowMs - QUOTA_BURN_WINDOW_MS;
+    while (list.length > 1 && list[0].ts < cutoff) list.shift();
+    if (list.length > 24) list.splice(0, list.length - 24);
+    if (list.length < 2) return { burnShort: null, justReset };
+    const first = list[0];
+    const last = list[list.length - 1];
+    const spanMs = last.ts - first.ts;
+    const deltaUsed = last.usedPercent - first.usedPercent;
+    if (spanMs < QUOTA_BURN_MIN_SPAN_MS || deltaUsed < 0.5) return { burnShort: null, justReset };
+    const remaining = Math.max(0, 100 - clamped);
+    if (remaining <= 0) return { burnShort: "0m", justReset };
+    const ratePerHour = deltaUsed / (spanMs / 3_600_000);
+    if (!Number.isFinite(ratePerHour) || ratePerHour <= 0) return { burnShort: null, justReset };
+    const hoursLeft = remaining / ratePerHour;
+    let burnShort = null;
+    if (hoursLeft < 0.25) burnShort = "<15m";
+    else if (hoursLeft < 1) burnShort = `~${Math.max(15, Math.round(hoursLeft * 60))}m`;
+    else if (hoursLeft < 48) burnShort = `~${hoursLeft.toFixed(1)}h`;
+    else if (hoursLeft < 24 * 14) burnShort = `~${(hoursLeft / 24).toFixed(1)}d`;
+    return { burnShort, justReset };
+  }
+
   function selectHudFiveHourWindow(windows) {
     return windows.find((w) => {
       // T3's native usage contract reports the authoritative duration in minutes.
@@ -3572,14 +3677,21 @@
       stats?.provider ||
       ""
     ).toLowerCase();
-    const liveCtxProvider = String(
-      rawLiveContext?.driver ||
-      rawLiveContext?.provider ||
-      rawLiveContext?.providerInstanceId ||
-      (live?.contextWindow ? (live?.providerInstanceId || live?.provider || "") : "") ||
+    const rawLiveCtxDrv = String(rawLiveContext?.driver || "").toLowerCase();
+    const rawLiveCtxInst = String(rawLiveContext?.providerInstanceId || rawLiveContext?.provider || "").toLowerCase();
+    const liveCtxProvider = (
+      (rawLiveCtxDrv === "acpregistry" && rawLiveCtxInst.startsWith("acpregistry_") ? rawLiveCtxInst : "") ||
+      rawLiveCtxDrv ||
+      rawLiveCtxInst ||
+      (live?.contextWindow ? String(live?.providerInstanceId || live?.provider || "").toLowerCase() : "") ||
       ""
-    ).toLowerCase();
-    const liveContext = rawLiveContext && (!activeProviderRaw || (liveCtxProvider ? liveCtxProvider === activeProviderRaw : !selectedProvider))
+    );
+    const liveCtxMatches = !activeProviderRaw || (liveCtxProvider
+      ? (liveCtxProvider === activeProviderRaw ||
+         (liveCtxProvider === "acpregistry" && activeProviderRaw.startsWith("acpregistry_")) ||
+         (activeProviderRaw === "acpregistry" && liveCtxProvider.startsWith("acpregistry_")))
+      : !selectedProvider);
+    const liveContext = rawLiveContext && liveCtxMatches
       ? rawLiveContext
       : null;
     // Prefer live composer-selected model so switching Gemini <-> Opus/Sonnet updates 周余 immediately!
@@ -3621,7 +3733,20 @@
         ctxUsed != null && ctxMax > 0 ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100)) : null;
     }
 
-    if (!live || !Array.isArray(live.providers)) {
+    const extProviders = typeof externalQuotaProviders !== "undefined" && Array.isArray(externalQuotaProviders) ? externalQuotaProviders : [];
+    const baseProviders = live && Array.isArray(live.providers) ? live.providers : [];
+    const mergedProviders = [...baseProviders];
+    for (const ep of extProviders) {
+      if (!ep?.usageLimits?.windows?.length) continue;
+      const epId = String(ep.instanceId || ep.driver || "").toLowerCase();
+      const alreadyHas = baseProviders.some((bp) => {
+        const bpId = String(bp.instanceId || bp.driver || "").toLowerCase();
+        return (bpId === epId || (epId.includes("devin") && bpId.includes("devin"))) && bp.usageLimits?.windows?.length;
+      });
+      if (!alreadyHas) mergedProviders.push(ep);
+    }
+
+    if (!mergedProviders.length) {
       return {
         primaryWeekly: null,
         primaryFiveHour: null,
@@ -3638,20 +3763,23 @@
     }
 
     const activeProv =
-      live.providers.find(
+      mergedProviders.find(
         (p) => p.instanceId?.toLowerCase() === activeProviderRaw && p.usageLimits?.windows?.length
       ) ||
-      live.providers.find(
+      mergedProviders.find(
         (p) => p.driver?.toLowerCase() === activeProviderRaw && p.usageLimits?.windows?.length
       ) ||
       null;
 
-    const toWinItem = (w, prefix = "") => {
+    const toWinItem = (w, prefix = "", burnScope = "") => {
       if (!w || typeof w.usedPercent !== "number" || !Number.isFinite(w.usedPercent) || w.usedPercent < 0 || w.usedPercent > 100) return null;
       const rem = Math.round(100 - w.usedPercent);
       const tone = rem >= 50 ? "ok" : rem >= 20 ? "mid" : "err";
       const reset = formatResetShort(w.resetsAt);
       const rawLbl = String(w.label || w.id || "Quota").replace(" (shared)", "");
+      const burnInfo = typeof recordQuotaBurnEstimate === "function" && burnScope
+        ? recordQuotaBurnEstimate(`${burnScope}:${w.id || rawLbl}`, w.usedPercent)
+        : { burnShort: null, justReset: false };
       return {
         id: String(w.id || ""),
         kind: w.kind,
@@ -3660,45 +3788,119 @@
         remainingPct: rem,
         tone,
         reset,
+        burnShort: burnInfo.burnShort,
+        justReset: burnInfo.justReset,
       };
     };
 
-    const currentWindows = (activeProv?.usageLimits?.windows || []).map((w) => toWinItem(w)).filter(Boolean);
+    const activeScopeKey = activeProv ? String(activeProv.instanceId || activeProv.driver || "active").toLowerCase() : "";
+    const currentWindows = (activeProv?.usageLimits?.windows || []).map((w) => toWinItem(w, "", activeScopeKey)).filter(Boolean);
+
+    const isWeeklyWindow = (w) => w.kind === "weekly" || /weekly|周/i.test(String(w.label || ""));
+    const isAgyClaudeWindow = (w) => /claude|gpt|3p/i.test(String(w.label || "")) || /claude|gpt|3p/i.test(String(w.id || ""));
+    const isAgyGeminiWindow = (w) => /gemini/i.test(String(w.label || "")) || /gemini/i.test(String(w.id || ""));
 
     let primaryWeekly = null;
-    const weeklyCandidates = currentWindows.filter(
-      (w) => w.kind === "weekly" || /weekly|周/.test(w.label.toLowerCase())
-    );
+    const weeklyCandidates = currentWindows.filter(isWeeklyWindow);
     if (weeklyCandidates.length === 1) {
       primaryWeekly = weeklyCandidates[0];
     } else if (weeklyCandidates.length > 1) {
       const isThirdPartyModel = /opus|sonnet|haiku|claude|gpt|o1\b|o3\b|o4\b/i.test(activeModelRaw);
       if (isThirdPartyModel) {
-        primaryWeekly =
-          weeklyCandidates.find((w) => /claude|gpt|3p/i.test(w.label) || /3p/i.test(w.id)) ||
-          weeklyCandidates[0];
+        primaryWeekly = weeklyCandidates.find(isAgyClaudeWindow) || weeklyCandidates[0];
       } else {
-        primaryWeekly =
-          weeklyCandidates.find((w) => /gemini/i.test(w.label) || /gemini/i.test(w.id)) ||
-          weeklyCandidates[0];
+        primaryWeekly = weeklyCandidates.find(isAgyGeminiWindow) || weeklyCandidates[0];
       }
     }
 
     const otherWindows = [];
     const providerQuotas = [];
-    const provDisplayName = { muse: "Muse", codex: "Codex", openai: "Codex", antigravity: "AGY", claudeagent: "Claude", claude: "Claude" };
-    for (const p of live.providers) {
+    const provDisplayName = {
+      muse: "Muse",
+      codex: "Codex",
+      openai: "Codex",
+      antigravity: "AGY",
+      claudeagent: "Claude",
+      claude: "Claude",
+      opencode: "OpenCode",
+      "opencode-go": "OpenCode Go",
+      devin: "Devin",
+      acpregistry_devin: "Devin",
+    };
+    const resolveLogoKey = (instanceId, driver) => {
+      const idLow = String(instanceId || "").toLowerCase();
+      const drvLow = String(driver || "").toLowerCase();
+      if (idLow.includes("opencode") || drvLow.includes("opencode")) return "opencode";
+      if (idLow.includes("devin") || drvLow.includes("devin")) return "devin";
+      return drvLow || idLow;
+    };
+    const resolveDisplayName = (instanceId, driver) => {
+      const idLow = String(instanceId || "").toLowerCase();
+      const drvLow = String(driver || "").toLowerCase();
+      if (provDisplayName[idLow]) return provDisplayName[idLow];
+      if (idLow.includes("opencode-go") || idLow.includes("opencode_go")) return "OpenCode Go";
+      if (idLow.includes("opencode") || drvLow === "opencode") return "OpenCode";
+      if (idLow.includes("devin") || drvLow.includes("devin")) return "Devin";
+      return provDisplayName[drvLow] || instanceId || "Provider";
+    };
+    for (const p of mergedProviders) {
       if (!p.usageLimits?.windows?.length) continue;
       const instanceId = String(p.instanceId || p.driver || "");
       const driver = String(p.driver || p.instanceId || "").toLowerCase();
-      const pName = provDisplayName[driver] || provDisplayName[instanceId.toLowerCase()] || instanceId || "Provider";
-      const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w)).filter(Boolean);
-      const weekly = p === activeProv ? primaryWeekly : windows.find((w) => w.kind === "weekly" || /weekly|周/.test(w.label.toLowerCase())) || null;
-      const fiveHour = selectHudFiveHourWindow(windows);
-      if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, name: pName, weekly, fiveHour });
+      const pName = typeof p.displayName === "string" && p.displayName.trim() ? p.displayName.trim() : resolveDisplayName(instanceId, driver);
+      const logoKey = resolveLogoKey(instanceId, driver);
+      const scopeKey = instanceId.toLowerCase() || driver;
+      const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w, "", scopeKey)).filter(Boolean);
+      if (driver === "antigravity") {
+        const claudePool = windows.filter(isAgyClaudeWindow);
+        const geminiPool = windows.filter((w) => isAgyGeminiWindow(w) || !isAgyClaudeWindow(w));
+        const gemWeekly = geminiPool.find(isWeeklyWindow) || null;
+        const gemFive = selectHudFiveHourWindow(geminiPool);
+        const claudeWeekly = claudePool.find(isWeeklyWindow) || null;
+        const claudeFive = selectHudFiveHourWindow(claudePool);
+        if (gemWeekly || gemFive) {
+          providerQuotas.push({
+            instanceId: claudePool.length ? `${instanceId}:gemini` : instanceId,
+            providerInstanceId: instanceId,
+            driver: "antigravity",
+            logoKey: "antigravity",
+            name: claudePool.length ? `${pName} · Gemini` : pName,
+            weekly: gemWeekly,
+            fiveHour: gemFive,
+          });
+        }
+        if (claudeWeekly || claudeFive) {
+          providerQuotas.push({
+            instanceId: `${instanceId}:claude`,
+            providerInstanceId: instanceId,
+            driver: "antigravity-claude",
+            logoKey: "antigravity-claude",
+            name: `${pName} · Claude`,
+            weekly: claudeWeekly,
+            fiveHour: claudeFive,
+          });
+        }
+      } else {
+        let weekly = p === activeProv ? primaryWeekly : windows.find(isWeeklyWindow) || null;
+        let fiveHour = selectHudFiveHourWindow(windows);
+        if (!fiveHour && logoKey === "devin") {
+          fiveHour = windows.find((w) => String(w.kind || "").toLowerCase() === "daily" || w.windowDurationMins === 1440) || null;
+        }
+        if (!weekly && !fiveHour && windows.length) {
+          const isExplicitBudgetWindow = (w) =>
+            ["monthly", "daily", "credits", "acu"].includes(String(w.kind || "").toLowerCase()) ||
+            /monthly|month|daily|acu|credit|月/i.test(`${w.id || ""} ${w.label || ""}`);
+          const budgetWindows = windows
+            .filter(isExplicitBudgetWindow)
+            .sort((a, b) => (Number(b.windowDurationMins) || 0) - (Number(a.windowDurationMins) || 0));
+          weekly = budgetWindows[0] || null;
+          fiveHour = budgetWindows[1] || null;
+        }
+        if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, logoKey, name: pName, weekly, fiveHour });
+      }
       if (p !== activeProv) {
         for (const w of p.usageLimits.windows) {
-          const item = toWinItem(w, pName);
+          const item = toWinItem(w, pName, scopeKey);
           if (item) otherWindows.push(item);
         }
       }
@@ -3722,8 +3924,12 @@
   function renderQuotaRowsHtml(items) {
     return items
       .map((q) => {
-        const rstTxt = q.reset
-          ? ` <span style="color:var(--hud-muted);font-weight:400;font-size:10px">(${escapeHtml(q.reset)})</span>`
+        const metaParts = [];
+        if (q.justReset) metaParts.push(hudLang === "zh" ? "已重置" : "reset");
+        else if (q.burnShort) metaParts.push(`${hudLang === "zh" ? "约" : ""}${q.burnShort}`);
+        if (q.reset) metaParts.push(q.reset);
+        const rstTxt = metaParts.length
+          ? ` <span style="color:var(--hud-muted);font-weight:400;font-size:10px">(${escapeHtml(metaParts.join(" · "))})</span>`
           : "";
         return `
           <div class="t3-quota-row">
@@ -4059,11 +4265,112 @@
     });
   }
 
-  function showPopoverAbove(anchorEl, mode) {
+  function renderQuotaRingCardHtml(provider) {
+    if (!provider) {
+      return `<div class="t3-qcard-hdr"><span class="t3-qcard-title">${escapeHtml(hudLang === "zh" ? "引擎额度" : "Provider Quota")}</span></div><div style="color:var(--hud-muted);font-size:11px">${escapeHtml(hudLang === "zh" ? "暂无额度数据" : "No quota data yet")}</div>`;
+    }
+    const isDualClaude = provider.logoKey === "antigravity-claude" || provider.driver === "antigravity-claude";
+    const isAgyGemini = provider.instanceId === `${provider.providerInstanceId || "antigravity"}:gemini`;
+    const title = isDualClaude
+      ? "Antigravity · Claude / 3P"
+      : isAgyGemini
+        ? "Antigravity · Gemini"
+        : (provider.name || provider.instanceId || "Quota");
+    const badge = isDualClaude
+      ? (hudLang === "zh" ? "双标独立池" : "Dual Pool")
+      : isAgyGemini
+        ? (hudLang === "zh" ? "Gemini 独立池" : "Gemini Pool")
+        : (provider.weekly && provider.fiveHour
+            ? (hudLang === "zh" ? "双环额度" : "Dual Ring")
+            : (hudLang === "zh" ? "额度" : "Quota"));
+
+    const outerLabelFor = (q) => {
+      const raw = String(q.label || "").trim();
+      if (!raw || q.kind === "weekly" || /weekly|周/i.test(raw)) {
+        return hudLang === "zh" ? "周额度（外圈）" : "Weekly (outer)";
+      }
+      return hudLang === "zh" ? `${raw}（外圈）` : `${raw} (outer)`;
+    };
+
+    const innerLabelFor = (q) => {
+      if (String(q.kind || "").toLowerCase() === "daily" || Number(q.windowDurationMins) === 1440) {
+        return hudLang === "zh" ? "日额度（内圈）" : "Daily (inner)";
+      }
+      if (provider.driver === "muse" || (q.kind !== "fiveHour" && !/5\s*[-_ ]?\s*h|five\s*[-_ ]?\s*hour/i.test(String(q.label || "")))) {
+        const mins = Number(q.windowDurationMins);
+        if (Number.isFinite(mins) && mins > 0) {
+          const hrs = mins % 60 === 0 ? `${mins / 60}` : (mins / 60).toFixed(1);
+          return hudLang === "zh" ? `${hrs} 小时（内圈）` : `${hrs}h (inner)`;
+        }
+        const raw = String(q.label || "").trim();
+        if (raw) return hudLang === "zh" ? `${raw}（内圈）` : `${raw} (inner)`;
+      }
+      return hudLang === "zh" ? "5 小时（内圈）" : "5-hour (inner)";
+    };
+
+    const renderWin = (q, label) => {
+      const pct = Math.max(0, Math.min(100, Math.round(Number(q.remainingPct) || 0)));
+      const tone = q.tone === "err" ? "err" : q.tone === "mid" ? "mid" : "ok";
+      let leftMeta = "";
+      if (q.justReset) {
+        leftMeta = hudLang === "zh" ? "已重置" : "Just reset";
+      } else if (q.burnShort) {
+        const dur = String(q.burnShort).replace(/^~/, "");
+        leftMeta = hudLang === "zh"
+          ? (tone === "err" ? `偏快 · 约 ${dur} 触顶` : `约 ${dur} 用完`)
+          : (tone === "err" ? `Fast · ~${dur} to cap` : `~${dur} left`);
+      }
+      const rightMeta = q.reset
+        ? (hudLang === "zh" ? `${q.reset} 重置` : `Resets in ${q.reset}`)
+        : "";
+      const metaRow = (leftMeta || rightMeta)
+        ? `<div class="t3-qcard-meta"><span>${escapeHtml(leftMeta)}</span><span>${escapeHtml(rightMeta)}</span></div>`
+        : "";
+      return `
+        <div class="t3-qcard-win">
+          <div class="t3-qcard-row">
+            <span class="t3-qcard-lbl">${escapeHtml(label)}</span>
+            <span class="t3-qcard-pct ${tone}">${pct}%</span>
+          </div>
+          <div class="t3-qcard-track"><div class="t3-qcard-fill ${tone}" style="width:${pct}%"></div></div>
+          ${metaRow}
+        </div>
+      `;
+    };
+
+    const sections = [];
+    if (provider.weekly) {
+      sections.push(renderWin(provider.weekly, outerLabelFor(provider.weekly)));
+    }
+    if (provider.fiveHour) {
+      sections.push(renderWin(provider.fiveHour, innerLabelFor(provider.fiveHour)));
+    }
+    return `
+      <div class="t3-qcard-hdr">
+        <span class="t3-qcard-title">${escapeHtml(title)}</span>
+        <span class="t3-qcard-badge">${escapeHtml(badge)}</span>
+      </div>
+      ${sections.length ? sections.join("") : `<div style="color:var(--hud-muted);font-size:11px">${escapeHtml(hudLang === "zh" ? "暂无额度数据" : "No quota data yet")}</div>`}
+    `;
+  }
+
+  function renderQuotaRingPopover(providerId) {
+    popover.style.width = "276px";
+    const qInfo = computeQuotaAndContext(latestStats);
+    const list = Array.isArray(qInfo.providerQuotas) ? qInfo.providerQuotas : [];
+    const target = list.find((p) => p.instanceId === providerId)
+      || list.find((p) => p.providerInstanceId === providerId)
+      || null;
+    popover.innerHTML = renderQuotaRingCardHtml(target);
+  }
+
+  function showPopoverAbove(anchorEl, mode, providerId = null) {
     currentPopoverMode = mode;
+    currentPopoverProvider = mode === "quota" ? providerId : null;
     if (mode === "context") renderContextRingPopover();
+    else if (mode === "quota") renderQuotaRingPopover(providerId);
     else renderStatsPopover();
-    const popW = mode === "context" ? 268 : 324;
+    const popW = mode === "context" ? 268 : mode === "quota" ? 276 : 324;
     const anchorRect = anchorEl.getBoundingClientRect();
     const centerX = anchorRect.left + anchorRect.width / 2;
     const leftPos = Math.max(12, Math.min(window.innerWidth - popW - 14, Math.round(centerX - popW / 2)));
@@ -4107,7 +4414,7 @@
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (!button || button.contains(event.relatedTarget)) return;
     clearTimeout(popoverHideTimer);
-    showPopoverAbove(button, "stats");
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   quotaRings.addEventListener("mouseout", (event) => {
     const button = event.target.closest?.(".t3-hud-quota-ring");
@@ -4117,11 +4424,17 @@
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (!button) return;
     clearTimeout(popoverHideTimer);
-    showPopoverAbove(button, "stats");
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   quotaRings.addEventListener("focusout", (event) => {
     const button = event.target.closest?.(".t3-hud-quota-ring");
     if (button && !button.contains(event.relatedTarget)) hidePopoverDelayed();
+  });
+  quotaRings.addEventListener("click", (event) => {
+    const button = event.target.closest?.(".t3-hud-quota-ring");
+    if (!button) return;
+    clearTimeout(popoverHideTimer);
+    showPopoverAbove(button, "quota", button.getAttribute("data-hud-provider"));
   });
   popover.addEventListener("mouseenter", () => clearTimeout(popoverHideTimer));
   popover.addEventListener("mouseleave", () => hidePopoverDelayed());
@@ -4139,6 +4452,19 @@
   // Provider artwork follows the icons shipped with T3 Code.
   const HUD_PROVIDER_LOGOS = {"codex":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"100 100 411 411\" fill=\"currentColor\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z\"/></svg>","openai":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"100 100 411 411\" fill=\"currentColor\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M252.794 108.802C289.191 99.0484 326.265 110.305 351.148 135.135C385.113 126.072 422.85 134.862 449.492 161.505C476.136 188.149 484.925 225.888 475.862 259.85V259.854C500.696 284.735 511.95 321.81 502.198 358.207C492.447 394.602 464.161 421.084 430.215 430.217C421.083 464.162 394.603 492.448 358.206 502.199C321.812 511.951 284.734 500.693 259.852 475.864C225.887 484.927 188.15 476.137 161.507 449.495C134.864 422.851 126.073 385.111 135.136 351.149C110.304 326.266 99.0496 289.192 108.801 252.795C118.552 216.4 146.84 189.918 180.784 180.785C189.917 146.841 216.396 118.553 252.794 108.802ZM374.292 407.145C374.292 411.271 372.092 415.086 368.517 417.148L283.723 466.102C302.487 480.585 327.555 486.459 352.217 479.852C386.997 470.532 410.068 439.312 410.555 405.006V317.717C410.555 315.08 409.125 312.621 406.843 311.303L374.292 292.509V407.145ZM251.868 415.897C248.296 417.959 243.893 417.959 240.317 415.897L155.526 366.942C152.366 390.436 159.811 415.08 177.866 433.136H177.863C203.325 458.594 241.896 462.962 271.85 446.232L347.449 402.586C349.735 401.268 351.148 398.8 351.148 396.163V358.579L251.868 415.897ZM368.602 220.628C366.319 219.309 363.474 219.318 361.191 220.637L328.641 239.431L427.921 296.749C431.496 298.811 433.697 302.627 433.697 306.752V404.661C455.622 395.654 473.244 376.881 479.851 352.218C489.169 317.442 473.668 281.85 444.201 264.274L368.602 220.628ZM177.303 206.34C155.377 215.348 137.756 234.122 131.148 258.783C121.832 293.561 137.331 329.153 166.799 346.727L242.398 390.373C244.68 391.692 247.525 391.684 249.807 390.366L282.357 371.572L183.078 314.253C179.504 312.189 177.303 308.375 177.303 304.251V206.34ZM259.849 279.145V331.858L305.5 358.213L351.15 331.858V279.145L305.5 252.789L259.849 279.145ZM327.276 144.9C308.512 130.418 283.445 124.543 258.782 131.15C224.002 140.471 200.931 171.691 200.445 205.995V293.286C200.445 295.923 201.875 298.381 204.158 299.7L236.707 318.493V203.856C236.707 199.731 238.909 195.916 242.483 193.853L327.276 144.9ZM433.137 177.867C407.675 152.407 369.103 148.038 339.149 164.769L263.55 208.415C261.265 209.734 259.852 212.202 259.852 214.838V252.423L359.132 195.105C362.703 193.041 367.108 193.041 370.682 195.105L455.473 244.06C458.635 220.567 451.189 195.922 433.135 177.867H433.137Z\"/></svg>","muse":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 287.56 191\" fill=\"none\"><defs><linearGradient id=\"muse-a\" x1=\"61\" y1=\"117\" x2=\"259\" y2=\"127\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#0064e1\"/><stop offset=\".4\" stop-color=\"#0064e1\"/><stop offset=\".83\" stop-color=\"#0073ee\"/><stop offset=\"1\" stop-color=\"#0082fb\"/></linearGradient><linearGradient id=\"muse-b\" x1=\"45\" y1=\"139\" x2=\"45\" y2=\"66\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#0082fb\"/><stop offset=\"1\" stop-color=\"#0064e0\"/></linearGradient></defs><path fill=\"#0081fb\" d=\"m31.06,125.96c0,10.98 2.41,19.41 5.56,24.51 4.13,6.68 10.29,9.51 16.57,9.51 8.1,0 15.51-2.01 29.79-21.76 11.44-15.83 24.92-38.05 33.99-51.98l15.36-23.6c10.67-16.39 23.02-34.61 37.18-46.96 11.56-10.08 24.03-15.68 36.58-15.68 21.07,0 41.14,12.21 56.5,35.11 16.81,25.08 24.97,56.67 24.97,89.27 0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75l0-31.02c17.63,0 22.03-16.2 22.03-34.74 0-26.42-6.16-55.74-19.73-76.69-9.63-14.86-22.11-23.94-35.84-23.94-14.85,0-26.8,11.2-40.23,31.17-7.14,10.61-14.47,23.54-22.7,38.13l-9.06,16.05c-18.2,32.27-22.81,39.62-31.91,51.75-15.95,21.24-29.57,29.29-47.5,29.29-21.27,0-34.72-9.21-43.05-23.09-6.8-11.31-10.14-26.15-10.14-43.06z\"/><path fill=\"url(#muse-a)\" d=\"m24.49,37.3c14.24-21.95 34.79-37.3 58.36-37.3 13.65,0 27.22,4.04 41.39,15.61 15.5,12.65 32.02,33.48 52.63,67.81l7.39,12.32c17.84,29.72 27.99,45.01 33.93,52.22 7.64,9.26 12.99,12.02 19.94,12.02 17.63,0 22.03-16.2 22.03-34.74l27.4-.86c0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75-12.8,0-24.14-2.78-36.68-14.61-9.64-9.08-20.91-25.21-29.58-39.71l-25.79-43.08c-12.94-21.62-24.81-37.74-31.68-45.04-7.39-7.85-16.89-17.33-32.05-17.33-12.27,0-22.69,8.61-31.41,21.78z\"/><path fill=\"url(#muse-b)\" d=\"m82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78-12.33,18.61-19.88,46.33-19.88,72.95 0,10.98 2.41,19.41 5.56,24.51l-26.48,17.44c-6.8-11.31-10.14-26.15-10.14-43.06 0-30.75 8.44-62.8 24.49-87.55 14.24-21.95 34.79-37.3 58.36-37.3z\"/></svg>","antigravity":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><image href=\"data:image/png;base64,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\" width=\"32\" height=\"32\"/></svg>"};
 
+  const HUD_CLAUDE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><g transform=\"translate(12 12)\" stroke=\"#d97757\" stroke-width=\"2.1\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-7.5\" x2=\"0\" y2=\"7.5\"/><line x1=\"-7.5\" y1=\"0\" x2=\"7.5\" y2=\"0\"/><line x1=\"-5.3\" y1=\"-5.3\" x2=\"5.3\" y2=\"5.3\"/><line x1=\"-5.3\" y1=\"5.3\" x2=\"5.3\" y2=\"-5.3\"/></g></svg>";
+  const HUD_AGY_CLAUDE_DUAL_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><defs><linearGradient id=\"t3-agy-dual\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0%\" stop-color=\"#ea4335\"/><stop offset=\"48%\" stop-color=\"#fbbc05\"/><stop offset=\"100%\" stop-color=\"#4285f4\"/></linearGradient></defs><path d=\"M2.4 14.8C5.1 13.8 6.9 4.8 8.9 4.8s3.3 9 5.6 10\" stroke=\"url(#t3-agy-dual)\" stroke-width=\"2.5\" stroke-linecap=\"round\"/><circle cx=\"15.8\" cy=\"14.8\" r=\"5.8\" fill=\"var(--hud-bg, #ffffff)\"/><g transform=\"translate(15.8 14.8)\" stroke=\"#d97757\" stroke-width=\"1.7\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-4.4\" x2=\"0\" y2=\"4.4\"/><line x1=\"-4.4\" y1=\"0\" x2=\"4.4\" y2=\"0\"/><line x1=\"-3.1\" y1=\"-3.1\" x2=\"3.1\" y2=\"3.1\"/><line x1=\"-3.1\" y1=\"3.1\" x2=\"3.1\" y2=\"-3.1\"/></g></svg>";
+  const HUD_OPENCODE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M4.5 2h15v20h-15V2zm3.8 3.8v12.4h7.4V5.8H8.3z\" fill=\"currentColor\"/><rect x=\"8.3\" y=\"11.4\" width=\"7.4\" height=\"6.8\" fill=\"currentColor\" fill-opacity=\"0.3\"/></svg>";
+  const HUD_DEVIN_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><polygon points=\"7.8,1.4 12.1,3.9 12.1,8.8 7.8,11.3 3.5,8.8 3.5,3.9\"/><polygon points=\"7.8,12.7 12.1,15.2 12.1,20.1 7.8,22.6 3.5,20.1 3.5,15.2\"/><polygon points=\"15.8,7.1 20.1,9.6 20.1,14.5 15.8,17.0 11.5,14.5 11.5,9.6\"/></svg>";
+  HUD_PROVIDER_LOGOS.claude = HUD_CLAUDE_LOGO;
+  HUD_PROVIDER_LOGOS.claudeagent = HUD_CLAUDE_LOGO;
+  HUD_PROVIDER_LOGOS["antigravity-claude"] = HUD_AGY_CLAUDE_DUAL_LOGO;
+  HUD_PROVIDER_LOGOS.opencode = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS["opencode-go"] = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS.opencodego = HUD_OPENCODE_LOGO;
+  HUD_PROVIDER_LOGOS.devin = HUD_DEVIN_LOGO;
+  HUD_PROVIDER_LOGOS.acpregistry_devin = HUD_DEVIN_LOGO;
+
   function hudQuotaRingMarkup(provider) {
     const description = (quota, label) => quota && `${label}: ${quota.remainingPct}% ${hudLang === "zh" ? "剩余" : "remaining"}${quota.reset ? ` · ${quota.reset}` : ""}`;
     const parts = [provider.name, description(provider.weekly, hudLang === "zh" ? "周额度（外圈）" : "Weekly quota (outer)"), description(provider.fiveHour, hudLang === "zh" ? "5 小时额度（内圈）" : "5-hour quota (inner)")].filter(Boolean);
@@ -4149,10 +4475,11 @@
       const color = quota.tone === "err" ? "#dc2626" : quota.tone === "mid" ? "#d97706" : "#10a37f";
       return `<circle cx="16" cy="16" r="${radius}" fill="none" stroke="color-mix(in srgb, var(--hud-fg) 14%, transparent)" stroke-width="2"/><circle class="quota-arc quota-${kind}-arc" cx="16" cy="16" r="${radius}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-dasharray="${circumference.toFixed(2)}" stroke-dashoffset="${offset.toFixed(2)}"/>`;
     };
-    const key = String(provider.driver || provider.instanceId || "").toLowerCase();
+    const key = String(provider.logoKey || provider.driver || provider.instanceId || "").toLowerCase();
     const logo = HUD_PROVIDER_LOGOS[key] || escapeHtml(String(provider.name || "?").slice(0, 1).toUpperCase());
+    const dualClass = key === "antigravity-claude" ? " is-dual" : "";
     const text = escapeHtml(parts.join(" · "));
-    return `<button class="t3-hud-quota-ring" type="button" data-hud-provider="${escapeHtml(provider.instanceId)}" title="${text}" aria-label="${text}"><svg viewBox="0 0 32 32" aria-hidden="true">${arc(provider.weekly, "week", 13.5)}${arc(provider.fiveHour, "five", 9.5)}</svg><span class="t3-hud-provider-logo" aria-hidden="true">${logo}</span></button>`;
+    return `<button class="t3-hud-quota-ring" type="button" data-hud-provider="${escapeHtml(provider.instanceId)}" title="${text}" aria-label="${text}"><svg viewBox="0 0 32 32" aria-hidden="true">${arc(provider.weekly, "week", 13.5)}${arc(provider.fiveHour, "five", 9.5)}</svg><span class="t3-hud-provider-logo${dualClass}" aria-hidden="true">${logo}</span></button>`;
   }
 
   let lastQuotaRingsSig = "";
@@ -4227,6 +4554,7 @@
     const qInfo = computeQuotaAndContext(stats);
     const sessionSpeed = resolveHudSessionSpeed(sessionSpeedState, stats, currentPathHint);
     renderQuotaRing(qInfo.providerQuotas);
+    refreshExternalQuotas();
 
     let nextDotClass;
     let nextSpeed;
@@ -4292,7 +4620,11 @@
     }
 
     updateLayoutPosition();
-    refreshHudStatsPopover(popover, currentPopoverMode, document.activeElement, renderStatsPopover);
+    if (popover.classList.contains("visible") && currentPopoverMode === "quota" && currentPopoverProvider) {
+      renderQuotaRingPopover(currentPopoverProvider);
+    } else {
+      refreshHudStatsPopover(popover, currentPopoverMode, document.activeElement, renderStatsPopover);
+    }
   }
 
   function graphLaneCount(maxLanes) {

@@ -227,6 +227,14 @@ case "$cmd" in
   lang)
     do_lang "${2:-}"
     ;;
+  guardian)
+    gcmd="${2:-status}"
+    if [[ "$gcmd" != "enable" && "$gcmd" != "disable" && "$gcmd" != "status" ]]; then
+      echo "用法: t3-hud guardian [enable|disable|status]" >&2
+      exit 1
+    fi
+    T3_HUD_DIR="$PLUGIN_DIR" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$PLUGIN_DIR/update-guardian.cjs" "--mode=$gcmd"
+    ;;
   status)
     MAIN_PID="$(get_main_pid)"
     echo "T3 应用: $T3_APP"

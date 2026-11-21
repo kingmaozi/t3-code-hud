@@ -13,8 +13,11 @@
     const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
     let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, style, liveBoard, occlusionBoardRect = null;
-    let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
+    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, settingsHandle, settingsPanel, artifactDock, style, liveBoard, occlusionBoardRect = null;
+    let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0, artifactDockSig = "";
+    let dockDrag = null, dockSuppressClickUntil = 0;
+    const savedDockTop = Number(storageGet("t3-hub-artifact-dock-top-v1"));
+    let artifactDockTopPct = Number.isFinite(savedDockTop) && savedDockTop >= 8 && savedDockTop <= 92 ? savedDockTop : 44;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
     let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
@@ -25,7 +28,7 @@
     const storedTab = initial?.tab || storageGet("t3-hub-tab") || "memory";
     const restoredSubView = initial?.settingsSubView || (storedTab === "agents" ? "agents" : "native");
     const normalizedTab = tabAliases[storedTab] || storedTab;
-    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null };
+    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null, providerResources: null, guardian: null };
     const errors = {}, drafts = initial?.drafts || {};
     const state = {
  open: initial?.open ?? false, tab: normalizedTab, settingsSubView: restoredSubView === "agents" ? "agents" : "native", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
@@ -33,6 +36,8 @@
  boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
  planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
+ artifactDockEnabled: storageGet("t3-hub-artifact-dock-v1") !== "false", artifactDockOpen: false, artifactMenuIndex: null, artifactApps: {}, artifactMenuLoading: false, dockPreview: null,
+ hubSettingsOpen: false, hubSettingsTab: "general", providerResProvider: "codex", providerResKind: "mcp", providerResLoading: false, guardianLoading: false, guardianUpdating: false, skillSyncAllProviders: storageGet("t3-hub-skill-sync-all-v1") === "true", providerMemoryPrompt: null,
  memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
  settingsHost: initial?.settingsHost || "codex", settingsRule: initial?.settingsRule || "", settingsRuleDirty: initial?.settingsRuleDirty || false,
  settingsDraft: initial?.settingsDraft && typeof initial.settingsDraft === "object" && !Array.isArray(initial.settingsDraft) ? initial.settingsDraft : {}, settingsDirty: initial?.settingsDirty || false,
@@ -229,17 +234,18 @@
 .hub-native-field-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px 8px;min-height:24px}.hub-native-field-heading label{font-weight:550}.hub-native-clear{border:0;border-radius:5px;background:var(--hub-bg-subtle);padding:3px 6px;font-size:9px!important;line-height:1.6;white-space:nowrap}.hub-native-clear:hover{background:var(--hud-hover)}.hub-native-field textarea{resize:vertical;min-height:36px}.hub-native-empty{display:inline-flex;margin-top:5px;padding:2px 6px;border:1px solid var(--hub-border);border-radius:5px;font-size:9px;line-height:1.6;color:var(--hub-secondary);background:var(--hub-bg-subtle)}
 #t3-sidecar-hub-root{--hub-bg:#fff;--hub-bg-subtle:#f7f7f8;--hub-border:#ececec;--hub-ink:#0d0d0d;--hub-secondary:#5d5d5d;--hub-muted:#8e8e93;--hub-active:#0d0d0d;--hub-on-active:#fff;--hud-bg:var(--hub-bg);--hud-bg-solid:var(--hub-bg);--hud-fg:var(--hub-ink);--hud-muted:var(--hub-secondary);--hud-surface:var(--hub-bg-subtle);--hud-border:var(--hub-border);--hud-hover:rgba(0,0,0,.045);--hud-shadow:0 16px 64px #00000014,0 2px 8px #00000008;--hud-emerald:var(--hub-ink);--hud-blue:var(--hub-ink);--hud-violet:var(--hub-ink);--hud-amber:var(--hub-secondary);--hud-red:var(--hub-ink);--hub-accent-bg:var(--hub-bg-subtle);position:fixed;inset:0;z-index:9993;pointer-events:none;color:var(--hub-ink);font:12px/1.6 -apple-system,BlinkMacSystemFont,"Inter Variable","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;color-scheme:light}
 #t3-sidecar-hub-root,#t3-sidecar-hub-root *{box-sizing:border-box}#t3-sidecar-hub-root :is(button,input,select,textarea){font:inherit;letter-spacing:inherit;color:inherit}#t3-sidecar-hub-root button{cursor:pointer;-webkit-app-region:no-drag}#t3-sidecar-hub-root button:disabled{opacity:.38;cursor:not-allowed}#t3-sidecar-hub-root :is(button,input,select,textarea):focus-visible{outline:2px solid var(--hub-ink);outline-offset:3px}#t3-sidecar-hub-root svg{flex:none;vertical-align:middle}#t3-sidecar-hub-root [hidden]{display:none!important}
-#t3-hub-title-controls{display:inline-flex;align-items:center;gap:6px;margin-left:8px;vertical-align:middle;pointer-events:auto;white-space:nowrap;-webkit-app-region:no-drag}#t3-hub-title-controls[hidden]{display:none!important}#t3-hub-title-controls>button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-width:0;height:27px;padding:4px 9px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;color:#253247;font:10px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:550;white-space:nowrap;cursor:pointer;pointer-events:auto;-webkit-app-region:no-drag}#t3-hub-title-controls>button:hover,#t3-hub-title-controls>button:focus-visible{background:#f1f6ff;border-color:#c8dcff}#t3-hub-memory-toggle[aria-checked="true"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}#t3-hub-memory-toggle[aria-checked="mixed"]{border-style:dashed;color:#64748b}#t3-hub-memory-toggle:disabled{opacity:.55;cursor:wait}
+#t3-hub-title-controls{display:inline-flex;align-items:center;gap:6px;margin-left:8px;vertical-align:middle;pointer-events:auto;white-space:nowrap;-webkit-app-region:no-drag}#t3-hub-title-controls[hidden]{display:none!important}.hub-memory-combo{display:inline-flex;align-items:center;height:27px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}.hub-memory-combo>button{display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:0;height:100%;padding:0 9px;border:0;border-radius:0;background:transparent;color:#253247;font:10px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:550;white-space:nowrap;cursor:pointer;pointer-events:auto;-webkit-app-region:no-drag}.hub-memory-combo>button:hover,.hub-memory-combo>button:focus-visible{background:#f1f6ff}.hub-memory-combo>#t3-hub-memory-toggle{border-left:1px solid #dbe4f0;padding:0 8px 0 7px}#t3-hub-title-controls>button{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-width:0;height:27px;padding:4px 9px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;color:#253247;font:10px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-weight:550;white-space:nowrap;cursor:pointer;pointer-events:auto;-webkit-app-region:no-drag}#t3-hub-title-controls>button:hover,#t3-hub-title-controls>button:focus-visible{background:#f1f6ff;border-color:#c8dcff}#t3-hub-memory-toggle[aria-checked="true"]{background:#eff6ff;color:#1d4ed8}#t3-hub-memory-toggle[aria-checked="mixed"]{color:#64748b}#t3-hub-memory-toggle:disabled{opacity:.55;cursor:wait}
 #t3-hub-plan-handle{position:relative;padding:4px 9px;border:1px solid #dbe4f0;border-radius:999px;background:#f8fafc;color:#253247;font-size:10px;pointer-events:auto}.is-open #t3-hub-plan-handle{display:none}
 #t3-sidecar-hub-root #t3-hub-drawer{position:fixed;right:12px;top:12px;bottom:12px;width:min(var(--hub-width,880px),94vw);max-height:calc(100dvh - 24px);display:grid;grid-template-columns:196px minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:none;visibility:hidden;opacity:0;transform:translateX(calc(100% + 28px));transition:transform .24s ease,opacity .2s,visibility .24s;-webkit-app-region:no-drag}#t3-sidecar-hub-root.is-open #t3-hub-drawer{pointer-events:auto;visibility:visible;opacity:1;transform:none}#t3-sidecar-hub-root.is-occluded{visibility:hidden!important}#t3-sidecar-hub-root.is-occluded :is(#t3-hub-drawer,#t3-hub-live-board){visibility:hidden!important;pointer-events:none!important}
-#t3-hub-drawer.is-compact{grid-template-columns:156px minmax(0,1fr)}.hub-header{grid-column:1/-1;padding:20px 24px 16px;border-bottom:1px solid var(--hub-border)}.hub-title-row,.hub-row{display:flex;align-items:center;gap:9px;min-width:0}.hub-title-row{gap:11px}.hub-brand{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-grow{min-width:0;flex:1}.hub-title{font-size:17px;font-weight:650;letter-spacing:-.5px;line-height:1.4}.hub-version{font-size:10px;color:var(--hub-muted);font-weight:450;margin-left:5px}.hub-kicker{color:var(--hub-secondary);font-size:11px;margin-top:2px}.hub-icon-btn{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--hub-secondary)!important}.hub-icon-btn:hover{background:var(--hud-hover);color:var(--hub-ink)!important}.hub-scope-bar{display:flex;gap:8px;align-items:center;margin-top:15px}.hub-scope-select{max-width:280px}.hub-shortcut{font-size:10px;color:var(--hub-muted);margin-left:auto}.hub-context{display:flex;align-items:center;min-width:0;margin-top:10px;font-size:10px;color:var(--hub-secondary)}.hub-context-status{display:flex;gap:6px;align-items:center;overflow:hidden}.hub-context-status>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.hub-widths{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px}.hub-widths button{font-size:10px!important;padding:4px 8px;border:0;border-radius:5px;background:transparent;color:var(--hub-secondary)}.hub-widths button.is-active{background:var(--hub-active);color:var(--hub-on-active)}
+#t3-hub-drawer.is-single-tab{grid-template-columns:minmax(0,1fr)}#t3-hub-drawer.is-single-tab .hub-tabs{display:none}
+#t3-hub-drawer.is-compact{grid-template-columns:156px minmax(0,1fr)}#t3-hub-drawer.is-compact.is-single-tab{grid-template-columns:minmax(0,1fr)}.hub-header{grid-column:1/-1;padding:20px 24px 16px;border-bottom:1px solid var(--hub-border)}.hub-title-row,.hub-row{display:flex;align-items:center;gap:9px;min-width:0}.hub-title-row{gap:11px}.hub-brand{display:grid;place-items:center;width:32px;height:32px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)}.hub-grow{min-width:0;flex:1}.hub-title{font-size:17px;font-weight:650;letter-spacing:-.5px;line-height:1.4}.hub-version{font-size:10px;color:var(--hub-muted);font-weight:450;margin-left:5px}.hub-kicker{color:var(--hub-secondary);font-size:11px;margin-top:2px}.hub-icon-btn{display:inline-grid;place-items:center;flex:none;width:30px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--hub-secondary)!important}.hub-icon-btn:hover{background:var(--hud-hover);color:var(--hub-ink)!important}.hub-scope-bar{display:flex;gap:8px;align-items:center;margin-top:15px}.hub-scope-select{max-width:280px}.hub-shortcut{font-size:10px;color:var(--hub-muted);margin-left:auto}.hub-context{display:flex;align-items:center;min-width:0;margin-top:10px;font-size:10px;color:var(--hub-secondary)}.hub-context-status{display:flex;gap:6px;align-items:center;overflow:hidden}.hub-context-status>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hub-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.hub-widths{display:flex;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px}.hub-widths button{font-size:10px!important;padding:4px 8px;border:0;border-radius:5px;background:transparent;color:var(--hub-secondary)}.hub-widths button.is-active{background:var(--hub-active);color:var(--hub-on-active)}
 .hub-tabs{grid-column:1;grid-row:2;display:flex;flex-direction:column;align-items:stretch;gap:4px;padding:18px 11px;overflow:auto;background:var(--hub-bg-subtle);border-right:1px solid var(--hub-border)}.hub-tab{display:flex;gap:10px;align-items:center;text-align:left;padding:10px 11px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--hub-secondary)!important;font-size:11px!important;line-height:1.5;white-space:nowrap}.hub-tab:hover{background:var(--hud-hover)}.hub-tab[aria-selected=true]{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-tab-count{margin-left:auto;font-size:9px;opacity:.65;font-variant-numeric:tabular-nums}.hub-content{grid-column:2;grid-row:2;min-width:0;min-height:0;padding:26px 28px 32px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--hub-border) transparent}.hub-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 8px;font-size:15px;font-weight:620;letter-spacing:-.2px}.hub-count{font-size:10px;font-weight:450;color:var(--hub-secondary);font-variant-numeric:tabular-nums}.hub-description{font-size:11px;line-height:1.8;color:var(--hub-secondary);margin:0 0 20px}.hub-card{padding:16px;border:1px solid var(--hub-border);border-radius:12px;background:var(--hub-bg);margin-bottom:12px;min-width:0}.hub-card-top{display:flex;gap:11px;align-items:flex-start;min-width:0}.hub-card-name{font-size:12px;font-weight:600;line-height:1.65;overflow-wrap:anywhere}.hub-card-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:4px}.hub-card-description{color:var(--hub-secondary);font-size:11px;line-height:1.75;margin:8px 0 12px;overflow-wrap:anywhere}.hub-badge,.hub-capability{display:inline-flex;gap:4px;align-items:center;border:1px solid var(--hub-border);border-radius:5px;padding:1px 6px;color:var(--hub-secondary);font-size:9px;line-height:1.7;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-capabilities{display:flex;gap:5px;flex-wrap:wrap;margin:8px 0}.hub-badge>span{overflow:hidden;text-overflow:ellipsis}.hub-asset-icon,.hub-brand-icon{width:32px;height:32px;display:grid;place-items:center;flex:none;position:relative;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);color:var(--hub-ink);overflow:hidden}.hub-brand-icon>img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;filter:none!important}.hub-brand-icon.has-image>svg{opacity:0}.hub-brand-icon.is-small{width:24px;height:24px;border-radius:6px}.hub-brand-icon.is-small>img{inset:2px;width:calc(100% - 4px);height:calc(100% - 4px)}.hub-connection-dot{position:absolute;right:2px;bottom:2px;width:5px;height:5px;border-radius:50%;background:var(--hub-muted);box-shadow:0 0 0 2px var(--hub-bg)}.hub-connection-dot.is-connected{background:var(--hub-ink)}
 .hub-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:7px 11px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);font-size:11px!important;line-height:1.4;white-space:nowrap}.hub-btn:hover:not(:disabled){background:var(--hud-hover)}.hub-btn.hub-primary{background:var(--hub-active);border-color:var(--hub-active);color:var(--hub-on-active)!important;font-weight:550}.hub-btn.hub-primary:hover:not(:disabled){opacity:.85;background:var(--hub-active)}.hub-btn.hub-small{font-size:10px!important;min-height:27px;padding:5px 9px}.hub-btn.is-busy{pointer-events:none;opacity:.65}.hub-spinner{display:inline-block;flex:none;width:12px;height:12px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:hub-spin .7s linear infinite}@keyframes hub-spin{to{transform:rotate(360deg)}}
 .hub-input,.hub-select,.hub-editor{display:block;width:100%;min-width:0;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);color:var(--hub-ink);padding:9px 11px;font-size:11px!important;line-height:1.6}.hub-input::placeholder,.hub-editor::placeholder{color:var(--hub-muted)}.hub-select{padding-right:25px;text-overflow:ellipsis;cursor:pointer}.hub-field{display:block;font-size:10px;color:var(--hub-secondary);margin-bottom:13px;min-width:0}.hub-field>:is(input,textarea,select){margin-top:6px}.hub-editor{font:11px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:175px;resize:vertical;overflow-wrap:anywhere;tab-size:2}.hub-search{position:relative;margin:14px 0}.hub-search>svg{position:absolute;top:50%;left:11px;transform:translateY(-50%);color:var(--hub-muted)}.hub-search .hub-input{padding-left:34px;background:var(--hub-bg-subtle)}.hub-hint{display:flex;gap:6px;align-items:flex-start;font-size:10px;color:var(--hub-secondary);line-height:1.8;overflow-wrap:anywhere}.hub-filters{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0 15px}.hub-pill{border:1px solid transparent;border-radius:6px;padding:5px 9px;font-size:10px!important;background:transparent;color:var(--hub-secondary)!important;white-space:nowrap}.hub-pill:hover{background:var(--hud-hover)}.hub-pill.is-active,.hub-segments>button.is-active{background:var(--hub-active);color:var(--hub-on-active)!important}.hub-pill-count{font-size:9px;opacity:.6;margin-left:4px}.hub-segments{display:flex;gap:3px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-segments>button{display:inline-flex;gap:5px;align-items:center;justify-content:center;flex:1;min-width:0;font-size:10px!important;line-height:1.5;white-space:nowrap;border:0;border-radius:5px;background:transparent;padding:6px 8px;color:var(--hub-secondary)}.hub-segments>button:hover:not(.is-active){background:var(--hud-hover)}.hub-resource-filters{padding:0 0 18px;border-bottom:1px solid var(--hub-border);margin-bottom:4px}.hub-agent-filters{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.hub-agent-filters .hub-pill{display:inline-flex;gap:5px;align-items:center}.hub-filter-bottom{display:flex;gap:8px;margin-top:10px}.hub-filter-bottom .hub-search{flex:1;min-width:0;margin:0}.hub-filter-bottom .hub-select{width:94px;font-size:10px!important}.hub-resource-row{display:grid;grid-template-columns:32px minmax(0,1fr);column-gap:12px;padding:19px 0;border-bottom:1px solid var(--hub-border);min-width:0}.hub-resource-row .hub-card-description{margin:4px 0 0}.hub-resource-row .hub-resource-toggle{grid-column:2;margin-top:12px;justify-self:start}.hub-resource-toggle{display:flex;flex-wrap:wrap;gap:7px;align-items:center;min-width:0;max-width:100%}.hub-resource-toggle-label{flex:0 0 100%}.hub-resource-toggle>.hub-btn{font-size:9px!important;min-height:26px;padding:4px 8px}.hub-agent-toggle{display:flex;flex-wrap:wrap;gap:2px;padding:3px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg-subtle);min-width:0}.hub-agent-toggle button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;gap:4px;min-width:0;border:0;border-radius:5px;padding:5px 7px;background:transparent;color:var(--hub-secondary);font-size:9px!important;line-height:1.4;white-space:nowrap}.hub-agent-toggle button[aria-pressed=true]{background:var(--hub-active);color:var(--hub-on-active)}.hub-agent-mark{width:12px;height:12px;flex:none}.hub-library-tabs{display:flex;gap:6px;border-bottom:1px solid var(--hub-border);margin-bottom:18px;padding-bottom:12px}.hub-market-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,245px),1fr));gap:12px;margin-top:18px}.hub-market-card{margin:0;display:flex;flex-direction:column;align-items:stretch}.hub-market-card>.hub-btn{align-self:flex-start;margin-top:auto}.hub-market-card .hub-card-description{min-height:38px}.hub-market-card .hub-capabilities{margin-bottom:16px}.hub-resource-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.hub-mcp-name{font-weight:600;font-size:12px;overflow-wrap:anywhere}.hub-mcp-detail{color:var(--hub-secondary);font-size:10px;margin-top:5px;overflow-wrap:anywhere}.hub-mcp-row-options{display:flex;gap:7px;margin-top:9px}.hub-mode-pill{width:auto;max-width:200px;padding:4px 20px 4px 8px;font-size:9px!important}.hub-live{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--hub-secondary)}.hub-status-strip{border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:12px;margin:12px 0}.hub-status-items{display:flex;gap:12px;flex-wrap:wrap}.hub-status-item{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--hub-secondary)}
 .hub-form-panel,.hub-import,.hub-new-memory{padding:15px;background:var(--hub-bg-subtle);border:1px solid var(--hub-border);border-radius:10px;margin:14px 0}.hub-import-title{font-size:11px;font-weight:550;display:flex;gap:7px;margin-bottom:10px}.hub-import-grid{display:grid;grid-template-columns:minmax(0,1fr) 94px auto;gap:7px}.hub-import .hub-hint{margin-top:8px}.hub-form-grid,.hub-subagent-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}.hub-custom-toggle{margin:4px 0 14px}.hub-editor-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:12px}.hub-confirm-delete{border:1px solid var(--hub-border);padding:10px;border-radius:8px;background:var(--hub-bg-subtle);font-size:10px;margin-top:10px}.hub-confirm-delete .hub-row{margin-top:8px}.hub-hook-card .hub-card-description{margin-bottom:13px}.hub-hook-command{display:block;white-space:pre-wrap;overflow-wrap:anywhere;font-size:10px;padding:10px;background:var(--hub-bg-subtle);margin:10px 0;border-radius:6px}.hub-group-heading{font-size:11px;margin:22px 0 10px}.hub-hook-group{margin-bottom:20px}.hub-switch{width:30px;height:18px;border:1px solid var(--hub-border);border-radius:20px;position:relative;flex:none;background:var(--hub-bg-subtle);padding:2px}.hub-switch>span{display:block;width:12px;height:12px;border-radius:50%;background:var(--hub-muted);transition:transform .15s}.hub-switch[aria-checked=true]{background:var(--hub-active);border-color:var(--hub-active)}.hub-switch[aria-checked=true]>span{background:var(--hub-on-active);transform:translateX(12px)}
-.hub-engine{background:var(--hub-bg-subtle);padding:18px;margin:0 0 26px}.hub-engine-label{font-size:9px;letter-spacing:1.2px;font-weight:650;color:var(--hub-secondary)}.hub-engine-status{display:flex;gap:6px;align-items:center;font-size:11px;font-weight:550;margin:12px 0 7px;flex-wrap:wrap}.hub-engine-model{font-size:10px;color:var(--hub-secondary);overflow-wrap:anywhere;margin-bottom:14px}.hub-engine-controls{display:flex;align-items:stretch;gap:7px}.hub-engine-controls>.hub-select{flex:1}.hub-engine-controls>.hub-btn{font-size:10px!important}.hub-checkbox{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--hub-secondary);margin-top:12px}.hub-checkbox input{accent-color:var(--hub-active);margin:0;width:13px;height:13px}.hub-progress-label{display:flex;justify-content:space-between;font-size:10px;color:var(--hub-secondary);margin:12px 0 6px}.hub-progress-track{height:4px;background:var(--hub-border);border-radius:5px;overflow:hidden}.hub-progress-fill{height:100%;background:var(--hub-ink);border-radius:5px;transition:width .3s}.indeterminate .hub-progress-fill{animation:hub-pulse 1.4s ease infinite}.hub-worktree-bar{margin:15px 0}.hub-worktree-bar .hub-segments{flex-wrap:wrap}.hub-worktree-bar .hub-segments>button{flex:1 1 42%;white-space:normal}.hub-worktree-caption{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:8px;color:var(--hub-secondary);font-size:10px}.hub-project-picker{display:flex;gap:8px;align-items:center;margin:12px 0}.hub-project-picker .hub-select{flex:1}.hub-memory-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.hub-memory-card{padding:0}.hub-memory-open{display:block;width:100%;text-align:left;padding:14px;border:0;background:transparent;border-radius:11px}.hub-memory-open:hover{background:var(--hud-hover)}.hub-memory-detail{padding:14px;border-top:1px solid var(--hub-border)}.hub-memory-date{margin-left:auto;font-size:9px;color:var(--hub-muted)}.hub-memory-hits{font-size:9px;color:var(--hub-secondary)}.hub-detail-meta{display:flex;gap:7px;align-items:center;font-size:9px;color:var(--hub-secondary);margin-top:8px}.hub-memory-history{padding:0 14px 12px}.hub-history-toggle{border:0;background:transparent;font-size:10px!important;color:var(--hub-secondary)}.hub-history-entry{padding:9px 0;border-top:1px solid var(--hub-border);font-size:10px}.hub-history-agent{font-size:9px;color:var(--hub-secondary)}
+.hub-engine{background:var(--hub-bg-subtle);padding:18px;margin:0 0 26px}.hub-engine-label{font-size:9px;letter-spacing:1.2px;font-weight:650;color:var(--hub-secondary)}.hub-engine-status{display:flex;gap:6px;align-items:center;font-size:11px;font-weight:550;margin:12px 0 7px;flex-wrap:wrap}.hub-engine-model{font-size:10px;color:var(--hub-secondary);overflow-wrap:anywhere;margin-bottom:14px}.hub-engine-controls{display:flex;align-items:stretch;gap:7px}.hub-engine-controls>.hub-select{flex:1}.hub-engine-controls>.hub-btn{font-size:10px!important}.hub-checkbox{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--hub-secondary);margin-top:12px}.hub-checkbox input{accent-color:var(--hub-active);margin:0;width:13px;height:13px}.hub-progress-label{display:flex;justify-content:space-between;font-size:10px;color:var(--hub-secondary);margin:12px 0 6px}.hub-progress-track{height:4px;background:var(--hub-border);border-radius:5px;overflow:hidden}.hub-progress-fill{height:100%;background:var(--hub-ink);border-radius:5px;transition:width .3s}.indeterminate .hub-progress-fill{animation:hub-pulse 1.4s ease infinite}.hub-worktree-bar{margin:15px 0}.hub-worktree-bar .hub-segments{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px}.hub-worktree-bar .hub-segments>button{flex:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}@media(max-width:540px){.hub-worktree-bar .hub-segments{grid-template-columns:minmax(0,1fr)}}.hub-worktree-caption{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:8px;color:var(--hub-secondary);font-size:10px}.hub-project-picker{display:flex;gap:8px;align-items:center;margin:12px 0}.hub-project-picker .hub-select{flex:1}.hub-memory-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.hub-memory-card{padding:0}.hub-memory-open{display:block;width:100%;text-align:left;padding:14px;border:0;background:transparent;border-radius:11px}.hub-memory-open:hover{background:var(--hud-hover)}.hub-memory-detail{padding:14px;border-top:1px solid var(--hub-border)}.hub-memory-date{margin-left:auto;font-size:9px;color:var(--hub-muted)}.hub-memory-hits{font-size:9px;color:var(--hub-secondary)}.hub-detail-meta{display:flex;gap:7px;align-items:center;font-size:9px;color:var(--hub-secondary);margin-top:8px}.hub-memory-history{padding:0 14px 12px}.hub-history-toggle{border:0;background:transparent;font-size:10px!important;color:var(--hub-secondary)}.hub-history-entry{padding:9px 0;border-top:1px solid var(--hub-border);font-size:10px}.hub-history-agent{font-size:9px;color:var(--hub-secondary)}
 .hub-subagent-scopes{display:flex;gap:8px;margin:18px 0}.hub-subagent-scope{flex:1;min-width:0;text-align:left;border:1px solid var(--hub-border);border-radius:9px;background:transparent;padding:10px 12px;font-size:11px!important}.hub-subagent-scope[aria-pressed=true]{background:var(--hub-bg-subtle);border-color:var(--hub-ink)}.hub-subagent-scope small{display:block;color:var(--hub-secondary);font-size:9px;margin-top:3px}.hub-subagent-heading{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:20px 0 10px}.hub-subagent-heading h3{font-size:13px;margin:0}.hub-subagent-heading h3>span{font-size:10px;color:var(--hub-secondary);margin-left:7px;font-weight:400}.hub-subagent-list{border:1px solid var(--hub-border);border-radius:11px;overflow:hidden}.hub-subagent-card{padding:16px;border-bottom:1px solid var(--hub-border);min-width:0}.hub-subagent-card:last-child{border-bottom:0}.hub-subagent-main{display:grid;grid-template-columns:28px minmax(0,1fr);gap:9px;align-items:center}.hub-subagent-summary{min-width:0;text-align:left;border:0;background:transparent;padding:0}.hub-subagent-name{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;font-weight:600}.hub-tool-badge{font-size:8px;line-height:1.5;font-weight:400;padding:2px 5px;border:1px solid var(--hub-border);border-radius:4px;color:var(--hub-secondary)}.hub-subagent-desc{display:block;font-size:10px;color:var(--hub-secondary);line-height:1.7;margin-top:3px;overflow-wrap:anywhere}.hub-subagent-controls{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1.3fr) minmax(0,.8fr);gap:6px;grid-column:2}.hub-subagent-controls .hub-select{font-size:10px!important;padding:7px 20px 7px 8px}.hub-subagent-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin:10px 0 0 37px}.hub-memory-policy{width:170px;padding:5px 18px 5px 7px;font-size:9px!important}.hub-subagent-edit{display:inline-flex;gap:4px;align-items:center;margin-left:auto;font-size:9px!important;border:0;background:transparent;padding:3px 0;color:var(--hub-secondary)!important}.hub-subagent-expand{display:none}.hub-subagent-expand.is-expanded{display:block}.hub-subagent-editor{border-top:1px solid var(--hub-border);margin-top:14px;padding-top:14px}.hub-subagent-custom{padding:12px;border:1px solid var(--hub-border);border-radius:8px;margin-top:10px}.hub-subagent-note{display:flex;align-items:flex-start;gap:6px;margin-top:14px;font-size:10px;color:var(--hub-secondary);line-height:1.8}.hub-commander{padding:18px;background:var(--hub-bg-subtle)}.hub-commander-title{font-size:14px;font-weight:600;margin-bottom:4px}.hub-commander .hub-description{margin-bottom:16px}.hub-commander-note{padding:10px 12px;border-left:2px solid var(--hub-ink);font-size:10px;line-height:1.9;color:var(--hub-secondary);margin:12px 0 16px}.hub-control-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-top:1px solid var(--hub-border)}.hub-control-row strong{font-size:11px;font-weight:550;display:block}.hub-control-row small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:3px}.hub-range{display:flex;align-items:center;gap:8px;max-width:170px}.hub-range input[type=range]{width:100px;accent-color:var(--hub-active)}.hub-range input[type=number]{width:49px;padding:5px;font-size:10px!important}
-.hub-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 24px;border-top:1px solid var(--hub-border);color:var(--hub-secondary);font-size:9px;min-height:40px;background:var(--hub-bg)}.hub-footer-status{display:flex;align-items:center;gap:6px}.hub-footer-key{color:var(--hub-muted)}.hub-toast{position:absolute;left:20px;right:20px;bottom:53px;display:flex;gap:8px;align-items:center;padding:11px 14px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-active);color:var(--hub-on-active);font-size:11px;box-shadow:var(--hud-shadow);pointer-events:auto;z-index:4}.hub-empty{display:flex;flex-direction:column;align-items:center;gap:9px;padding:36px 18px;color:var(--hub-secondary);text-align:center;font-size:11px}.hub-empty strong{font-size:12px;color:var(--hub-ink);font-weight:550}.hub-empty>svg{opacity:.5}.hub-empty>span{font-size:10px;line-height:1.8;max-width:280px}.hub-error{display:flex;gap:9px;align-items:flex-start;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:13px;margin:12px 0;color:var(--hub-ink)}.hub-error>div{flex:1;min-width:0}.hub-error strong{font-size:11px;display:block}.hub-error span{display:block;font-size:10px;color:var(--hub-secondary);margin-top:4px;overflow-wrap:anywhere}.hub-skeleton>div{border-bottom:1px solid var(--hub-border);padding:18px 0}.hub-skeleton i{display:block;background:var(--hub-bg-subtle);height:9px;border-radius:3px;margin:9px 0;animation:hub-pulse 1.3s ease infinite}.hub-skeleton i:first-child{width:40%}.hub-skeleton i:last-child{width:70%}@keyframes hub-pulse{50%{opacity:.35}}
+.hub-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 24px;border-top:1px solid var(--hub-border);color:var(--hub-secondary);font-size:9px;min-height:40px;background:var(--hub-bg)}.hub-footer-status{display:flex;align-items:center;gap:6px}.hub-footer-key{color:var(--hub-muted)}.hub-toast{position:fixed;right:20px;bottom:20px;max-width:360px;display:flex;gap:8px;align-items:center;padding:11px 14px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-active);color:var(--hub-on-active);font-size:11px;box-shadow:var(--hud-shadow);pointer-events:auto;z-index:2147483005}.hub-empty{display:flex;flex-direction:column;align-items:center;gap:9px;padding:36px 18px;color:var(--hub-secondary);text-align:center;font-size:11px}.hub-empty strong{font-size:12px;color:var(--hub-ink);font-weight:550}.hub-empty>svg{opacity:.5}.hub-empty>span{font-size:10px;line-height:1.8;max-width:280px}.hub-error{display:flex;gap:9px;align-items:flex-start;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);padding:13px;margin:12px 0;color:var(--hub-ink)}.hub-error>div{flex:1;min-width:0}.hub-error strong{font-size:11px;display:block}.hub-error span{display:block;font-size:10px;color:var(--hub-secondary);margin-top:4px;overflow-wrap:anywhere}.hub-skeleton>div{border-bottom:1px solid var(--hub-border);padding:18px 0}.hub-skeleton i{display:block;background:var(--hub-bg-subtle);height:9px;border-radius:3px;margin:9px 0;animation:hub-pulse 1.3s ease infinite}.hub-skeleton i:first-child{width:40%}.hub-skeleton i:last-child{width:70%}@keyframes hub-pulse{50%{opacity:.35}}
 #t3-hub-resize-handle{position:absolute;z-index:5;left:0;top:0;bottom:0;width:7px;background:transparent;cursor:ew-resize;touch-action:none;border:0;padding:0}#t3-hub-resize-handle:after{content:"";position:absolute;top:45%;left:2px;width:2px;height:32px;background:var(--hub-border);border-radius:3px}#t3-hub-resize-handle:hover:after{background:var(--hub-ink)}
 #t3-hub-live-board{position:fixed;z-index:2147483000;pointer-events:auto;min-width:0;background:var(--hub-bg);color:var(--hub-ink);border:1px solid var(--hub-border);border-radius:0 0 12px 12px;padding:12px 14px;box-shadow:none;overflow:hidden;font:12px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#t3-hub-live-board[hidden]{display:none!important}#t3-hub-live-board,#t3-hub-live-board *{box-sizing:border-box}#t3-hub-live-board :is(button,input){font:inherit;color:inherit}#t3-hub-live-board button{cursor:pointer}#t3-hub-live-board :focus-visible{outline:2px solid var(--hub-accent);outline-offset:2px}#t3-hub-live-board.is-collapsed{}.hub-board-toggle{flex:1;min-width:0;width:100%;display:flex;gap:8px;align-items:center;justify-content:space-between;border:0;background:transparent;text-align:left;padding:0;font-size:11px!important;font-weight:550}.is-collapsed .hub-board-toggle{padding:0;font-size:11px!important}.hub-board-content{padding:14px 0 0;max-height:420px;overflow:auto}.hub-board-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 0 15px}.hub-board-heading strong{font-size:14px;font-weight:600}.hub-board-background{margin:0 0 16px;padding:10px 11px;background:var(--hub-bg-subtle);border-radius:7px;font-size:10px;color:var(--hub-secondary);white-space:pre-wrap;line-height:1.85}.hub-board-section{font-size:10px;color:var(--hub-secondary);display:flex;align-items:center;justify-content:space-between;margin:18px 0 10px;font-weight:550}.hub-board-section:first-child{margin-top:4px}.hub-board-section b{font-size:11px;font-weight:600;color:var(--hub-ink)}.hub-board-steps{display:flex;flex-direction:column;gap:12px;margin:0;padding:0;list-style:none}.hub-board-step{display:flex;gap:10px;align-items:flex-start;font-size:11px;line-height:1.7;min-width:0}.hub-step-icon{display:grid;place-items:center;flex:none;width:16px;height:19px;font-size:13px;font-weight:600}.hub-board-step.is-completed{color:var(--hub-muted)}.hub-board-step.is-completed .hub-step-text{text-decoration:line-through}.hub-board-step.is-in-progress{font-weight:600;color:var(--hub-ink)}.is-in-progress .hub-step-icon{animation:hub-pulse 1.5s ease infinite}.hub-step-check{padding:0;border:0;background:transparent;line-height:1;color:inherit}.hub-artifacts{display:flex;flex-wrap:wrap;gap:6px}.hub-artifact-chip{border:1px solid var(--hub-border);border-radius:6px;font-size:9px!important;padding:5px 7px;background:var(--hub-bg-subtle);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-board-studio{border:1px solid var(--hub-border);border-radius:12px;padding:20px;margin:0 0 16px}.hub-board-studio .hub-board-step{font-size:12px}.hub-board-studio .hub-board-steps{gap:14px}.hub-board-add{display:flex;gap:7px;margin-top:20px}.hub-board-add .hub-input{flex:1}.hub-artifact-preview{padding:16px;background:var(--hub-bg-subtle);border:1px solid var(--hub-border);border-radius:10px;margin-top:16px}.hub-artifact-preview pre{white-space:pre-wrap;overflow-wrap:anywhere;font:10px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:340px;overflow:auto}.hub-native-hosts{margin-bottom:18px}.hub-settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:18px 0}.hub-settings-host-description{margin:8px 0 18px;font-size:10px;color:var(--hub-secondary)}
 .hub-agents-targets{display:flex;gap:8px;margin:12px 0}.hub-agents-target{min-width:0;flex:1;border:1px solid var(--hub-border);border-radius:9px;background:transparent;padding:12px;text-align:left}.hub-agents-target.is-active{background:var(--hub-bg-subtle);border-color:var(--hub-ink)}.hub-agents-target strong{display:block;font-size:11px}.hub-agents-target small{display:block;font-size:9px;color:var(--hub-secondary)}.hub-token-bar{display:flex;justify-content:space-between;gap:8px;align-items:center;margin:16px 0 9px;font-size:11px}.hub-token{font-size:9px;color:var(--hub-secondary)}.hub-token-warning{font-size:10px;color:var(--hub-secondary)}.hub-agents-editor{min-height:300px}.hub-agents-save{display:flex;gap:8px;justify-content:space-between;margin-top:12px;align-items:center}.hub-saved-hint{font-size:10px;color:var(--hub-secondary)}.hub-sync-badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:14px}.hub-soft-route{margin-top:16px}
@@ -261,16 +267,20 @@
       style.textContent += `#t3-hub-plan-handle{position:relative!important;right:auto!important;top:auto!important;padding:3px 7px!important;border-radius:7px!important;border-right:1px solid var(--hub-border)!important;background:var(--hub-bg)!important}#t3-hub-live-board{display:block;flex:none;min-height:0;padding:0;border-radius:11px;overflow:auto}#t3-hub-live-board[hidden]{display:none!important}.hub-connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:8px;margin:12px 0}.hub-connection-agent{min-width:0;padding:10px 12px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg)}.hub-connection-agent h3{margin:0 0 8px;font-size:11px}.hub-connection-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.hub-connection-cell{min-width:0;padding:7px;border-radius:7px;background:var(--hub-bg-subtle)}.hub-connection-cell>span,.hub-connection-cell>strong,.hub-connection-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-connection-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-connection-cell>strong{margin-top:2px;font-size:9px}.hub-connection-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:8px;line-height:1.45}.hub-connection-cell>strong[data-status="configured"]{color:#047857}.hub-connection-cell>strong[data-status="missing"]{color:var(--hub-secondary)}.hub-connection-cell>strong[data-status="unsupported"]{color:var(--hub-muted)}.hub-connection-cell>strong[data-status="unknown"]{color:#b45309}.hub-connection-note{align-items:center;flex-wrap:wrap}.hub-connection-error{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border:1px solid var(--hub-border);border-radius:8px;color:var(--hub-secondary);font-size:10px}@media(max-width:639px){.hub-connection-grid{grid-template-columns:minmax(0,1fr)}.hub-connection-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
       style.textContent += `#t3-hub-plan-handle{justify-content:flex-start!important;gap:7px!important;width:auto!important;min-width:0!important;height:27px!important;padding:4px 10px!important;border:1px solid #dbe4f0!important;border-radius:999px!important;background:#f8fafc!important;color:#253247!important;box-shadow:0 1px 4px #0f172a12!important;font-size:10px!important;font-weight:550!important;line-height:1!important;white-space:nowrap!important}#t3-hub-plan-handle:hover,#t3-hub-plan-handle:focus-visible{background:#f1f6ff!important;border-color:#c8dcff!important}.hub-plan-indicator{gap:7px!important;white-space:nowrap}.hub-plan-ring{display:block;flex:none;width:15px;height:15px;transform:rotate(-90deg)}.hub-plan-ring-track{fill:none;stroke:#dbeafe;stroke-width:2.4}.hub-plan-ring-progress{fill:none;stroke:#3980f6;stroke-width:2.4;stroke-linecap:round;transition:stroke-dashoffset .18s ease}.hub-plan-label{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-memory-access-switch{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;font-weight:550;color:var(--hub-ink)}.hub-memory-access-switch input{flex:none;width:15px;height:15px;accent-color:#3980f6}.hub-memory-access-state{font-size:10px;color:var(--hub-secondary);white-space:normal;text-align:right}.hub-memory-access-actions{flex-wrap:wrap;margin-top:10px}.hub-memory-access-summary{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hub-memory-access-summary>span{padding:2px 7px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary)}.hub-memory-access-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:6px;margin-top:9px}.hub-memory-access-provider{min-width:0;padding:7px 9px;border:1px solid var(--hub-border);border-radius:8px;font-size:9px}.hub-memory-access-provider strong,.hub-memory-access-provider small{display:block;overflow-wrap:anywhere}.hub-memory-access-provider small{margin-top:2px;color:var(--hub-secondary)}.hub-memory-access-prompt{margin-top:10px;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:120px;resize:vertical;white-space:pre-wrap}@media(max-width:639px){.hub-memory-access-switch{align-items:flex-start}.hub-memory-access-state{text-align:left}}`;
       style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
+      style.textContent += "\n#t3-hub-settings-handle[aria-expanded=\"true\"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}\n#t3-hub-artifact-dock{position:fixed;right:0;top:44%;transform:translateY(-50%);z-index:2147482990;display:flex;align-items:center;pointer-events:auto;font:12px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-app-region:no-drag}\n#t3-hub-artifact-dock.is-dragging,#t3-hub-artifact-dock.is-dragging *{cursor:grabbing!important;user-select:none!important}\n#t3-hub-artifact-dock[hidden]{display:none!important}\n#t3-sidecar-hub-root.is-occluded #t3-hub-artifact-dock,#t3-sidecar-hub-root.is-occluded #t3-hub-settings-panel{visibility:hidden!important;pointer-events:none!important}\n.hub-arc-tab{width:26px;height:76px;padding:0 0 0 3px;border:1px solid var(--hub-border);border-right:0;border-radius:24px 0 0 24px;background:var(--hub-bg);color:var(--hub-secondary);box-shadow:-2px 4px 14px #0f172a14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-tab:hover{color:var(--hub-ink);border-color:var(--hub-ink)}\n.hub-arc-grip{font-size:10px;line-height:1;letter-spacing:-1px;color:var(--hub-muted);user-select:none}\n.hub-arc-drag{display:inline-flex;align-items:center;gap:5px;min-width:0;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}\n.hub-arc-sheet{width:296px;max-height:62vh;overflow:auto;border:1px solid var(--hub-border);border-right:0;border-radius:16px 0 0 16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:-8px 12px 32px #0f172a1c;padding:12px;display:flex;flex-direction:column;gap:8px}\n.hub-arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-arc-item{padding:8px 10px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:6px}\n.hub-arc-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}\n.hub-arc-name{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:550;color:var(--hub-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.hub-arc-meta{font-size:10px;color:var(--hub-secondary);flex:none}\n.hub-arc-actions{display:flex;gap:5px;flex-wrap:wrap}\n.hub-arc-btn{height:23px;padding:0 8px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg);color:var(--hub-ink);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-arc-btn:hover{background:var(--hud-hover)}\n.hub-arc-btn.is-primary{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:600}\n.hub-arc-menu{margin-top:3px;padding:4px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);display:flex;flex-direction:column;gap:2px}\n.hub-arc-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:5px;background:transparent;padding:5px 7px;text-align:left;font-size:11px!important;color:var(--hub-ink);cursor:pointer}\n.hub-arc-opt:hover{background:var(--hud-hover)}\n.hub-arc-opt small{color:var(--hub-secondary);font-size:10px}\n.hub-arc-preview{margin-top:4px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg);max-height:240px;overflow:auto}\n.hub-arc-preview pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:10.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-ink)}\n#t3-hub-settings-panel{position:fixed;right:12px;top:12px;bottom:12px;width:min(740px,92vw);max-height:calc(100dvh - 24px);z-index:2147482995;display:flex;flex-direction:column;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}\n#t3-hub-settings-panel[hidden]{display:none!important}\n.hub-set-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}\n@media(max-width:620px){.hub-set-grid-2{grid-template-columns:minmax(0,1fr)}}\n.hub-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--hub-border)}\n.hub-set-head strong{font-size:14px;font-weight:620}\n.hub-set-body{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}\n.hub-set-sec{border:1px solid var(--hub-border);border-radius:11px;padding:12px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:9px}\n.hub-set-sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg)}\n.hub-set-meta{min-width:0;flex:1}\n.hub-set-meta strong{display:block;font-size:11.5px;font-weight:600;overflow-wrap:anywhere}\n.hub-set-meta small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:2px;overflow-wrap:anywhere}\n.hub-set-pills{display:flex;gap:5px;flex-wrap:wrap}\n.hub-set-pill{height:25px;padding:0 9px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg);color:var(--hub-secondary);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-set-pill.is-active{background:var(--hub-active);color:var(--hub-on-active);border-color:var(--hub-active);font-weight:600}\n";
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer><div class="hub-toast" role="status" aria-live="polite" hidden></div></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
  handle = null;
  titleControls = root.querySelector("#t3-hub-title-controls");
  memoryHandle = root.querySelector("#t3-hub-memory-handle");
  memoryToggle = root.querySelector("#t3-hub-memory-toggle");
+ settingsHandle = root.querySelector("#t3-hub-settings-handle");
+ settingsPanel = root.querySelector("#t3-hub-settings-panel");
+ artifactDock = root.querySelector("#t3-hub-artifact-dock");
  planHandle = root.querySelector("#t3-hub-plan-handle");
  content = root.querySelector(".hub-content");
  liveBoard = root.querySelector("#t3-hub-live-board");
@@ -285,7 +295,12 @@
  listen(planHandle, "blur", () => deferPlanPopoverClose());
  listen(liveBoard, "pointerenter", () => { state.planHovering = true; });
  listen(liveBoard, "pointerleave", (event) => { if (event.relatedTarget && (planHandle.contains(event.relatedTarget) || liveBoard.contains(event.relatedTarget))) return; state.planHovering = false; deferPlanPopoverClose(); });
- listen(document, "pointerdown", (event) => { if (!planHandle.contains(event.target) && !liveBoard.contains(event.target) && state.planPinned) setPlanPopover(false); });
+ listen(document, "pointerdown", (event) => {
+  if (!planHandle.contains(event.target) && !liveBoard.contains(event.target) && state.planPinned) setPlanPopover(false);
+  if (state.artifactDockOpen && artifactDock && !artifactDock.contains(event.target)) {
+   state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; renderArtifactDock();
+  }
+ });
  listen(root, "focusout", () => later(flushBoardRender, 0));
  listen(root, "error", (event) => { if (event.target.matches?.(".hub-brand-icon>img")) { event.target.parentElement.classList.remove("has-image"); event.target.remove(); } }, true);
  const resizeHandle = root.querySelector("#t3-hub-resize-handle");
@@ -293,6 +308,12 @@
  listen(resizeHandle, "pointermove", moveResize);
  listen(resizeHandle, "pointerup", endResize);
  listen(resizeHandle, "pointercancel", endResize);
+ if (artifactDock) {
+  listen(artifactDock, "pointerdown", startArtifactDockDrag);
+  listen(artifactDock, "pointermove", moveArtifactDockDrag);
+  listen(artifactDock, "pointerup", endArtifactDockDrag);
+  listen(artifactDock, "pointercancel", endArtifactDockDrag);
+ }
  listen(resizeHandle, "keydown", (event) => { if (["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); setWidth(state.width + (event.key === "ArrowLeft" ? 40 : -40)); } });
  listen(root, "pointerover", (event) => { const card = event.target.closest("[data-subagent-card]"); if (card && !card.contains(event.relatedTarget)) greetBots(card.dataset.subagentCard); });
  listen(root, "keydown", onEditorKeydown);
@@ -302,6 +323,7 @@
  });
  listen(memoryHandle, "click", openMemoryFromTitle);
  listen(memoryToggle, "click", toggleMemoryAccessFromTitle);
+ if (settingsHandle) listen(settingsHandle, "click", () => setHubSettingsOpen(!state.hubSettingsOpen));
  listen(window, "keydown", onKeydown);
  listen(window, "resize", positionHandle);
  listen(window, "resize", () => { applyWidth(); positionConversationTools(); });
@@ -356,6 +378,7 @@
  renderMemoryTitleControls();
  root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("当前项目", "Current project"))}" disabled><option value="project" selected>${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
  const tabs = [["memory", "memory", tr("记忆", "Memory")]];
+ drawer?.classList.toggle("is-single-tab", tabs.length <= 1);
  root.querySelector(".hub-tabs").innerHTML = tabs.map(([key, glyph, label]) => {
  const count = tabCount(key);
  return `<button type="button" id="t3-hub-tab-${key}" class="hub-tab" role="tab" data-action="tab" data-tab="${key}" aria-controls="t3-hub-panel" aria-selected="${key === navTab}" tabindex="${key === navTab ? 0 : -1}">${icon(glyph, 14)}<span>${esc(label)}</span>${count == null ? "" : `<span class="hub-tab-count">${esc(count)}</span>`}</button>`;
@@ -1016,9 +1039,10 @@
  return ({ constraint: "constraints", rule: "constraints", rules: "constraints", pitfall: "pitfalls", experience: "pitfalls", topic: "topics", "topic-memory": "topics", memory: "constraints" })[module] || module || "topics";
     }
  function renderMemory() {
- content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span class="hub-count" id="t3-hub-memory-total"></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签。本机接入状态不代表当前会话已加载。", "Read and maintain shared knowledge and worktree notes for the currently confirmed project only. Local access status does not prove the current session loaded it."))}</p><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-memory-connections"></div><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
+ content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span style="display:inline-flex;align-items:center;gap:8px;flex:none"><span class="hub-count" id="t3-hub-memory-total"></span><button type="button" class="hub-btn hub-small" data-action="open-hub-memory-settings" style="white-space:nowrap">${icon("settings", 12)}<span>${esc(tr("记忆设置", "Memory settings"))}</span></button></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签；本机记忆接入与向量模型配置已整合至顶栏「设置」。", "Read and maintain shared knowledge and worktree notes for the confirmed project. Local access and vector model settings live under Settings."))}</p><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
  renderMemoryAgentAccess();
  renderMemoryRuntime();
+ renderEngine();
  renderMemoryConnections();
  renderWorktreeScopes();
  renderMemoryNav();
@@ -1041,7 +1065,77 @@
  return ["missing", "conflict", "unsupported", "unknown", "pending"].some((key) => Number(summary[key]) > 0);
     }
     function memoryAccessIssueText(reason) {
- return ({ managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"), agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"), entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"), unknown: tr("状态无法确认", "Status could not be confirmed") })[String(reason || "")] || tr("需要进一步检查", "Needs review");
+ return ({
+  managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"),
+  agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"),
+  unsupported_driver: tr("自动写入暂不支持，可复制专属接入提示词交由该 Agent 配置", "Auto-write not supported; copy the tailored setup prompt for this Agent"),
+  entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"),
+  unknown: tr("状态无法确认", "Status could not be confirmed"),
+ })[String(reason || "")] || tr("需要进一步检查", "Needs review");
+    }
+    function providerMemorySetupPrompt(providerId, displayName) {
+ const idLow = String(providerId || "").toLowerCase();
+ const name = String(displayName || providerId || "Agent").trim();
+ if (idLow.includes("opencode")) {
+  return [
+   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   "1. 打开 `~/.config/opencode/opencode.json`（先备份原文件），在顶层 `mcp` 对象下仅新增或更新 `t3_hub` 条目：",
+   '```json',
+   '{',
+   '  "mcp": {',
+   '    "t3_hub": {',
+   '      "type": "local",',
+   '      "command": ["/bin/sh", "-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"],',
+   '      "enabled": true',
+   '    }',
+   '  }',
+   '}',
+   '```',
+   "2. 保留文件中所有其他字段、已有 MCP、模型与插件配置，不要重启 T3。",
+   "3. 在新会话或重新加载 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
+  ].join("\n");
+ }
+ if (idLow.includes("devin")) {
+  return [
+   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   "1. 打开 `~/.config/devin/mcp_config.json`（先备份原文件），在顶层 `mcpServers` 对象下仅新增或更新 `t3_hub` 条目：",
+   '```json',
+   '{',
+   '  "mcpServers": {',
+   '    "t3_hub": {',
+   '      "command": "/bin/sh",',
+   '      "args": ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]',
+   '    }',
+   '  }',
+   '}',
+   '```',
+   "2. 保留文件中所有其他 MCP 与本机配置，不要重启 T3。",
+   "3. 在新会话或重连 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
+  ].join("\n");
+ }
+ return [
+  `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型与其他 MCP）：`,
+  `1. 检查 ${name} 的本机原生 MCP 配置文件并先做好备份。`,
+  "2. 仅新增或更新名为 `t3_hub` 的本机 stdio MCP 服务，启动命令为：",
+  '   `command: "/bin/sh"`, `args: ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]`',
+  "3. 保留原有所有 MCP、模型、认证与路由设置，不要重启 T3。",
+  "4. 配置完成后调用 `memory_status` 核验当前项目记忆是否就绪；若当前会话尚未加载新 MCP，请提示在新会话中再核验。",
+ ].join("\n");
+    }
+    async function copyProviderMemorySetupPrompt(providerId, displayName) {
+ const label = String(displayName || providerId || "Agent").trim();
+ const text = providerMemorySetupPrompt(providerId, label);
+ state.providerMemoryPrompt = { id: String(providerId || label), label, text };
+ try {
+  const clipboard = window.navigator?.clipboard;
+  if (typeof clipboard?.writeText !== "function") throw new Error("clipboard_unavailable");
+  await clipboard.writeText(text);
+  renderMemoryAgentAccess();
+  toast(tr(`已复制 ${label} 专属接入提示词`, `Copied setup prompt for ${label}`));
+ } catch {
+  renderMemoryAgentAccess();
+  toast(tr(`无法自动复制；已展开 ${label} 专属接入提示词供手动复制`, `Clipboard unavailable; showing ${label} setup prompt to copy`), true);
+ }
     }
     async function refreshMemoryAgentAccess(force = false) {
  if (disposed || cache.agentAccess && !force) return cache.agentAccess;
@@ -1094,12 +1188,18 @@
   const stateName = ["configured", "missing", "conflict", "unsupported", "unknown", "pending"].includes(provider?.status) ? provider.status : "unknown";
   const label = provider?.displayName || provider?.instanceId || tr("Agent", "Agent");
   const detail = stateName === "configured" ? tr("已找到 Hub MCP 配置", "Hub MCP configuration found") : memoryAccessIssueText(provider?.reason);
-  return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small></div>`;
+  const promptBtn = stateName !== "configured"
+   ? `<div style="margin-top:6px"><button type="button" class="hub-arc-btn" data-action="copy-provider-memory-prompt" data-provider-id="${esc(provider?.instanceId || label)}" data-provider-name="${esc(label)}">${esc(tr("复制接入提示词", "Copy setup prompt"))}</button></div>`
+   : "";
+  return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small>${promptBtn}</div>`;
  }).join("");
+ const providerPromptArea = state.providerMemoryPrompt
+  ? `<div style="margin-top:10px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle)"><div class="hub-row" style="margin-bottom:6px"><strong style="font-size:11px">${esc(tr(`${state.providerMemoryPrompt.label} 专属接入提示词`, `${state.providerMemoryPrompt.label} setup prompt`))}</strong><span class="hub-grow"></span><button type="button" class="hub-arc-btn" data-action="close-provider-memory-prompt">${esc(tr("收起", "Hide"))}</button></div><textarea class="hub-input hub-memory-access-prompt" style="margin-top:0" readonly spellcheck="false">${esc(state.providerMemoryPrompt.text)}</textarea></div>`
+  : "";
  const errorHtml = errors.agentAccess ? `<p class="hub-hint" role="status">${esc(tr("暂时无法核验本机 T3 Agent 的记忆接入状态。", "Could not verify local T3 Agent memory access."))}</p>`
   : state.memorySetupNotice === "incomplete" ? `<p class="hub-hint" role="status">${esc(tr("接入检查未完成，仍有 Agent 待处理或无法确认；请勿将其视为已全部接入。", "Setup is incomplete. Some agents remain pending or unverified; access is not confirmed for all agents."))}</p>`
   : state.memorySetupNotice === "checked" ? `<p class="hub-hint" role="status">${esc(tr("本机配置检查完成；当前会话是否已加载仍未验证。", "Local configuration was checked; current session loading remains unverified."))}</p>` : "";
- node.innerHTML = `<section class="hub-card hub-memory-access"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryAgentAccess" aria-label="${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}" aria-checked="${access.enabled == null ? "mixed" : String(enabled)}" ${enabled ? "checked" : ""} ${updating ? "disabled" : ""}><span>${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${errors.agentAccess || access.enabled == null ? "unknown" : state.memorySetupNotice === "incomplete" || enabled && memoryAccessIssues(summary) ? "pending" : enabled ? "configured" : "missing"}">${esc(status)}</span></div><p class="hub-card-description">${esc(tr("这是本机设置，不用于 Connect 远端会话。关闭访问会保留记忆内容和手工配置。开关会即时控制 Hub MCP 接入；已加载 MCP 的旧会话需自然重连后更新，不会由这里强制结束。当前会话可用 memory_status 验证。", "This is a local setting and does not apply to Connect remote chats. Disabling access keeps saved memories and manual configuration. The switch immediately controls Hub MCP access; an existing session that already loaded the MCP updates after it naturally reconnects. This does not force that session to close. Verify the current session with memory_status."))}</p><div class="hub-memory-access-actions">${button("memory-access-setup", tr("检查并接入", "Check and set up"), { primary: true, small: true, icon: "check", disabled: updating })}${button("memory-access-copy-prompt", tr("复制首次接入提示词", "Copy setup prompt"), { small: true, disabled: updating })}${button("memory-access-refresh", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh", disabled: updating })}</div>${counts ? `<div class="hub-memory-access-summary">${counts}</div>` : ""}${providerHtml ? `<div class="hub-memory-access-providers">${providerHtml}</div>` : ""}${errorHtml}${state.memorySetupPromptVisible ? `<label class="hub-field" style="margin-top:10px">${esc(tr("首次接入提示词（可手动复制）", "First setup prompt (copy manually)"))}<textarea class="hub-input hub-memory-access-prompt" readonly spellcheck="false">${esc(memorySetupPrompt)}</textarea></label>` : ""}</section>`;
+ node.innerHTML = `<section class="hub-card hub-memory-access"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryAgentAccess" aria-label="${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}" aria-checked="${access.enabled == null ? "mixed" : String(enabled)}" ${enabled ? "checked" : ""} ${updating ? "disabled" : ""}><span>${esc(tr("允许本机 T3 Agent 使用记忆", "Allow local T3 Agents to use memory"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${errors.agentAccess || access.enabled == null ? "unknown" : state.memorySetupNotice === "incomplete" || enabled && memoryAccessIssues(summary) ? "pending" : enabled ? "configured" : "missing"}">${esc(status)}</span></div><p class="hub-card-description">${esc(tr("这是本机设置，不用于 Connect 远端会话。关闭访问会保留记忆内容和手工配置。开关会即时控制 Hub MCP 接入；已加载 MCP 的旧会话需自然重连后更新，不会由这里强制结束。当前会话可用 memory_status 验证。", "This is a local setting and does not apply to Connect remote chats. Disabling access keeps saved memories and manual configuration. The switch immediately controls Hub MCP access; an existing session that already loaded the MCP updates after it naturally reconnects. This does not force that session to close. Verify the current session with memory_status."))}</p><div class="hub-memory-access-actions">${button("memory-access-setup", tr("检查并接入", "Check and set up"), { primary: true, small: true, icon: "check", disabled: updating })}${button("memory-access-copy-prompt", tr("复制首次接入提示词", "Copy setup prompt"), { small: true, disabled: updating })}${button("memory-access-refresh", tr("刷新状态", "Refresh status"), { small: true, icon: "refresh", disabled: updating })}</div>${counts ? `<div class="hub-memory-access-summary">${counts}</div>` : ""}${providerHtml ? `<div class="hub-memory-access-providers">${providerHtml}</div>` : ""}${providerPromptArea}${errorHtml}${state.memorySetupPromptVisible ? `<label class="hub-field" style="margin-top:10px">${esc(tr("首次接入提示词（可手动复制）", "First setup prompt (copy manually)"))}<textarea class="hub-input hub-memory-access-prompt" readonly spellcheck="false">${esc(memorySetupPrompt)}</textarea></label>` : ""}</section>`;
  renderMemoryTitleControls();
  renderMemoryRuntime();
     }
@@ -1186,7 +1286,7 @@
   if (!disposed) state.memoryVectorTest = { status: "error", message: errorText(error) };
  } finally {
   state.memoryVectorTestRunning = false;
-  if (!disposed && state.tab === "memory") renderMemoryRuntime();
+  if (!disposed && (state.tab === "memory" || state.hubSettingsOpen)) renderMemoryRuntime();
  }
     }
     function renderMemoryRuntime() {
@@ -1347,7 +1447,7 @@
  if (!disposed && errors.embed) throw new Error(tr("缓存已释放，但读数刷新失败，请刷新状态重试", "Cache released, but readings could not refresh. Refresh the status to retry."));
  if (!disposed) toast(tr("向量缓存已释放，读数已刷新", "Vector cache released; readings refreshed"));
  });
- } finally { state.embedTrimming = false; if (!disposed && state.tab === "memory") renderEngine(); }
+ } finally { state.embedTrimming = false; if (!disposed && (state.tab === "memory" || state.hubSettingsOpen)) renderEngine(); }
     }
     function renderMemoryNav() {
  const node = root.querySelector("#t3-hub-memory-nav");
@@ -1398,7 +1498,8 @@
  const module = normalizeModule(item.module || item.category || item.type);
  const source = item.sourceAgent || item.agent || item.source || "migrated";
  const draft = drafts[memoryDraftKey(id)];
- return `<article class="hub-card hub-memory-card ${selected ? "is-selected" : ""}" data-memory-id="${esc(id)}"><button type="button" class="hub-memory-open" data-action="open-memory" data-id="${esc(id)}" aria-expanded="${selected}"><div class="hub-card-top"><span class="hub-asset-icon ${module === "constraints" ? "accent" : ""}" style="width:27px;height:27px;font-size:13px">${icon(module === "constraints" ? "pin" : "memory", 14)}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.name || memoryBody(item).split("\n")[0].replace(/^#+\s*/, "") || tr("未命名记忆", "Untitled memory"))}</div><div class="hub-card-meta"><span class="hub-badge">${esc(source)}</span>${Number(item.version) > 1 ? `<span class="hub-badge hub-purple"> v${esc(item.version)}</span>` : ""}${Number(item.hitCount) > 0 ? `<span class="hub-memory-hits"> ${esc(item.hitCount)}</span>` : ""}${item.lastRecalledAt ? `<span class="hub-memory-hits">${esc(tr("召回", "Recalled"))} ${exactTimeMarkup(item.lastRecalledAt)}</span>` : ""}<span class="hub-memory-date">${exactTimeMarkup(item.updatedAt || item.updated_at || item.createdAt)}</span></div></div><span style="color:var(--hud-muted);transform:rotate(${selected ? 90 : 0}deg)">${icon("chevron", 12)}</span></div>${selected ? "" : `<p class="hub-card-description">${esc(item.summary || memoryBody(item).replace(/[#*`>]/g, "").slice(0, 210))}</p>`}</button>${selected ? `<div class="hub-memory-detail"><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="memory-title" data-id="${esc(id)}" value="${esc(draft?.title ?? item.title ?? item.name ?? "")}"></label><label class="hub-field">Markdown<textarea class="hub-editor" name="memory-content" data-id="${esc(id)}" spellcheck="false" aria-label="${esc(tr("记忆内容", "Memory content"))}">${esc(draft?.content ?? memoryBody(item))}</textarea></label><div class="hub-detail-meta"><span class="hub-badge">${esc(source)}</span><span>${esc(tr("更新于", "Updated"))} ${exactTimeMarkup(item.updatedAt || item.updated_at || item.createdAt)}</span></div>${item.lastRecalledAt ? `<div class="hub-detail-meta">${esc(tr("最近召回", "Last recalled"))} ${exactTimeMarkup(item.lastRecalledAt)}</div>` : ""}<div class="hub-editor-actions">${button("save-memory", tr("保存修改", "Save"), { primary: true, icon: "save", attrs: `data-id="${esc(id)}"` })}${button("pin-memory", tr("置顶到 AGENTS.md", "Pin to AGENTS.md"), { icon: "pin", disabled: !selectedMemoryRoot(), attrs: `data-id="${esc(id)}" title="${esc(!selectedMemoryRoot() ? tr("请选择要写入的项目", "Choose a project to pin into") : "")}"` })}${button("delete-memory", tr("删除", "Delete"), { icon: "trash", danger: true, attrs: `data-id="${esc(id)}"` })}</div><div data-delete-confirm hidden class="hub-confirm-delete">${esc(tr("确定删除这条记忆？此操作无法撤销。", "Delete this memory? This cannot be undone."))}<div class="hub-row">${button("confirm-delete-memory", tr("确认删除", "Delete memory"), { danger: true, small: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-delete-memory", tr("取消", "Cancel"), { small: true })}</div></div></div>` : ""}${item.scope === "worktree" || item.memoryScope === "worktree" ? `<div style="padding:0 14px 12px">${button("promote-memory", tr("↑ 提炼为长期共享", "↑ Promote to shared memory"), { small: true, attrs: `data-id="${esc(id)}"` })}</div>` : ""}${renderMemoryHistory(item)}</article>`;
+ const moduleLabel = moduleOptions().find(([k]) => k === module)?.[1] || module;
+ return `<article class="hub-card hub-memory-card ${selected ? "is-selected" : ""}" data-memory-id="${esc(id)}"><button type="button" class="hub-memory-open" data-action="open-memory" data-id="${esc(id)}" aria-expanded="${selected}"><div class="hub-card-top"><span class="hub-asset-icon ${module === "constraints" ? "accent" : ""}" style="width:27px;height:27px;font-size:13px">${icon(module === "constraints" ? "pin" : "memory", 14)}</span><div class="hub-grow"><div class="hub-card-name">${esc(item.title || item.name || memoryBody(item).split("\n")[0].replace(/^#+\s*/, "") || tr("未命名记忆", "Untitled memory"))}</div><div class="hub-card-meta"><span class="hub-badge">${esc(moduleLabel)}</span><span class="hub-badge">${esc(source)}</span>${Number(item.version) > 1 ? `<span class="hub-badge hub-purple"> v${esc(item.version)}</span>` : ""}${Number(item.hitCount) > 0 ? `<span class="hub-memory-hits"> ${esc(item.hitCount)}</span>` : ""}${item.lastRecalledAt ? `<span class="hub-memory-hits">${esc(tr("召回", "Recalled"))} ${exactTimeMarkup(item.lastRecalledAt)}</span>` : ""}<span class="hub-memory-date">${exactTimeMarkup(item.updatedAt || item.updated_at || item.createdAt)}</span></div></div><span style="color:var(--hud-muted);transform:rotate(${selected ? 90 : 0}deg)">${icon("chevron", 12)}</span></div>${selected ? "" : `<p class="hub-card-description">${esc(item.summary || memoryBody(item).replace(/[#*`>]/g, "").slice(0, 210))}</p>`}</button>${selected ? `<div class="hub-memory-detail"><label class="hub-field">${esc(tr("标题", "Title"))}<input class="hub-input" name="memory-title" data-id="${esc(id)}" value="${esc(draft?.title ?? item.title ?? item.name ?? "")}"></label><label class="hub-field">Markdown<textarea class="hub-editor" name="memory-content" data-id="${esc(id)}" spellcheck="false" aria-label="${esc(tr("记忆内容", "Memory content"))}">${esc(draft?.content ?? memoryBody(item))}</textarea></label><div class="hub-detail-meta"><span class="hub-badge">${esc(source)}</span><span>${esc(tr("更新于", "Updated"))} ${exactTimeMarkup(item.updatedAt || item.updated_at || item.createdAt)}</span></div>${item.lastRecalledAt ? `<div class="hub-detail-meta">${esc(tr("最近召回", "Last recalled"))} ${exactTimeMarkup(item.lastRecalledAt)}</div>` : ""}<div class="hub-editor-actions">${button("save-memory", tr("保存修改", "Save"), { primary: true, icon: "save", attrs: `data-id="${esc(id)}"` })}${button("pin-memory", tr("置顶到 AGENTS.md", "Pin to AGENTS.md"), { icon: "pin", disabled: !selectedMemoryRoot(), attrs: `data-id="${esc(id)}" title="${esc(!selectedMemoryRoot() ? tr("请选择要写入的项目", "Choose a project to pin into") : "")}"` })}${button("delete-memory", tr("删除", "Delete"), { icon: "trash", danger: true, attrs: `data-id="${esc(id)}"` })}</div><div data-delete-confirm hidden class="hub-confirm-delete">${esc(tr("确定删除这条记忆？此操作无法撤销。", "Delete this memory? This cannot be undone."))}<div class="hub-row">${button("confirm-delete-memory", tr("确认删除", "Delete memory"), { danger: true, small: true, attrs: `data-id="${esc(id)}"` })}${button("cancel-delete-memory", tr("取消", "Cancel"), { small: true })}</div></div></div>` : ""}${item.scope === "worktree" || item.memoryScope === "worktree" ? `<div style="padding:0 14px 12px">${button("promote-memory", tr("↑ 提炼为长期共享", "↑ Promote to shared memory"), { small: true, attrs: `data-id="${esc(id)}"` })}</div>` : ""}${renderMemoryHistory(item)}</article>`;
  }).join("");
     }
     function renderMemoryHistory(item) {
@@ -1619,6 +1720,7 @@
  const top = anchor.bottom + estimatedHeight + 12 <= innerHeight ? anchor.bottom + 8 : Math.max(8, anchor.top - estimatedHeight - 8);
  Object.assign(liveBoard.style, { left: `${left}px`, width: `${width}px`, top: `${top}px`, maxHeight: `${Math.max(100, innerHeight - top - 8)}px` });
  }
+ renderArtifactDock();
     }
     function boardMismatch() {
  const remoteEnv = remotePlanEnvironmentId();
@@ -1930,6 +2032,320 @@
  const hasPlan = hasActualPlan(board);
  return `${compact || !hasPlan ? "" : `<div class="hub-board-heading"><strong>${esc(tr("计划", "Plan"))}</strong><span class="hub-badge">${esc(boardSourceLabel(board.source))}${manual ? "" : ` · ${esc(tr("只读", "Read only"))}`}</span></div>`}${!compact && board.background ? `<button type="button" class="hub-pill" data-action="board-background" aria-expanded="${state.boardBackground}">≣ ${esc(tr("背景", "Background"))}</button><div class="hub-board-background" ${state.boardBackground ? "" : "hidden"}>${esc(typeof board.background === "string" ? board.background : board.background.text || board.background.content || "")}</div>` : ""}${compact || !board.steps.length ? "" : `<div class="hub-board-section"><span>${esc(tr("进度", "Progress"))}</span><b>${board.progress.completed}/${board.progress.total}</b></div>`}${markdownHtml}${board.steps.length ? `<ol class="hub-board-steps">${board.steps.map((step, index) => `<li class="hub-board-step is-${step.status}">${manual ? `<button type="button" class="hub-step-check" data-action="board-step" data-index="${index}" data-step-id="${escIdentity(step.id)}" data-step-text="${escIdentity(step.text)}" aria-label="${esc(`${step.status === "completed" ? tr("标为待完成", "Mark pending") : tr("标为已完成", "Mark completed")} · ${step.text}`)}" aria-pressed="${step.status === "completed"}"><span class="hub-step-icon">${step.status === "completed" ? "✓" : ""}</span></button>` : `<span class="hub-step-icon" aria-label="${esc(step.status)}">${step.status === "completed" ? "✓" : ""}</span>`}<span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : !hasPlan ? `<p class="hub-hint">${esc(tr("本会话暂无主计划", "No main plan in this conversation"))}</p>` : ""}${!compact ? subagentSummary(board, true) : ""}${artifactButtons ? `<div class="hub-board-section"><span>${esc(tr("产物文档", "Artifacts"))}</span></div><div class="hub-artifacts">${artifactButtons}</div>` : ""}${board.artifactScopeError === "unknown" ? `<p class="hub-hint">${esc(tr("暂无法核实会话归属，产物暂不可用", "Artifact ownership could not be verified"))}</p>` : ""}`;
     }
+
+    function formatArtifactBytes(bytes) {
+ if (bytes == null || !Number.isFinite(Number(bytes))) return "";
+ const n = Number(bytes);
+ if (n < 1024) return n + " B";
+ if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+ return (n / 1048576).toFixed(1) + " MB";
+    }
+    function setArtifactDockEnabled(enabled) {
+ state.artifactDockEnabled = Boolean(enabled);
+ storageSet("t3-hub-artifact-dock-v1", state.artifactDockEnabled ? "true" : "false");
+ if (!state.artifactDockEnabled) { state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; }
+ renderArtifactDock();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+    }
+    function setHubSettingsOpen(open, tab = null) {
+ state.hubSettingsOpen = Boolean(open);
+ if (tab === "general" || tab === "memory") state.hubSettingsTab = tab;
+ if (state.hubSettingsOpen && state.open) setOpen(false, false);
+ if (settingsHandle) settingsHandle.setAttribute("aria-expanded", String(state.hubSettingsOpen));
+ if (settingsPanel) settingsPanel.hidden = !state.hubSettingsOpen;
+ renderArtifactDock();
+ if (state.hubSettingsOpen) {
+  renderHubSettingsPanel();
+  if (!cache.providerResources && !state.providerResLoading) loadProviderResources();
+  if (!cache.guardian && !state.guardianLoading) loadGuardianStatus();
+  if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded();
+ }
+    }
+    async function ensureMemorySettingsLoaded(force = false) {
+ const confirmedRoot = memoryProjectReady() ? state.projectRoot : null;
+ const tasks = [refreshMemoryAgentAccess(force), refreshEmbed(true, force, confirmedRoot)];
+ if (!cache.connections || force) {
+  tasks.push((async () => {
+   try {
+    const data = await request("memory:connections", {});
+    if (!disposed) { cache.connections = data; delete errors.connections; }
+   } catch (error) {
+    if (!disposed) errors.connections = error;
+   }
+  })());
+ }
+ await Promise.all(tasks);
+ if (!disposed) {
+  renderMemoryAgentAccess();
+  renderMemoryRuntime();
+  renderEngine();
+  renderMemoryConnections();
+ }
+    }
+    async function loadProviderResources(force = false) {
+ if (disposed || (state.providerResLoading && !force)) return;
+ state.providerResLoading = true;
+ delete errors.providerResources;
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ try {
+  const data = await request("providerResources:list", {});
+  if (disposed) return;
+  cache.providerResources = data;
+  delete errors.providerResources;
+ } catch (error) {
+  if (!disposed) errors.providerResources = error;
+ } finally {
+  state.providerResLoading = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    async function toggleProviderResourceItem(element) {
+ const provider = element.dataset.provider, kind = element.dataset.kind, id = element.dataset.id;
+ const sourceFile = element.dataset.sourceFile || undefined, sourceDir = element.dataset.sourceDir || undefined;
+ const currentEnabled = element.getAttribute("aria-checked") === "true";
+ const nextEnabled = !currentEnabled;
+ const syncAllProviders = kind === "skills" && state.skillSyncAllProviders === true;
+ await busy(`prov-res:${provider}:${kind}:${id}`, element, async () => {
+  const res = await request("providerResources:toggle", { provider, kind, id, enabled: nextEnabled, sourceFile, sourceDir, syncAllProviders });
+  if (disposed) return;
+  await loadProviderResources(true);
+  const synced = Array.isArray(res?.syncedProviders) ? res.syncedProviders : [];
+  if (syncAllProviders && synced.length > 1) {
+   toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"} · 已同步 ${synced.length} 端 (${synced.join("、")})`, `${id} ${nextEnabled ? "enabled" : "disabled"} · synced across ${synced.length} providers (${synced.join(", ")})`));
+  } else {
+   toast(tr(`${id} 已${nextEnabled ? "开启" : "关闭"}`, `${id} ${nextEnabled ? "enabled" : "disabled"}`));
+  }
+ });
+    }
+    async function loadGuardianStatus() {
+ if (disposed || state.guardianLoading) return;
+ state.guardianLoading = true;
+ try {
+  const data = await request("guardian:status", {});
+  if (!disposed) { cache.guardian = data; delete errors.guardian; }
+ } catch (error) {
+  if (!disposed) errors.guardian = error;
+ } finally {
+  state.guardianLoading = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    async function toggleGuardian(element) {
+ if (disposed || state.guardianUpdating) return;
+ const nextEnabled = cache.guardian?.enabled !== true;
+ state.guardianUpdating = true;
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ try {
+  const res = await request("guardian:set", { enabled: nextEnabled });
+  if (!disposed) {
+   cache.guardian = res;
+   toast(nextEnabled ? tr("T3 升级自动防掉线守护已开启", "Upgrade anti-drop guardian enabled") : tr("T3 升级防掉线守护已关闭", "Upgrade anti-drop guardian disabled"));
+  }
+ } catch (error) {
+  if (!disposed) toast(errorText(error), true);
+ } finally {
+  state.guardianUpdating = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    function renderHubSettingsPanel() {
+ if (!settingsPanel || disposed) return;
+ settingsPanel.hidden = !state.hubSettingsOpen;
+ if (!state.hubSettingsOpen) return;
+ const providers = Array.isArray(cache.providerResources?.providers) ? cache.providerResources.providers : [];
+ const activeProv = providers.find((p) => p.id === state.providerResProvider) || providers[0] || null;
+ if (activeProv && activeProv.id !== state.providerResProvider) state.providerResProvider = activeProv.id;
+ const kinds = [["mcp", "MCP"], ["skills", "Skills"], ["plugins", tr("插件", "Plugins")]];
+ const activeList = activeProv && Array.isArray(activeProv[state.providerResKind]) ? activeProv[state.providerResKind] : [];
+ const guardianOn = cache.guardian?.enabled === true;
+ const resListHtml = state.providerResLoading && !providers.length
+  ? `<p class="hub-hint">${esc(tr("正在读取本机提供方配置…", "Reading local provider configs…"))}</p>`
+  : errors.providerResources
+  ? `<p class="hub-hint">${esc(errorText(errors.providerResources))} ${button("refresh-provider-resources", tr("重试", "Retry"), { small: true })}</p>`
+  : !activeList.length
+  ? `<p class="hub-hint">${esc(tr("当前提供方暂无此类型配置条目。", "No configured items for this provider and category."))}</p>`
+  : activeList.map((item) => `<div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(item.name || item.id)}</strong>${item.description ? `<small>${esc(item.description)}</small>` : ""}</div>${item.readonly ? `<span class="hub-badge">${esc(tr("只读", "Read-only"))}</span>` : `<button type="button" role="switch" class="hub-switch" data-action="toggle-provider-resource" data-provider="${esc(item.provider)}" data-kind="${esc(item.kind)}" data-id="${esc(item.id)}" ${item.sourceFile ? `data-source-file="${esc(item.sourceFile)}"` : ""} ${item.sourceDir ? `data-source-dir="${esc(item.sourceDir)}"` : ""} aria-checked="${item.enabled === true}" aria-label="${esc(item.name || item.id)}"><span></span></button>`}</div>`).join("");
+ const skillSyncRowHtml = state.providerResKind === "skills"
+  ? `<div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("同名 Skill 跨端同步开关", "Sync same-name skills across providers"))}</strong><small>${esc(tr("开启后，切换任一技能时会同步更新 Codex / OpenCode / Antigravity / Claude / Muse / Devin 中已安装的同名技能（未安装的端不新建文件）", "When on, toggling a skill syncs existing same-name copies across Codex, OpenCode, Antigravity, Claude, Muse, and Devin"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-skill-sync-all" aria-checked="${state.skillSyncAllProviders === true}" aria-label="${esc(tr("同名 Skill 跨端同步开关", "Sync same-name skills across providers"))}"><span></span></button></div>`
+  : "";
+ const isMemTab = state.hubSettingsTab === "memory";
+ const chromeHtml = `<div class="hub-set-head"><strong>${esc(tr("T3 Hub 设置", "T3 Hub Settings"))}</strong><div style="display:flex;align-items:center;gap:6px"><button type="button" class="hub-set-pill ${!isMemTab ? "is-active" : ""}" data-action="hub-settings-tab" data-tab="general">${esc(tr("常规与提供方", "General & Providers"))}</button><button type="button" class="hub-set-pill ${isMemTab ? "is-active" : ""}" data-action="hub-settings-tab" data-tab="memory">${esc(tr("记忆与向量", "Memory & Vector"))}</button><button type="button" class="hub-arc-btn" data-action="close-hub-settings">${esc(tr("关闭", "Close"))}</button></div></div>`;
+ const generalHtml = `<section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("桌面控件与升级守护", "Desktop controls & upgrade guardian"))}</span></div><div class="hub-set-grid-2"><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}</strong><small>${esc(tr("在窗口右侧边缘显示当前会话产物，支持直接打开与选择打开方式", "Show current session artifacts on the right edge with Open & Open With"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-artifact-dock-setting" aria-checked="${state.artifactDockEnabled === true}" aria-label="${esc(tr("右侧圆弧产物悬浮窗", "Right-edge curved artifacts dock"))}"><span></span></button></div><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}</strong><small>${esc(tr("零 CPU 监听 T3 升级与冷启动，仅空闲冷启动时自动重挂 HUD，绝不中断对话", "Zero-CPU WatchPaths guard; auto-reattaches only on idle cold boot"))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-guardian" aria-checked="${guardianOn}" ${state.guardianUpdating ? "disabled" : ""} aria-label="${esc(tr("T3 升级自动防掉线守护", "T3 upgrade auto-reattach guardian"))}"><span></span></button></div></div></section><section class="hub-set-sec"><div class="hub-set-sec-title"><span>${esc(tr("提供方资源（只查看与开关）", "Provider resources (view & toggle)"))}</span><button type="button" class="hub-arc-btn" data-action="refresh-provider-resources">${esc(tr("刷新", "Refresh"))}</button></div><p class="hub-hint" style="margin:0">${esc(tr("独立读取各提供方原生配置，仅控制启停，不负责新增或删除。", "Reads each provider's native local config directly; toggle on/off only."))}</p><div class="hub-set-pills">${providers.map((p) => { const total = (p.counts?.mcp || 0) + (p.counts?.skills || 0) + (p.counts?.plugins || 0); return `<button type="button" class="hub-set-pill ${p.id === state.providerResProvider ? "is-active" : ""}" data-action="provider-res-tab" data-provider="${esc(p.id)}">${esc(p.label)} (${total})</button>`; }).join("")}</div><div class="hub-set-pills">${kinds.map(([k, lbl]) => { const c = activeProv?.counts?.[k] ?? 0; return `<button type="button" class="hub-set-pill ${k === state.providerResKind ? "is-active" : ""}" data-action="provider-res-kind" data-kind="${esc(k)}">${esc(lbl)} (${c})</button>`; }).join("")}</div>${skillSyncRowHtml}<div style="display:flex;flex-direction:column;gap:6px">${resListHtml}</div></section>`;
+ const chromeNode = settingsPanel.querySelector?.("#t3-hub-settings-chrome");
+ const generalPane = settingsPanel.querySelector?.("#t3-hub-settings-general-pane");
+ const memoryPane = settingsPanel.querySelector?.("#t3-hub-settings-memory-pane");
+ if (chromeNode && generalPane && memoryPane) {
+  chromeNode.innerHTML = chromeHtml;
+  generalPane.innerHTML = generalHtml;
+  generalPane.hidden = isMemTab;
+  memoryPane.hidden = !isMemTab;
+  const quickbar = settingsPanel.querySelector?.("#t3-hub-settings-memory-quickbar");
+  if (quickbar) {
+   const ready = memoryProjectReady();
+   quickbar.innerHTML = `<section class="hub-set-sec" style="margin-bottom:2px"><div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(tr("项目记忆与演进历史文件", "Project memories & version history files"))}</strong><small>${esc(tr("浏览、搜索、编辑与回滚记忆版本请打开「记忆工作台」，或直接在 Finder 中打开本地 Markdown 历史文件夹。", "Open Memory Workspace to browse/rollback history, or reveal the local Markdown memory folder in Finder."))}</small></div><div style="display:flex;gap:6px;flex:none"><button type="button" class="hub-arc-btn is-primary" data-action="open-memory-from-settings">${esc(tr("查看记忆与历史", "Memory & History"))}</button><button type="button" class="hub-arc-btn" data-action="open-memory-folder" ${ready ? "" : "disabled"}>${esc(tr("打开记忆文件夹", "Open folder"))}</button></div></div></section>`;
+  }
+  if (isMemTab) {
+   renderMemoryAgentAccess();
+   renderMemoryRuntime();
+   renderEngine();
+   renderMemoryConnections();
+  }
+ } else {
+  settingsPanel.innerHTML = `${chromeHtml}<div class="hub-set-body">${generalHtml}</div>`;
+ }
+    }
+    function applyArtifactDockPosition() {
+ if (!artifactDock || disposed) return;
+ const vh = Math.max(240, window.innerHeight || 720);
+ const dockH = Math.max(76, artifactDock.getBoundingClientRect().height || (state.artifactDockOpen ? 260 : 76));
+ const half = Math.min(dockH / 2, vh / 2 - 24);
+ const minCenter = Math.max(52 + half, 56);
+ const maxCenter = Math.max(minCenter, vh - 20 - half);
+ const rawCenter = (artifactDockTopPct / 100) * vh;
+ const clamped = Math.max(minCenter, Math.min(maxCenter, rawCenter));
+ artifactDock.style.top = `${Math.round(clamped)}px`;
+    }
+    function startArtifactDockDrag(event) {
+ if (!artifactDock || event.button !== 0) return;
+ if (!event.target?.closest?.("[data-dock-drag]")) return;
+ const rect = artifactDock.getBoundingClientRect();
+ dockDrag = { pointerId: event.pointerId, startY: event.clientY, startCenterY: rect.top + rect.height / 2, moved: false };
+ try { artifactDock.setPointerCapture?.(event.pointerId); } catch {}
+    }
+    function moveArtifactDockDrag(event) {
+ if (!dockDrag || event.pointerId !== dockDrag.pointerId) return;
+ const dy = event.clientY - dockDrag.startY;
+ if (!dockDrag.moved && Math.abs(dy) < 5) return;
+ if (!dockDrag.moved) {
+  dockDrag.moved = true;
+  artifactDock?.classList.add("is-dragging");
+ }
+ const vh = Math.max(240, window.innerHeight || 720);
+ const nextCenter = Math.max(52, Math.min(vh - 52, dockDrag.startCenterY + dy));
+ artifactDockTopPct = Math.round((nextCenter / vh) * 1000) / 10;
+ applyArtifactDockPosition();
+    }
+    function endArtifactDockDrag(event) {
+ if (!dockDrag || (event && event.pointerId !== dockDrag.pointerId)) return;
+ const moved = dockDrag.moved;
+ const pid = dockDrag.pointerId;
+ dockDrag = null;
+ artifactDock?.classList.remove("is-dragging");
+ try { artifactDock?.releasePointerCapture?.(pid); } catch {}
+ if (moved) {
+  dockSuppressClickUntil = Date.now() + 260;
+  storageSet("t3-hub-artifact-dock-top-v1", String(artifactDockTopPct));
+ }
+    }
+    function dockArtifacts() {
+ if (!state.connected || boardProblem() || boardMismatch()) return [];
+ const board = boardData();
+ return Array.isArray(board.artifacts) ? board.artifacts : [];
+    }
+    function renderArtifactDock() {
+ if (!artifactDock || disposed) return;
+ const show = state.artifactDockEnabled && !state.open && !state.hubSettingsOpen && !root.classList.contains("is-occluded") && Boolean(state.threadId && state.threadId !== "__NEW__");
+ const list = show ? dockArtifacts() : [];
+ const count = list.length;
+ const activeArt = state.artifactMenuIndex != null ? list[state.artifactMenuIndex] : null;
+ const appsForActive = activeArt?.path ? (state.artifactApps[activeArt.path]?.apps || []).map((a) => `${a.name}:${a.path}:${a.isDefault ? 1 : 0}`).join("|") : "";
+ const nextSig = JSON.stringify([
+  show,
+  state.artifactDockOpen,
+  state.artifactMenuIndex,
+  state.artifactMenuLoading,
+  state.dockPreview ? `${state.dockPreview.name}:${(state.dockPreview.content || "").length}` : "",
+  list.map((a) => `${a.path || a.name || ""}:${a.sizeBytes ?? ""}`),
+  appsForActive,
+  state.lang,
+ ]);
+ if (nextSig === artifactDockSig) {
+  if (show) applyArtifactDockPosition();
+  return;
+ }
+ artifactDockSig = nextSig;
+ artifactDock.hidden = !show;
+ if (!show) return;
+ if (!state.artifactDockOpen) {
+  artifactDock.innerHTML = `<button type="button" class="hub-arc-tab" data-action="dock-toggle" data-dock-drag="1" title="${esc(tr(`当前会话产物 (${count}) · 上下拖动可调整位置`, `Session artifacts (${count}) · Drag vertically to move`))}" aria-label="${esc(tr("展开右侧产物悬浮框", "Expand artifacts dock"))}"><span class="hub-arc-grip" aria-hidden="true">⋮</span>${icon("file", 13)}<span class="hub-arc-badge">${count}</span></button>`;
+  applyArtifactDockPosition();
+  return;
+ }
+ const previewHtml = state.dockPreview ? `<div class="hub-arc-preview"><div class="hub-arc-row"><strong class="hub-arc-name">${esc(state.dockPreview.name)}</strong><button type="button" class="hub-arc-btn" data-action="dock-close-preview">${esc(tr("关闭预览", "Close"))}</button></div><pre>${esc(state.dockPreview.content)}</pre></div>` : "";
+ const itemsHtml = !count
+  ? `<p class="hub-hint" style="margin:6px 0">${esc(tr("当前会话暂无可打开的产物。", "No artifacts in this session yet."))}</p>`
+  : list.map((art, index) => {
+   const name = art.name || String(art.path || "").split(/[\\/]/).pop() || tr("产物", "Artifact");
+   const sizeTxt = formatArtifactBytes(art.sizeBytes);
+   const isMd = /\.md$/i.test(name);
+   const menuOpen = state.artifactMenuIndex === index;
+   const appInfo = state.artifactApps[art.path] || null;
+   const menuHtml = menuOpen ? `<div class="hub-arc-menu">${isMd ? `<button type="button" class="hub-arc-opt" data-action="dock-preview-artifact" data-index="${index}"><span>${esc(tr("T3 内置预览", "T3 inline preview"))}</span><small>${esc(tr("内置", "Built-in"))}</small></button>` : ""}${state.artifactMenuLoading && !appInfo ? `<span class="hub-hint" style="padding:4px 6px">${esc(tr("正在读取本机应用…", "Loading apps…"))}</span>` : (appInfo?.apps || []).slice(0, 8).map((app) => `<button type="button" class="hub-arc-opt" data-action="dock-open-with-app" data-index="${index}" data-app-path="${esc(app.path)}"><span>${esc(app.name)}</span>${app.isDefault ? `<small>${esc(tr("默认", "Default"))}</small>` : ""}</button>`).join("")}<button type="button" class="hub-arc-opt" data-action="dock-choose-app" data-index="${index}"><span>${esc(tr("选择其他应用…", "Choose other app…"))}</span></button></div>` : "";
+   return `<div class="hub-arc-item"><div class="hub-arc-row"><span class="hub-arc-name" title="${esc(art.path || name)}">${esc(name)}</span>${sizeTxt ? `<span class="hub-arc-meta">${esc(sizeTxt)}</span>` : ""}</div><div class="hub-arc-actions"><button type="button" class="hub-arc-btn is-primary" data-action="dock-open-default" data-index="${index}">${esc(tr("打开", "Open"))}</button><button type="button" class="hub-arc-btn" data-action="dock-toggle-menu" data-index="${index}">${esc(tr("打开方式 ▾", "Open With ▾"))}</button><button type="button" class="hub-arc-btn" data-action="dock-reveal" data-index="${index}">Finder</button></div>${menuHtml}</div>`;
+  }).join("");
+ artifactDock.innerHTML = `<button type="button" class="hub-arc-tab" data-action="dock-toggle" data-dock-drag="1" title="${esc(tr("点击收起 · 上下拖动可调整位置", "Click to collapse · Drag vertically to move"))}" aria-label="${esc(tr("收起产物悬浮框", "Collapse artifacts dock"))}"><span class="hub-arc-grip" aria-hidden="true">⋮</span>${icon("file", 13)}<span class="hub-arc-badge">${count}</span></button><div class="hub-arc-sheet"><div class="hub-arc-head"><span class="hub-arc-drag" data-dock-drag="1" title="${esc(tr("上下拖动调整位置", "Drag vertically to move"))}"><span class="hub-arc-grip" aria-hidden="true">⋮⋮</span><span>${esc(tr(`会话产物 (${count})`, `Artifacts (${count})`))}</span></span><div style="display:flex;gap:4px"><button type="button" class="hub-arc-btn" data-action="dock-refresh">${esc(tr("刷新", "Refresh"))}</button><button type="button" class="hub-arc-btn" data-action="dock-toggle">${esc(tr("收起", "Hide"))}</button></div></div>${itemsHtml}${previewHtml}</div>`;
+ applyArtifactDockPosition();
+    }
+    async function dockOpenDefault(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-open:${index}`, element, async () => {
+  const res = await request("artifact:openDefault", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path });
+  if (disposed) return;
+  if (res?.kind === "safe-degraded") toast(tr(`脚本安全保护：已用 ${res.openedWith || "Finder"} 打开（未执行）`, `Executable guard: opened safely with ${res.openedWith || "Finder"}`));
+  else toast(tr("已打开产物", "Artifact opened"));
+ });
+    }
+    async function dockToggleMenu(index) {
+ if (state.artifactMenuIndex === index) { state.artifactMenuIndex = null; renderArtifactDock(); return; }
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ state.artifactMenuIndex = index;
+ state.artifactMenuLoading = true;
+ renderArtifactDock();
+ try {
+  const res = await request("artifact:listApps", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path });
+  if (!disposed) state.artifactApps[art.path] = res;
+ } catch (error) {
+  if (!disposed) toast(errorText(error), true);
+ } finally {
+  state.artifactMenuLoading = false;
+  if (!disposed) renderArtifactDock();
+ }
+    }
+    async function dockOpenWith(index, appPath, chooseApp, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-open-with:${index}`, element, async () => {
+  const res = await request("artifact:openWith", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, appPath, chooseApp });
+  if (disposed) return;
+  state.artifactMenuIndex = null;
+  renderArtifactDock();
+  if (res?.kind === "opened-with") toast(tr(`已用 ${res.appName || "所选应用"} 打开`, `Opened with ${res.appName || "selected app"}`));
+ });
+    }
+    async function dockPreviewMarkdown(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-preview:${index}`, element, async () => {
+  const res = await request("board:openArtifact", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, operation: "preview" });
+  if (disposed) return;
+  if (res?.kind === "markdown") {
+   state.dockPreview = { name: res.name || art.name, content: res.content || "" };
+   state.artifactMenuIndex = null;
+   renderArtifactDock();
+  }
+ });
+    }
+    async function dockReveal(index, element) {
+ const art = dockArtifacts()[index];
+ if (!art?.path || !state.projectRoot || !state.threadId) return;
+ await busy(`dock-reveal:${index}`, element, async () => {
+  await request("board:openArtifact", { projectRoot: state.projectRoot, threadId: state.threadId, path: art.path, operation: "reveal" });
+  if (!disposed) toast(tr("已在 Finder 中显示", "Revealed in Finder"));
+ });
+    }
+
     function renderLiveBoard() {
  if (!liveBoard || disposed) return;
  const board = boardData(), hasPlan = (state.connected || remotePlanContextReady()) && !boardProblem() && !boardMismatch() && hasActualPlan(board);
@@ -1939,6 +2355,7 @@
  planHandle.setAttribute("aria-label", planProgress.total ? tr(`当前会话计划：${planProgress.label}`, `Current conversation plan: ${planProgress.label}`) : tr("查看当前会话计划", "View current conversation plan"));
  planHandle.title = planProgress.label;
  planHandle.setAttribute("aria-expanded", String(!!state.planOpen));
+ renderArtifactDock();
  liveBoard.innerHTML = `<div class="hub-plan-popover" role="region" aria-label="${esc(tr("当前会话计划进度", "Current conversation plan progress"))}">${planProgress.total ? `<div class="hub-plan-summary"><strong>${esc(planProgress.label)}</strong><span>${planProgress.done ? esc(tr("已完成", "Complete")) : esc(tr(`已完成 ${planProgress.completed} 项`, `${planProgress.completed} completed`))}</span></div>` : ""}${board.steps.length ? `<ol class="hub-plan-steps">${board.steps.map((step) => `<li class="hub-board-step is-${esc(step.status)}"><span class="hub-step-icon" aria-hidden="true">${step.status === "completed" ? "✓" : step.status === "in-progress" ? "•" : ""}</span><span class="hub-step-text">${esc(step.text)}</span></li>`).join("")}</ol>` : `<div class="hub-plan-document">${esc(String(board.planMarkdown || "").trim().slice(0, 1800))}</div>`}</div>`;
  positionConversationTools();
  applyTheme();
@@ -2771,6 +3188,7 @@
  const data = { ...response };
  if (!scopedRoot) { delete data.vectorStats; delete data.vectorStatsError; }
  embedProjectKey = projectKey;
+ const hadEmbed = Boolean(cache.embed);
  const wasActive = cache.embed?.downloadJob?.active;
  const prevVs = cache.embed?.vectorStats;
  const prevMemory = [cache.embed?.activeMb, cache.embed?.ceilingMb, cache.embed?.cacheMb, cache.embed?.rssMb, prevVs?.activeMb, prevVs?.ceilingMb, prevVs?.cacheMb].join("/");
@@ -2779,7 +3197,7 @@
  const nextSig = data.vectorStats ? `${data.vectorStats.syncedVectors}/${data.vectorStats.totalMemories}:${data.vectorStats.reindexing}` : data.vectorStatsError || "";
  const wasWaiting = state.embedReadyDeadline > 0;
  cache.embed = data;
- if (state.tab === "memory") renderMemoryRuntime();
+ if (state.tab === "memory" || state.hubSettingsOpen) renderMemoryRuntime();
  if (!state.embedInitialized) { state.useMirror = !!data.useMirror; state.embedInitialized = true; }
  if (data.downloadJob?.active) state.embedReadyDeadline = Date.now() + 60000;
  if (data.vectorStats?.reindexing) state.embedReadyDeadline = Date.now() + 300000;
@@ -2787,13 +3205,13 @@
  const keyword = /keyword|fts|none/.test(data.mode || data.engine?.mode || "");
  if ((ready === true || keyword) && !data.vectorStats?.reindexing) state.embedReadyDeadline = 0;
  delete errors.embed;
- if (render && state.tab === "memory") {
- if (!!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
+ if (render && (state.tab === "memory" || state.hubSettingsOpen)) {
+ if (!hadEmbed || !!wasActive !== !!data.downloadJob?.active || prevSig !== nextSig || prevMemory !== nextMemory || wasWaiting && ready === true) renderEngine();
  else renderDownloadProgress();
  }
  if ((wasActive || wasWaiting) && ready === true && !data.downloadJob?.active && !data.downloadJob?.error) {
  state.modelChoice = "";
- if (state.tab === "memory") renderEngine();
+ if (state.tab === "memory" || state.hubSettingsOpen) renderEngine();
  toast(tr("向量模型已就绪", "Vector model is ready"));
  }
  if (state.embedReadyDeadline && Date.now() > state.embedReadyDeadline) {
@@ -2801,16 +3219,16 @@
  toast(tr("模型尚未就绪，请刷新状态后重试", "The model is not ready yet. Refresh its status to retry."), true);
  }
  } catch (error) {
- if (!disposed && version === embedVersion) { errors.embed = error; if (state.tab === "memory") renderMemoryRuntime(); if (render && state.tab === "memory") toast(errorText(error), true); }
+ if (!disposed && version === embedVersion) { errors.embed = error; if (state.tab === "memory" || state.hubSettingsOpen) renderMemoryRuntime(); if (render && state.tab === "memory") toast(errorText(error), true); }
  }
     }
     function scheduleEmbedPoll() {
  cancelTimer(embedTimer);
  embedTimer = null;
- if (!disposed && state.open && state.tab === "memory" && (cache.embed?.downloadJob?.active || state.embedReadyDeadline || cache.embed?.vectorStats?.reindexing)) embedTimer = later(pollEmbed, 1000);
+ if (!disposed && ((state.open && state.tab === "memory") || state.hubSettingsOpen) && (cache.embed?.downloadJob?.active || state.embedReadyDeadline || cache.embed?.vectorStats?.reindexing)) embedTimer = later(pollEmbed, 1000);
     }
     async function pollEmbed() {
- if (disposed || !state.open || state.tab !== "memory" || document.hidden) return;
+ if (disposed || (!((state.open && state.tab === "memory") || state.hubSettingsOpen)) || document.hidden) return;
  await refreshEmbed(true, true);
  scheduleEmbedPoll();
     }
@@ -2824,6 +3242,7 @@
     function setOpen(open, focus = true) {
  state.open = !!open;
  if (!root || disposed) return;
+ if (state.open && state.hubSettingsOpen) setHubSettingsOpen(false);
  if (state.open && focus) focusReturn = document.activeElement;
  root.classList.toggle("is-open", state.open);
  handle?.setAttribute("aria-expanded", String(state.open));
@@ -2933,7 +3352,30 @@
  if (!target || (!root.contains(target) && !liveBoard?.contains(target)) || target.disabled) return;
  const action = target.dataset.action;
  const id = target.dataset.id;
- if (action === "open-memory") openMemoryFromTitle();
+ if (action === "open-memory" && !id) openMemoryFromTitle();
+ else if (action === "open-hub-settings") setHubSettingsOpen(!state.hubSettingsOpen);
+ else if (action === "open-hub-memory-settings") setHubSettingsOpen(true, "memory");
+ else if (action === "open-memory-from-settings") { setHubSettingsOpen(false); openMemoryFromTitle(); }
+ else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); }
+ else if (action === "close-hub-settings") setHubSettingsOpen(false);
+ else if (action === "copy-provider-memory-prompt") copyProviderMemorySetupPrompt(target.dataset.providerId, target.dataset.providerName);
+ else if (action === "close-provider-memory-prompt") { state.providerMemoryPrompt = null; renderMemoryAgentAccess(); }
+ else if (action === "toggle-skill-sync-all") { state.skillSyncAllProviders = !state.skillSyncAllProviders; storageSet("t3-hub-skill-sync-all-v1", state.skillSyncAllProviders ? "true" : "false"); renderHubSettingsPanel(); }
+ else if (action === "toggle-artifact-dock-setting") setArtifactDockEnabled(!state.artifactDockEnabled);
+ else if (action === "toggle-guardian") toggleGuardian(target);
+ else if (action === "refresh-provider-resources") loadProviderResources(true);
+ else if (action === "provider-res-tab") { state.providerResProvider = target.dataset.provider; renderHubSettingsPanel(); }
+ else if (action === "provider-res-kind") { state.providerResKind = target.dataset.kind; renderHubSettingsPanel(); }
+ else if (action === "toggle-provider-resource") toggleProviderResourceItem(target);
+ else if (action === "dock-toggle") { if (Date.now() < dockSuppressClickUntil) return; state.artifactDockOpen = !state.artifactDockOpen; if (!state.artifactDockOpen) { state.artifactMenuIndex = null; state.dockPreview = null; } renderArtifactDock(); }
+ else if (action === "dock-refresh") { pollBoard(true).then(() => { if (!disposed) renderArtifactDock(); }); }
+ else if (action === "dock-open-default") dockOpenDefault(Number(target.dataset.index), target);
+ else if (action === "dock-toggle-menu") dockToggleMenu(Number(target.dataset.index));
+ else if (action === "dock-open-with-app") dockOpenWith(Number(target.dataset.index), target.dataset.appPath, false, target);
+ else if (action === "dock-choose-app") dockOpenWith(Number(target.dataset.index), null, true, target);
+ else if (action === "dock-preview-artifact") dockPreviewMarkdown(Number(target.dataset.index), target);
+ else if (action === "dock-close-preview") { state.dockPreview = null; renderArtifactDock(); }
+ else if (action === "dock-reveal") dockReveal(Number(target.dataset.index), target);
  else if (action === "set-theme") setTheme(target.dataset.theme);
  else if (action === "open-board-studio") { switchTab("board"); setOpen(true); }
  else if (action === "dashboard-tab") { switchTab(target.dataset.tab); setOpen(true); }
@@ -3170,6 +3612,8 @@
     }
     function onKeydown(event) {
  const key = event.key.toLowerCase();
+ if (key === "escape" && state.hubSettingsOpen) { event.preventDefault(); setHubSettingsOpen(false); return; }
+ if (key === "escape" && state.artifactDockOpen) { event.preventDefault(); state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; renderArtifactDock(); return; }
  if (key === "escape" && state.planOpen) { event.preventDefault(); setPlanPopover(false); return; }
  if (((event.metaKey || event.ctrlKey) && event.shiftKey && key === "k") || (event.altKey && !event.metaKey && !event.ctrlKey && key === "h")) {
  if (event.repeat) return;
@@ -3407,7 +3851,7 @@
  if (result.downloadJob || result.mode) cache.embed = { ...cache.embed, ...result };
  await refreshEmbed(false, true);
  if (disposed) return;
- if (state.tab === "memory") renderEngine();
+ if (state.tab === "memory" || state.hubSettingsOpen) renderEngine();
  scheduleEmbedPoll();
  toast(cache.embed?.downloadJob?.active ? tr("已开始下载，可继续浏览记忆", "Download started. Keep browsing your memories.") : tr("记忆引擎已切换", "Memory engine switched"));
  });
@@ -3520,6 +3964,7 @@
  destroy: () => {
  if (disposed) return;
  disposed = true;
+ artifactDockSig = "";
  contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; embedVersion++; boardVersion++;
  clearInterval(routeTimer); timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();
@@ -3527,7 +3972,7 @@
  try { unsubscribeRouter?.(); } catch {}
  unsubscribeRouter = null; cachedRouter = null;
  disposers.splice(0).forEach((dispose) => { try { dispose(); } catch {} });
- liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); root?.remove(); style?.remove();
+ liveBoard?.remove(); settingsPanel?.remove(); artifactDock?.remove(); titleControls?.remove(); planHandle?.remove(); root?.remove(); style?.remove();
  if (window.__t3SidecarHub === api) delete window.__t3SidecarHub;
  if (window.__t3SidecarHubCleanup === api.destroy) delete window.__t3SidecarHubCleanup;
  },

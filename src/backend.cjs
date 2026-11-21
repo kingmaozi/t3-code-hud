@@ -18,6 +18,9 @@ const hubHooks = require("./hub-hooks.cjs");
 const hubMemoryConnections = require("./hub-memory-connections.cjs");
 const hubTaskBoard = require("./hub-task-board.cjs");
 const { createArtifactAccess } = require("./hub-artifact-access.cjs");
+const { createProviderResourcesManager } = require("./hub-provider-resources.cjs");
+const { createDevinQuotaReader } = require("./hub-devin-quota.cjs");
+const { createGuardianManager } = require("./update-guardian.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
 const { createHudUpdater, sha256 } = require("./hub-update.cjs");
 const { createDreamScheduler, beginDreamRun } = require("./hub-dream-scheduler.cjs");
@@ -31,6 +34,15 @@ let _taskBoardInstance = null;
 let _taskBoardHome = null;
 let _hostSettingsInstance = null;
 let _hostSettingsHome = null;
+let _devinQuotaInstance = null;
+let _devinQuotaHome = null;
+function getDevinQuotaReader() {
+  const curHome = process.env.HOME || os.homedir();
+  if (_devinQuotaInstance && _devinQuotaHome === curHome) return _devinQuotaInstance;
+  _devinQuotaInstance = createDevinQuotaReader({ homeDir: curHome });
+  _devinQuotaHome = curHome;
+  return _devinQuotaInstance;
+}
 function getTaskBoard() {
   const curHome = process.env.HOME || os.homedir();
   if (_taskBoardInstance && _taskBoardHome === curHome) return _taskBoardInstance;
@@ -1232,6 +1244,202 @@ function readCodexSessionFile(jsonlPath, fallbackModel) {
   return data;
 }
 
+// --- D. Devin CLI Native SQLite Reader (`~/.local/share/devin/cli/sessions.db`) ---
+function normalizeEffectiveDriver(driver, providerOrInstance) {
+  if (driver === "acpRegistry" && providerOrInstance && String(providerOrInstance).startsWith("acpRegistry_")) {
+    return String(providerOrInstance);
+  }
+  return driver || providerOrInstance || null;
+}
+
+function driversCompatible(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const sa = String(a);
+  const sb = String(b);
+  return (sa === "acpRegistry" && sb.startsWith("acpRegistry_")) || (sb === "acpRegistry" && sa.startsWith("acpRegistry_"));
+}
+
+function findDevinSessionsDb() {
+  const home = process.env.HOME || os.homedir();
+  const dataRoot = process.env.DEVIN_DATA_DIR
+    ? path.resolve(process.env.DEVIN_DATA_DIR)
+    : process.env.XDG_DATA_HOME
+      ? path.join(path.resolve(process.env.XDG_DATA_HOME), "devin")
+      : path.join(home, ".local", "share", "devin");
+  const candidate = path.join(dataRoot, "cli", "sessions.db");
+  try {
+    return fs.existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
+  if (!sessionId || typeof sessionId !== "string") return null;
+  const dbPath = overrideDbPath || findDevinSessionsDb();
+  if (!dbPath) return null;
+  const sig = getFileSig(dbPath);
+  if (!sig) return null;
+  const cacheKey = `devin:${dbPath}:${sessionId}`;
+  const cached = lruGet(fileParseCache, cacheKey);
+  if (cached && cached.sig === sig) return cached.data;
+
+  let ddb;
+  try {
+    ddb = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const sessRow = ddb.prepare("SELECT model FROM sessions WHERE id = ?").get(sessionId);
+    const rows = ddb
+      .prepare("SELECT row_id, created_at, chat_message FROM message_nodes WHERE session_id = ? ORDER BY row_id ASC")
+      .all(sessionId);
+
+    let sumUncached = 0;
+    let sumCached = 0;
+    let sumCacheWrite = 0;
+    let sumOutput = 0;
+    let sumReasoning = 0;
+    let sumUsd = 0;
+    let sumSavedUsd = 0;
+    let decodeTokensSum = 0;
+    let decodeSecSum = 0;
+    let e2eTokensSum = 0;
+    let e2eSecSum = 0;
+    const byModelDecode = {};
+    let lastDecodeTps = null;
+    let lastDecodeSec = null;
+    let lastStepCacheRate = null;
+    let lastContextPrompt = null;
+    let lastEventMs = null;
+    let lastUsageEventMs = null;
+    let lastSpeedEventMs = null;
+    let latestModel = (sessRow?.model && String(sessRow.model).trim()) || fallbackModel || null;
+    let stepCount = 0;
+    const seenRequests = new Set();
+
+    for (const r of rows) {
+      const cm = safeJsonParse(r.chat_message);
+      if (!cm || cm.role !== "assistant") continue;
+      const meta = cm.metadata;
+      const metrics = meta?.metrics;
+      if (!metrics || typeof metrics !== "object") continue;
+
+      const createdMsRaw = meta.created_at ? Date.parse(meta.created_at) : Number.isFinite(r.created_at) ? r.created_at * 1000 : NaN;
+      const eventMs = Number.isFinite(createdMsRaw) && createdMsRaw >= 946684800000 ? createdMsRaw : null;
+      const reqKey =
+        (typeof meta.request_id === "string" && meta.request_id.trim()) ||
+        `${meta.started_generation_at || ""}|${meta.created_at || r.created_at || ""}|${metrics.output_tokens ?? ""}`;
+      if (seenRequests.has(reqKey)) continue;
+      seenRequests.add(reqKey);
+
+      if (eventMs != null) {
+        lastEventMs = eventMs;
+        lastUsageEventMs = eventMs;
+      }
+      const stepModel =
+        (typeof meta.generation_model === "string" && meta.generation_model.trim()) ||
+        latestModel;
+      if (stepModel) latestModel = stepModel;
+
+      const unc = Math.max(0, Number(metrics.input_tokens) || 0);
+      const cr = Math.max(0, Number(metrics.cache_read_tokens) || 0);
+      const cw = Math.max(0, Number(metrics.cache_creation_tokens) || 0);
+      const out = Math.max(0, Number(metrics.output_tokens) || 0);
+      const ctxIn = Number.isFinite(Number(metrics.context_input_tokens)) && Number(metrics.context_input_tokens) > 0
+        ? Number(metrics.context_input_tokens)
+        : unc + cr + cw;
+
+      sumUncached += unc;
+      sumCached += cr;
+      sumCacheWrite += cw;
+      sumOutput += out;
+      stepCount++;
+
+      const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, stepModel, "acpRegistry_devin");
+      sumUsd += priced.usd;
+      sumSavedUsd += priced.savedUsd;
+
+      const totalPrompt = unc + cr + cw;
+      if (totalPrompt > 0) lastStepCacheRate = Math.min(totalPrompt, cr) / totalPrompt;
+      if (ctxIn > 0 || out > 0) lastContextPrompt = ctxIn + out;
+
+      const totalMs = Number(metrics.total_time_ms);
+      const ttftMs = Number(metrics.ttft_ms);
+      const decodeSec = Number.isFinite(totalMs) && Number.isFinite(ttftMs) && totalMs > ttftMs
+        ? (totalMs - ttftMs) / 1000
+        : null;
+      const e2eSec = Number.isFinite(totalMs) && totalMs > 0 ? totalMs / 1000 : null;
+
+      if (e2eSec != null && e2eSec >= 0.1 && out > 0) {
+        e2eTokensSum += out;
+        e2eSecSum += e2eSec;
+      }
+      if (out >= 15 && decodeSec != null && decodeSec >= 0.15 && out / decodeSec <= 1500) {
+        const tps = out / decodeSec;
+        decodeTokensSum += out;
+        decodeSecSum += decodeSec;
+        lastDecodeTps = tps;
+        lastDecodeSec = decodeSec;
+        if (eventMs != null) lastSpeedEventMs = eventMs;
+        if (stepModel) {
+          const cur = (byModelDecode[stepModel] ||= { tok: 0, sec: 0 });
+          cur.tok += out;
+          cur.sec += decodeSec;
+        }
+      } else if (out >= 15 && e2eSec != null && e2eSec >= 0.15 && out / e2eSec <= 1500) {
+        const tps = out / e2eSec;
+        decodeTokensSum += out;
+        decodeSecSum += e2eSec;
+        lastDecodeTps = tps;
+        lastDecodeSec = e2eSec;
+        if (eventMs != null) lastSpeedEventMs = eventMs;
+        if (stepModel) {
+          const cur = (byModelDecode[stepModel] ||= { tok: 0, sec: 0 });
+          cur.tok += out;
+          cur.sec += e2eSec;
+        }
+      }
+    }
+
+    if (stepCount === 0) return null;
+    const avgDecodeTps = decodeSecSum > 0.1 ? decodeTokensSum / decodeSecSum : null;
+    const avgE2eTps = e2eSecSum > 0.1 ? e2eTokensSum / e2eSecSum : null;
+    const data = {
+      stepCount,
+      model: latestModel,
+      uncached: sumUncached,
+      cached: sumCached,
+      cacheWrite: sumCacheWrite,
+      output: sumOutput,
+      reasoning: sumReasoning,
+      usd: sumUsd,
+      savedUsd: sumSavedUsd,
+      lastStepCacheRate,
+      lastContextPrompt,
+      contextMax: null,
+      tokPerSec: avgDecodeTps ?? lastDecodeTps ?? avgE2eTps,
+      lastDecodeTps,
+      avgDecodeTps,
+      decodeTokensSum,
+      decodeSecSum,
+      byModelDecode,
+      e2eTokPerSec: avgE2eTps,
+      durationSec: lastDecodeSec,
+      lastEventMs,
+      lastUsageEventMs,
+      lastSpeedEventMs,
+      hasPendingUnfinishedCallAfterLastUsage: false,
+    };
+    lruSet(fileParseCache, cacheKey, { sig, data });
+    return data;
+  } catch {
+    return null;
+  } finally {
+    if (ddb) {
+      try { ddb.close(); } catch {}
+    }
+  }
+}
+
 function resolveCodexSessionContext(parts, report, activeProviderThreadId) {
   let part;
   if (activeProviderThreadId) {
@@ -1367,7 +1575,7 @@ function itemBelongsToCurrentTurn(p, row, latestTurnIds, effDriver) {
   const itemIds = itemTurnIdentityIds(p, row);
   const itemDriver = itemDriverOf(p, row);
   if (itemDriver === "__conflicting_driver__") return false;
-  if (itemDriver != null && effDriver != null && itemDriver !== effDriver) return false;
+  if (itemDriver != null && effDriver != null && !driversCompatible(itemDriver, effDriver)) return false;
   if (itemIds.size === 0 || !latestTurnIds || latestTurnIds.size === 0) return false;
   for (const id of itemIds) {
     if (latestTurnIds.has(id)) return true;
@@ -1405,7 +1613,7 @@ function isDbTurnStaticallyActive(latestTurn, effDriver) {
     if (typeof completedAt === "string" && completedAt.trim() !== "") return false;
   }
   const d = payload?.nativeTurnRef?.driver || payload?.driver || row?.driver || null;
-  if (d != null && effDriver != null && String(d) !== String(effDriver)) return false;
+  if (d != null && effDriver != null && !driversCompatible(d, effDriver)) return false;
   return true;
 }
 
@@ -1415,7 +1623,7 @@ function isRemoteTurnActive(last, selectedProvider) {
   if (st === "completed" || st === "interrupted" || st === "failed" || st === "error" || st === "cancelled" || st === "canceled") return false;
   if (st === "running" || st === "pending" || st === "starting" || st === "in_progress") {
     const d = last.driver || null;
-    if (d != null && selectedProvider != null && String(d) !== String(selectedProvider)) return false;
+    if (d != null && selectedProvider != null && !driversCompatible(d, selectedProvider)) return false;
     return true;
   }
   const completedMs = last.completedMs ?? last.completedAt ?? null;
@@ -1430,7 +1638,7 @@ function isRemoteTurnActive(last, selectedProvider) {
 function computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver, isRunning, nowMs = Date.now() }) {
   if (!isRunning) return null;
   if (!latestTurn || !Number.isFinite(latestTurn.stamp) || !isDbTurnStaticallyActive(latestTurn, effDriver)) return null;
-  if (latestTurnDriver && latestTurnDriver !== effDriver) return null;
+  if (latestTurnDriver && !driversCompatible(latestTurnDriver, effDriver)) return null;
   const latestTurnIds = latestTurnIdentityIds(latestTurn);
   let toolIntervals = [];
   let items = [];
@@ -1633,8 +1841,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   const turnRows = [...turnEvidence.filter((entry) => !Number.isFinite(entry.stamp)), ...dated]
     .filter((entry) => entry !== latestTurn).map((entry) => entry.row);
   if (latestTurn) turnRows.push(latestTurn.row);
-  const latestTurnDriver = latestTurn?.payload?.nativeTurnRef?.driver || latestTurn?.payload?.driver || null;
-
+  const providerThreadDriverById = new Map();
   let isRunning = false;
   let contextUsed = null;
   let contextMax = null;
@@ -1645,13 +1852,15 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
 
   for (const pt of pThreadRows) {
     const p = safeJsonParse(pt.payload_json);
-    if (pt.driver) latestDriver = pt.driver;
+    const ptDriver = normalizeEffectiveDriver(pt.driver, p?.providerInstanceId || pt.provider);
+    if (pt.provider_thread_id && ptDriver) providerThreadDriverById.set(pt.provider_thread_id, ptDriver);
+    if (ptDriver) latestDriver = ptDriver;
     const updatedMs = Date.parse(pt.updated_at || "");
     const isActive = Boolean(activeProviderThreadId && pt.provider_thread_id === activeProviderThreadId);
-    const previous = contextsByDriver.get(pt.driver);
+    const previous = contextsByDriver.get(ptDriver);
     // An old sibling can have a higher rowid even after the active branch reports new usage.
     if (isActive || (!previous?.isActive && (!Number.isFinite(previous?.updatedMs) || updatedMs >= previous.updatedMs))) {
-      contextsByDriver.set(pt.driver, {
+      contextsByDriver.set(ptDriver, {
         used: Number.isFinite(p?.contextUsage?.usedTokens) ? p.contextUsage.usedTokens : null,
         max: Number.isFinite(p?.contextUsage?.maxTokens) && p.contextUsage.maxTokens > 0 ? p.contextUsage.maxTokens : null,
         updatedMs,
@@ -1659,12 +1868,23 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
         nativeId: p?.nativeThreadRef?.nativeId,
       });
     }
-    const current = contextsByDriver.get(pt.driver);
+    const current = contextsByDriver.get(ptDriver);
     contextUsed = current?.used ?? null;
     contextMax = current?.max ?? null;
     contextMaxSource = contextMax != null ? "reported" : null;
   }
-  const providerChanged = Boolean(fallbackProvider && (latestTurnDriver || latestDriver) && fallbackProvider !== (latestTurnDriver || latestDriver));
+  const resolveTurnDriver = (payload) => {
+    const raw = payload?.nativeTurnRef?.driver || payload?.driver || null;
+    if (raw === "acpRegistry" && payload?.providerThreadId && providerThreadDriverById.has(payload.providerThreadId)) {
+      return providerThreadDriverById.get(payload.providerThreadId);
+    }
+    if (raw === "acpRegistry" && fallbackProvider && String(fallbackProvider).startsWith("acpRegistry_")) {
+      return fallbackProvider;
+    }
+    return raw;
+  };
+  const latestTurnDriver = resolveTurnDriver(latestTurn?.payload);
+  const providerChanged = Boolean(fallbackProvider && (latestTurnDriver || latestDriver) && !driversCompatible(fallbackProvider, latestTurnDriver || latestDriver));
   isRunning = !providerChanged && isDbTurnStaticallyActive(latestTurn, fallbackProvider || latestTurnDriver);
   if (fallbackProvider || latestTurnDriver) {
     // Historical accumulation keeps its driver; only the returned current-provider fields are replaced below.
@@ -1675,7 +1895,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     contextMaxSource = contextMax != null ? "reported" : null;
   }
   const currentProviderTelemetry = (telemetry) => {
-    if (!providerChanged && (!fallbackProvider || telemetry.provider === fallbackProvider)) return telemetry;
+    if (!providerChanged && (!fallbackProvider || driversCompatible(telemetry.provider, fallbackProvider))) return telemetry;
     return { ...telemetry, provider: fallbackProvider, model: fallbackModel || null,
       isRunning: false, turnCacheRate: null, lastTurnCacheRate: null, lastCallCacheRate: null,
       contextCacheRate: null, lastDecodeTps: null, currentTurnEstimateTps: null, durationSec: null,
@@ -1687,14 +1907,17 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
   const agyConvIds = new Set();
   const museNativeIds = new Set();
   const codexNativeIds = new Set();
+  const devinNativeIds = new Set();
 
   for (const pt of pThreadRows) {
     const p = safeJsonParse(pt.payload_json);
+    const ptDriver = normalizeEffectiveDriver(pt.driver, p?.providerInstanceId || pt.provider);
     const nid = p?.nativeThreadRef?.nativeId;
     if (!nid) continue;
-    if (pt.driver === "muse") museNativeIds.add(nid);
-    else if (pt.driver === "codex") codexNativeIds.add(nid);
-    else if (pt.driver === "antigravity" && !nid.startsWith("pending:")) {
+    if (ptDriver === "muse") museNativeIds.add(nid);
+    else if (ptDriver === "codex") codexNativeIds.add(nid);
+    else if (ptDriver === "acpRegistry_devin" && !String(nid).startsWith("pending:")) devinNativeIds.add(nid);
+    else if (ptDriver === "antigravity" && !nid.startsWith("pending:")) {
       agyConvIds.add(nid.split(":")[0]);
     }
   }
@@ -1749,6 +1972,18 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
         const part = { ...d, driver: "codex", nativeId: xid, mtimeMs: getLatestMtimeMs(fp) };
         if (d.stepCount > 0) nativeParts.push(part);
         if (d.lastContextPrompt != null || d.contextMax != null) codexContextParts.push(part);
+      }
+    }
+  }
+  if (devinNativeIds.size > 0) {
+    const devinDbPath = findDevinSessionsDb();
+    if (devinDbPath) {
+      const devinMtimeMs = getLatestMtimeMs(devinDbPath);
+      for (const did of devinNativeIds) {
+        const d = readDevinSessionDb(did, latestModel, devinDbPath);
+        if (d && d.stepCount > 0) {
+          nativeParts.push({ ...d, driver: "acpRegistry_devin", nativeId: did, mtimeMs: devinMtimeMs });
+        }
       }
     }
   }
@@ -1825,7 +2060,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     // so zero turns are ever dropped (e.g., thread with both claudeAgent and muse turns).
     for (const tr of turnRows) {
       const p = safeJsonParse(tr.payload_json);
-      const d = p?.nativeTurnRef?.driver;
+      const d = resolveTurnDriver(p);
       if (!d || coveredDrivers.has(d)) continue;
       const u = p?.turnTokenUsage;
       const completed = tr.status === "completed" || Boolean(tr.completed_at || p?.completedAt);
@@ -1884,7 +2119,8 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     // Mixed-provider freshness: if an uncovered provider ran after the newest
     // native part, its statev2 metadata wins over stale native metadata.
     const lastPThread = pThreadRows[pThreadRows.length - 1];
-    const lastPThreadDriver = lastPThread?.driver || null;
+    const lastPThreadPayload = safeJsonParse(lastPThread?.payload_json);
+    const lastPThreadDriver = normalizeEffectiveDriver(lastPThread?.driver, lastPThreadPayload?.providerInstanceId || lastPThread?.provider);
     const lastPThreadMs = lastPThread?.updated_at ? Date.parse(lastPThread.updated_at) : NaN;
     let overrideDriver = null;
     let overrideModel = null;
@@ -1918,7 +2154,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     }
     const completedDriverTurns = turnRows.reduce((cnt, tr) => {
       const p = safeJsonParse(tr.payload_json);
-      if (p?.nativeTurnRef?.driver !== effDriver) return cnt;
+      if (!driversCompatible(resolveTurnDriver(p), effDriver)) return cnt;
       return (tr.status === "completed" || Boolean(tr.completed_at || p?.completedAt)) ? cnt + 1 : cnt;
     }, 0);
     const latestTurnCompleted = latestTurn && (String(latestTurn.row.status || latestTurn.payload?.status) === "completed" || Boolean(latestTurn.row.completed_at || latestTurn.payload?.completedAt));
@@ -1945,7 +2181,10 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       latestTurnStartMs >= epochFloorMs &&
       (lastPart.mtimeMs || 0) > 0 &&
       lastPart.mtimeMs < latestTurnStartMs - 1000;
-    const latestSameDriverPThread = [...pThreadRows].reverse().find((pt) => pt.driver === effDriver);
+    const latestSameDriverPThread = [...pThreadRows].reverse().find((pt) => {
+      const p = safeJsonParse(pt.payload_json);
+      return driversCompatible(normalizeEffectiveDriver(pt.driver, p?.providerInstanceId || pt.provider), effDriver);
+    });
     const latestSameDriverNativeId = (() => {
       const turnNid = latestTurnDriver === effDriver && typeof latestTurn?.payload?.nativeTurnRef?.nativeId === "string"
         ? (effDriver === "antigravity" ? latestTurn.payload.nativeTurnRef.nativeId.split(":")[0] : null)
@@ -2014,7 +2253,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     const sessionCacheRate = promptTotal > 0 ? cached / promptTotal : null;
     const currentTurnEstimateTpsNative = computeCurrentTurnEstimateTps({ db, threadId, latestTurn, latestTurnDriver, effDriver, isRunning });
     const latestTurnHasOutput = Number.isFinite(latestTurn?.payload?.turnTokenUsage?.outputTokens) && latestTurn.payload.turnTokenUsage.outputTokens > 0;
-    const currentTurnSpeedKnown = !latestTurn || (latestTurnCompleted && latestTurnHasOutput && (!latestTurnDriver || latestTurnDriver === effDriver));
+    const latestTurnUsageUnavailable = latestTurn?.payload?.turnTokenUsage?.usageStatus === "unavailable";
+    const latestTurnHasNativeOutput = Boolean(
+      latestTurnUsageUnavailable &&
+      lastPartCoversLatestTurn &&
+      !staleBySpeedTime &&
+      lastPart.lastDecodeTps != null
+    );
+    const currentTurnSpeedKnown = !latestTurn || (latestTurnCompleted && (latestTurnHasOutput || latestTurnHasNativeOutput) && (!latestTurnDriver || driversCompatible(latestTurnDriver, effDriver)));
     const latestTurnActive = isDbTurnStaticallyActive(latestTurn, effDriver);
     const runningWithoutActiveTurn = Boolean(isRunning && !latestTurnActive);
 
@@ -2063,11 +2309,18 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
           resolvedContextMax = 1007997;
           resolvedContextMaxSource = "estimated";
         }
+      } else if (drv === "acpRegistry_devin") {
+        const model = (mdl || "").toLowerCase();
+        if (resolvedContextMax == null && /swe-2/.test(model)) {
+          resolvedContextMax = 262000;
+          resolvedContextMaxSource = "estimated";
+        }
       } else if (drv === "codex") {
         // Unknown if neither the host nor the local model catalog has a value.
       }
     }
 
+    const effectiveNativeTurnCacheRate = turnCacheRate ?? (latestTurnUsageUnavailable && lastPartCoversLatestTurn ? lastPart.lastStepCacheRate ?? null : null);
     return currentProviderTelemetry({
       source: "native",
       provider: effDriver,
@@ -2084,10 +2337,10 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       usd,
       savedUsd,
       sessionCacheRate,
-      turnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
-      lastTurnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && latestTurnDriver !== effDriver ? null : turnCacheRate,
+      turnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && !driversCompatible(latestTurnDriver, effDriver) ? null : effectiveNativeTurnCacheRate,
+      lastTurnCacheRate: runningWithoutActiveTurn ? null : latestTurnDriver && !driversCompatible(latestTurnDriver, effDriver) ? null : effectiveNativeTurnCacheRate,
       lastCallCacheRate: latestCallCacheRate,
-      contextCacheRate: turnCacheRate ?? latestCallCacheRate ?? sessionCacheRate,
+      contextCacheRate: effectiveNativeTurnCacheRate ?? latestCallCacheRate ?? sessionCacheRate,
       tokPerSec: sessionAvgTps ?? lastPart.tokPerSec,
       byModelSpeed: Object.fromEntries(Object.entries(mergedByModel).filter(([, v]) => v.sec > 0.1).map(([k, v]) => [k, Math.round((v.tok / v.sec) * 10) / 10])),
       // Use the latest uncovered turn's own effective duration when it wins the
@@ -2325,7 +2578,7 @@ function getThreadStats(threadHint) {
     const selectedProvider = threadPayload?.modelSelection?.provider || threadPayload?.modelSelection?.instanceId || null;
     const selectedModel = threadPayload?.modelSelection?.model || null;
     const threadUpdatedMs = Date.parse(threadRow?.updated_at || "");
-    const psProvider = psRow?.driver || psRow?.provider || null;
+    const psProvider = normalizeEffectiveDriver(psRow?.driver, psRow?.provider);
     const psUpdatedMs = Date.parse(psRow?.updated_at || "");
     const turnEvidenceAfterSelection = (tr, tp) => {
       let startedMs = NaN;
@@ -2351,7 +2604,7 @@ function getThreadStats(threadHint) {
           const tp = safeJsonParse(tr.payload_json);
           const drv = tp?.nativeTurnRef?.driver || tp?.driver || null;
           if (!drv) return false;
-          if (targetDriver ? drv !== targetDriver : drv === selectedProvider) return false;
+          if (targetDriver ? !driversCompatible(drv, targetDriver) : driversCompatible(drv, selectedProvider)) return false;
           return turnEvidenceAfterSelection(tr, tp);
         });
       } catch {
@@ -2362,14 +2615,16 @@ function getThreadStats(threadHint) {
       if (psRow || !selectedProvider || selectedProvider !== threadRow.default_provider) return false;
       try {
         const ptRows = db
-          .prepare("SELECT driver, updated_at FROM orchestration_v2_projection_provider_threads WHERE thread_id = ?")
+          .prepare("SELECT driver, updated_at, payload_json FROM orchestration_v2_projection_provider_threads WHERE thread_id = ?")
           .all(threadId);
         let selMax = NaN;
         let otherMax = NaN;
         for (const r of ptRows || []) {
           const ms = Date.parse(r?.updated_at || "");
-          if (!Number.isFinite(ms) || !r?.driver) continue;
-          if (r.driver === selectedProvider) {
+          const rPayload = safeJsonParse(r?.payload_json);
+          const rDriver = normalizeEffectiveDriver(r?.driver, rPayload?.providerInstanceId || r?.provider);
+          if (!Number.isFinite(ms) || !rDriver) continue;
+          if (driversCompatible(rDriver, selectedProvider)) {
             if (!Number.isFinite(selMax) || ms > selMax) selMax = ms;
           } else if (!Number.isFinite(otherMax) || ms > otherMax) {
             otherMax = ms;
@@ -2383,13 +2638,13 @@ function getThreadStats(threadHint) {
     // A cross-driver session can supersede selection only when an actual turn on that driver ran after selection.
     const selectionWins = Boolean(
       selectedProvider &&
-      psProvider !== selectedProvider &&
+      !driversCompatible(psProvider, selectedProvider) &&
       !(psProvider ? hasTurnAfterSelection(psProvider) : (hasTurnAfterSelection(null) || hasSupersededDefaultWithoutSession()))
     );
     const modelSelectionWins = Boolean(
       selectedProvider &&
       selectedModel &&
-      psProvider === selectedProvider &&
+      driversCompatible(psProvider, selectedProvider) &&
       Number.isFinite(threadUpdatedMs) &&
       (!Number.isFinite(psUpdatedMs) || threadUpdatedMs > psUpdatedMs) &&
       !hasTurnAfterSelection(selectedProvider)
@@ -2504,7 +2759,7 @@ function getThreadStats(threadHint) {
         }
         // A completed current-provider turn at/after the session observation wins
         // over a stale session 'running' flag, even when another driver is older.
-        const sameProvider = evidence.filter(e => (e.payload?.nativeTurnRef?.driver || e.payload?.driver || null) === resolvedProvider);
+        const sameProvider = evidence.filter(e => driversCompatible(e.payload?.nativeTurnRef?.driver || e.payload?.driver || null, resolvedProvider));
         const currentDated = sameProvider.filter(e => Number.isFinite(e.stamp)).sort((a, b) => a.stamp - b.stamp || a.order - b.order);
         let currentLatest = currentDated[currentDated.length - 1] || null;
         for (const e of sameProvider) {
@@ -2534,6 +2789,10 @@ function getThreadStats(threadHint) {
       }
       if (resolvedContextMax == null && resolvedProvider === "muse") {
         resolvedContextMax = 1007997;
+        resolvedContextMaxSource = "estimated";
+      }
+      if (resolvedContextMax == null && resolvedProvider === "acpRegistry_devin" && /swe-2/i.test(resolvedModel || "")) {
+        resolvedContextMax = 262000;
         resolvedContextMaxSource = "estimated";
       }
     }
@@ -2796,6 +3055,10 @@ function priceRemoteProjection(payload) {
   }
   if (contextMax == null && effDriver === "muse") {
     contextMax = 1007997;
+    contextMaxSource = "estimated";
+  }
+  if (contextMax == null && effDriver === "acpRegistry_devin" && /swe-2/i.test(effModel || "")) {
+    contextMax = 262000;
     contextMaxSource = "estimated";
   }
   // Live in-progress Turn 1: contextUsage.usedTokens is already live before the
@@ -3772,6 +4035,33 @@ async function hubCall(action, payload = {}) {
         const rawPath = payload?.path || payload?.file || payload?.artifactPath || payload?.filePath || "";
         return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...payload, path: rawPath, operation: "preview" });
       }
+      case "artifact:listApps":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "list-apps" });
+      case "artifact:openDefault":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "open-default" });
+      case "artifact:openWith":
+        return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })({ ...(payload || {}), operation: "open-with" });
+      case "providerResources:list":
+        return createProviderResourcesManager({ homeDir: process.env.HOME || os.homedir() }).listProviderResources();
+      case "providerResources:toggle":
+        return createProviderResourcesManager({ homeDir: process.env.HOME || os.homedir() }).toggleProviderResource(payload || {});
+      case "guardian:status": {
+        const homeDir = process.env.HOME || os.homedir();
+        const pluginDir = process.env.T3_HUD_DIR || path.join(homeDir, ".t3", "hud-plugin");
+        return createGuardianManager({ homeDir, pluginDir }).getStatus();
+      }
+      case "guardian:set": {
+        const homeDir = process.env.HOME || os.homedir();
+        const pluginDir = process.env.T3_HUD_DIR || path.join(homeDir, ".t3", "hud-plugin");
+        const mgr = createGuardianManager({ homeDir, pluginDir });
+        return payload?.enabled === true ? mgr.enable() : mgr.disable();
+      }
+      case "quota:external": {
+        const devin = await getDevinQuotaReader().readDevinQuota({ force: payload?.force === true });
+        const providers = [];
+        if (devin?.available && devin.provider) providers.push(devin.provider);
+        return { ok: true, providers };
+      }
       case "settings:get": {
         let t3EnvironmentId = null;
         try {
@@ -4574,4 +4864,7 @@ module.exports = {
   forEachJsonlLineSync,
   readMuseSessionFile,
   readCodexSessionFile,
+  readDevinSessionDb,
+  normalizeEffectiveDriver,
+  driversCompatible,
 };
