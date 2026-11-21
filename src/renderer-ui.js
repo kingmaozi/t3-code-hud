@@ -358,14 +358,27 @@
       p.thread?.providerInstanceId ||
       ""
     );
+    const normalizeProjDriver = (driver, providerOrInstance) => {
+      const d = String(driver || "").trim();
+      const pId = String(providerOrInstance || "").trim();
+      if (d === "acpRegistry" && pId.startsWith("acpRegistry_")) return pId;
+      return d || pId;
+    };
+    const driversMatch = (a, b) => {
+      const la = String(a || "").trim().toLowerCase();
+      const lb = String(b || "").trim().toLowerCase();
+      if (!la || !lb) return false;
+      if (la === lb) return true;
+      return (la === "acpregistry" && lb.startsWith("acpregistry_")) || (lb === "acpregistry" && la.startsWith("acpregistry_"));
+    };
     let lastUsage = null;
     let driverUsage = null;
     for (const pt of ctxList) {
       if (!pt || !pt.contextUsage) continue;
-      const drv = String(pt.driver || pt.providerThreadRef?.driver || pt.provider || "");
+      const drv = normalizeProjDriver(pt.driver || pt.providerThreadRef?.driver, pt.providerInstanceId || pt.provider);
       if (!drv) lastUsage = pt.contextUsage;
       if (activeDriver) {
-        if (drv === activeDriver) driverUsage = pt.contextUsage;
+        if (driversMatch(drv, activeDriver)) driverUsage = pt.contextUsage;
       } else {
         lastUsage = pt.contextUsage;
       }
@@ -373,14 +386,14 @@
     const contextUsage = activeDriver ? driverUsage : lastUsage;
     const isRunningStatus = (st) => st === "running" || st === "starting" || st === "in_progress";
     const isActiveTurnStatus = (st) => st === "running" || st === "pending" || st === "starting" || st === "in_progress";
-    const sessionDriverOf = (s) => String(s?.driver || s?.provider || s?.providerInstanceId || "").trim();
+    const sessionDriverOf = (s) => normalizeProjDriver(s?.driver, s?.providerInstanceId || s?.provider);
     const linkedSessionDriverOf = (pt) => {
       const sid = pt?.providerSessionId ?? pt?.sessionId ?? null;
       if (sid == null || String(sid) === "") return "";
       const sess = (p.providerSessions || []).find((s) => String(s?.id ?? s?.providerSessionId ?? "") === String(sid));
       return sess ? sessionDriverOf(sess) : "";
     };
-    const turnDriverOf = (pt) => String(pt?.nativeTurnRef?.driver || pt?.driver || pt?.provider || linkedSessionDriverOf(pt) || "").trim();
+    const turnDriverOf = (pt) => normalizeProjDriver(pt?.nativeTurnRef?.driver || pt?.driver, pt?.providerInstanceId || pt?.provider || linkedSessionDriverOf(pt));
     const itemDriverOf = (it) => {
       const drivers = new Set();
       const add = (v) => { if (v != null && String(v).trim() !== "") drivers.add(String(v).trim()); };
@@ -417,10 +430,10 @@
       return best;
     };
     const latestDriverSession = activeDriver
-      ? pickLatestRecord(p.providerSessions, (s) => sessionDriverOf(s) === activeDriver)
+      ? pickLatestRecord(p.providerSessions, (s) => driversMatch(sessionDriverOf(s), activeDriver))
       : pickLatestRecord(p.providerSessions, Boolean);
     const latestDriverTurn = activeDriver
-      ? pickLatestRecord(p.providerTurns, (pt) => turnDriverOf(pt) === activeDriver)
+      ? pickLatestRecord(p.providerTurns, (pt) => driversMatch(turnDriverOf(pt), activeDriver))
       : pickLatestRecord(p.providerTurns, Boolean);
     const latestSessionRunning = (() => {
       if (!latestDriverSession || !isRunningStatus(String(latestDriverSession.status || ""))) return false;
@@ -449,7 +462,7 @@
     const latestRelevantRun = activeDriver
       ? pickLatestRecord(p.runs, (r) => {
           const d = resolveRunDriver(r);
-          return d ? d === activeDriver : hasActiveDriverWork;
+          return d ? driversMatch(d, activeDriver) : hasActiveDriverWork;
         })
       : pickLatestRecord(p.runs, Boolean);
     const latestRunRunning = Boolean(latestRelevantRun && isRunningStatus(String(latestRelevantRun.status || "")));
@@ -1053,6 +1066,10 @@
     }
     if (contextMax == null && effDriver === "muse") {
       contextMax = 1007997;
+      contextMaxSource = "estimated";
+    }
+    if (contextMax == null && effDriver === "acpRegistry_devin" && /swe-2/i.test(String(effModel || ""))) {
+      contextMax = 262000;
       contextMaxSource = "estimated";
     }
     if (pricedTurns === 0 && Number.isFinite(contextUsed) && contextUsed > 0) {
@@ -3660,14 +3677,21 @@
       stats?.provider ||
       ""
     ).toLowerCase();
-    const liveCtxProvider = String(
-      rawLiveContext?.driver ||
-      rawLiveContext?.provider ||
-      rawLiveContext?.providerInstanceId ||
-      (live?.contextWindow ? (live?.providerInstanceId || live?.provider || "") : "") ||
+    const rawLiveCtxDrv = String(rawLiveContext?.driver || "").toLowerCase();
+    const rawLiveCtxInst = String(rawLiveContext?.providerInstanceId || rawLiveContext?.provider || "").toLowerCase();
+    const liveCtxProvider = (
+      (rawLiveCtxDrv === "acpregistry" && rawLiveCtxInst.startsWith("acpregistry_") ? rawLiveCtxInst : "") ||
+      rawLiveCtxDrv ||
+      rawLiveCtxInst ||
+      (live?.contextWindow ? String(live?.providerInstanceId || live?.provider || "").toLowerCase() : "") ||
       ""
-    ).toLowerCase();
-    const liveContext = rawLiveContext && (!activeProviderRaw || (liveCtxProvider ? liveCtxProvider === activeProviderRaw : !selectedProvider))
+    );
+    const liveCtxMatches = !activeProviderRaw || (liveCtxProvider
+      ? (liveCtxProvider === activeProviderRaw ||
+         (liveCtxProvider === "acpregistry" && activeProviderRaw.startsWith("acpregistry_")) ||
+         (activeProviderRaw === "acpregistry" && liveCtxProvider.startsWith("acpregistry_")))
+      : !selectedProvider);
+    const liveContext = rawLiveContext && liveCtxMatches
       ? rawLiveContext
       : null;
     // Prefer live composer-selected model so switching Gemini <-> Opus/Sonnet updates 周余 immediately!
@@ -4431,7 +4455,7 @@
   const HUD_CLAUDE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><g transform=\"translate(12 12)\" stroke=\"#d97757\" stroke-width=\"2.1\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-7.5\" x2=\"0\" y2=\"7.5\"/><line x1=\"-7.5\" y1=\"0\" x2=\"7.5\" y2=\"0\"/><line x1=\"-5.3\" y1=\"-5.3\" x2=\"5.3\" y2=\"5.3\"/><line x1=\"-5.3\" y1=\"5.3\" x2=\"5.3\" y2=\"-5.3\"/></g></svg>";
   const HUD_AGY_CLAUDE_DUAL_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><defs><linearGradient id=\"t3-agy-dual\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0%\" stop-color=\"#ea4335\"/><stop offset=\"48%\" stop-color=\"#fbbc05\"/><stop offset=\"100%\" stop-color=\"#4285f4\"/></linearGradient></defs><path d=\"M2.4 14.8C5.1 13.8 6.9 4.8 8.9 4.8s3.3 9 5.6 10\" stroke=\"url(#t3-agy-dual)\" stroke-width=\"2.5\" stroke-linecap=\"round\"/><circle cx=\"15.8\" cy=\"14.8\" r=\"5.8\" fill=\"var(--hud-bg, #ffffff)\"/><g transform=\"translate(15.8 14.8)\" stroke=\"#d97757\" stroke-width=\"1.7\" stroke-linecap=\"round\"><line x1=\"0\" y1=\"-4.4\" x2=\"0\" y2=\"4.4\"/><line x1=\"-4.4\" y1=\"0\" x2=\"4.4\" y2=\"0\"/><line x1=\"-3.1\" y1=\"-3.1\" x2=\"3.1\" y2=\"3.1\"/><line x1=\"-3.1\" y1=\"3.1\" x2=\"3.1\" y2=\"-3.1\"/></g></svg>";
   const HUD_OPENCODE_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M4.5 2h15v20h-15V2zm3.8 3.8v12.4h7.4V5.8H8.3z\" fill=\"currentColor\"/><rect x=\"8.3\" y=\"11.4\" width=\"7.4\" height=\"6.8\" fill=\"currentColor\" fill-opacity=\"0.3\"/></svg>";
-  const HUD_DEVIN_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\"><path d=\"M5.5 4.5h6.2c4.4 0 7.3 3 7.3 7.5s-2.9 7.5-7.3 7.5H5.5V4.5zm3.4 3.1v8.8h2.7c2.4 0 4-1.7 4-4.4s-1.6-4.4-4-4.4H8.9z\" fill=\"#0ea5e9\"/></svg>";
+  const HUD_DEVIN_LOGO = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><polygon points=\"7.8,1.4 12.1,3.9 12.1,8.8 7.8,11.3 3.5,8.8 3.5,3.9\"/><polygon points=\"7.8,12.7 12.1,15.2 12.1,20.1 7.8,22.6 3.5,20.1 3.5,15.2\"/><polygon points=\"15.8,7.1 20.1,9.6 20.1,14.5 15.8,17.0 11.5,14.5 11.5,9.6\"/></svg>";
   HUD_PROVIDER_LOGOS.claude = HUD_CLAUDE_LOGO;
   HUD_PROVIDER_LOGOS.claudeagent = HUD_CLAUDE_LOGO;
   HUD_PROVIDER_LOGOS["antigravity-claude"] = HUD_AGY_CLAUDE_DUAL_LOGO;

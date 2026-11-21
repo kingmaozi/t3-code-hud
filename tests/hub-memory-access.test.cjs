@@ -528,3 +528,57 @@ test("nonboolean JSON/TOML router toggle fields stay unknown and are never rewri
   assert.equal(codexResult.setupSummary.providers[0].reason, "hub_entry_toggle_invalid");
   assert.equal(fs.readFileSync(codexConfig, "utf8"), codexBefore);
 });
+
+test("OpenCode and Devin recognize portable shell-wrapper MCP entries and setup safely preserves sibling keys", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, {
+    opencode: { driver: "opencode", enabled: true, displayName: "OpenCode" },
+    acpRegistry_devin: { driver: "acpRegistry", enabled: true, displayName: "Devin", config: { agentId: "devin" } },
+    acpRegistry_other: { driver: "acpRegistry", enabled: true, displayName: "Other ACP", config: { agentId: "other-cli" } },
+  });
+  const opencodeConfig = path.join(f.homeDir, ".config", "opencode", "opencode.json");
+  const devinConfig = path.join(f.homeDir, ".config", "devin", "mcp_config.json");
+  write(opencodeConfig, {
+    model: "keep-model",
+    mcp: {
+      existing: { type: "local", command: ["keep-mcp"], enabled: true },
+      t3_hub: { type: "local", command: ["/bin/sh", "-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'], enabled: true },
+    },
+  });
+  write(devinConfig, {
+    mcpServers: {
+      existing: { command: "keep-devin-mcp", args: [] },
+      t3_hub: { command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'] },
+    },
+  });
+
+  const summary = manager(f).getSetupSummary();
+  assert.equal(summary.configured, 2);
+  assert.equal(summary.unsupported, 1);
+  assert.equal(summary.providers.find((p) => p.instanceId === "opencode").status, "configured");
+  assert.equal(summary.providers.find((p) => p.instanceId === "opencode").reason, "router_memory_only");
+  assert.equal(summary.providers.find((p) => p.instanceId === "acpRegistry_devin").status, "configured");
+  assert.equal(summary.providers.find((p) => p.instanceId === "acpRegistry_devin").reason, "router_memory_only");
+  assert.equal(summary.providers.find((p) => p.instanceId === "acpRegistry_other").status, "unsupported");
+
+  // Shell injection in /bin/sh -c must be flagged as conflict, never configured
+  write(devinConfig, {
+    mcpServers: {
+      t3_hub: { command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only; id'] },
+    },
+  });
+  assert.equal(manager(f).getSetupSummary().providers.find((p) => p.instanceId === "acpRegistry_devin").status, "conflict");
+
+  // Missing OpenCode and Devin entries are written cleanly without clobbering other entries
+  write(opencodeConfig, { model: "keep-model", mcp: { existing: { type: "local", command: ["keep-mcp"], enabled: true } } });
+  write(devinConfig, { mcpServers: { existing: { command: "keep-devin-mcp", args: [] } } });
+  const setupRes = manager(f).setup();
+  assert.deepEqual(setupRes.changed.sort(), ["acpRegistry_devin", "opencode"]);
+  const ocAfter = JSON.parse(fs.readFileSync(opencodeConfig, "utf8"));
+  assert.equal(ocAfter.model, "keep-model");
+  assert.deepEqual(ocAfter.mcp.existing, { type: "local", command: ["keep-mcp"], enabled: true });
+  assert.deepEqual(ocAfter.mcp.t3_hub, { type: "local", command: [f.routerBin, "--memory-only"], enabled: true });
+  const dvAfter = JSON.parse(fs.readFileSync(devinConfig, "utf8"));
+  assert.deepEqual(dvAfter.mcpServers.existing, { command: "keep-devin-mcp", args: [] });
+  assert.deepEqual(dvAfter.mcpServers.t3_hub, { command: f.routerBin, args: ["--memory-only"] });
+});

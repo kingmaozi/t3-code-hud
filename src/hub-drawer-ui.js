@@ -14,7 +14,7 @@
     let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
     let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, settingsHandle, settingsPanel, artifactDock, style, liveBoard, occlusionBoardRect = null;
-    let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0;
+    let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0, artifactDockSig = "";
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
     let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
@@ -292,7 +292,12 @@
  listen(planHandle, "blur", () => deferPlanPopoverClose());
  listen(liveBoard, "pointerenter", () => { state.planHovering = true; });
  listen(liveBoard, "pointerleave", (event) => { if (event.relatedTarget && (planHandle.contains(event.relatedTarget) || liveBoard.contains(event.relatedTarget))) return; state.planHovering = false; deferPlanPopoverClose(); });
- listen(document, "pointerdown", (event) => { if (!planHandle.contains(event.target) && !liveBoard.contains(event.target) && state.planPinned) setPlanPopover(false); });
+ listen(document, "pointerdown", (event) => {
+  if (!planHandle.contains(event.target) && !liveBoard.contains(event.target) && state.planPinned) setPlanPopover(false);
+  if (state.artifactDockOpen && artifactDock && !artifactDock.contains(event.target)) {
+   state.artifactDockOpen = false; state.artifactMenuIndex = null; state.dockPreview = null; renderArtifactDock();
+  }
+ });
  listen(root, "focusout", () => later(flushBoardRender, 0));
  listen(root, "error", (event) => { if (event.target.matches?.(".hub-brand-icon>img")) { event.target.parentElement.classList.remove("has-image"); event.target.remove(); } }, true);
  const resizeHandle = root.querySelector("#t3-hub-resize-handle");
@@ -2188,10 +2193,24 @@
     function renderArtifactDock() {
  if (!artifactDock || disposed) return;
  const show = state.artifactDockEnabled && !state.open && !state.hubSettingsOpen && !root.classList.contains("is-occluded") && Boolean(state.threadId && state.threadId !== "__NEW__");
+ const list = show ? dockArtifacts() : [];
+ const count = list.length;
+ const activeArt = state.artifactMenuIndex != null ? list[state.artifactMenuIndex] : null;
+ const appsForActive = activeArt?.path ? (state.artifactApps[activeArt.path]?.apps || []).map((a) => `${a.name}:${a.path}:${a.isDefault ? 1 : 0}`).join("|") : "";
+ const nextSig = JSON.stringify([
+  show,
+  state.artifactDockOpen,
+  state.artifactMenuIndex,
+  state.artifactMenuLoading,
+  state.dockPreview ? `${state.dockPreview.name}:${(state.dockPreview.content || "").length}` : "",
+  list.map((a) => `${a.path || a.name || ""}:${a.sizeBytes ?? ""}`),
+  appsForActive,
+  state.lang,
+ ]);
+ if (nextSig === artifactDockSig) return;
+ artifactDockSig = nextSig;
  artifactDock.hidden = !show;
  if (!show) return;
- const list = dockArtifacts();
- const count = list.length;
  if (!state.artifactDockOpen) {
   artifactDock.innerHTML = `<button type="button" class="hub-arc-tab" data-action="dock-toggle" title="${esc(tr(`当前会话产物 (${count})`, `Session artifacts (${count})`))}" aria-label="${esc(tr("展开右侧产物悬浮框", "Expand artifacts dock"))}">${icon("file", 13)}<span class="hub-arc-badge">${count}</span></button>`;
   return;
@@ -3888,6 +3907,7 @@
  destroy: () => {
  if (disposed) return;
  disposed = true;
+ artifactDockSig = "";
  contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; embedVersion++; boardVersion++;
  clearInterval(routeTimer); timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();

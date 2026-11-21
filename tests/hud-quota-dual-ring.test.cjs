@@ -196,7 +196,7 @@ test("OpenCode Go uses geometric square-frame logo and Devin non-weekly/ACU wind
   assert.equal(devin.name, "Devin");
   assert.equal(devin.weekly.remainingPct, 70);
   assert.match(ctx.markup(oc), /fill-opacity="0\.3"/, "OpenCode Go uses geometric frame logo SVG");
-  assert.match(ctx.markup(devin), /#0ea5e9/, "Devin uses dedicated Devin logo SVG");
+  assert.match(ctx.markup(devin), /<polygon points="7\.8,1\.4/, "Devin uses authentic 3-hexagon cluster logo SVG");
 });
 
 test("externalQuotaProviders merges Devin weekly+daily rings and renders Daily (inner) card label", () => {

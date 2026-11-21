@@ -13,7 +13,23 @@ const SUMMARY_STATES = ["configured", "missing", "conflict", "unsupported", "unk
 const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 const MEMORY_ONLY_ARGS = ["--memory-only"];
 const HUB_NAMES = ["t3_hub", "t3-hub"];
-const DRIVER_HOSTS = Object.freeze({ codex: "codex", muse: "muse", antigravity: "antigravity" });
+const DRIVER_HOSTS = Object.freeze({
+  codex: "codex",
+  muse: "muse",
+  antigravity: "antigravity",
+  opencode: "opencode",
+  devin: "devin",
+});
+function resolveTargetHost(target) {
+  const driver = String(target?.driver || "").toLowerCase();
+  if (DRIVER_HOSTS[driver]) return DRIVER_HOSTS[driver];
+  if (driver === "acpregistry") {
+    const agentId = String(target?.config?.agentId || "").trim().toLowerCase();
+    const instanceId = String(target?.instanceId || "").trim().toLowerCase();
+    if (agentId === "devin" || instanceId === "acpregistry_devin") return "devin";
+  }
+  return null;
+}
 
 function isPlainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
 function hasInvalidToggle(entry) {
@@ -267,10 +283,10 @@ function createMemoryAccessManager(options = {}) {
     const driver = String(target.driver || "").toLowerCase();
     if (target.state === "unknown") return { target, status: "unknown", reason: target.reason || "provider_invalid", file: null, format: null, managedByMagpie: false };
     if (target.unknownSelection) return { target, status: "unsupported", reason: "unknown_default_provider", file: null, format: null, managedByMagpie: false };
-    const host = DRIVER_HOSTS[driver];
+    const host = resolveTargetHost(target);
     if (!host) return { target, status: "unsupported", reason: driver ? "unsupported_driver" : "driver_missing", file: null, format: null, managedByMagpie: false };
     let file, format;
-    if (driver === "codex") {
+    if (host === "codex") {
       let codexHome = path.join(homeDir, ".codex");
       if (Object.prototype.hasOwnProperty.call(target.config || {}, "homePath")) {
         const raw = target.config.homePath;
@@ -282,8 +298,12 @@ function createMemoryAccessManager(options = {}) {
         try { assertNoSymlinkPath(codexHome, { includeTarget: true }); } catch { return { target, status: "unknown", reason: "codex_home_unsafe", file: null, format: null, managedByMagpie: false }; }
       }
       file = path.join(codexHome, "config.toml"); format = "toml";
-    } else if (driver === "muse") {
+    } else if (host === "muse") {
       file = path.join(homeDir, ".config", "muse", "settings.json"); format = "json";
+    } else if (host === "opencode") {
+      file = path.join(homeDir, ".config", "opencode", "opencode.json"); format = "opencode-json";
+    } else if (host === "devin") {
+      file = path.join(homeDir, ".config", "devin", "mcp_config.json"); format = "json";
     } else {
       const profileId = crypto.createHash("sha256").update(target.instanceId, "utf8").digest("hex");
       const profileDir = path.join(userDataDir, "providers", "antigravity", profileId);
@@ -301,7 +321,11 @@ function createMemoryAccessManager(options = {}) {
       targetFileExists = read.exists;
       if (read.exists) {
         sourceText = read.text; mode = read.mode;
-        const identity = format === "json" ? inspectJsonEntry(sourceText, routerBin) : inspectTomlEntry(sourceText, routerBin);
+        const identity = format === "opencode-json"
+          ? inspectOpenCodeJsonEntry(sourceText, routerBin)
+          : format === "json"
+            ? inspectJsonEntry(sourceText, routerBin)
+            : inspectTomlEntry(sourceText, routerBin);
         status = identity.status; reason = identity.reason;
       } else if (format === "toml") {
         // Validate the existing Codex document before allowing an appended table.
@@ -359,15 +383,64 @@ function createMemoryAccessManager(options = {}) {
     return identity.memoryOnly ? { status: "configured", reason: "router_memory_only" } : { status: "configured", reason: "legacy_broad_mode" };
   }
 
+  function inspectOpenCodeJsonEntry(text, expectedRouter) {
+    let document;
+    try { document = JSON.parse(text); } catch { return { status: "unknown", reason: "json_invalid" }; }
+    if (!isPlainObject(document)) return { status: "unknown", reason: "json_root_invalid" };
+    if (document.mcp != null && !isPlainObject(document.mcp)) return { status: "unknown", reason: "mcp_servers_invalid" };
+    const servers = document.mcp || {};
+    const matches = Object.entries(servers).filter(([name]) => isHubName(name));
+    if (!matches.length) return { status: "missing", reason: "entry_missing" };
+    if (matches.length !== 1) return { status: "conflict", reason: "duplicate_hub_entries" };
+    return inspectOpenCodeRouter(matches[0][1], expectedRouter);
+  }
+
+  function inspectOpenCodeRouter(entry, expectedRouter) {
+    if (!isPlainObject(entry)) return { status: "conflict", reason: "hub_entry_invalid" };
+    if (hasInvalidToggle(entry)) return { status: "unknown", reason: "hub_entry_toggle_invalid" };
+    if (entry.enabled === false || entry.disabled === true) return { status: "conflict", reason: "hub_entry_disabled" };
+    if (entry.type != null && entry.type !== "local") return { status: "conflict", reason: "hub_entry_custom_options" };
+    const keys = Object.keys(entry);
+    if (keys.some(key => !["type", "command", "enabled", "disabled"].includes(key))) return { status: "conflict", reason: "hub_entry_custom_options" };
+    if (!Array.isArray(entry.command) || entry.command.length < 1 || !entry.command.every(value => typeof value === "string")) {
+      return { status: "conflict", reason: "hub_command_unknown" };
+    }
+    const identity = routerCommand(entry.command[0], entry.command.slice(1), expectedRouter);
+    if (!identity.ok) return { status: "conflict", reason: identity.reason };
+    return identity.memoryOnly ? { status: "configured", reason: "router_memory_only" } : { status: "configured", reason: "legacy_broad_mode" };
+  }
+
+  function expandHomeToken(raw) {
+    const s = String(raw || "");
+    if (s.startsWith("$HOME/")) return path.join(homeDir, s.slice(6));
+    if (s.startsWith("${HOME}/")) return path.join(homeDir, s.slice(8));
+    if (s.startsWith("~/")) return path.join(homeDir, s.slice(2));
+    return s;
+  }
+
   function routerCommand(command, args, expectedRouter) {
     if (typeof command !== "string" || command.trim() === "") return { ok: false, reason: "hub_command_unknown" };
     const values = args === undefined ? [] : args;
     if (!Array.isArray(values) || !values.every(value => typeof value === "string")) return { ok: false, reason: "hub_args_unknown" };
-    let isRouter = path.resolve(command) === expectedRouter;
+    let isRouter = path.resolve(expandHomeToken(command)) === expectedRouter;
     let rest = values;
     if (!isRouter && /^(?:node|nodejs)(?:\.exe)?$/i.test(path.basename(command))) {
-      isRouter = path.resolve(values[0] || "") === expectedRouter;
+      isRouter = path.resolve(expandHomeToken(values[0] || "")) === expectedRouter;
       rest = values.slice(1);
+    }
+    // Accept the portable stdio shell wrapper generated by Hub UI:
+    // /bin/sh -c 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'
+    if (!isRouter && path.basename(command) === "sh" && values.length === 2 && values[0] === "-c") {
+      const script = values[1].trim();
+      if (!/[;&|`\r\n]|\$\(/.test(script)) {
+        const m = script.match(/^(?:exec\s+)?(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+(--memory-only))?$/);
+        if (m) {
+          const bin = m[1] || m[2] || m[3] || "";
+          if (bin && path.resolve(expandHomeToken(bin)) === expectedRouter) {
+            return { ok: true, memoryOnly: m[4] === "--memory-only" };
+          }
+        }
+      }
     }
     if (!isRouter) return { ok: false, reason: "hub_command_custom" };
     if (rest.length === 0) return { ok: true, memoryOnly: false };
@@ -469,6 +542,35 @@ function createMemoryAccessManager(options = {}) {
     }
     const result = reconcile();
     return { ...result, ok: true, enabled: true, state: "enabled", setupOk: result.ok, setupSummary: getSetupSummary() };
+  }
+
+  function writeOpenCodeJsonTarget(target, detected) {
+    const file = detected.file;
+    if (!file) throw new Error("target_unknown");
+    const parent = path.dirname(file);
+    const parentStat = lstatOptional(parent);
+    if (!parentStat || !parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("target_directory_missing");
+    assertNoSymlinkPath(file, { includeTarget: true });
+    const before = readRegular(file);
+    if (detected.sourceText !== undefined && before.text !== detected.sourceText) throw new Error("concurrent_change");
+    let document = {};
+    if (before.exists) {
+      try { document = JSON.parse(before.text); } catch { throw new Error("json_invalid"); }
+      if (!isPlainObject(document)) throw new Error("json_root_invalid");
+    }
+    if (document.mcp != null && !isPlainObject(document.mcp)) throw new Error("mcp_servers_invalid");
+    document.mcp ||= {};
+    const matches = Object.keys(document.mcp).filter(isHubName);
+    if (matches.length) {
+      if (matches.length !== 1) throw new Error("duplicate_hub_entries");
+      const current = document.mcp[matches[0]];
+      const identity = inspectOpenCodeRouter(current, routerBin);
+      if (!current || !isPlainObject(current) || identity.status === "conflict") throw new Error(identity.reason || "hub_entry_conflict");
+      document.mcp[matches[0]] = { ...current, type: "local", command: [routerBin, ...MEMORY_ONLY_ARGS], enabled: true };
+    } else {
+      document.mcp.t3_hub = { type: "local", command: [routerBin, ...MEMORY_ONLY_ARGS], enabled: true };
+    }
+    atomicWrite(file, JSON.stringify(document, null, 2) + "\n", { backup: true, mode: 0o600, expectedText: before.text });
   }
 
   function writeJsonTarget(target, detected) {
@@ -610,7 +712,8 @@ function createMemoryAccessManager(options = {}) {
       if (!detected.file) { skipped.push({ instanceId: safeLabel(target.instanceId), status: "unknown", reason: "target_unavailable" }); continue; }
       if (!fs.existsSync(routerBin)) { skipped.push({ instanceId: safeLabel(target.instanceId), status: "unsupported", reason: "router_not_installed" }); continue; }
       try {
-        if (detected.format === "json") writeJsonTarget(target, detected);
+        if (detected.format === "opencode-json") writeOpenCodeJsonTarget(target, detected);
+        else if (detected.format === "json") writeJsonTarget(target, detected);
         else if (detected.format === "toml") writeTomlTarget(target, detected);
         else throw new Error("format_unsupported");
         const after = detectTarget(target, magpie);
