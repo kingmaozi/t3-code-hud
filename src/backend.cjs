@@ -824,7 +824,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       const hasStepType = cols.some((c) => c.name === "step_type");
       if (hasStepType) {
         rows = adb
-          .prepare("SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
+          .prepare("SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL OR step_type = 15 ORDER BY idx ASC")
           .all();
       } else {
         rows = adb
@@ -861,10 +861,25 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
     let hasPendingUnfinishedCallAfterLastUsage = false;
     let latestModel = fallbackModel || null;
     let stepCount = 0;
+    const usageSteps = [];
+
+    const parseUsageField = (chunks) => {
+      if (!Array.isArray(chunks) || chunks.length === 0) return null;
+      const bufs = chunks.filter((c) => Buffer.isBuffer(c));
+      if (!bufs.length) return null;
+      return parseProtoSimple(bufs.length === 1 ? bufs[0] : Buffer.concat(bufs));
+    };
+    const lastNum = (arr) => (Array.isArray(arr) && arr.length > 0 ? Number(arr[arr.length - 1]) || 0 : 0);
 
     for (const r of rows) {
       if (!r.metadata) {
-        if (Number(r.step_type) === 15) hasPendingUnfinishedCallAfterLastUsage = true;
+        if (Number(r.step_type) === 15) {
+          lastStreamTps = null;
+          lastStreamSec = null;
+          lastStepCacheRate = null;
+          lastSpeedEventMs = null;
+          hasPendingUnfinishedCallAfterLastUsage = true;
+        }
         continue;
       }
       const f = parseProtoSimple(Buffer.from(r.metadata));
@@ -874,17 +889,17 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       const evSec = t7 ?? t6 ?? t1;
       const eventMs = Number.isFinite(evSec) && evSec * 1000 >= 946684800000 ? evSec * 1000 : null;
       if (eventMs != null) lastEventMs = eventMs;
+      const u = parseUsageField(f[9]);
       // step_type === 15 marks inference/token-usage steps; when the column exists, prefer it.
-      // We still accept any step with f[9] usage metadata for backward compatibility.
+      // We still accept any step with valid f[9] usage metadata (e.g. step_type 23) for backward compatibility.
       if (r.step_type != null && Number(r.step_type) !== 15) {
-        if (!f[9]?.[0]) continue;
-        const uProbe = parseProtoSimple(f[9][0]);
+        if (!u) continue;
         const probeTotal =
-          (Number(uProbe[2]?.[0]) || 0) + (Number(uProbe[5]?.[0]) || 0) + (Number(uProbe[4]?.[0]) || 0) +
-          Math.max(Number(uProbe[3]?.[0]) || 0, (Number(uProbe[9]?.[0]) || 0) + (Number(uProbe[10]?.[0]) || 0));
+          lastNum(u[2]) + lastNum(u[5]) + lastNum(u[4]) +
+          Math.max(lastNum(u[3]), lastNum(u[9]) + lastNum(u[10]));
         if (probeTotal === 0) continue;
       }
-      if (!f[9]?.[0]) {
+      if (!u) {
         // With the typed schema, a new inference row is a new model call even
         // if its usage submessage is absent. Do not label the previous call's
         // cache rate as the latest one.
@@ -898,19 +913,18 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
         continue;
       }
 
-      const u = parseProtoSimple(f[9][0]);
       // Do not carry the previous inference step's rate into this step when
       // the newest step has no valid visible-output/decode window.
       lastStreamTps = null;
       lastStreamSec = null;
       lastSpeedEventMs = null;
       lastStepCacheRate = null;
-      const uncached = Math.max(0, Number(u[2]?.[0]) || 0);
-      const cacheRead = Math.max(0, Number(u[5]?.[0]) || 0);
-      const cacheWrite = Math.max(0, Number(u[4]?.[0]) || 0);
-      const reasoning = Math.max(0, Number(u[9]?.[0]) || 0);
-      const visOut = Math.max(0, Number(u[10]?.[0]) || 0);
-      const output = Math.max(Number(u[3]?.[0]) || 0, reasoning + visOut);
+      const uncached = Math.max(0, lastNum(u[2]));
+      const cacheRead = Math.max(0, lastNum(u[5]));
+      const cacheWrite = Math.max(0, lastNum(u[4]));
+      const reasoning = Math.max(0, lastNum(u[9]));
+      const visOut = Math.max(0, lastNum(u[10]));
+      const output = Math.max(lastNum(u[3]), reasoning + visOut);
 
       const promptTotal = uncached + cacheRead + cacheWrite;
       if (promptTotal + output === 0) {
@@ -947,6 +961,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       if (promptTotal > 0) {
         lastStepCacheRate = cacheRead / promptTotal;
         lastContextPrompt = promptTotal + output;
+        usageSteps.push({ eventMs, prompt: promptTotal, cached: cacheRead });
       }
 
       // Pure API E2E duration (excludes all bash/tool execution wait time!)
@@ -999,6 +1014,7 @@ function readAntigravityConvDb(dbFile, fallbackModel) {
       lastUsageEventMs,
       lastSpeedEventMs,
       hasPendingUnfinishedCallAfterLastUsage,
+      usageSteps,
     };
 
     lruSet(fileParseCache, dbFile, { sig, data });
@@ -1315,6 +1331,7 @@ function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
     let latestModel = (sessRow?.model && String(sessRow.model).trim()) || fallbackModel || null;
     let stepCount = 0;
     const seenRequests = new Set();
+    const usageSteps = [];
 
     for (const r of rows) {
       const cm = safeJsonParse(r.chat_message);
@@ -1323,13 +1340,25 @@ function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
       const metrics = meta?.metrics;
       if (!metrics || typeof metrics !== "object") continue;
 
-      const createdMsRaw = meta.created_at ? Date.parse(meta.created_at) : Number.isFinite(r.created_at) ? r.created_at * 1000 : NaN;
+      const createdMsRaw = meta.created_at
+        ? Date.parse(meta.created_at)
+        : Number.isFinite(r.created_at)
+          ? r.created_at * 1000
+          : typeof r.created_at === "string"
+            ? Date.parse(r.created_at)
+            : NaN;
       const eventMs = Number.isFinite(createdMsRaw) && createdMsRaw >= 946684800000 ? createdMsRaw : null;
       const reqKey =
         (typeof meta.request_id === "string" && meta.request_id.trim()) ||
         `${meta.started_generation_at || ""}|${meta.created_at || r.created_at || ""}|${metrics.output_tokens ?? ""}`;
       if (seenRequests.has(reqKey)) continue;
       seenRequests.add(reqKey);
+
+      // Clear prior step metrics first so an empty or zero-prompt latest call never leaks stale values.
+      lastStepCacheRate = null;
+      lastDecodeTps = null;
+      lastDecodeSec = null;
+      lastSpeedEventMs = null;
 
       if (eventMs != null) {
         lastEventMs = eventMs;
@@ -1341,7 +1370,7 @@ function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
       if (stepModel) latestModel = stepModel;
 
       const unc = Math.max(0, Number(metrics.input_tokens) || 0);
-      const cr = Math.max(0, Number(metrics.cache_read_tokens) || 0);
+      const cr = Math.max(0, Number(metrics.cache_read_tokens ?? metrics.cached_input_tokens ?? metrics.cache_read_input_tokens) || 0);
       const cw = Math.max(0, Number(metrics.cache_creation_tokens) || 0);
       const out = Math.max(0, Number(metrics.output_tokens) || 0);
       const ctxIn = Number.isFinite(Number(metrics.context_input_tokens)) && Number(metrics.context_input_tokens) > 0
@@ -1359,7 +1388,10 @@ function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
       sumSavedUsd += priced.savedUsd;
 
       const totalPrompt = unc + cr + cw;
-      if (totalPrompt > 0) lastStepCacheRate = Math.min(totalPrompt, cr) / totalPrompt;
+      if (totalPrompt > 0) {
+        lastStepCacheRate = Math.min(totalPrompt, cr) / totalPrompt;
+        usageSteps.push({ eventMs, prompt: totalPrompt, cached: Math.min(totalPrompt, cr) });
+      }
       if (ctxIn > 0 || out > 0) lastContextPrompt = ctxIn + out;
 
       const totalMs = Number(metrics.total_time_ms);
@@ -1428,6 +1460,7 @@ function readDevinSessionDb(sessionId, fallbackModel, overrideDbPath = null) {
       lastUsageEventMs,
       lastSpeedEventMs,
       hasPendingUnfinishedCallAfterLastUsage: false,
+      usageSteps,
     };
     lruSet(fileParseCache, cacheKey, { sig, data });
     return data;
@@ -1982,7 +2015,7 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       for (const did of devinNativeIds) {
         const d = readDevinSessionDb(did, latestModel, devinDbPath);
         if (d && d.stepCount > 0) {
-          nativeParts.push({ ...d, driver: "acpRegistry_devin", nativeId: did, mtimeMs: devinMtimeMs });
+          nativeParts.push({ ...d, driver: "acpRegistry_devin", nativeId: did, mtimeMs: d.lastEventMs || devinMtimeMs });
         }
       }
     }
@@ -2112,8 +2145,27 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
           ? uncoveredOut / uncoveredNetSec
           : null;
 
-    const matchingParts = latestTurnDriver ? nativeParts.filter((part) => part.driver === latestTurnDriver) : nativeParts;
-    const lastPart = matchingParts[matchingParts.length - 1] || nativeParts[nativeParts.length - 1];
+    const matchingParts = latestTurnDriver ? nativeParts.filter((part) => driversCompatible(part.driver, latestTurnDriver)) : nativeParts;
+    const expectedActiveNativeId = (() => {
+      const targetDrv = latestTurnDriver || latestDriver;
+      if (latestTurnDriver && typeof latestTurn?.payload?.nativeTurnRef?.nativeId === "string" && targetDrv === "antigravity") {
+        return latestTurn.payload.nativeTurnRef.nativeId.split(":")[0];
+      }
+      const activePt = activeProviderThreadId
+        ? pThreadRows.find((pt) => pt.provider_thread_id === activeProviderThreadId)
+        : null;
+      const activePtDrv = activePt ? normalizeEffectiveDriver(activePt.driver, safeJsonParse(activePt.payload_json)?.providerInstanceId || activePt.provider) : null;
+      if (activePt && (!targetDrv || driversCompatible(activePtDrv, targetDrv))) {
+        const nid = safeJsonParse(activePt.payload_json)?.nativeThreadRef?.nativeId;
+        if (nid && !String(nid).startsWith("pending:")) {
+          return targetDrv === "antigravity" ? String(nid).split(":")[0] : String(nid);
+        }
+      }
+      return null;
+    })();
+    const lastPart = (expectedActiveNativeId && matchingParts.find((part) => part.nativeId === expectedActiveNativeId))
+      || matchingParts[matchingParts.length - 1]
+      || nativeParts[nativeParts.length - 1];
     const matchingStepsSum = matchingParts.reduce((sum, part) => sum + (part.stepCount || 0), 0);
 
     // Mixed-provider freshness: if an uncovered provider ran after the newest
@@ -2195,15 +2247,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       return effDriver === "antigravity" ? String(ptNid).split(":")[0] : String(ptNid);
     })();
     const missingExpectedLatestNativePart = Boolean(
-      latestSameDriverNativeId && !matchingParts.some((part) => part.nativeId === latestSameDriverNativeId)
+      latestSameDriverNativeId && lastPart.nativeId !== latestSameDriverNativeId
     );
     const lastPartCoversLatestTurn =
-      !staleByUsageTime && !pendingNativeCall && (
+      !staleByUsageTime && !pendingNativeCall && !missingExpectedLatestNativePart && (
         !latestTurn ||
         !latestTurnCompleted ||
-        (latestTurnDriver && latestTurnDriver !== effDriver) ||
-        (lastPart.driver === effDriver &&
-          !missingExpectedLatestNativePart &&
+        (latestTurnDriver && !driversCompatible(latestTurnDriver, effDriver)) ||
+        (driversCompatible(lastPart.driver, effDriver) &&
           matchingStepsSum >= Math.max(1, completedDriverTurns) &&
           !staleByEventTime &&
           !staleByMtime)
@@ -2320,7 +2371,37 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       }
     }
 
-    const effectiveNativeTurnCacheRate = turnCacheRate ?? (latestTurnUsageUnavailable && lastPartCoversLatestTurn ? lastPart.lastStepCacheRate ?? null : null);
+    // Compute exact token-weighted whole-turn cache rate from attributed native steps when available.
+    // Never substitute a single call's lastStepCacheRate for a whole-turn rate.
+    const nativeTurnSteps = (lastPartCoversLatestTurn && Array.isArray(lastPart.usageSteps) && hasLatestTurnStart)
+      ? lastPart.usageSteps.filter((st) =>
+          Number.isFinite(st.eventMs) &&
+          st.eventMs >= latestTurnStartMs - 50 &&
+          (!Number.isFinite(latestTurnEndMs) || st.eventMs <= latestTurnEndMs + 2000)
+        )
+      : [];
+    const nativeTurnPromptSum = nativeTurnSteps.reduce((acc, st) => acc + (st.prompt || 0), 0);
+    const nativeTurnCachedSum = nativeTurnSteps.reduce((acc, st) => acc + (st.cached || 0), 0);
+    const nativeWeightedTurnCacheRate = nativeTurnPromptSum > 0
+      ? Math.min(nativeTurnPromptSum, nativeTurnCachedSum) / nativeTurnPromptSum
+      : null;
+
+    let effectiveNativeTurnCacheRate = turnCacheRate;
+    // For Antigravity, when native DB calls match statev2's turnTokenUsage.inputTokens directly
+    // (T3 v0.1.11+ no longer double-counts cachedInputTokens), avoid the legacy `input >= cached * 2` subtraction.
+    if (effDriver === "antigravity" && nativeTurnPromptSum > 0 && latestTurn?.payload?.turnTokenUsage) {
+      const u = latestTurn.payload.turnTokenUsage;
+      if (u.usageStatus !== "unavailable" && Number.isFinite(u.inputTokens) && u.inputTokens > 0 && Number.isFinite(u.cachedInputTokens)) {
+        const directMatch = Math.abs(u.inputTokens - nativeTurnPromptSum) <= Math.max(100, nativeTurnPromptSum * 0.02);
+        const doubledMatch = Math.abs(u.inputTokens - (nativeTurnPromptSum + nativeTurnCachedSum)) <= Math.max(100, nativeTurnPromptSum * 0.02);
+        if (directMatch && !doubledMatch) {
+          effectiveNativeTurnCacheRate = Math.min(u.inputTokens, Math.max(0, u.cachedInputTokens)) / u.inputTokens;
+        }
+      }
+    }
+    if (effectiveNativeTurnCacheRate == null && latestTurnUsageUnavailable && nativeWeightedTurnCacheRate != null) {
+      effectiveNativeTurnCacheRate = nativeWeightedTurnCacheRate;
+    }
     return currentProviderTelemetry({
       source: "native",
       provider: effDriver,
@@ -2386,13 +2467,14 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
       lastTurnNetSec = null;
     }
     const u = p?.turnTokenUsage;
-    if (!u || typeof u.inputTokens !== "number") continue;
+    if (!u || u.usageStatus === "unavailable" || typeof u.inputTokens !== "number") continue;
 
-    // Guard against T3's geminiPromptUsage double-adding cachedInputTokens
+    const trDriver = resolveTurnDriver(p) || tr.driver || latestDriver || null;
+    // Guard against legacy T3's geminiPromptUsage double-adding cachedInputTokens
     let inp = Math.max(0, u.inputTokens || 0);
     const cr = Math.max(0, u.cachedInputTokens || 0);
     const cw = Math.max(0, u.cacheCreationTokens || 0);
-    if (latestDriver === "antigravity" && inp >= cr * 2) {
+    if (trDriver === "antigravity" && inp >= cr * 2) {
       inp = inp - cr;
     }
     const unc = Math.max(0, inp - cr - cw);
@@ -2405,10 +2487,10 @@ function aggregateSingleThreadTelemetry(db, threadId, fallbackModel, fallbackPro
     output += out;
     reasoning += reas;
 
-    const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, latestModel, latestDriver);
+    const priced = priceStep({ uncached: unc, cached: cr, cacheWrite: cw, output: out }, latestModel, trDriver || latestDriver);
     usd += priced.usd;
     savedUsd += priced.savedUsd;
-    if (inp > 0) lastTurnCacheRate = cr / inp;
+    if (inp > 0 && Number.isFinite(u.cachedInputTokens)) lastTurnCacheRate = Math.min(inp, cr) / inp;
 
     if (Number.isFinite(sMs) && Number.isFinite(eMs) && eMs > sMs) {
       turnDurSum += (eMs - sMs) / 1000;
@@ -2836,7 +2918,7 @@ function getThreadStats(threadHint) {
         mainSessionRate: mainTel.sessionCacheRate,
         withSubagentsSessionRate: combinedSessionCacheRate,
         lastTurnRate: runningWithoutActiveTurn ? null : mainTel.turnCacheRate ?? null,
-        lastCallRate: mainTel.lastCallCacheRate ?? null,
+        lastCallRate: runningWithoutActiveTurn ? null : mainTel.lastCallCacheRate ?? null,
         savedUsd: mainTel.savedUsd + subagentSavedUsd,
       },
       speed: {

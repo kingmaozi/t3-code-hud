@@ -581,4 +581,12 @@ test("OpenCode and Devin recognize portable shell-wrapper MCP entries and setup 
   const dvAfter = JSON.parse(fs.readFileSync(devinConfig, "utf8"));
   assert.deepEqual(dvAfter.mcpServers.existing, { command: "keep-devin-mcp", args: [] });
   assert.deepEqual(dvAfter.mcpServers.t3_hub, { command: f.routerBin, args: ["--memory-only"] });
+
+  // OpenCode using opencode.jsonc without opencode.json stays pending instead of creating a duplicate opencode.json
+  fs.rmSync(opencodeConfig, { force: true });
+  write(path.join(f.homeDir, ".config", "opencode", "opencode.jsonc"), '// comment\n{ "mcp": {} }\n');
+  const jsoncSummary = manager(f).setup();
+  assert.equal(jsoncSummary.setupSummary.providers.find((p) => p.instanceId === "opencode").status, "pending");
+  assert.equal(jsoncSummary.setupSummary.providers.find((p) => p.instanceId === "opencode").reason, "opencode_jsonc_manual");
+  assert.equal(fs.existsSync(opencodeConfig), false, "must not create sibling opencode.json when opencode.jsonc is in use");
 });

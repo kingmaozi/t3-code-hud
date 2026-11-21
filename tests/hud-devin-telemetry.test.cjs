@@ -239,3 +239,84 @@ test("getThreadStats resolves acpRegistry_devin context window, speed, and cache
   assert.equal(stats.speed.tokPerSec, 424.4);
   assert.ok(stats.cache.turnRate > 0.99);
 });
+
+test("multi-step Devin turn uses token-weighted turnRate instead of single-call lastStepCacheRate and clears zero-prompt steps", (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3-devin-multi-"));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const t3Home = path.join(tmp, ".t3", "userdata");
+  fs.mkdirSync(t3Home, { recursive: true });
+  const stateDb = new DatabaseSync(path.join(t3Home, "statev2.sqlite"));
+  stateDb.exec(`
+    CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, title TEXT, workspace_root TEXT);
+    CREATE TABLE orchestration_v2_projection_threads (
+      thread_id TEXT PRIMARY KEY, project_id TEXT, title TEXT, default_provider TEXT,
+      updated_at TEXT, archived_at TEXT, deleted_at TEXT, payload_json TEXT
+    );
+    CREATE TABLE orchestration_v2_projection_provider_sessions (
+      provider_session_id TEXT PRIMARY KEY, thread_id TEXT, provider TEXT, driver TEXT,
+      model TEXT, status TEXT, updated_at TEXT, payload_json TEXT
+    );
+    CREATE TABLE orchestration_v2_projection_provider_threads (
+      provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, provider TEXT, driver TEXT,
+      updated_at TEXT, payload_json TEXT
+    );
+    CREATE TABLE orchestration_v2_projection_provider_turns (
+      provider_turn_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, status TEXT,
+      started_at TEXT, completed_at TEXT, payload_json TEXT
+    );
+    CREATE TABLE orchestration_v2_projection_turn_items (thread_id TEXT, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT, thread_id TEXT, driver TEXT, child_thread_id TEXT);
+  `);
+
+  const threadId = "22222222-3333-4444-5555-666666666666";
+  const pThreadId = "pt-devin-multi";
+  stateDb.prepare("INSERT INTO projection_projects VALUES (?, ?, ?)").run("proj-1", "demo", tmp);
+  stateDb.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)").run(
+    threadId, "proj-1", "Devin Multi", "acpRegistry_devin", "2026-11-21T15:01:00.000Z",
+    JSON.stringify({ activeProviderThreadId: pThreadId, modelSelection: { provider: "acpRegistry_devin", instanceId: "acpRegistry_devin", model: "swe-2-high" } })
+  );
+  stateDb.prepare("INSERT INTO orchestration_v2_projection_provider_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+    "ps-m", threadId, "acpRegistry_devin", "acpRegistry", "swe-2-high", "ready", "2026-11-21T15:00:00.000Z", "{}"
+  );
+  stateDb.prepare("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?, ?, ?, ?)").run(
+    pThreadId, threadId, "acpRegistry_devin", "acpRegistry", "2026-11-21T15:01:00.000Z",
+    JSON.stringify({ id: pThreadId, driver: "acpRegistry", providerInstanceId: "acpRegistry_devin", nativeThreadRef: { driver: "acpRegistry", nativeId: "multi-sess", strength: "strong" }, contextUsage: { usedTokens: 20000, maxTokens: 262000 } })
+  );
+  stateDb.prepare("INSERT INTO orchestration_v2_projection_provider_turns VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+    "turn-m1", threadId, 1, "completed", "2026-11-21T15:00:00.000Z", "2026-11-21T15:01:00.000Z",
+    JSON.stringify({ id: "turn-m1", providerThreadId: pThreadId, nativeTurnRef: { driver: "acpRegistry", nativeId: "multi-sess:turn:1" }, status: "completed", startedAt: "2026-11-21T15:00:00.000Z", completedAt: "2026-11-21T15:01:00.000Z", turnTokenUsage: { usageStatus: "unavailable" } })
+  );
+  stateDb.close();
+
+  const dbPath = createDevinDb(tmp, [{ id: "multi-sess", model: "swe-2-max" }], [
+    {
+      session_id: "multi-sess", node_id: 1,
+      chat_message: { role: "assistant", metadata: { request_id: "r1", created_at: "2026-11-21T15:00:10.000Z", metrics: { input_tokens: 1000, cache_read_tokens: 9000, output_tokens: 100, ttft_ms: 500, total_time_ms: 1500 } } },
+    },
+    {
+      session_id: "multi-sess", node_id: 2,
+      chat_message: { role: "assistant", metadata: { request_id: "r2", created_at: "2026-11-21T15:00:40.000Z", metrics: { input_tokens: 10000, cache_read_tokens: 0, output_tokens: 100, ttft_ms: 500, total_time_ms: 1500 } } },
+    },
+  ]);
+
+  const repo = path.resolve(__dirname, "..");
+  const script = `const b = require(${JSON.stringify(path.join(repo, "src/backend.cjs"))}); process.stdout.write(JSON.stringify(b.getThreadStats(${JSON.stringify(threadId)})));`;
+  const run = spawnSync(process.execPath, ["-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: tmp, T3CODE_HOME: t3Home, NODE_ENV: "test" },
+    timeout: 10000,
+  });
+  assert.equal(run.status, 0, run.stderr);
+  const stats = JSON.parse(run.stdout);
+  assert.equal(stats.cache.lastCallRate, 0, "last call missed cache");
+  assert.ok(Math.abs(stats.cache.turnRate - 0.45) < 1e-9, `whole turn must be token-weighted 9000/20000=0.45, got ${stats.cache.turnRate}`);
+
+  // Zero-prompt final call must clear lastStepCacheRate to null instead of leaking prior rate
+  const zDbPath = createDevinDb(path.join(tmp, "z"), [{ id: "zero-sess", model: "swe-2-max" }], [
+    { session_id: "zero-sess", node_id: 1, chat_message: { role: "assistant", metadata: { request_id: "z1", created_at: "2026-11-21T15:00:10.000Z", metrics: { input_tokens: 100, cache_read_tokens: 900, output_tokens: 50 } } } },
+    { session_id: "zero-sess", node_id: 2, chat_message: { role: "assistant", metadata: { request_id: "z2", created_at: "2026-11-21T15:00:20.000Z", metrics: { input_tokens: 0, cache_read_tokens: 0, output_tokens: 10 } } } },
+  ]);
+  const zParsed = backend.readDevinSessionDb("zero-sess", "swe-2-max", zDbPath);
+  assert.equal(zParsed.lastStepCacheRate, null, "zero-prompt latest step must clear lastStepCacheRate");
+});
