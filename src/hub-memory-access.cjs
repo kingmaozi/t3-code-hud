@@ -177,6 +177,21 @@ function createMemoryAccessManager(options = {}) {
   const now = typeof options.now === "function" ? options.now : () => Date.now();
   const watcherPollMs = Number.isInteger(options.watcherPollMs) && options.watcherPollMs >= 25 ? options.watcherPollMs : 60_000;
 
+  function resolveConfigHome() {
+    const rawXdg = options.xdgConfigHome
+      || (path.resolve(homeDir) === path.resolve(os.homedir()) && process.env.XDG_CONFIG_HOME ? process.env.XDG_CONFIG_HOME : "");
+    if (typeof rawXdg === "string" && rawXdg.trim() && path.isAbsolute(rawXdg.trim())) {
+      const candidate = path.resolve(rawXdg.trim());
+      if (within(homeDir, candidate)) {
+        try {
+          assertNoSymlinkPath(candidate, { includeTarget: true });
+          return candidate;
+        } catch {}
+      }
+    }
+    return path.join(homeDir, ".config");
+  }
+
   function readAccess() {
     try {
       const file = readRegular(configPath, 16 * 1024);
@@ -299,11 +314,23 @@ function createMemoryAccessManager(options = {}) {
       }
       file = path.join(codexHome, "config.toml"); format = "toml";
     } else if (host === "muse") {
-      file = path.join(homeDir, ".config", "muse", "settings.json"); format = "json";
+      file = path.join(resolveConfigHome(), "muse", "settings.json"); format = "json";
     } else if (host === "opencode") {
-      file = path.join(homeDir, ".config", "opencode", "opencode.json"); format = "opencode-json";
+      const ocDir = path.join(resolveConfigHome(), "opencode");
+      const jsonFile = path.join(ocDir, "opencode.json");
+      const jsoncFile = path.join(ocDir, "opencode.jsonc");
+      try {
+        const hasJson = Boolean(lstatOptional(jsonFile));
+        const hasJsonc = Boolean(lstatOptional(jsoncFile));
+        if (!hasJson && hasJsonc) {
+          return { target, status: "pending", reason: "opencode_jsonc_manual", file: jsoncFile, format: "opencode-json", managedByMagpie: false };
+        }
+      } catch {
+        return { target, status: "unknown", reason: "target_unreadable", file: null, format: null, managedByMagpie: false };
+      }
+      file = jsonFile; format = "opencode-json";
     } else if (host === "devin") {
-      file = path.join(homeDir, ".config", "devin", "mcp_config.json"); format = "json";
+      file = path.join(resolveConfigHome(), "devin", "mcp_config.json"); format = "json";
     } else {
       const profileId = crypto.createHash("sha256").update(target.instanceId, "utf8").digest("hex");
       const profileDir = path.join(userDataDir, "providers", "antigravity", profileId);

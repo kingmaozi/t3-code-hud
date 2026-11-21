@@ -4007,10 +4007,11 @@
       ? `${formatCompactTokens(qInfo.ctxMax)} · ${t(contextSourceKey)}`
       : `-- · ${t("contextSourceUnknown")}`;
     const avgCacheRate = s?.cache.withSubagentsSessionRate ?? s?.cache.sessionRate;
-    const cachePct = Number.isFinite(avgCacheRate) ? Math.min(100, Math.max(0, avgCacheRate * 100)) : 0;
-    const cacheTone = avgCacheRate >= 0.75 ? "" : avgCacheRate >= 0.45 ? "mid" : "low";
+    const avgCacheValid = isValidHudCacheRate(avgCacheRate);
+    const cachePct = avgCacheValid ? Math.min(100, Math.max(0, avgCacheRate * 100)) : 0;
+    const cacheTone = !avgCacheValid ? "low" : avgCacheRate >= 0.75 ? "" : avgCacheRate >= 0.45 ? "mid" : "low";
     const avgCacheTxt =
-      s && avgCacheRate != null ? `${(avgCacheRate * 100).toFixed(1)}%` : "--";
+      s && avgCacheValid ? `${(avgCacheRate * 100).toFixed(1)}%` : "--";
     const showAgyNote = qInfo.activeProviderRaw === "antigravity" || s?.provider === "antigravity";
 
     popover.style.width = "268px";
@@ -5169,7 +5170,14 @@
         pendingFastRefresh = true;
         return;
       }
-      if (currentSelectedProvider && stats?.ok && stats?.provider && String(stats.provider) !== currentSelectedProvider) {
+      const hudProvidersCompat = (a, b) => {
+        const la = String(a || "").trim().toLowerCase();
+        const lb = String(b || "").trim().toLowerCase();
+        if (!la || !lb) return false;
+        if (la === lb) return true;
+        return (la === "acpregistry" && lb.startsWith("acpregistry_")) || (lb === "acpregistry" && la.startsWith("acpregistry_"));
+      };
+      if (currentSelectedProvider && stats?.ok && stats?.provider && !hudProvidersCompat(stats.provider, currentSelectedProvider)) {
         const mismatchKey = `${hint}:${currentSelectedProvider}`;
         if (refreshStats._mismatchKey !== mismatchKey) {
           refreshStats._mismatchKey = mismatchKey;
@@ -5336,7 +5344,14 @@
       lastPickerSig = pSig;
       lastPickerModelSig = mSig;
       if (latestStats) {
-        if (pickerChanged && live.selectedProvider && latestStats.provider && String(latestStats.provider) !== String(live.selectedProvider)) {
+        const pickerCompat = (a, b) => {
+          const la = String(a || "").trim().toLowerCase();
+          const lb = String(b || "").trim().toLowerCase();
+          if (!la || !lb) return false;
+          if (la === lb) return true;
+          return (la === "acpregistry" && lb.startsWith("acpregistry_")) || (lb === "acpregistry" && la.startsWith("acpregistry_"));
+        };
+        if (pickerChanged && live.selectedProvider && latestStats.provider && !pickerCompat(latestStats.provider, live.selectedProvider)) {
           latestStats = {
             ...latestStats,
             provider: String(live.selectedProvider),

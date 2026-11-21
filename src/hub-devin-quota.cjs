@@ -34,13 +34,19 @@ function parseCredentialsToml(text) {
   };
   const apiKey = pick("windsurf_api_key");
   if (!apiKey) return null;
-  const rawServer = pick("api_server_url") || "https://server.codeium.com";
-  let serverUrl = "https://server.codeium.com";
+  const hasExplicitServer = /^\s*api_server_url\s*=/m.test(text);
+  const rawServer = pick("api_server_url");
+  if (!hasExplicitServer) {
+    return { apiKey, serverUrl: "https://server.codeium.com" };
+  }
+  if (!rawServer) return null;
   try {
     const u = new URL(rawServer);
-    if (u.protocol === "https:") serverUrl = u.origin;
-  } catch {}
-  return { apiKey, serverUrl };
+    if (u.protocol !== "https:" || u.username || u.password) return null;
+    return { apiKey, serverUrl: u.origin };
+  } catch {
+    return null;
+  }
 }
 
 function isDevinEnabledInT3(homeDir) {

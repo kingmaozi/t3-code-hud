@@ -107,4 +107,12 @@ test("normalizeDevinStatusResponse supports Enterprise monthlyPromptCredits fall
 
   assert.equal(normalizeDevinStatusResponse({ userStatus: { planStatus: { weeklyQuotaRemainingPercent: 150 } } }), null);
   assert.equal(parseCredentialsToml('api_server_url = "https://server.codeium.com"'), null);
+  // Explicit invalid or non-HTTPS custom api_server_url must fail closed (never send key to default server)
+  assert.equal(parseCredentialsToml('windsurf_api_key = "sk-ws-test"\napi_server_url = "http://insecure.local"'), null);
+  assert.equal(parseCredentialsToml('windsurf_api_key = "sk-ws-test"\napi_server_url = "not-a-url"'), null);
+  assert.equal(parseCredentialsToml('windsurf_api_key = "sk-ws-test"\napi_server_url = "https://user:pass@example.com"'), null);
+  assert.deepEqual(parseCredentialsToml('windsurf_api_key = "sk-ws-test"\n'), {
+    apiKey: "sk-ws-test",
+    serverUrl: "https://server.codeium.com",
+  });
 });
