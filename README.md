@@ -172,6 +172,8 @@ T3 Code v0.1.11 translates native controls. HUD v1.0.10 locates the attachment a
 
 HUD v1.1.1 adds dual Antigravity quota rings (Gemini + Claude/GPT pools), Devin Pro weekly/daily quota rings & native context/speed telemetry, single-provider quota popover cards, a draggable right-edge session artifacts dock, standalone zero-Magpie settings with OpenCode/Devin provider resources and memory access support, full-width single-tab Memory Studio, and a T3 upgrade guardian.
 
+HUD v1.1.2 refines whole-turn token-weighted cache-hit aggregation for Devin and Antigravity (verifying native step totals before legacy double-count deduplication), tightens multi-session native attribution and in-flight pending-step detection, fails closed on invalid custom Devin API server URLs, and adds `XDG_CONFIG_HOME` / `opencode.jsonc` safeguards for Memory access onboarding.
+
 For the macOS ARM64 Antigravity wrapper shutdown issue, the optional `scripts/agy-acp-wrapper-install.py` installs the canonical sibling wrapper, with backups. Run with `--check` first. It requires an executable Homebrew Python at `/opt/homebrew/bin/python3`. It does not change provider settings or restart existing processes. Newly spawned wrappers use the repaired code; already-running wrappers keep their previous code. Keep any existing custom wrapper backup for rollback.
 
 Runtime RPC records are now stored per process (`run/rpc-<pid>.json`). Legacy `rpc.json` is accepted for explicit hot reload only; its older status response cannot prove window readiness, so `status` remains unconfirmed until a restart loads the new hook.
