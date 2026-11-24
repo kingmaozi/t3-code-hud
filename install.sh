@@ -104,6 +104,9 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/bootstrap.cjs" \
    "$SCRIPT_DIR/src/hud-health.cjs" \
    "$SCRIPT_DIR/src/hud-release.cjs" \
+   "$SCRIPT_DIR/src/hud-config.cjs" \
+   "$SCRIPT_DIR/src/hub-telemetry-guard.cjs" \
+   "$SCRIPT_DIR/src/hub-host-settings.cjs" \
    "$SCRIPT_DIR/src/hub-update.cjs" \
    "$SCRIPT_DIR/src/hub-drawer-ui.js" \
    "$DEST_DIR/"
@@ -1255,16 +1258,22 @@ fi
 mkdir -p "$DEST_DIR"
 if [[ -n "$JS_RUNNER" && -x "$JS_RUNNER" ]]; then
   ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" -e '
-    const fs = require("node:fs");
+    const path = require("node:path");
     const [cfgFile, defLang, explicitLang] = process.argv.slice(1);
-    let d = {};
-    try { d = JSON.parse(fs.readFileSync(cfgFile, "utf8")) || {}; } catch {}
-    d.defaultLang = defLang;
+    const { updateHudLanguage } = require(path.resolve(path.dirname(cfgFile), "hud-config.cjs"));
+    const patch = { defaultLang: defLang };
     if (explicitLang === "zh" || explicitLang === "en") {
-      d.userLang = explicitLang;
-      d.langUpdatedAt = Date.now();
+      patch.userLang = explicitLang;
+      patch.langUpdatedAt = Date.now();
     }
-    fs.writeFileSync(cfgFile, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+    updateHudLanguage(cfgFile, patch);
+    const pluginDir = path.dirname(cfgFile);
+    try {
+      const { createTelemetryGuard } = require(path.resolve(pluginDir, "hub-telemetry-guard.cjs"));
+      createTelemetryGuard({ pluginDir }).reconcileProfile();
+    } catch {
+      console.warn("[t3-hud] Could not sync the product telemetry setting to the shell profile");
+    }
   ' "$CONFIG_FILE" "$INSTALL_LANG" "$LANG_ARG"
 elif [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ "$LANG_ARG" == "zh" || "$LANG_ARG" == "en" ]]; then

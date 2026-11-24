@@ -304,6 +304,8 @@ process.env.T3CODE_HOME = tmpUserdata;
 process.env.MUSE_DATA_DIR = tmpMuse;
 process.env.CODEX_HOME = tmpCodex;
 delete process.env.XDG_DATA_HOME;
+delete process.env.T3_HUD_DIR;
+delete process.env.ZDOTDIR;
 
 const backend = require(path.join(REPO, "src", "backend.cjs"));
 
@@ -505,12 +507,17 @@ describe("Fix 3 CLI: t3-hud lang writes langUpdatedAt", () => {
   it("lang en/zh write userLang + timestamp; lang auto writes null + timestamp", () => {
     const hudDir = path.join(tmpRoot, "hud-plugin");
     const fakeApp = path.join(tmpRoot, "Fake.app");
+    fs.mkdirSync(hudDir, { recursive: true });
+    for (const module of ["hud-config.cjs", "hub-host-settings.cjs"]) {
+      fs.copyFileSync(path.join(REPO, "src", module), path.join(hudDir, module));
+    }
     fs.mkdirSync(path.join(fakeApp, "Contents", "MacOS"), { recursive: true });
     const fakeBin = path.join(fakeApp, "Contents", "MacOS", "fakebin");
     fs.writeFileSync(fakeBin, `#!/bin/sh\nif [ "$ELECTRON_RUN_AS_NODE" = "1" ]; then exec "${process.execPath}" "$@"; fi\nexit 0\n`);
     fs.chmodSync(fakeBin, 0o755);
     const env = { T3_HUD_DIR: hudDir, T3_APP_PATH: fakeApp };
     const cfgFile = path.join(hudDir, "config.json");
+    fs.writeFileSync(cfgFile, '{"disableOfficialTelemetry":false}');
     const read = () => JSON.parse(fs.readFileSync(cfgFile, "utf8"));
 
     runSh("bash bin/t3-hud lang en", env);
@@ -528,6 +535,7 @@ describe("Fix 3 CLI: t3-hud lang writes langUpdatedAt", () => {
     runSh("bash bin/t3-hud lang zh", env);
     cfg = read();
     assert.equal(cfg.userLang, "zh");
+    assert.equal(cfg.disableOfficialTelemetry, false);
     assert.equal(typeof cfg.langUpdatedAt, "number");
   });
 

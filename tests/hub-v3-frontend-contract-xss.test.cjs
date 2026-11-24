@@ -49,9 +49,10 @@ function harness(rpc = async () => ({}), environment = {}) {
   };
   const expose = `if (opts.__testHarness) {
     root = opts.root; content = opts.content;
+    settingsPanel = root.querySelector("#t3-hub-settings-panel"); settingsPanel.querySelector = root.querySelector;
     handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
 
-    return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings,
+    return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings, renderHubSettingsPanel, refreshOfficialTelemetry,
       onInput, onChange, onClick, onEditorKeydown, renderMemory, renderMemoryConnections, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
       renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
@@ -93,6 +94,47 @@ test("Hub exposes only the lightweight memory workspace", () => {
   assert.match(nav, /记忆/);
   assert.doesNotMatch(nav, /个性化|子智能体|技能与 MCP|插件|Hooks/);
   assert.doesNotMatch(header, /本机 · 全局|Local · Global/);
+});
+
+test("General settings show bilingual telemetry switches and verified launch state", async () => {
+  const calls = [];
+  const snapshot = {
+    config: { disableOfficialTelemetry: false, syncShellProfileTelemetryOptOut: false },
+    runtime: { state: "not-enabled", restartRequired: false }, profile: "manual", policy: "locked-off",
+  };
+  const ui = harness(async (action, patch) => {
+    calls.push([action, patch]);
+    if (action.endsWith(":update")) {
+      snapshot.config = { ...snapshot.config, ...patch };
+      snapshot.runtime.restartRequired = true;
+    }
+    return snapshot;
+  });
+  ui.state.hubSettingsOpen = true;
+  const html = () => ui.nodes.get("#t3-hub-settings-general-pane").innerHTML;
+  await ui.refreshOfficialTelemetry();
+  assert.match(html(), /T3 官方遥测/);
+  assert.match(html(), /多台电脑的用量汇总照常显示/);
+  assert.equal((html().match(/data-action="toggle-official-telemetry"/g) || []).length, 1);
+  assert.match(html(), /检测到手动配置/);
+  assert.match(html(), /策略锁定关闭/);
+  assert.doesNotMatch(html(), /待重启生效|已生效/);
+  ui.root.contains = () => true;
+  const toggle = { dataset: { action: "toggle-official-telemetry", key: "disableOfficialTelemetry" }, getAttribute: () => "false" };
+  ui.onClick({ target: { closest: () => toggle } });
+  await new Promise(setImmediate);
+  assert.equal(calls.at(-1)[0], "settings:officialTelemetry:update");
+  assert.equal(calls.at(-1)[1].disableOfficialTelemetry, true);
+  assert.match(html(), /待重启生效[\s\S]*T3 Code HUD/);
+  snapshot.runtime = { state: "applied", injected: true, restartRequired: false };
+  await ui.refreshOfficialTelemetry();
+  assert.match(html(), /关闭设置已生效/);
+  assert.doesNotMatch(html(), /待重启生效/);
+  ui.state.lang = "en";
+  ui.renderHubSettingsPanel();
+  assert.match(html(), /Official Telemetry/);
+  assert.match(html(), /Opt-out active/);
+  assert.match(html(), /mobile activity notifications/);
 });
 
 test("legacy Hub tabs migrate to memory without deleting saved data", () => {

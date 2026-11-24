@@ -30,6 +30,7 @@
     const normalizedTab = tabAliases[storedTab] || storedTab;
     const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null, providerResources: null, guardian: null };
     const errors = {}, drafts = initial?.drafts || {};
+    const officialTelemetry = { status: null, busy: false, error: "" };
     const state = {
  open: initial?.open ?? false, tab: normalizedTab, settingsSubView: restoredSubView === "agents" ? "agents" : "native", width: Number(initial?.width || storageGet("t3-hub-width")) || 880,
  resourceFilters: initial?.resourceFilters || {}, memoryScope: ["smart", "project", "worktree"].includes(initial?.memoryScope) ? initial.memoryScope : "smart",
@@ -2059,6 +2060,7 @@
   if (!cache.providerResources && !state.providerResLoading) loadProviderResources();
   if (!cache.guardian && !state.guardianLoading) loadGuardianStatus();
   if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded();
+  else refreshOfficialTelemetry();
  }
     }
     async function ensureMemorySettingsLoaded(force = false) {
@@ -2148,6 +2150,59 @@
   if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
  }
     }
+    async function refreshOfficialTelemetry(patch) {
+ if (officialTelemetry.busy) return;
+ officialTelemetry.busy = true;
+ officialTelemetry.error = "";
+ renderHubSettingsPanel();
+ try {
+  const action = patch ? "settings:officialTelemetry:update" : "settings:officialTelemetry:get";
+  officialTelemetry.status = await request(action, patch);
+ } catch (error) {
+  if (!patch) officialTelemetry.status = null;
+  officialTelemetry.error = patch ? tr("保存失败", "Save failed") : tr("读取失败", "Could not read status");
+  officialTelemetry.error += ` (${error.message})`;
+ } finally {
+  officialTelemetry.busy = false;
+  if (!disposed) renderHubSettingsPanel();
+ }
+    }
+    function renderOfficialTelemetry() {
+ const { status, busy, error } = officialTelemetry;
+ const config = status?.configurationError ? null : status?.config;
+ const enabled = config?.disableOfficialTelemetry;
+ const runtime = status?.runtime;
+ const unknown = tr("未核实", "Unverified");
+ const runtimeLabels = {
+  applied: tr("关闭设置已生效", "Opt-out active"),
+  partial: tr("部分关闭（启动环境）", "Partly disabled (launch environment)"),
+  "not-enabled": tr("启动时未启用拦截", "Launch opt-out inactive"),
+  "not-running": tr("T3 未运行", "T3 is not running"),
+ };
+ const profileLabels = {
+  managed: tr("已写入托管块", "Managed block present"), manual: tr("检测到手动配置", "Manual setting detected"),
+  unconfigured: tr("未配置", "Unconfigured"), unreadable: tr("无法读取或托管块异常", "Unreadable or invalid managed block"),
+ };
+ const policyLabels = {
+  "locked-off": tr("策略锁定关闭产品遥测和 Relay 追踪", "Policy disables product telemetry and relay traces"),
+  missing: tr("未找到策略文件", "No policy file"), "not-enforced": tr("策略未要求关闭", "Policy does not disable telemetry"),
+  invalid: tr("策略文件无效", "Invalid policy file"), unreadable: tr("无法读取策略文件", "Policy file unreadable"),
+ };
+ const applied = runtime?.state === "applied" && !runtime?.restartRequired;
+ const pendingRestart = runtime?.restartRequired === true;
+ const runtimeLabel = pendingRestart ? tr("待重启生效", "Pending restart") : runtimeLabels[runtime?.state] || unknown;
+ const toggleLabel = tr("关闭官方遥测与账号追踪", "Disable official telemetry & account tracking");
+ const restart = pendingRestart ? `<p class="hub-hint" style="margin:0">${esc(tr("当前任务结束后，完全退出 T3，再打开 T3 Code HUD 即可应用。", "After your current work finishes, quit T3 and reopen T3 Code HUD to apply."))}</p>` : "";
+ const directPending = enabled && status?.profile === "unconfigured" ? `<p class="hub-hint" style="margin:0">${esc(tr("通过 HUD 启动时，会自动补齐直接打开官方 App 的设置。", "Starting through the HUD will also set up the opt-out for direct app launches."))}</p>` : "";
+ const statusError = error || (status?.configurationError ? tr("HUD 配置无法读取", "HUD configuration is unreadable") : "");
+ return `<section class="hub-set-sec" aria-labelledby="t3-hub-telemetry-title"><div class="hub-set-sec-title"><span id="t3-hub-telemetry-title">${esc(tr("T3 官方遥测", "Official Telemetry"))}</span><button type="button" class="hub-arc-btn" data-action="refresh-official-telemetry" ${busy ? "disabled" : ""}>${esc(tr("刷新", "Refresh"))}</button></div>
+  <div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(toggleLabel)}</strong><small>${esc(tr("一次设置同时用于 HUD 启动和直接打开官方 App。多台电脑的用量汇总照常显示。", "Applies to HUD launches and direct launches of the official app. Usage totals across your connected devices remain available."))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-official-telemetry" aria-label="${esc(toggleLabel)}" aria-checked="${config ? enabled === true : "mixed"}" ${busy || !config ? "disabled" : ""}><span></span></button></div>
+  <div role="status"><span class="hub-badge"><span aria-hidden="true" style="color:${applied ? "#16a34a" : pendingRestart ? "#b45309" : "inherit"}">${applied || pendingRestart ? "●" : "○"}</span>${esc(runtimeLabel)}</span></div>
+  ${restart}${directPending}${statusError ? `<p class="hub-error" role="alert">${esc(statusError)}</p>` : ""}
+  <details><summary>${esc(tr("查看详细状态", "View status details"))}</summary><p class="hub-hint">${esc(tr("直开官方 App", "Direct app launch"))} · ${esc(profileLabels[status?.profile] || unknown)}<br>${esc(tr("系统策略文件", "System policy file"))} · ${esc(policyLabels[status?.policy] || unknown)}</p>
+  <p class="hub-hint">${esc(tr("运行状态依据本机桌面进程的关闭设置。HUD 启动会关闭官方遥测上报、账号哈希归因、本机 Relay 和 OTLP 导出。模型请求、手机活动通知和其他设备的 Relay 追踪走各自的通道。", "Runtime status is based on opt-out flags verified in this desktop process. HUD launches disable official telemetry reporting, hashed account attribution, local Relay tracing and OTLP export. Model requests, mobile activity notifications and Relay traces on other devices use separate channels."))}</p></details>
+ </section>`;
+    }
     function renderHubSettingsPanel() {
  if (!settingsPanel || disposed) return;
  settingsPanel.hidden = !state.hubSettingsOpen;
@@ -2176,7 +2231,7 @@
  const memoryPane = settingsPanel.querySelector?.("#t3-hub-settings-memory-pane");
  if (chromeNode && generalPane && memoryPane) {
   chromeNode.innerHTML = chromeHtml;
-  generalPane.innerHTML = generalHtml;
+  generalPane.innerHTML = renderOfficialTelemetry() + generalHtml;
   generalPane.hidden = isMemTab;
   memoryPane.hidden = !isMemTab;
   const quickbar = settingsPanel.querySelector?.("#t3-hub-settings-memory-quickbar");
@@ -3356,7 +3411,9 @@
  else if (action === "open-hub-settings") setHubSettingsOpen(!state.hubSettingsOpen);
  else if (action === "open-hub-memory-settings") setHubSettingsOpen(true, "memory");
  else if (action === "open-memory-from-settings") { setHubSettingsOpen(false); openMemoryFromTitle(); }
- else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); }
+ else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); else refreshOfficialTelemetry(); }
+ else if (action === "refresh-official-telemetry") refreshOfficialTelemetry();
+ else if (action === "toggle-official-telemetry") refreshOfficialTelemetry({ disableOfficialTelemetry: target.getAttribute("aria-checked") !== "true" });
  else if (action === "close-hub-settings") setHubSettingsOpen(false);
  else if (action === "copy-provider-memory-prompt") copyProviderMemorySetupPrompt(target.dataset.providerId, target.dataset.providerName);
  else if (action === "close-provider-memory-prompt") { state.providerMemoryPrompt = null; renderMemoryAgentAccess(); }

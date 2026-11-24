@@ -136,7 +136,16 @@ const CODEX_HOME_ROOT = process.env.CODEX_HOME
   : path.join(HOME_DIR, ".codex");
 const CODEX_SESSIONS_ROOT = path.join(CODEX_HOME_ROOT, "sessions");
 const AGY_PROVIDERS_ROOT = path.join(T3_USERDATA, "providers", "antigravity");
-const HUD_CONFIG_PATH = path.join(HOME_DIR, ".t3", "hud-plugin", "config.json");
+const HUD_CONFIG_PATH = path.join(process.env.T3_HUD_DIR || path.join(HOME_DIR, ".t3", "hud-plugin"), "config.json");
+// Older HUD hot-update bundles replace this file without installing new siblings.
+const hudConfigModule = path.join(__dirname, "hud-config.cjs");
+const telemetryGuardModule = path.join(__dirname, "hub-telemetry-guard.cjs");
+if (process.type === "browser" && fs.existsSync(telemetryGuardModule)) {
+  try {
+    const { verifyLegacyTelemetryLaunch } = require(telemetryGuardModule);
+    verifyLegacyTelemetryLaunch(path.join(path.dirname(HUD_CONFIG_PATH), "run"), process.pid, process.env);
+  } catch {}
+}
 
 // ============================================================================
 // 1. Official T3 / LiteLLM Model Rate Catalog Loader (5,900+ models + tiers)
@@ -4154,6 +4163,14 @@ async function hubCall(action, payload = {}) {
         return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId };
       }
       case "settings:update": return getHostSettingsManager().updateHostSetting(payload);
+      case "settings:officialTelemetry:get":
+      case "settings:officialTelemetry:update": {
+        if (!fs.existsSync(telemetryGuardModule)) throw new Error("A full HUD install is needed for official telemetry settings");
+        const { createTelemetryGuard } = require(telemetryGuardModule);
+        const pid = process.type === "browser" ? process.pid : Number(process.env.T3_WATCH_PID) || null;
+        const guard = createTelemetryGuard({ pid });
+        return action.endsWith(":get") ? guard.status() : guard.update(payload);
+      }
       case "settings:getRule": return getHostSettingsManager().getRuleContent(payload?.host);
       case "settings:saveRule": return getHostSettingsManager().saveRuleContent(payload?.host, payload?.content, payload?.expectedContent, payload?.expectedTarget);
       default: return { ok: false, error: "unknown action: " + action };
@@ -4882,29 +4899,19 @@ function getConfig() {
 
 function setConfig(patch) {
   const p = patch && typeof patch === "object" ? patch : {};
-  let current = { defaultLang: "zh" };
   try {
-    const raw = fs.readFileSync(HUD_CONFIG_PATH, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") current = { ...current, ...parsed };
-  } catch {}
-  if (p.defaultLang === "zh" || p.defaultLang === "en") current.defaultLang = p.defaultLang;
-  if (p.userLang === "zh" || p.userLang === "en" || p.userLang === "auto" || p.userLang === null) current.userLang = p.userLang;
-  if (Number.isFinite(Number(p.langUpdatedAt)) && Number(p.langUpdatedAt) > 0) {
-    current.langUpdatedAt = Math.round(Number(p.langUpdatedAt));
-  }
-  try {
-    const dir = path.dirname(HUD_CONFIG_PATH);
-    try {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    } catch {}
-    try {
-      const st = fs.statSync(dir);
-      if (st.isSymbolicLink()) {
-        fs.unlinkSync(dir);
-      }
-    } catch {}
-    fs.writeFileSync(HUD_CONFIG_PATH, JSON.stringify(current, null, 2) + "\n", { mode: 0o600 });
+    if (fs.existsSync(hudConfigModule)) {
+      require(hudConfigModule).updateHudLanguage(HUD_CONFIG_PATH, p);
+    } else {
+      let current = { defaultLang: "zh" };
+      try { current = { ...current, ...JSON.parse(fs.readFileSync(HUD_CONFIG_PATH, "utf8")) }; } catch {}
+      if (p.defaultLang === "zh" || p.defaultLang === "en") current.defaultLang = p.defaultLang;
+      if (["zh", "en", "auto", null].includes(p.userLang)) current.userLang = p.userLang;
+      const updatedAt = Number(p.langUpdatedAt);
+      if (Number.isFinite(updatedAt) && updatedAt > 0) current.langUpdatedAt = Math.round(updatedAt);
+      fs.mkdirSync(path.dirname(HUD_CONFIG_PATH), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(HUD_CONFIG_PATH, JSON.stringify(current, null, 2) + "\n", { mode: 0o600 });
+    }
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
   }

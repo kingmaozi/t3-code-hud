@@ -98,7 +98,7 @@ quit_t3_gracefully() {
 }
 
 launch_enhanced() {
-  T3_APP_PATH="$T3_APP" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$BOOTSTRAP_PATH"
+  T3_HUD_DIR="$PLUGIN_DIR" T3_APP_PATH="$T3_APP" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$BOOTSTRAP_PATH"
   sleep 0.8
   activate_t3
 }
@@ -182,14 +182,10 @@ do_lang() {
   fi
   mkdir -p "$PLUGIN_DIR"
   ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
-    const fs = require("node:fs"), path = require("node:path");
-    const cfgFile = process.argv[1], arg = process.argv[2];
-    let d = { defaultLang: "zh" };
-    try { d = { ...d, ...JSON.parse(fs.readFileSync(cfgFile, "utf8")) }; } catch {}
-    d.userLang = arg === "auto" ? null : arg;
-    d.langUpdatedAt = Date.now();
-    fs.mkdirSync(path.dirname(cfgFile), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(cfgFile, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+    const path = require("node:path");
+    const [cfgFile, arg] = process.argv.slice(1);
+    const { updateHudLanguage } = require(path.resolve(path.dirname(cfgFile), "hud-config.cjs"));
+    updateHudLanguage(cfgFile, { userLang: arg === "auto" ? null : arg, langUpdatedAt: Date.now() });
   ' "$CONFIG_FILE" "$lang_arg"
   echo "[t3-hud] Language set to: $lang_arg (config: $CONFIG_FILE)"
   # Reload UI if running
@@ -227,6 +223,10 @@ case "$cmd" in
   lang)
     do_lang "${2:-}"
     ;;
+  telemetry)
+    T3_HUD_DIR="$PLUGIN_DIR" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" \
+      "$PLUGIN_DIR/hub-telemetry-guard.cjs" "${2:-status}" "$(get_main_pid)"
+    ;;
   guardian)
     gcmd="${2:-status}"
     if [[ "$gcmd" != "enable" && "$gcmd" != "disable" && "$gcmd" != "status" ]]; then
@@ -253,7 +253,7 @@ case "$cmd" in
     fi
     ;;
   *)
-    echo "用法: t3-hud [start|restart|reload|status|lang zh|en|auto]"
+    echo "用法: t3-hud [start|restart|reload|status|lang zh|en|auto|telemetry status|off|on]"
     exit 1
     ;;
 esac

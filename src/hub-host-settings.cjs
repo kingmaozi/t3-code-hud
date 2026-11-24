@@ -70,10 +70,14 @@ function inspectBackupPath(file) {
   if (st && !st.isFile()) throw new Error(`Refusing unsafe backup path (expected a regular file): ${bak}`);
   return { bak, st };
 }
-function readTextFileStrict(file) {
+function readTextFileStrict(file, { requireUtf8 = false } = {}) {
   const resolved = resolveRegularFile(file);
   inspectBackupPath(file);
-  return { missing: resolved.missing, content: resolved.missing ? "" : fs.readFileSync(resolved.target, "utf8") };
+  if (resolved.missing) return { missing: true, content: "" };
+  const content = requireUtf8
+    ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(resolved.target))
+    : fs.readFileSync(resolved.target, "utf8");
+  return { missing: false, content };
 }
 function probeTextSnapshot(file) {
   try { return { ...readTextFileStrict(file), error: null, corrupted: false }; }
@@ -1096,6 +1100,10 @@ function createHostSettingsManager(opts = {}) {
 
 module.exports = {
   createHostSettingsManager,
+  readTextFileStrict,
+  readJsonFileStrict,
+  writeTextAtomic,
+  backupOnce,
   parseTomlTopLevel,
   readTomlTable,
   countMcpServersInToml,
