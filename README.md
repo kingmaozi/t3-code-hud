@@ -181,6 +181,8 @@ HUD v1.1.1 adds dual Antigravity quota rings (Gemini + Claude/GPT pools), Devin 
 
 HUD v1.1.2 refines whole-turn token-weighted cache-hit aggregation for Devin and Antigravity (verifying native step totals before legacy double-count deduplication), tightens multi-session native attribution and in-flight pending-step detection, fails closed on invalid custom Devin API server URLs, and adds `XDG_CONFIG_HOME` / `opencode.jsonc` safeguards for Memory access onboarding.
 
+HUD v1.1.3 adds one-click official T3 telemetry & account-tracking opt-out in Hub Settings and `t3-hud telemetry status|off|on`, injects opt-out flags on HUD launches with verified desktop-process status receipts, syncs a backed-up managed block to `~/.zshrc` (including `$ZDOTDIR/.zshrc` via interactive login probe) for direct app launches without affecting connected-device Usage totals, and unifies custom `T3_HUD_DIR` run paths across launcher and main hook.
+
 For the macOS ARM64 Antigravity wrapper shutdown issue, the optional `scripts/agy-acp-wrapper-install.py` installs the canonical sibling wrapper, with backups. Run with `--check` first. It requires an executable Homebrew Python at `/opt/homebrew/bin/python3`. It does not change provider settings or restart existing processes. Newly spawned wrappers use the repaired code; already-running wrappers keep their previous code. Keep any existing custom wrapper backup for rollback.
 
 Runtime RPC records are now stored per process (`run/rpc-<pid>.json`). Legacy `rpc.json` is accepted for explicit hot reload only; its older status response cannot prove window readiness, so `status` remains unconfirmed until a restart loads the new hook.
