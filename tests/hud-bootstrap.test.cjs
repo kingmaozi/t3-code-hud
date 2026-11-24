@@ -15,33 +15,49 @@ const source = fs.readFileSync(path.join(repo, 'src/bootstrap.cjs'), 'utf8');
 const bin = fs.readFileSync(path.join(repo, 'bin/t3-hud'), 'utf8');
 const electron = '/Applications/T3 Code (Beta).app/Contents/MacOS/T3 Code (Beta)';
 const tick = () => new Promise(r => setImmediate(r));
-function sandbox(t, {healthy=true, failWrite=false, marker}={}) {
+function sandbox(t, {healthy=true, failWrite=false, marker, config, env={}}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'hud-bootstrap-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const runDir=path.join(root,'.t3/hud-plugin/run'); fs.mkdirSync(runDir,{recursive:true});
   const markerFile=path.join(runDir,'active.pid');
+  if (config) fs.writeFileSync(path.join(runDir, '..', 'config.json'), JSON.stringify(config));
   if(marker) fs.writeFileSync(markerFile,marker);
   const child = new EventEmitter(); child.pid=123456789;
   child.stderr=new EventEmitter(); child.stderr.destroy=()=>{}; child.unref=()=>{};
-  const timers=[]; const sockets=[]; const exits=[]; let probes=0;
+  const timers=[]; const sockets=[]; const exits=[]; let probes=0, launchEnv;
   const mockFs=Object.create(fs);
   mockFs.existsSync=p=>String(p).startsWith('/Applications/') || fs.existsSync(p);
   mockFs.readdirSync=p=>String(p).startsWith('/Applications/') ? ['T3 Code (Beta)'] : fs.readdirSync(p);
   mockFs.writeFileSync=(p,...args)=>{if(failWrite && String(p).startsWith(runDir)) throw new Error('EACCES'); return fs.writeFileSync(p,...args);};
-  class Socket { constructor(){sockets.push(this);} send(){} close(){} }
+  class Socket { constructor(){sockets.push(this);} send(message){this.request=JSON.parse(message);} close(){} }
   const context={require(id){
     if(id==='node:fs')return mockFs;
     if(id==='node:os')return {...os,homedir:()=>root};
-    if(id==='node:child_process')return {spawn:()=>child};
+    if(id==='node:child_process')return {spawn:(_exe,_args,options)=>{launchEnv=options.env;return child;}};
     if(id==='./hud-health.cjs')return {checkHud:async()=>{probes++;return healthy;}};
+    if(id==='./hub-telemetry-guard.cjs')return {...require('../src/hub-telemetry-guard.cjs'),
+      buildTelemetryLaunch:(childEnv)=>require('../src/hub-telemetry-guard.cjs').buildTelemetryLaunch(childEnv,path.dirname(runDir)),
+      createTelemetryGuard:()=>require('../src/hub-telemetry-guard.cjs').createTelemetryGuard({homeDir:root,pluginDir:path.dirname(runDir)}),
+      processStart:()=>"test process start"};
     return require(id);
-  },__dirname:path.join(repo,'src'),process:{env:{},argv:['node','bootstrap'],pid:process.pid,
+  },__dirname:path.join(repo,'src'),process:{env,argv:['node','bootstrap'],pid:process.pid,
     kill(pid){if(pid===child.pid) return; return process.kill(pid,0);},exit:c=>exits.push(c)},
     console:{error(){}},WebSocket:Socket,setTimeout(fn,ms){const h={fn,ms,unref(){}};timers.push(h);return h;},clearTimeout(h){if(h)h.cancelled=true;}};
   vm.runInNewContext(source,context);
   function url(){child.stderr.emit('data',Buffer.from('Debugger listening on ws://127.0.0.1:9999/abcdef\n'));}
-  async function evaluate(ok=true){url();sockets[0].onmessage({data:JSON.stringify({id:1,result:{result:{value:ok?'OK':'ERR:test'}}})});await tick();}
-  return {child,exits,timers,markerFile,url,evaluate,get probes(){return probes;}};
+  async function evaluate(ok=true, observed={}) {
+    url();
+    sockets[0].onopen();
+    const desktop = {
+      pid:child.pid, env:launchEnv,
+      getBuiltinModule:(id)=>id==='node:module' ? {createRequire:()=>()=>{}} : {close(){}},
+    };
+    const value = ok ? vm.runInNewContext(sockets[0].request.params.expression,{process:desktop,setTimeout(){}}) : 'ERR:test';
+    if (ok) Object.assign(value.telemetry,observed);
+    sockets[0].onmessage({data:JSON.stringify({id:1,result:{result:{value}}})});
+    await tick();
+  }
+  return {child,exits,timers,markerFile,url,evaluate,launchEnv,get probes(){return probes;}};
 }
 test('real Electron reads valid ASAR package without launching user application', {skip:!fs.existsSync(electron)},()=>{
  const output=execFileSync(electron,['-e',`console.log(require('node:fs').existsSync('/Applications/T3 Code (Beta).app/Contents/Resources/app.asar/package.json'))`],{env:{...process.env,NODE_OPTIONS:'',ELECTRON_RUN_AS_NODE:'1'},encoding:'utf8',timeout:10000,cwd:'/tmp'});
@@ -50,6 +66,44 @@ test('real Electron reads valid ASAR package without launching user application'
 test('successful evaluate waits for a live RPC before writing marker',async t=>{
  const s=sandbox(t); assert.equal(fs.existsSync(s.markerFile),false); await s.evaluate();
  assert.ok(s.probes>0); assert.deepEqual(s.exits,[0]);assert.equal(fs.readFileSync(s.markerFile,'utf8'),String(s.child.pid));
+});
+test('bootstrap sends all opt-out flags to T3 and records only verified launch evidence', async t=>{
+ const s=sandbox(t,{env:{T3CODE_TELEMETRY_ENABLED:'true',T3CODE_OTEL_SDK_DISABLED:'false',OTEL_SDK_DISABLED:'false',PRIVATE_TEST_FLAG:'secret'}});
+ const receipt=path.join(path.dirname(s.markerFile),'official-telemetry-launch.json');
+ assert.equal(s.launchEnv.T3CODE_TELEMETRY_ENABLED,'false');
+ assert.equal(s.launchEnv.T3CODE_OTEL_SDK_DISABLED,'true');
+ assert.equal(s.launchEnv.OTEL_SDK_DISABLED,'true');
+ assert.equal(fs.existsSync(receipt),false);
+ await s.evaluate();
+ assert.deepEqual(JSON.parse(fs.readFileSync(receipt,'utf8')),{pid:s.child.pid,started:'test process start',injected:true,observed:true,productOff:true,otelOff:true});
+});
+test('observed desktop flags take precedence over the launch intent', async t=>{
+ const s=sandbox(t);
+ await s.evaluate(true,{otelOff:false});
+ const receipt=JSON.parse(fs.readFileSync(path.join(path.dirname(s.markerFile),'official-telemetry-launch.json'),'utf8'));
+ assert.equal(receipt.otelOff,false);
+ assert.deepEqual(s.exits,[0]);
+});
+test('bootstrap leaves inherited flags alone when telemetry opt-out is off', t=>{
+ const s=sandbox(t,{config:{disableOfficialTelemetry:false},env:{T3CODE_TELEMETRY_ENABLED:'false',OTEL_SDK_DISABLED:'false'}});
+ assert.equal(s.launchEnv.T3CODE_TELEMETRY_ENABLED,'false');
+ assert.equal(s.launchEnv.T3CODE_OTEL_SDK_DISABLED,undefined);
+ assert.equal(s.launchEnv.OTEL_SDK_DISABLED,'false');
+});
+test('custom T3_HUD_DIR writes telemetry launch receipt to the custom run directory', async t=>{
+ const customDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hud-custom-dir-'));
+ t.after(()=>fs.rmSync(customDir,{recursive:true,force:true}));
+ const customRunDir = path.join(customDir, 'run');
+ fs.mkdirSync(customRunDir, { recursive: true });
+ const s = sandbox(t, { env: { T3_HUD_DIR: customDir } });
+ await s.evaluate();
+ const defaultReceipt = path.join(path.dirname(s.markerFile), 'official-telemetry-launch.json');
+ const customReceipt = path.join(customRunDir, 'official-telemetry-launch.json');
+ assert.equal(fs.existsSync(defaultReceipt), false);
+ assert.deepEqual(JSON.parse(fs.readFileSync(customReceipt, 'utf8')), {
+  pid: s.child.pid, started: 'test process start', injected: true, observed: true, productOff: true, otelOff: true,
+ });
+ assert.deepEqual(s.exits, [0]);
 });
 test('evaluate OK with unavailable RPC never reports mounted',async t=>{
  const s=sandbox(t,{healthy:false});await s.evaluate();assert.ok(s.probes>0);
@@ -115,7 +169,7 @@ test('normal start preserves an existing unmounted T3 instead of restarting it',
  const script=`set -eu\ncmd=start\nget_main_pid(){ echo 123; }\nis_hud_mounted(){ return 1; }\nactivate_t3(){ :; }\nquit_t3_gracefully(){ touch "$FIXTURE_QUIT"; }\nlaunch_enhanced(){ touch "$FIXTURE_QUIT"; }\n${bin.slice(bin.indexOf('case "$cmd" in'))}`;
  await assert.rejects(run('bash',['-c',script],{env:{...process.env,FIXTURE_QUIT:path.join(root,'quit')}}));assert.equal(fs.existsSync(path.join(root,'quit')),false);
 });
-function hookFixture(t, root, pid) {
+function hookFixture(t, root, pid, env = {}) {
  const source=fs.readFileSync(path.join(repo,'src/main-hook.cjs'),'utf8');const servers=[];
  let mounted=false,loading=false,delayed=false;
  const win={id:1,isDestroyed:()=>false,getTitle:()=> 'T3 Code',webContents:{isDestroyed:()=>false,isLoading:()=>loading,getURL:()=> 't3code://app/',executeJavaScript:()=>delayed?new Promise(()=>{}):Promise.resolve(mounted)}};
@@ -127,10 +181,22 @@ function hookFixture(t, root, pid) {
    if(id==='node:http')return {...http,createServer(...args){const s=http.createServer(...args);servers.push(s);return s;}};
    if(id.endsWith('/backend.cjs'))return {};
    return require(id);
- },{pid,versions:{electron:'fixture'},type:'browser',execPath:'/fixture/T3 Code'},path.join(repo,'src'),setTimeout,clearTimeout,setInterval,URL);
+ },{pid,env,versions:{electron:'fixture'},type:'browser',execPath:'/fixture/T3 Code'},path.join(repo,'src'),setTimeout,clearTimeout,setInterval,URL);
  t.after(async()=>{for(const s of servers){s.closeAllConnections();await new Promise(r=>s.close(r));}});
  return {...hooks,setMounted:x=>mounted=x,setLoading:x=>loading=x,setDelayed:x=>delayed=x};
 }
+test('main hook publishes RPC into custom T3_HUD_DIR so bootstrap health check succeeds',async t=>{
+ const {checkHud}=require('../src/hud-health.cjs');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'hud-hook-custom-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const customDir=path.join(root,'custom-hud');
+ const h=hookFixture(t,root,process.pid,{T3_HUD_DIR:customDir});
+ h.setMounted(true);
+ await h.startLoopbackFallbackServer();
+ const customRpc=path.join(customDir,'run',`rpc-${process.pid}.json`);
+ const defaultRpc=path.join(root,'.t3','hud-plugin','run',`rpc-${process.pid}.json`);
+ assert.equal(fs.existsSync(defaultRpc),false);
+ assert.equal(await checkHud({rpcFile:customRpc,pid:process.pid}),true);
+});
 test('main hook readiness queries actual window elements; unmounted/loading/unresponsive are false',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'hud-hook-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
  const h=hookFixture(t,root,process.pid);await h.startLoopbackFallbackServer();

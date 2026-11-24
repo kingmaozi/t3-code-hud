@@ -89,7 +89,14 @@ t3-hud status    # Show PID + mount state + language config
 t3-hud lang zh   # Set HUD language to Chinese (persists userLang)
 t3-hud lang en   # Set HUD language to English
 t3-hud lang auto # Clear explicit choice (auto-detect from T3 UI language)
+t3-hud telemetry status # Show saved settings, launch evidence, shell profile and policy file
+t3-hud telemetry off    # Disable official telemetry on subsequent HUD launches (default)
+t3-hud telemetry on     # Stop HUD injection on subsequent launches
 ```
+
+In **T3 Hub Settings → General & Providers → Official Telemetry**, one switch controls both launch paths. The HUD passes all three opt-out flags to T3 Code and manages the product telemetry flag in `~/.zshrc` (or `$ZDOTDIR/.zshrc` when configured) for direct launches of the official app. The HUD backs up the existing profile before the first change. The status card confirms the flags in the desktop process separately from the shell profile and the read-only macOS policy file. Connected-device Usage totals remain available. Restart through `t3-hud` when your work can be interrupted to apply a launch change. Existing environment variables and system policy can still disable telemetry after `t3-hud telemetry on`.
+
+To add this feature to an older HUD installation, use the full HUD installer once to update the launcher, CLI, and settings panel together.
 
 ### Shortcuts
 
@@ -150,7 +157,7 @@ curl -fsSL https://raw.githubusercontent.com/kingmaozi/t3-code-hud/main/uninstal
 ./uninstall.sh
 ```
 
-Uninstall removes `~/.t3/hud-plugin`, the `t3-hud` symlink, `~/Applications/T3 Code HUD.app`, and legacy `/tmp/t3-hud-*.pid/json`. Restart T3 to return to 100% stock.
+Turn off the opt-out in Hub settings or run `t3-hud telemetry on` first to remove the managed shell block. Uninstall removes `~/.t3/hud-plugin`, the `t3-hud` symlink, `~/Applications/T3 Code HUD.app`, and legacy `/tmp/t3-hud-*.pid/json`. Restart T3 to return to the stock app.
 
 ---
 

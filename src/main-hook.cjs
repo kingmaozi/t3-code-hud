@@ -44,7 +44,7 @@ function reloadBackend() {
 
 const PRELOAD_BRIDGE_PATH = path.join(__dirname, "preload-bridge.cjs");
 const RENDERER_UI_PATH = path.join(__dirname, "renderer-ui.js");
-const HUD_RUN_DIR = path.join(os.homedir(), ".t3", "hud-plugin", "run");
+const HUD_RUN_DIR = path.join((process.env && process.env.T3_HUD_DIR) || path.join(os.homedir(), ".t3", "hud-plugin"), "run");
 // Per-process records prevent a second launch from replacing the active RPC.
 const RPC_INFO_FILE = path.join(HUD_RUN_DIR, `rpc-${process.pid}.json`);
 

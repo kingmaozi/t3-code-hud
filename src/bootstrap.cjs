@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { checkHud } = require("./hud-health.cjs");
+const { buildTelemetryLaunch, createTelemetryGuard, optOutFlags, processStart, recordTelemetryLaunch } = require("./hub-telemetry-guard.cjs");
 
 function resolveT3Bundle() {
   const candidates = [
@@ -45,7 +46,9 @@ if (!resolved) {
 }
 
 const HOOK_PATH = path.join(__dirname, "main-hook.cjs");
-const RUN_DIR = path.join(os.homedir(), ".t3", "hud-plugin", "run");
+const PLUGIN_DIR = process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin");
+const TELEMETRY_PLUGIN_DIR = process.env.T3_HUD_DIR || __dirname;
+const RUN_DIR = path.join(PLUGIN_DIR, "run");
 const MARKER_FILE = path.join(RUN_DIR, "active.pid");
 
 
@@ -60,11 +63,15 @@ childEnv.PATH = [...new Set([
 ].filter(Boolean))].join(path.delimiter);
 
 const extraArgs = process.argv.slice(2);
+try { createTelemetryGuard({ pluginDir: TELEMETRY_PLUGIN_DIR }).reconcileProfile(); }
+catch { console.error("[t3-hud] Could not sync the product telemetry setting to the shell profile"); }
+const telemetryLaunch = buildTelemetryLaunch(childEnv, TELEMETRY_PLUGIN_DIR);
 const child = spawn(resolved.binPath, ["--inspect=127.0.0.1:0", ...extraArgs], {
-  env: childEnv,
+  env: telemetryLaunch.env,
   detached: true,
   stdio: ["ignore", "ignore", "pipe"],
 });
+const childStarted = processStart(child.pid);
 
 // A failed secondary launch must not mutate the active instance's marker.
 // Publish atomically, only after both evaluate and authenticated RPC succeed.
@@ -93,6 +100,7 @@ let verifying = false;
 let retryTimer;
 let inspectorSocket;
 let stderrBuf = "";
+let observedTelemetry = null;
 
 const finish = (code = 0) => {
   if (finished) return;
@@ -126,8 +134,11 @@ async function confirmReady() {
   const ready = await checkHud({rpcFile: path.join(RUN_DIR, `rpc-${child.pid}.json`), pid: child.pid});
   if (finished) return;
   if (!ready) { retryTimer = setTimeout(confirmReady, 100); return; }
-  try { writeMarker(); finish(0); }
-  catch (err) { console.error("[t3-hud] Could not record HUD readiness:", err.message); finish(1); }
+  try { writeMarker(); }
+  catch (err) { console.error("[t3-hud] Could not record HUD readiness:", err.message); finish(1); return; }
+  try { recordTelemetryLaunch(RUN_DIR, child.pid, childStarted, telemetryLaunch, observedTelemetry); }
+  catch (err) { console.error("[t3-hud] Could not record telemetry launch evidence:", err.message); }
+  finish(0);
 }
 
 child.stderr.on("data", (chunk) => {
@@ -145,7 +156,7 @@ child.stderr.on("data", (chunk) => {
       req(${JSON.stringify(HOOK_PATH)});
       const ins = process.getBuiltinModule("node:inspector");
       setTimeout(() => { try { ins.close(); } catch {} }, 80);
-      return "OK";
+      return { ready: true, telemetry: { pid: process.pid, ...(${optOutFlags.toString()})(process.env) } };
     } catch (e) {
       return "ERR:" + (e && e.stack ? e.stack : e);
     }
@@ -178,7 +189,8 @@ child.stderr.on("data", (chunk) => {
       if (msg && msg.id === 1) {
         const val = msg.result?.result?.value;
         const hasException = Boolean(msg.result?.exceptionDetails);
-        if (!msg.error && !hasException && val === "OK") {
+        if (!msg.error && !hasException && val?.ready === true) {
+          observedTelemetry = val.telemetry;
           verifying = true;
           try {
             ws.close();
