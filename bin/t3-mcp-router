@@ -295,15 +295,17 @@ function readSkillFileLimited(dir, filePath, maxBytes) {
   }
   return { content: buf.toString("utf8"), truncated, size: st.size };
 }
+function mcpRouterCandidates() {
+  return [
+    process.env.T3_MCP_ROUTER ? path.resolve(process.env.T3_MCP_ROUTER) : null,
+    path.join(__dirname, "..", "src", "mcp-router.cjs"),
+    path.join(__dirname, "..", "hud-plugin", "mcp-router.cjs"),
+    path.join(HOME_DIR, ".t3", "hud-plugin", "mcp-router.cjs"),
+  ].filter(Boolean);
+}
 function discoveredDefs() {
   try {
-    const cands = [
-      process.env.T3_MCP_ROUTER ? path.resolve(process.env.T3_MCP_ROUTER) : null,
-      path.join(__dirname, "..", "src", "mcp-router.cjs"),
-      path.join(__dirname, "..", "hud-plugin", "mcp-router.cjs"),
-      path.join(HOME_DIR, ".t3", "hud-plugin", "mcp-router.cjs"),
-    ].filter(Boolean);
-    for (const c of cands) {
+    for (const c of mcpRouterCandidates()) {
       try {
         const mod = require(c);
         if (!mod) continue;
@@ -492,6 +494,15 @@ function getTaskBoard() {
   }
   return hubTaskBoardMod;
 }
+const planUpdateRouter = (() => {
+  for (const file of mcpRouterCandidates()) {
+    try {
+      const mod = require(file);
+      if (mod.PLAN_UPDATE_TOOL && typeof mod.handlePlanUpdate === "function") return mod;
+    } catch {}
+  }
+  return null;
+})();
 function memoizeVault(names) {
   let cached;
   let tried = false;
@@ -516,9 +527,7 @@ function memoryTools() {
     tools.push({ name: "subagent_resolve", description: "Resolve live sub-agent provider/model/effort route from ~/.t3/hub/subagents.json + project overrides before delegate_task.", inputSchema: { type: "object", properties: { idOrTitle: { type: "string" }, role: { type: "string" }, projectRoot: { type: "string" } } } });
   }
   // plan_update is available even without memoryVault for Pi/general hosts
-  if (hubTaskBoardMod) {
-    tools.push({ name: "plan_update", description: "Update or clear the live T3 Hub task progress checklist (计划/进程 N/M) so the user sees real-time step completion across AGY, Pi, Muse, Codex, and Claude", inputSchema: { type: "object", properties: { title: { type: "string" }, background: { type: "string" }, steps: { type: "array", items: { type: "object", properties: { id: { type: "string" }, text: { type: "string" }, status: { type: "string" } }, required: ["text", "status"] } }, clear: { type: "boolean" }, projectRoot: { type: "string" }, threadId: { type: "string" } } } });
-  }
+  if (hubTaskBoardMod && planUpdateRouter) tools.push(planUpdateRouter.PLAN_UPDATE_TOOL);
   tools.push(
     { name: "context_search", description: "Call memory_status first, confirm its projectRoot is the current T3 project, then pass that exact path automatically. Search only that project's memories and available skills. Shared means shared by worktrees of this same project.", inputSchema: { type: "object", properties: { query: { type: "string" }, projectRoot: { type: "string" }, limit: { type: "number", minimum: 1, maximum: 20, default: 6 }, scopeFilter: { type: "string", enum: ["auto", "shared", "worktree", "all"] } }, required: ["query", "projectRoot"] } },
     { name: "skill_read", description: "Read a skill SKILL.md on demand (Runelay read_skill).", inputSchema: { type: "object", properties: { slug: { type: "string" }, projectRoot: { type: "string" } }, required: ["slug"] } },
@@ -1017,24 +1026,8 @@ async function handleToolsCall(params) {
   }
   if (name === "plan_update") {
     const board = getTaskBoard();
-    if (!board) throw new Error("hub-task-board not available");
-    const projectRoot = args.projectRoot || resolveProjectRoot();
-    const threadId = args.threadId || "";
-    if (args.clear === true) {
-      const res = board.clearPlan({ threadId: threadId || undefined, projectRoot });
-      // Also support clearPlan with projectRoot only fallback
-      const final = res && res.deleted !== undefined ? res : board.clearPlan({ projectRoot });
-      return { content: [{ type: "text", text: JSON.stringify(final ?? true) }] };
-    }
-    // Require steps array for update
-    if (!Array.isArray(args.steps)) throw new Error("steps array required");
-    const res = board.updatePlan({
-      title: args.title || "",
-      background: args.background || "",
-      steps: args.steps,
-      projectRoot,
-      threadId: threadId || undefined,
-    });
+    if (!board || !planUpdateRouter) throw new Error("Hub plan update is unavailable");
+    const res = planUpdateRouter.handlePlanUpdate(args, board, resolveProjectRoot);
     return { content: [{ type: "text", text: JSON.stringify(res ?? null) }] };
   }
   if (name === "subagent_resolve") {

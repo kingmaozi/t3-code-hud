@@ -589,8 +589,74 @@ function resolveCurrentThread(db, opts) {
   return { threadId: "", title: "" };
 }
 
-function readT3Plan(db, threadId) {
-  if (!db || !threadId || !tableExists(db, "orchestration_v2_projection_plans")) return null;
+function readThreadPlanUpdateItems(db, threadId, projectRoot) {
+  const table = "orchestration_v2_projection_turn_items";
+  if (!db || !threadId || !tableExists(db, table)) return null;
+  const columns = tableColumns(db, table);
+  if (!columns.has("thread_id") || !columns.has("payload_json")) return null;
+  const toolTypes = ["mcp_tool_call", "dynamic_tool", "dynamic_tool_call", "tool_call"];
+  const fields = ["payload_json", "type", "status", "updated_at", "ordinal", "parent_item_id"].filter((field) => columns.has(field));
+  let rows;
+  try {
+    const byType = columns.has("type") ? " AND type IN (?, ?, ?, ?)" : "";
+    rows = db.prepare(`SELECT ${fields.join(", ")} FROM ${table} WHERE thread_id = ?${byType} AND instr(payload_json, 'plan_update') > 0`)
+      .all(String(threadId), ...(byType ? toolTypes : []));
+  } catch { return null; }
+  let newest = null;
+  for (const row of rows) {
+    const item = safeJson(row.payload_json, null);
+    const type = item?.type || row.type;
+    if (!item || !toolTypes.includes(type) || (row.type && row.type !== type) || row.parent_item_id || item.parentItemId ||
+        (item.threadId && item.threadId !== threadId)) continue;
+    const firstText = (...values) => values.find((value) => typeof value === "string" && value) || "";
+    const name = firstText(item.toolName, item.tool, item.name);
+    const server = firstText(item.serverName, item.server);
+    // ACP projects recognized MCP calls as dynamic_tool with server.tool
+    // and an MCP source (native T3 tools may omit that presentation field).
+    const qualified = /^(?:mcp__(.+)__plan_update|([\w.-]+)\.plan_update)$/.exec(name);
+    const knownServer = /^(?:t3[_-](?:hub|code)|briking[_-]t3[_-]hub)$/i;
+    const mcpSource = item.toolSource?.kind === "integration" ? firstText(item.toolSource.key) : "";
+    const sourceNamespace = /^mcp:([\w.-]+)$/.exec(mcpSource)?.[1];
+    const namespace = qualified?.[1] || qualified?.[2] || server || sourceNamespace;
+    const isPlanTool = (qualified || name === "plan_update") &&
+      (type === "mcp_tool_call" || knownServer.test(namespace) ||
+       (namespace && mcpSource === `mcp:${namespace.toLowerCase()}`));
+    const status = item.status || row.status;
+    if (!isPlanTool || ["failed", "error", "declined", "cancelled", "interrupted"].includes(status) ||
+        item.output?.isError === true) continue;
+    const args = item.input ?? item.arguments;
+    if (!args || typeof args !== "object" || Array.isArray(args) ||
+        (args.threadId && args.threadId !== threadId) ||
+        (args.projectRoot && (!projectRoot || typeof args.projectRoot !== "string" || !sameProject(projectRoot, args.projectRoot)))) continue;
+    const cleared = args.clear === true;
+    if (!cleared && !Array.isArray(args.steps)) continue;
+    const steps = cleared ? [] : args.steps.flatMap((step, i) => {
+      if (typeof step?.text !== "string" || !step.text.trim() || typeof step.status !== "string") return [];
+      return [{ id: firstText(step.id) || `step-${i + 1}`, text: step.text, status: normalizeStepStatus(step.status) }];
+    });
+    if (!cleared && !steps.length) continue;
+    const updatedAt = firstText(row.updated_at, item.updatedAt, item.completedAt, item.startedAt);
+    const callTime = Date.parse(firstText(item.startedAt, updatedAt)) || 0;
+    const ordinal = [row.ordinal, item.ordinal].find(Number.isFinite) ?? 0;
+    const candidate = {
+      steps,
+      cleared,
+      title: typeof args.title === "string" ? args.title : "",
+      background: typeof args.background === "string" ? args.background : "",
+      updatedAt,
+      source: "t3-mcp-plan-update",
+    };
+    if (!newest || callTime > newest.callTime ||
+        (callTime === newest.callTime && (ordinal > newest.ordinal ||
+         (ordinal === newest.ordinal && cleared && !newest.candidate.cleared)))) {
+      newest = { candidate, callTime, ordinal };
+    }
+  }
+  return newest?.candidate || null;
+}
+
+function readT3Plan(db, threadId, toolPlan = null) {
+  if (!db || !threadId || !tableExists(db, "orchestration_v2_projection_plans")) return toolPlan;
   let rows = [];
   try {
     const itemCols = tableExists(db, "orchestration_v2_projection_turn_items")
@@ -611,8 +677,8 @@ function readT3Plan(db, threadId) {
     ` : `SELECT rowid AS plan_rowid, kind, status, payload_json
          FROM orchestration_v2_projection_plans WHERE thread_id = ? ORDER BY rowid DESC`;
     rows = db.prepare(sql).all(String(threadId));
-  } catch { return null; }
-  let best = null;
+  } catch { return toolPlan; }
+  let best = toolPlan;
   for (const row of rows) {
     const payload = safeJson(row.payload_json, null);
     if (!payload || row.status === "superseded" || payload.status === "superseded") continue;
@@ -1174,7 +1240,7 @@ function computeProgress(steps) {
 }
 
 function freshnessScore(plan) {
-  if (!plan || (!(plan.steps && plan.steps.length) && !(typeof plan.planMarkdown === "string" && plan.planMarkdown.trim()) && !plan.planReadError)) return -Infinity;
+  if (!plan || (!plan.cleared && !(plan.steps && plan.steps.length) && !(typeof plan.planMarkdown === "string" && plan.planMarkdown.trim()) && !plan.planReadError)) return -Infinity;
   const t = Date.parse(plan.updatedAt || "");
   return Number.isNaN(t) ? 0 : t;
 }
@@ -1527,7 +1593,13 @@ function createTaskBoard(opts = {}) {
         }
       }
       if (db) {
-        t3Plan = readT3Plan(db, tid);
+        let toolPlan = null;
+        if (requestedThreadId && requestedThreadId === tid) {
+          const picked = q.projectRoot ? null : pickThreadsTable(db);
+          const owningProject = q.projectRoot || (picked ? lookupThreadWorkspaceRoot(db, picked, tid) : null);
+          toolPlan = readThreadPlanUpdateItems(db, tid, owningProject);
+        }
+        t3Plan = readT3Plan(db, tid, toolPlan);
         subagents = readT3Subagents(db, tid, nowFn);
         try { nativeIds = readThreadNativeIds(db, tid); } catch { nativeIds = tid ? [tid] : []; }
       } else {
@@ -1557,9 +1629,8 @@ function createTaskBoard(opts = {}) {
     const hub = findHubPlan(hubPlansDir, { threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
     if (q.projectRoot && (resolved.threadId || q.threadId)) queuePlanMirror({ threadId: resolved.threadId || q.threadId, projectRoot: q.projectRoot });
 
-    const candidates = [hub, t3Plan, agy].filter(Boolean).filter((c) =>
-      (c.steps && c.steps.length) || (typeof c.planMarkdown === "string" && c.planMarkdown.trim()) || c.planReadError);
-    candidates.sort((a, b) => freshnessScore(b) - freshnessScore(a));
+    const candidates = [hub, t3Plan, agy].filter((candidate) => freshnessScore(candidate) !== -Infinity);
+    candidates.sort((a, b) => freshnessScore(b) - freshnessScore(a) || Number(!!b.cleared) - Number(!!a.cleared));
     let winner = candidates[0] || null;
     if (!winner && subagents.length && q.excludeSubagentInference !== true) winner = inferStepsFromSubagents(subagents);
     if (!winner) winner = { steps: [], background: "", updatedAt: "", source: "t3-native" };
@@ -1569,14 +1640,14 @@ function createTaskBoard(opts = {}) {
     return {
       threadId: resolved.threadId || "",
       projectRoot: q.projectRoot ? String(q.projectRoot) : "",
-      title: resolved.title || "",
-      background: String(winner.background || ""),
+      title: winner.cleared ? resolved.title || "" : winner.title || resolved.title || "",
+      background: winner.cleared ? "" : String(winner.background || ""),
       steps,
       planMarkdown: String(winner.planMarkdown || ""),
       planStatus: String(winner.planStatus || ""),
       planReadError: String(winner.planReadError || ""),
       progressKnown: steps.length > 0,
-      ...(!candidates.length ? { emptyPlanReason: "no_explicit_plan" } : {}),
+      ...(!candidates.length || winner.cleared ? { emptyPlanReason: "no_explicit_plan" } : {}),
       subagents,
       artifacts,
       ...(!artifactScope.ok && candidateIds?.length ? { artifactScopeError: artifactScope.reason } : {}),

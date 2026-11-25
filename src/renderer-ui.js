@@ -330,7 +330,7 @@
 
   function extractLastThreadIdFromHint(rawHint) {
     const clean = String(rawHint || "").split(/[?#]/, 1)[0];
-    if (clean === "__NEW__" || clean === "__ROUTE_invalid__" || /^\/?(?:_t3_env_\/[^/]+\/)?draft(?:\/|$)/i.test(clean)) return "__NEW__";
+    if (clean === "__NEW__" || clean === "__ROUTE_invalid__" || /^\/?(?:_t3_env_\/[^/]+\/)?draft(?:\/|$)/i.test(clean) || /^\/?new\/?$/i.test(clean)) return "__NEW__";
     if (!clean) return null;
     const parts = clean.split("/").filter(Boolean);
     if ((parts[0] === "_t3_env_" && parts.length === 3) ||
@@ -832,7 +832,8 @@
     const wantedEnv = typeof request.environmentId === "string" ? request.environmentId : "";
     const wantedThread = typeof request.threadId === "string" ? request.threadId : "";
     if (!wantedEnv || !wantedThread) return null;
-    const route = String(getRouteHint() || "").split(/[?#]/, 1)[0];
+    const routeHint = getRouteHint();
+    const route = String(routeHint || "").split(/[?#]/, 1)[0];
     const parts = route.split("/").filter(Boolean);
     let envPart = null;
     if (parts[0] === "_t3_env_" && parts.length === 3) envPart = parts[1];
@@ -861,7 +862,7 @@
         const absolute = typeof cwd === "string" && (/^\//.test(cwd) || /^[A-Za-z]:[\\\\/]/.test(cwd));
         const safe = absolute && !/[\u0000-\u001f\u007f]/.test(cwd) && !cwd.split(/[\\\\/]+/).includes("..");
         if (props?.isServerThread === true && props.environmentId === wantedEnv && props.threadId === wantedThread && safe) {
-          if (getRouteHint() !== route) return null;
+          if (getRouteHint() !== routeHint) return null;
           return { environmentId: wantedEnv, threadId: wantedThread, projectRoot: cwd };
         }
         if (fiber.sibling) stack.push(fiber.sibling);
@@ -1905,6 +1906,8 @@
     }
     #t3-hud-header-tools { display: flex; gap: 4px; height: 32px; }
     #t3-hud-header-tools.is-compact #t3-hud-branch { display: none; }
+    #t3-hud-header-tools.is-quota-only #t3-hud-git-btn { display: none; }
+    #t3-hud-header-tools.has-no-rings #t3-hud-quota-rings { display: none; }
     #t3-hud-context-control { display: inline-flex; justify-content: center; width: 22px; height: 28px; border: 0; padding: 0; background: transparent; color: var(--hud-fg); cursor: pointer; }
     #t3-hud-header-tools.is-hidden, #t3-hud-context-control.is-hidden { display: none !important; }
     #t3-hud-quota-rings { display: inline-flex; align-items: center; gap: 4px; }
@@ -1939,6 +1942,7 @@
 
     .t3-hud-metric {
       display: inline-flex;
+      flex: none;
       align-items: center;
       gap: 4px;
       height: 20px;
@@ -2672,11 +2676,14 @@
     #t3-hud-root .t3-quota-fill.mid,#t3-hud-root .t3-quota-fill.warn,#t3-hud-root #t3-hud-quota-bar.mid,#t3-hud-root #t3-hud-quota-bar.warn{background:#d97706}#t3-hud-root .t3-quota-val.mid,#t3-hud-root .t3-quota-val.warn,#t3-hud-root #t3-hud-quota.mid,#t3-hud-root #t3-hud-quota.warn{color:#d97706}
     #t3-hud-root .t3-quota-fill.err,#t3-hud-root #t3-hud-quota-bar.err{background:#dc2626}#t3-hud-root .t3-quota-val.err,#t3-hud-root #t3-hud-quota.err{color:#dc2626}
     #t3-hud-root :is(.t3-diff-add,.t3-diff-del,.t3-patch-hunk){color:var(--hud-fg)}#t3-hud-root .t3-diff-add{font-weight:600}#t3-hud-root .t3-diff-del{opacity:.65}
-    #t3-hud-topbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; max-width: none; }
-    #t3-hud-topbar::-webkit-scrollbar { display: none; }
+    #t3-hud-topbar { width: max-content; max-width: none; }
     #t3-hud-topbar.is-tight .t3-hud-metric { padding: 0 3px; }
-    #t3-hud-topbar.is-mini .t3-hud-metric { padding: 0 2px; }
+    #t3-hud-topbar.is-tight .t3-hud-sub-badge,
+    #t3-hud-topbar.is-mini :is(.lbl, #t3-hud-speed-label) { display: none; }
+    #t3-hud-topbar.is-mini { gap: 1px; padding: 0 4px; }
+    #t3-hud-topbar.is-mini .t3-hud-metric { gap: 2px; padding: 0 2px; }
     #t3-hud-topbar.is-mini .t3-hud-sep { margin: 0; }
+    #t3-hud-topbar .is-overflow-hidden, #t3-hud-quota-rings .is-overflow-hidden { display: none; }
     @media(max-width:639px){#t3-hud-popover{max-height:calc(100dvh - 120px);overflow:auto}}
     @media(prefers-reduced-motion:reduce){#t3-hud-root *,#t3-hud-root *:before,#t3-hud-root *:after{animation:none!important;transition:none!important}}
 
@@ -2692,19 +2699,19 @@
     <div id="t3-hud-topbar" class="is-hidden">
       <button class="t3-hud-metric" data-hud-hover="stats" data-hud-stats-trigger type="button" aria-controls="t3-hud-popover" title="${escapeHtml(t("hudStatsDetails"))}">
         <span id="t3-hud-dot" class="t3-hud-dot"></span>
-        <span id="t3-hud-speed" class="val">-- tok/s</span>
+        <span class="val"><span id="t3-hud-speed-label"></span><span id="t3-hud-speed">-- tok/s</span></span>
       </button>
       <span class="t3-hud-sep"></span>
-      <div id="t3-hud-cache-item" class="t3-hud-metric" data-hud-hover="stats">
+      <div id="t3-hud-cache-item" class="t3-hud-metric" data-hud-metric="cache" data-hud-hover="stats">
         <span class="lbl" id="t3-hud-cache-lbl">本轮缓存</span>
         <span id="t3-hud-cache" class="val">--%</span>
       </div>
       <span class="t3-hud-sep"></span>
-      <div class="t3-hud-metric" data-hud-hover="stats">
+      <div class="t3-hud-metric" data-hud-metric="tokens" data-hud-hover="stats">
         <span id="t3-hud-tokens" class="val">0 tok</span>
       </div>
       <span class="t3-hud-sep"></span>
-      <div class="t3-hud-metric" data-hud-hover="stats">
+      <div class="t3-hud-metric" data-hud-metric="cost" data-hud-hover="stats">
         <span id="t3-hud-cost" class="val">$0.00</span>
       </div>
     </div>
@@ -2786,6 +2793,7 @@
   const topbar = document.getElementById("t3-hud-topbar");
   const dotEl = document.getElementById("t3-hud-dot");
   const speedEl = document.getElementById("t3-hud-speed");
+  const speedLabelEl = document.getElementById("t3-hud-speed-label");
   const cacheEl = document.getElementById("t3-hud-cache");
   const cacheLblEl = document.getElementById("t3-hud-cache-lbl");
   const tokensEl = document.getElementById("t3-hud-tokens");
@@ -2830,6 +2838,7 @@
   let popoverHideTimer = null;
   let hudUpdateState = {};
   let externalQuotaProviders = [];
+  let hudLocalQuotaEnvironmentId = "";
   let externalQuotaFetchedAt = 0;
   let externalQuotaInFlight = false;
   function refreshExternalQuotas(force = false) {
@@ -2844,8 +2853,13 @@
         externalQuotaFetchedAt = Date.now();
         if (res && res.ok && Array.isArray(res.providers)) {
           externalQuotaProviders = res.providers;
+          hudLocalQuotaEnvironmentId = typeof res.t3EnvironmentId === "string" ? res.t3EnvironmentId : "";
           if (latestStats) renderTopbarStats(latestStats);
-          else renderQuotaRing(computeQuotaAndContext(null).providerQuotas);
+          else {
+            const quota = computeQuotaAndContext(null);
+            renderQuotaRing(quota.providerQuotas, quota.activeQuotaRingId);
+            scheduleLayoutSync();
+          }
         }
       })
       .catch(() => {
@@ -3359,15 +3373,31 @@
     return intervals;
   }
 
-  function calculateHudLayout({ header, title, headerObstacles, attach, model, footerObstacles, viewportWidth, headerFullWidth = 152, headerCompactWidth = 96 }) {
+  function calculateHudLayout({
+    header, title, headerObstacles, attach, model, footerObstacles, viewportWidth,
+    headerFullWidth = 152, headerCompactWidth = 96, headerCompactGitWidth = headerCompactWidth, ringCount = 0,
+  }) {
     const result = { header: null, context: null, stats: null };
     if (header && header.width >= 120) {
       const left = Math.max(header.left + 8, title ? title.right + 8 : header.left + 8);
-      const gaps = hudFreeIntervals(left, Math.min(header.right - 8, viewportWidth - 8), headerObstacles)
-        .filter((gap) => gap.right - gap.left >= headerCompactWidth).sort((a, b) => b.right - a.right);
-      if (gaps.length) {
-        const gap = gaps[0], compact = gap.right - gap.left < headerFullWidth, width = compact ? headerCompactWidth : headerFullWidth;
-        result.header = { left: gap.right - width, top: header.top + (header.height - 32) / 2, width, compact };
+      const gaps = hudFreeIntervals(left, Math.min(header.right - 8, viewportWidth - 8), headerObstacles);
+      let bestPriority = -1;
+      for (const gap of gaps) {
+        const available = gap.right - gap.left;
+        const gitFits = available >= headerCompactGitWidth;
+        const ringsWithGit = !gitFits ? 0 : available >= headerCompactWidth ? ringCount :
+          Math.min(ringCount, Math.floor((available - headerCompactGitWidth) / 36));
+        const quotaOnly = ringCount > 0 && ringsWithGit === 0 && available >= 32;
+        if (!gitFits && !quotaOnly) continue;
+        const compact = quotaOnly || available < headerFullWidth;
+        const maxVisibleRings = quotaOnly ? 1 : ringsWithGit;
+        const width = quotaOnly ? 32 : !compact ? headerFullWidth : headerCompactGitWidth + maxVisibleRings * 36;
+        // Prefer more rings, then keep Git if it fits, then show its full label.
+        const priority = maxVisibleRings * 3 + (quotaOnly ? 0 : compact ? 1 : 2);
+        if (priority > bestPriority || (priority === bestPriority && gap.right > result.header.left + result.header.width)) {
+          bestPriority = priority;
+          result.header = { left: gap.right - width, top: header.top + (header.height - 32) / 2, width, compact, quotaOnly, maxVisibleRings };
+        }
       }
     }
     if (attach && model && model.left > attach.right && model.width > 0 && attach.width > 0) {
@@ -3386,10 +3416,37 @@
     return result;
   }
 
-  function visibleHudRect(node) {
-    if (!node || node.hidden || node.closest?.('[hidden], [inert], [aria-hidden="true"]')) return null;
+  function visibleHudRect(node, includeAriaHiddenSpacer = false) {
+    if (!node || node.hidden || node.closest?.('[hidden], [inert]') ||
+        (includeAriaHiddenSpacer ? node.parentElement : node)?.closest?.('[aria-hidden="true"]')) return null;
     const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 ? rect : null;
+    if (!(rect.width > 0 && rect.height > 0)) return null;
+    if (!includeAriaHiddenSpacer && typeof getComputedStyle === "function" && /^(hidden|collapse)$/.test(getComputedStyle(node).visibility)) return null;
+    return rect;
+  }
+
+  function measureHudTitleRect(title) {
+    const rect = visibleHudRect(title);
+    if (!rect || title.closest?.('button, [role="button"]') || title.tagName === "INPUT") return rect;
+    const textRects = [];
+    try {
+      const range = document.createRange();
+      const walker = document.createTreeWalker(title, 4); // NodeFilter.SHOW_TEXT
+      for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+        if (!text.data.trim() || text.parentElement?.closest('[hidden], [aria-hidden="true"]')) continue;
+        range.selectNodeContents(text);
+        textRects.push(...range.getClientRects());
+      }
+    } catch {}
+    let content = textRects.filter((part) => part.width > 0 && part.height > 0);
+    if (!content.length) {
+      content = [...(title.querySelectorAll?.("span, b, em, i, strong") || [])]
+        .map((node) => visibleHudRect(node)).filter(Boolean);
+    }
+    if (!content.length) return rect;
+    const left = Math.max(rect.left, Math.min(...content.map((part) => part.left)));
+    const right = Math.min(rect.right, Math.max(...content.map((part) => part.right)));
+    return right > left ? { top: rect.top, bottom: rect.bottom, height: rect.height, left, right, width: right - left } : rect;
   }
 
   function placeHudElement(element, layout) {
@@ -3398,7 +3455,6 @@
     element.style.left = `${Math.round(layout.left)}px`;
     element.style.top = `${Math.round(layout.top)}px`;
     element.style.right = "auto";
-    if (element === topbar) element.style.maxWidth = `${Math.max(0, Math.floor(layout.width))}px`;
   }
 
   function measureHudHeaderWidths() {
@@ -3422,16 +3478,59 @@
     return {
       headerFullWidth: full > 0 ? Math.ceil(full + ringSpace) + 2 : Infinity,
       headerCompactWidth: compact > 0 ? Math.ceil(compact + ringSpace) + 2 : Infinity,
+      headerCompactGitWidth: compact > 0 ? Math.ceil(compact) + 2 : Infinity,
+      ringCount: count,
     };
   }
 
   function findHudLayoutAnchors(header, composer, footer) {
     // T3 v0.1.11 translates the control labels. The icon and chevron survive a language change.
-    const title = header?.querySelector("[data-thread-title-chevron]")?.closest('button[aria-haspopup="menu"]') ||
+    const title = header?.querySelector('input[aria-label="Thread title"]') ||
+      header?.querySelector("input.min-w-0.flex-1") ||
+      header?.querySelector("[data-thread-title-chevron]")?.closest('button[aria-haspopup="menu"]') ||
       header?.querySelector('[aria-label^="Thread actions for"], h1, h2');
     const attach = (footer || composer)?.querySelector("svg.lucide-paperclip")?.closest("button") ||
       composer?.querySelector('button[aria-label="Attach files"]');
     return { title, attach };
+  }
+
+  function collectHudLayoutObstacles(container, selector, row, excluded, spacerSelector) {
+    if (!row) return [];
+    return [...(container?.querySelectorAll(selector) || [])]
+      .filter((node) => !excluded.some((anchor) => anchor && (node.contains(anchor) || anchor.contains(node))))
+      .map((node) => visibleHudRect(node, spacerSelector && node.matches(spacerSelector)))
+      .filter((rect) => rect && rect.top < row.bottom && rect.bottom > row.top);
+  }
+
+  function fitHudStatsBar(element, layout) {
+    if (!layout) return null;
+    const available = layout.left + layout.width - Math.round(layout.left);
+    const metrics = ["cache", "tokens", "cost"].map((key) => element.querySelector(`[data-hud-metric="${key}"]`));
+    const hide = (metric, hidden) => {
+      metric.classList.toggle("is-overflow-hidden", hidden);
+      metric.previousElementSibling?.classList.toggle("is-overflow-hidden", hidden);
+    };
+    element.classList.remove("is-hidden", "is-tight", "is-mini");
+    for (const metric of metrics) hide(metric, false);
+    const fits = () => element.getBoundingClientRect().width <= available;
+    if (fits()) return layout;
+    element.classList.add("is-tight");
+    if (fits()) return layout;
+    element.classList.add("is-mini");
+    if (fits()) return layout;
+    for (const metric of metrics) {
+      hide(metric, true);
+      if (fits()) return layout;
+    }
+    return null;
+  }
+
+  function fitHudQuotaRings(rings, maxVisibleRings) {
+    const ordered = [...rings.children];
+    const active = ordered.filter((button) => button.hasAttribute("data-hud-quota-active"))
+      .sort((a, b) => Number(b.hasAttribute("data-hud-quota-primary")) - Number(a.hasAttribute("data-hud-quota-primary")));
+    const visible = new Set([...active, ...ordered.filter((button) => !active.includes(button))].slice(0, maxVisibleRings));
+    for (const button of ordered) button.classList.toggle("is-overflow-hidden", !visible.has(button));
   }
 
   // Anchor to the native title/composer controls without altering them.
@@ -3457,21 +3556,24 @@
     const model = composer?.querySelector('[data-chat-provider-model-picker]');
     const footer = composer?.querySelector('[data-chat-composer-footer="true"]');
     const { title, attach } = findHudLayoutAnchors(header, composer, footer);
-    const hRect = visibleHudRect(header), titleRect = visibleHudRect(title);
+    const hRect = visibleHudRect(header), titleRect = measureHudTitleRect(title);
     const modelRect = visibleHudRect(model), attachRect = visibleHudRect(attach);
-    const headerObstacles = [...(header?.querySelectorAll('button, [role="button"]') || [])]
-      .filter((el) => el !== title && !el.contains(title) && !title?.contains(el)).map(visibleHudRect).filter(Boolean);
-    const footerObstacles = [...(footer?.querySelectorAll('button, [role="button"]') || [])]
-      .filter((el) => el !== attach && el !== model && !el.contains(attach) && !el.contains(model) && !attach?.contains(el) && !model?.contains(el))
-      .map(visibleHudRect).filter((r) => r && modelRect && r.top < modelRect.bottom && r.bottom > modelRect.top);
+    const headerSpacer = ':scope > span[aria-hidden="true"]';
+    const headerObstacles = collectHudLayoutObstacles(header, `button, [role="button"], ${headerSpacer}`, hRect, [title], 'span[aria-hidden="true"]');
+    const footerObstacles = collectHudLayoutObstacles(footer,
+      'button, [role="button"], [data-resting-block], [data-resting-controls-separator], [data-resting-controls-overflow]',
+      modelRect, [attach, model]);
     const layout = calculateHudLayout({ header: hRect, title: titleRect, headerObstacles, attach: attachRect, model: modelRect, footerObstacles, viewportWidth: window.innerWidth, ...measureHudHeaderWidths() });
     headerTools.classList.toggle("is-compact", !!layout.header?.compact);
-    topbar.classList.toggle("is-tight", !!layout.stats && layout.stats.width < 360);
-    topbar.classList.toggle("is-mini", !!layout.stats && layout.stats.width < 240);
+    headerTools.classList.toggle("is-quota-only", !!layout.header?.quotaOnly);
+    const visibleRings = layout.header?.maxVisibleRings || 0;
+    headerTools.classList.toggle("has-no-rings", visibleRings === 0);
+    fitHudQuotaRings(quotaRings, visibleRings);
+    const statsLayout = fitHudStatsBar(topbar, layout.stats);
     placeHudElement(headerTools, layout.header);
     placeHudElement(contextControl, layout.context);
-    placeHudElement(topbar, layout.stats);
-    lastLayoutState.hidden = !layout.stats;
+    placeHudElement(topbar, statsLayout);
+    lastLayoutState.hidden = !statsLayout;
   }
 
   // Draggable floating drawer support
@@ -3522,31 +3624,70 @@
     let contextWindow = null;
     let selectedModel = null;
     let selectedProvider = null;
+    let environmentId = null;
     try {
+      // Keep the raw draft ID even though the telemetry route collapses
+      // unpromoted drafts to __NEW__. Only this draft can supply its environment.
+      const location = typeof window !== "undefined" ? window.location : null;
+      const raw = (typeof getRouterPathname === "function" ? getRouterPathname(findTanStackRouter()) : "") ||
+        location?.hash?.replace(/^#/, "") || location?.pathname || "";
+      const parts = raw.split(/[?#]/, 1)[0].split("/").filter(Boolean);
+      const scoped = parts[0] === "_t3_env_" && (parts.length === 3 || (parts.length === 4 && parts[2] === "draft"));
+      if (parts[0] === "_t3_env_" && !scoped) return { usage, contextWindow, selectedModel, selectedProvider, environmentId };
+      const native = parts.length === 2 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(parts[0]);
+      const routeEnv = scoped || native ? decodeURIComponent(parts[scoped ? 1 : 0]) : "";
+      const routeParts = scoped ? parts.slice(2) : parts;
+      const isDraft = routeParts[0]?.toLowerCase() === "draft";
+      const draftId = isDraft && routeParts[1] ? decodeURIComponent(routeParts[1]) : "";
+      const isLauncher = Boolean(raw) && (!parts.length || (/^new$/i.test(parts[0]) && parts.length === 1));
+      const threadId = isDraft || isLauncher ? "" : scoped || native ? decodeURIComponent(parts.at(-1)) :
+        parts.length === 1 && typeof extractLastThreadIdFromHint === "function" ? extractLastThreadIdFromHint(raw) : "";
+      const explicitDraft = scoped && isDraft;
+      let needsOwner = Boolean(routeEnv || isDraft || isLauncher || threadId);
+      environmentId = routeEnv || (isDraft || isLauncher ? null : "");
+      const header = document.querySelector?.("header[data-chat-header]");
       const rootEl = document.getElementById("root");
-      if (!rootEl) return { usage, contextWindow, selectedModel, selectedProvider };
+      if (!rootEl) return { usage, contextWindow, selectedModel, selectedProvider, environmentId };
       const fk = Object.keys(rootEl).find(
         (k) => k.startsWith("__reactContainer") || k.startsWith("__reactFiber")
       );
-      if (!fk) return { usage, contextWindow, selectedModel, selectedProvider };
-      const stack = [rootEl[fk]];
-      let visited = 0;
-      while (stack.length && visited < 20000) {
+      if (!fk) return { usage, contextWindow, selectedModel, selectedProvider, environmentId };
+      let entry = rootEl[fk];
+      const ancestors = new Set();
+      while (entry?.return && !entry.stateNode?.current && ancestors.size < 400 && !ancestors.has(entry)) {
+        ancestors.add(entry);
+        entry = entry.return;
+      }
+      if (entry?.return && !entry.stateNode?.current) return { usage, contextWindow, selectedModel, selectedProvider, environmentId };
+      const stack = [entry?.stateNode?.current || entry?.current || entry];
+      const seen = new Set();
+      while (stack.length && seen.size < 20000) {
         const f = stack.pop();
-        if (!f) continue;
-        visited++;
+        if (!f || seen.has(f)) continue;
+        seen.add(f);
         const p = f.memoizedProps;
         if (p) {
-          if (!usage && p.usage && Array.isArray(p.usage.providers)) {
+          const scopeMatches = threadId ? p.isServerThread === true && p.threadId === threadId :
+            draftId ? p.draftId === draftId :
+            explicitDraft || isLauncher ? p.isServerThread === false : !isDraft;
+          const ownerMatches = (!routeEnv || p.environmentId === routeEnv) &&
+            scopeMatches && (!header || !p.anchor || p.anchor.current === header);
+          if (!usage && ownerMatches && typeof p.isServerThread === "boolean") {
+            environmentId = routeEnv || (typeof p.environmentId === "string" ? p.environmentId : "");
+            needsOwner = false;
+          }
+          if (!usage && ownerMatches && p.usage && !needsOwner &&
+              (Array.isArray(p.usage.providers) || Array.isArray(p.usage.sources) || Array.isArray(p.usage.usageLimitSources))) {
             usage = p.usage;
           }
-          if (!contextWindow && p.contextWindow && typeof p.contextWindow.usedTokens === "number") {
+          const matchesSelection = p.isServerThread === undefined || ownerMatches;
+          if (!contextWindow && matchesSelection && typeof p.contextWindow?.usedTokens === "number") {
             contextWindow = p.contextWindow;
           }
-          if (!selectedModel && typeof p.selectedModel === "string") {
+          if (!selectedModel && matchesSelection && typeof p.selectedModel === "string") {
             selectedModel = p.selectedModel;
             selectedProvider = p.selectedProvider || selectedProvider;
-          } else if (!selectedModel && p.modelSelection && typeof p.modelSelection.model === "string") {
+          } else if (!selectedModel && matchesSelection && typeof p.modelSelection?.model === "string") {
             selectedModel = p.modelSelection.model;
             selectedProvider = p.modelSelection.instanceId || p.modelSelection.provider || selectedProvider;
           }
@@ -3555,11 +3696,24 @@
         if (f.child) stack.push(f.child);
         if (f.sibling) stack.push(f.sibling);
       }
+      if (needsOwner) {
+        selectedModel = null;
+        selectedProvider = null;
+        contextWindow = null;
+      }
+      // A promoted draft can keep its raw URL after its draft Fiber unmounts.
+      // Recover only the environment proven by that draft's promotion.
+      if (environmentId === null && draftId && typeof getRouteHint === "function") {
+        const promotedEnv = /^\/_t3_env_\/([^/]+)\/[^/]+$/.exec(getRouteHint())?.[1];
+        if (promotedEnv) environmentId = decodeURIComponent(promotedEnv);
+      }
+      selectedModel ||= typeof usage?.model === "string" ? usage.model : null;
+      selectedProvider ||= typeof usage?.providerInstanceId === "string" ? usage.providerInstanceId : null;
     } catch {}
     finally {
       if (typeof refreshStats === "function") refreshStats._observeSelection?.({ selectedProvider, selectedModel });
     }
-    return { usage, contextWindow, selectedModel, selectedProvider };
+    return { usage, contextWindow, selectedModel, selectedProvider, environmentId };
   }
 
   function formatResetShort(isoStr) {
@@ -3668,8 +3822,135 @@
     }) || null;
   }
 
+  function mergeUsageLimitProviders(providers, sources, externalProviders = []) {
+    const providerKey = (provider) => String(provider?.instanceId || provider?.providerInstanceId || provider?.driver || "").toLowerCase();
+    const driverKey = (provider) => String(provider?.driver || "").toLowerCase();
+    const timestamp = (value) => value == null ? null : toEpochMs(value);
+    const agyPool = (text) => /claude|gpt|3p/i.test(text) ? "Claude" : /gemini/i.test(text) ? "Gemini" : "";
+    const windowKey = (window, pool) => {
+      const duration = window.windowDurationMins;
+      let id = String(window.id || window.label || window.kind || "").trim().toLowerCase();
+      if (pool) id = id.replace(/^(?:gemini|gem|claude|gpt|3p)[\s_-]+/, "");
+      id = id.replace(/[\s_-]+/g, "");
+      if (/^(?:wk|week|weekly)$/.test(id)) id = "weekly";
+      if (/^(?:5h|5hour|fivehour)$/.test(id) || (id === "session" && duration === 300)) id = "5h";
+      const standardDuration = id === "5h" ? 300 : id === "weekly" || window.kind === "weekly" ? 10080 : null;
+      return JSON.stringify([pool, id, duration === standardDuration ? null : duration ?? null]);
+    };
+    const byInstance = new Map();
+    const add = (provider, accountPool = "") => {
+      const key = providerKey(provider);
+      if (!key) return;
+      const windows = Array.isArray(provider.usageLimits?.windows) ? provider.usageLimits.windows.filter((window) =>
+        Number.isFinite(window?.usedPercent) && window.usedPercent >= 0 && window.usedPercent <= 100) : [];
+      const checkedAt = timestamp(provider.usageLimits?.checkedAt ?? provider.checkedAt) ?? 0;
+      const entry = byInstance.get(key) || { windows: new Map() };
+      if (!entry.provider || (windows.length && (!entry.windows.size || checkedAt > entry.checkedAt))) {
+        const instanceId = provider.instanceId || provider.providerInstanceId || entry.provider?.instanceId || provider.driver;
+        entry.provider = { ...entry.provider, ...provider, instanceId };
+        entry.checkedAt = checkedAt;
+      }
+      byInstance.set(key, entry);
+
+      const isAgy = driverKey(entry.provider) === "antigravity";
+      for (const window of windows) {
+        const windowPool = isAgy ? agyPool(`${window.id || ""} ${window.label || ""}`) : "";
+        const pool = windowPool || accountPool;
+        const id = windowKey(window, pool || (isAgy ? "Gemini" : ""));
+        const previous = entry.windows.get(id);
+        const sampleTime = timestamp(window.checkedAt) ?? checkedAt;
+        if (previous && sampleTime <= previous.checkedAt) continue;
+
+        let sample = window;
+        if (!windowPool && accountPool) {
+          sample = { ...sample, label: `${accountPool} · ${window.label || window.id || window.kind || "Quota"}` };
+        }
+        const priorDuration = previous?.window.windowDurationMins;
+        if (sample.windowDurationMins == null && priorDuration != null) {
+          sample = { ...sample, windowDurationMins: priorDuration };
+        }
+        entry.windows.set(id, { window: sample, checkedAt: sampleTime });
+      }
+    };
+    for (const provider of providers) add(provider);
+    const addAccount = (account, usageLimits, source) => {
+      if (!Array.isArray(usageLimits?.windows) || !usageLimits.windows.length) return;
+      const instanceId = account.providerInstanceId || account.instanceId;
+      const driver = driverKey(account);
+      const existing = byInstance.get(String(instanceId || account.id || "").toLowerCase())?.provider ||
+        (!instanceId && driver ? [...byInstance.values()].find((entry) => driverKey(entry.provider) === driver)?.provider : null);
+      const resolvedDriver = existing?.driver || account.driver || instanceId;
+      const accountPool = String(resolvedDriver || "").toLowerCase() === "antigravity" ?
+        agyPool(account.label || "") || agyPool(account.id || "") : "";
+      add({
+        instanceId: instanceId || existing?.instanceId || driver || account.id,
+        driver: resolvedDriver,
+        displayName: existing?.displayName || account.displayName || (accountPool ? undefined : account.label),
+        usageLimits: { ...usageLimits, checkedAt: usageLimits.checkedAt ?? account.checkedAt ?? source.checkedAt },
+      }, accountPool);
+    };
+    for (const source of sources) {
+      if (!source) continue;
+      if (source.kind === "http" && Array.isArray(source.quotaAccounts)) {
+        for (const account of source.quotaAccounts) {
+          if (account) addAccount(account, { windows: account.windows }, source);
+        }
+      }
+      if (Array.isArray(source.accounts)) {
+        for (const account of source.accounts) {
+          if (account) addAccount(account, account.usageLimits, source);
+        }
+      }
+    }
+    for (const provider of externalProviders) {
+      const key = providerKey(provider);
+      if (!key || [...byInstance].some(([id, entry]) => entry.windows.size &&
+          (id === key || (key.includes("devin") && id.includes("devin"))))) continue;
+      add(provider);
+    }
+    return [...byInstance.values()].filter((entry) => entry.windows.size).map(({ provider, windows }) => ({
+      ...provider,
+      usageLimits: { ...provider.usageLimits, windows: [...windows.values()].map((sample) => sample.window) },
+    }));
+  }
+
+  const hudQuotaSnapshots = new Map();
+  const HUD_QUOTA_SNAPSHOT_TTL_MS = 30 * 60_000;
+
+  function hudUsageSources(usage) {
+    if (Array.isArray(usage?.sources) && usage.sources.length) return usage.sources;
+    return Array.isArray(usage?.usageLimitSources) ? usage.usageLimitSources : [];
+  }
+
+  function readHudQuotaProviders(usage, environmentId, localEnvironmentId, externalProviders, now = Date.now()) {
+    if (environmentId === null) return [];
+    const providers = Array.isArray(usage?.providers) ? usage.providers : [];
+    const sources = hudUsageSources(usage);
+    // Legacy usage without a reported environment can render its current
+    // observations; only an explicit environment key can use the cache.
+    if (environmentId === undefined) return mergeUsageLimitProviders(providers, sources, externalProviders);
+    const local = !environmentId || environmentId === localEnvironmentId;
+    const key = environmentId || localEnvironmentId || "";
+    for (const [id, snapshot] of hudQuotaSnapshots) {
+      if (now - snapshot.observedAt >= HUD_QUOTA_SNAPSHOT_TTL_MS) hudQuotaSnapshots.delete(id);
+    }
+    // A verified local UUID and a legacy unscoped local route use one bucket.
+    const unscoped = hudQuotaSnapshots.get("");
+    if (localEnvironmentId && unscoped) {
+      const scoped = hudQuotaSnapshots.get(localEnvironmentId);
+      if (!scoped || unscoped.observedAt > scoped.observedAt) hudQuotaSnapshots.set(localEnvironmentId, unscoped);
+      hudQuotaSnapshots.delete("");
+    }
+    // Only remember native data here. External quota belongs to the local host
+    // and follows its existing refresh policy independently of the chat.
+    const merged = mergeUsageLimitProviders(providers, sources);
+    if (merged.length) hudQuotaSnapshots.set(key, { observedAt: now, providers: merged });
+    const current = merged.length ? merged : hudQuotaSnapshots.get(key)?.providers || [];
+    return local && externalProviders.length ? mergeUsageLimitProviders(current, [], externalProviders) : current;
+  }
+
   function computeQuotaAndContext(stats) {
-    const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider } = readLiveT3State();
+    const { usage: live, contextWindow: liveCtx, selectedModel, selectedProvider, environmentId } = readLiveT3State();
     const rawLiveContext = live?.contextWindow ?? liveCtx ?? null;
     const activeProviderRaw = (
       selectedProvider ||
@@ -3686,7 +3967,7 @@
       (live?.contextWindow ? String(live?.providerInstanceId || live?.provider || "").toLowerCase() : "") ||
       ""
     );
-    const liveCtxMatches = !activeProviderRaw || (liveCtxProvider
+    const liveCtxMatches = !activeProviderRaw || rawLiveCtxInst === activeProviderRaw || (liveCtxProvider
       ? (liveCtxProvider === activeProviderRaw ||
          (liveCtxProvider === "acpregistry" && activeProviderRaw.startsWith("acpregistry_")) ||
          (activeProviderRaw === "acpregistry" && liveCtxProvider.startsWith("acpregistry_")))
@@ -3734,17 +4015,9 @@
     }
 
     const extProviders = typeof externalQuotaProviders !== "undefined" && Array.isArray(externalQuotaProviders) ? externalQuotaProviders : [];
-    const baseProviders = live && Array.isArray(live.providers) ? live.providers : [];
-    const mergedProviders = [...baseProviders];
-    for (const ep of extProviders) {
-      if (!ep?.usageLimits?.windows?.length) continue;
-      const epId = String(ep.instanceId || ep.driver || "").toLowerCase();
-      const alreadyHas = baseProviders.some((bp) => {
-        const bpId = String(bp.instanceId || bp.driver || "").toLowerCase();
-        return (bpId === epId || (epId.includes("devin") && bpId.includes("devin"))) && bp.usageLimits?.windows?.length;
-      });
-      if (!alreadyHas) mergedProviders.push(ep);
-    }
+    const localEnvironmentId = typeof hudLocalQuotaEnvironmentId === "string" ? hudLocalQuotaEnvironmentId : "";
+    const mergedProviders = typeof readHudQuotaProviders === "function" ?
+      readHudQuotaProviders(live, environmentId, localEnvironmentId, extProviders) : [];
 
     if (!mergedProviders.length) {
       return {
@@ -3778,7 +4051,7 @@
       const reset = formatResetShort(w.resetsAt);
       const rawLbl = String(w.label || w.id || "Quota").replace(" (shared)", "");
       const burnInfo = typeof recordQuotaBurnEstimate === "function" && burnScope
-        ? recordQuotaBurnEstimate(`${burnScope}:${w.id || rawLbl}`, w.usedPercent)
+        ? recordQuotaBurnEstimate(`${burnScope}:${w.id || ""}:${rawLbl}`, w.usedPercent)
         : { burnShort: null, justReset: false };
       return {
         id: String(w.id || ""),
@@ -3793,19 +4066,20 @@
       };
     };
 
-    const activeScopeKey = activeProv ? String(activeProv.instanceId || activeProv.driver || "active").toLowerCase() : "";
+    const quotaEnvironment = environmentId || localEnvironmentId;
+    const activeScopeKey = activeProv ? `${quotaEnvironment}:${String(activeProv.instanceId || activeProv.driver || "active").toLowerCase()}` : "";
     const currentWindows = (activeProv?.usageLimits?.windows || []).map((w) => toWinItem(w, "", activeScopeKey)).filter(Boolean);
 
     const isWeeklyWindow = (w) => w.kind === "weekly" || /weekly|周/i.test(String(w.label || ""));
     const isAgyClaudeWindow = (w) => /claude|gpt|3p/i.test(String(w.label || "")) || /claude|gpt|3p/i.test(String(w.id || ""));
     const isAgyGeminiWindow = (w) => /gemini/i.test(String(w.label || "")) || /gemini/i.test(String(w.id || ""));
 
+    const isThirdPartyModel = /opus|sonnet|haiku|claude|gpt|o1\b|o3\b|o4\b/i.test(activeModelRaw);
     let primaryWeekly = null;
     const weeklyCandidates = currentWindows.filter(isWeeklyWindow);
     if (weeklyCandidates.length === 1) {
       primaryWeekly = weeklyCandidates[0];
     } else if (weeklyCandidates.length > 1) {
-      const isThirdPartyModel = /opus|sonnet|haiku|claude|gpt|o1\b|o3\b|o4\b/i.test(activeModelRaw);
       if (isThirdPartyModel) {
         primaryWeekly = weeklyCandidates.find(isAgyClaudeWindow) || weeklyCandidates[0];
       } else {
@@ -3815,6 +4089,7 @@
 
     const otherWindows = [];
     const providerQuotas = [];
+    let activeQuotaRingId = "";
     const provDisplayName = {
       muse: "Muse",
       codex: "Codex",
@@ -3849,7 +4124,7 @@
       const driver = String(p.driver || p.instanceId || "").toLowerCase();
       const pName = typeof p.displayName === "string" && p.displayName.trim() ? p.displayName.trim() : resolveDisplayName(instanceId, driver);
       const logoKey = resolveLogoKey(instanceId, driver);
-      const scopeKey = instanceId.toLowerCase() || driver;
+      const scopeKey = `${quotaEnvironment}:${instanceId.toLowerCase() || driver}`;
       const windows = p === activeProv ? currentWindows : p.usageLimits.windows.map((w) => toWinItem(w, "", scopeKey)).filter(Boolean);
       if (driver === "antigravity") {
         const claudePool = windows.filter(isAgyClaudeWindow);
@@ -3880,6 +4155,10 @@
             fiveHour: claudeFive,
           });
         }
+        if (p === activeProv) {
+          const activeRings = providerQuotas.filter((quota) => quota.providerInstanceId === instanceId);
+          activeQuotaRingId = (isThirdPartyModel ? activeRings.at(-1) : activeRings[0])?.instanceId || "";
+        }
       } else {
         let weekly = p === activeProv ? primaryWeekly : windows.find(isWeeklyWindow) || null;
         let fiveHour = selectHudFiveHourWindow(windows);
@@ -3896,7 +4175,10 @@
           weekly = budgetWindows[0] || null;
           fiveHour = budgetWindows[1] || null;
         }
-        if (weekly || fiveHour) providerQuotas.push({ instanceId, driver, logoKey, name: pName, weekly, fiveHour });
+        if (weekly || fiveHour) {
+          providerQuotas.push({ instanceId, driver, logoKey, name: pName, weekly, fiveHour });
+          if (p === activeProv) activeQuotaRingId = instanceId;
+        }
       }
       if (p !== activeProv) {
         for (const w of p.usageLimits.windows) {
@@ -3910,6 +4192,7 @@
       primaryWeekly,
       primaryFiveHour: selectHudFiveHourWindow(currentWindows),
       providerQuotas,
+      activeQuotaRingId,
       currentWindows,
       otherWindows,
       ctxUsed,
@@ -4484,17 +4767,25 @@
   }
 
   let lastQuotaRingsSig = "";
-  function renderQuotaRing(providers) {
+  function renderQuotaRing(providers, activeQuotaRingId) {
     const signature = JSON.stringify([hudLang, providers]);
-    if (signature === lastQuotaRingsSig) return;
-    lastQuotaRingsSig = signature;
-    const activeButton = document.activeElement?.closest?.(".t3-hud-quota-ring");
-    const activeProvider = activeButton && quotaRings.contains(activeButton) ? activeButton.getAttribute("data-hud-provider") : null;
-    quotaRings.innerHTML = providers.map(hudQuotaRingMarkup).join("");
-    if (activeProvider != null) {
-      const replacement = [...quotaRings.querySelectorAll(".t3-hud-quota-ring")].find((button) => button.getAttribute("data-hud-provider") === activeProvider);
-      try { replacement?.focus({ preventScroll: true }); } catch { replacement?.focus(); }
+    if (signature !== lastQuotaRingsSig) {
+      lastQuotaRingsSig = signature;
+      const activeButton = document.activeElement?.closest?.(".t3-hud-quota-ring");
+      const activeProvider = activeButton && quotaRings.contains(activeButton) ? activeButton.getAttribute("data-hud-provider") : null;
+      quotaRings.innerHTML = providers.map(hudQuotaRingMarkup).join("");
+      if (activeProvider != null) {
+        const replacement = [...quotaRings.children].find((button) => button.getAttribute("data-hud-provider") === activeProvider);
+        try { replacement?.focus({ preventScroll: true }); } catch { replacement?.focus(); }
+      }
     }
+    const primary = providers.find((provider) => provider.instanceId === activeQuotaRingId);
+    const activeProvider = primary?.providerInstanceId || primary?.instanceId;
+    [...quotaRings.children].forEach((button, index) => {
+      const provider = providers[index];
+      button.toggleAttribute("data-hud-quota-active", (provider.providerInstanceId || provider.instanceId) === activeProvider);
+      button.toggleAttribute("data-hud-quota-primary", provider === primary);
+    });
   }
 
   let lastTopbarSig = "";
@@ -4554,7 +4845,7 @@
     }
     const qInfo = computeQuotaAndContext(stats);
     const sessionSpeed = resolveHudSessionSpeed(sessionSpeedState, stats, currentPathHint);
-    renderQuotaRing(qInfo.providerQuotas);
+    renderQuotaRing(qInfo.providerQuotas, qInfo.activeQuotaRingId);
     refreshExternalQuotas();
 
     let nextDotClass;
@@ -4573,7 +4864,7 @@
     let hideDirty = false;
     const speedLabel = sessionSpeed.kind === "average" ? (hudLang === "zh" ? "均速 " : "Avg ") :
       sessionSpeed.kind === "last" ? (hudLang === "zh" ? "末轮 " : "Last ") : "";
-    nextSpeed = sessionSpeed.value == null ? "-- tok/s" : `${speedLabel}${sessionSpeed.value.toFixed(1)} tok/s`;
+    nextSpeed = sessionSpeed.value == null ? "-- tok/s" : `${sessionSpeed.value.toFixed(1)} tok/s`;
 
     if (!stats || !stats.ok) {
       nextDotClass = "t3-hud-dot";
@@ -4599,11 +4890,12 @@
       nextCost = `${formatUsd(totalUsd)}${subSuffix}`;
     }
 
-    const sig = `${nextDotClass}|${nextSpeed}|${nextCacheLabel}|${nextCache}|${nextCacheTitle}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
+    const sig = `${nextDotClass}|${speedLabel}${nextSpeed}|${nextCacheLabel}|${nextCache}|${nextCacheTitle}|${nextCacheColor}|${nextTokens}|${nextCost}|${nextCtxTxt}|${nextRingOffset}|${nextRingColor}|${nextBranch}|${hideDirty}|${hudLang}`;
     if (sig !== lastTopbarSig) {
       lastTopbarSig = sig;
       dotEl.className = nextDotClass;
       speedEl.textContent = nextSpeed;
+      speedLabelEl.textContent = sessionSpeed.value == null ? "" : speedLabel;
       speedEl.style.color = "var(--hud-fg)";
       cacheLblEl.textContent = nextCacheLabel;
       cacheEl.textContent = nextCache;
@@ -5324,6 +5616,7 @@
 
   let lastPickerSig = "";
   let lastPickerModelSig = "";
+  let lastQuotaInput = null;
   const stopSelectionObservers = installHudSelectionObservers();
   const routeWatchTimer = setInterval(() => {
     if (document.hidden) return;
@@ -5339,7 +5632,10 @@
     refreshStats._observeSelection?.(live);
     const mSig = `${live.selectedProvider || ""}:${live.selectedModel || ""}`;
     const pSig = `${mSig}:${live.usage?.contextWindow?.usedTokens ?? ""}`;
-    if (pSig !== lastPickerSig) {
+    const quotaInput = [live.environmentId, live.usage?.providers, live.usage?.sources, live.usage?.usageLimitSources];
+    const quotaChanged = !lastQuotaInput || quotaInput.some((value, index) => value !== lastQuotaInput[index]);
+    lastQuotaInput = quotaInput;
+    if (pSig !== lastPickerSig || quotaChanged) {
       const pickerChanged = mSig !== lastPickerModelSig;
       lastPickerSig = pSig;
       lastPickerModelSig = mSig;
