@@ -3750,6 +3750,15 @@ function projectMemoryPayload(payload) {
   return { ...payload, projectRoot: root, includeGlobal: false };
 }
 
+function readHudLocalEnvironmentId() {
+  try {
+    const activeUserdata = process.env.T3CODE_HOME ? path.resolve(process.env.T3CODE_HOME) : T3_USERDATA;
+    const id = fs.readFileSync(path.join(activeUserdata, "environment-id"), "utf8").trim();
+    if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) return id;
+  } catch {}
+  return null;
+}
+
 async function hubCall(action, payload = {}) {
   try {
     if (PROJECT_MEMORY_ACTIONS.has(action)) payload = projectMemoryPayload(payload);
@@ -4151,17 +4160,9 @@ async function hubCall(action, payload = {}) {
         const devin = await getDevinQuotaReader().readDevinQuota({ force: payload?.force === true });
         const providers = [];
         if (devin?.available && devin.provider) providers.push(devin.provider);
-        return { ok: true, providers };
+        return { ok: true, providers, t3EnvironmentId: readHudLocalEnvironmentId() };
       }
-      case "settings:get": {
-        let t3EnvironmentId = null;
-        try {
-          const activeUserdata = process.env.T3CODE_HOME ? path.resolve(process.env.T3CODE_HOME) : T3_USERDATA;
-          const id = fs.readFileSync(path.join(activeUserdata, "environment-id"), "utf8").trim();
-          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) t3EnvironmentId = id;
-        } catch {}
-        return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId };
-      }
+      case "settings:get": return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId: readHudLocalEnvironmentId() };
       case "settings:update": return getHostSettingsManager().updateHostSetting(payload);
       case "settings:officialTelemetry:get":
       case "settings:officialTelemetry:update": {

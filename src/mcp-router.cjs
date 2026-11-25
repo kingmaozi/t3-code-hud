@@ -5,6 +5,39 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 
+const PLAN_UPDATE_TOOL = {
+  name: "plan_update",
+  description: "Update or clear the live T3 Hub checklist. Pass the current threadId explicitly when available so the changes appear immediately in that thread's header.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      background: { type: "string" },
+      steps: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: { type: "string" }, text: { type: "string" }, status: { type: "string" } },
+          required: ["text", "status"],
+        },
+      },
+      clear: { type: "boolean" },
+      projectRoot: { type: "string" },
+      threadId: { type: "string", description: "The current thread ID. Defaults to T3_THREAD_ID if the host supplies it." },
+    },
+  },
+};
+
+function handlePlanUpdate(args, board, resolveProjectRoot) {
+  const scope = {
+    threadId: args.threadId || process.env.T3_THREAD_ID || undefined,
+    projectRoot: args.projectRoot || resolveProjectRoot(),
+  };
+  if (args.clear === true) return board.clearPlan(scope);
+  if (!Array.isArray(args.steps)) throw new Error("steps array required");
+  return board.updatePlan({ ...scope, title: args.title || "", background: args.background || "", steps: args.steps });
+}
+
 function safeMkdir(dir) { fs.mkdirSync(dir, { recursive: true }); }
 function readJsonFile(file, fallback) { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } }
 function writeJsonFile(file, obj) {
@@ -2110,6 +2143,7 @@ function listServers(args) { return getDefaultMcpRouter().listServers(args || {}
 function toggleServerForAgent(args) { return getDefaultMcpRouter().toggleServerForAgent(args || {}); }
 function setServerAgents(args) { return getDefaultMcpRouter().setServerAgents(args || {}); }
 module.exports = {
+  PLAN_UPDATE_TOOL, handlePlanUpdate,
   createMcpRouter, redactSummary, redactArgs, redactUrl, ALLOWED_MODES, BUILTIN_UPSTREAM_MCPS, probeMcpServers, autoSyncHosts,
   listMcpServers, listServers, getAgentMatrix, toggleServerForAgent, setServerAgents, setMcpMode, setServerMode, upsertMcpServer, removeMcpServer, syncRouterToClis,
   discoverServerDefinitions, getDefaultMcpRouter, parseTomlTableHeader, CANONICAL_HOSTS, normalizeAgentHost,
