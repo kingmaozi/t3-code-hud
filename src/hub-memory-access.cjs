@@ -9,6 +9,27 @@ const mcpRouter = require("./mcp-router.cjs");
 
 const CONFIG_VERSION = 1;
 const ACCESS_FILE = "memory-access.json";
+const RUNTIME_HINTS_FILE = "t3-runtime-hints.json";
+const RUNTIME_HINTS_SCOPE = "t3-code-only";
+const RUNTIME_HINTS_MAX_LENGTH = 2000;
+const RUNTIME_HINTS_MAX_BYTES = 32 * 1024;
+const RUNTIME_HINTS_LOCK_FILE = ".t3-runtime-hints.lock.sqlite";
+const RUNTIME_HINTS_LOCK_TIMEOUT_MS = 3000;
+const RUNTIME_HINTS_STRICT_READ = Object.freeze({ rejectUnsafeMode: true, strictUtf8: true });
+const RUNTIME_HINTS_TRUNCATED_TOOLS = Object.freeze([
+  "delegate_task",
+  "html_render",
+  "t3_thread_launch",
+  "schedule_task",
+  "t3_project_update",
+]);
+const DEFAULT_T3_RUNTIME_HINTS = Object.freeze({
+  version: CONFIG_VERSION,
+  enabled: true,
+  scope: RUNTIME_HINTS_SCOPE,
+  planUpdateHint: "仅 T3 Code 顶层主会话执行 >=3 步复杂多步任务时，开干前及关键阶段变化时顺手调一次 plan_update(title, steps:[{text,status}])（status 用 pending|in_progress|completed）点亮顶栏蓝环进度；简单问答、<=2 步小活及所有子代理不调。",
+  acp48kFallbackHint: "若 antigravity-acp 因 48KiB 上限截断 t3-code 原生工具（delegate_task / html_render / t3_thread_launch / schedule_task / t3_project_update），必须以单条直连命令直接执行 ELECTRON_RUN_AS_NODE=1 \"$T3_ACP_MCP_NODE\" ${T3_ACP_MCP_ENTRYPOINT:+\"$T3_ACP_MCP_ENTRYPOINT\"} acp-mcp-call <tool> '<json>'（严禁外包 node -e / python3 / 脚本套壳或尾部串联其他命令，否则 T3 正则失配、html_render 不会内嵌卡片；按需读 <appDataDir>/mcp/t3-code/<tool>.json 核对参数）。",
+});
 const SUMMARY_STATES = ["configured", "missing", "conflict", "unsupported", "unknown", "pending"];
 const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 const MEMORY_ONLY_ARGS = ["--memory-only"];
@@ -92,7 +113,8 @@ function lstatOptional(file) {
   try { return fs.lstatSync(file); }
   catch (error) { if (error?.code === "ENOENT") return null; throw error; }
 }
-function readRegular(file, maxBytes = MAX_CONFIG_BYTES) {
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+function readRegular(file, maxBytes = MAX_CONFIG_BYTES, { rejectUnsafeMode = false, strictUtf8 = false } = {}) {
   assertNoSymlinkPath(file, { includeTarget: true });
   const st = lstatOptional(file);
   if (!st) return { exists: false, text: "", mode: null };
@@ -102,12 +124,23 @@ function readRegular(file, maxBytes = MAX_CONFIG_BYTES) {
   try {
     const opened = fs.fstatSync(fd);
     if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino) throw new Error("file_changed");
-    return { exists: true, text: fs.readFileSync(fd, "utf8"), mode: st.mode & 0o777 };
+    const mode = opened.mode & 0o777;
+    if (rejectUnsafeMode && (mode & 0o022) !== 0) throw new Error("unsafe_permissions");
+    if (opened.size > maxBytes) throw new Error("file_too_large");
+    const buf = fs.readFileSync(fd);
+    if (buf.length > maxBytes) throw new Error("file_too_large");
+    let text;
+    if (strictUtf8) {
+      try { text = STRICT_UTF8_DECODER.decode(buf); } catch { throw new Error("invalid_utf8"); }
+    } else {
+      text = buf.toString("utf8");
+    }
+    return { exists: true, text, mode };
   } finally { fs.closeSync(fd); }
 }
-function atomicWrite(file, text, { backup = true, mode = 0o600, expectedText, preserveMode = true } = {}) {
+function atomicWrite(file, text, { backup = true, mode = 0o600, expectedText, preserveMode = true, readOptions = {} } = {}) {
   assertNoSymlinkPath(path.dirname(file), { includeTarget: true });
-  const before = readRegular(file);
+  const before = readRegular(file, MAX_CONFIG_BYTES, readOptions);
   if (expectedText !== undefined && before.text !== expectedText) throw new Error("concurrent_change");
   if (before.exists && backup) {
     const backupPath = file + ".t3hub.bak";
@@ -150,8 +183,8 @@ function atomicWrite(file, text, { backup = true, mode = 0o600, expectedText, pr
     const current = lstatOptional(file);
     if (current?.isSymbolicLink() || (current && !current.isFile())) throw new Error("unsafe_file");
     if (expectedText !== undefined) {
-      const latest = current ? fs.readFileSync(file, "utf8") : "";
-      if (latest !== expectedText) throw new Error("concurrent_change");
+      const latest = readRegular(file, MAX_CONFIG_BYTES, readOptions);
+      if (latest.text !== expectedText) throw new Error("concurrent_change");
     }
     fs.renameSync(temp, file);
     try { fs.chmodSync(file, preserveMode ? before.mode ?? mode : mode); } catch {}
@@ -172,6 +205,8 @@ function createMemoryAccessManager(options = {}) {
   const settingsPath = path.join(userDataDir, "settings.json");
   const magpiePath = path.join(homeDir, ".config", "magpie", "library.json");
   const configPath = path.join(hubDir, ACCESS_FILE);
+  const runtimeHintsPath = path.join(hubDir, RUNTIME_HINTS_FILE);
+  const runtimeHintsLockPath = path.join(hubDir, RUNTIME_HINTS_LOCK_FILE);
   const routerBin = path.resolve(options.routerBin || path.join(homeDir, ".t3", "bin", "t3-mcp-router"));
   const vaultDir = path.resolve(options.vaultDir || process.env.T3_MEMORY_VAULT_DIR || process.env.T3_HUB_MEMORY_DIR || path.join(hubDir, "memory"));
   const now = typeof options.now === "function" ? options.now : () => Date.now();
@@ -207,6 +242,265 @@ function createMemoryAccessManager(options = {}) {
       };
     } catch {
       return { ok: false, enabled: null, state: "unknown", persisted: true, legacyDefault: false, revision: "unsafe" };
+    }
+  }
+
+  function parseRuntimeHintsFile(file) {
+    if (!file.exists) {
+      return {
+        trusted: true,
+        exists: false,
+        corrupted: false,
+        fallback: false,
+        warning: null,
+        enabled: DEFAULT_T3_RUNTIME_HINTS.enabled,
+        planUpdateHint: DEFAULT_T3_RUNTIME_HINTS.planUpdateHint,
+        acp48kFallbackHint: DEFAULT_T3_RUNTIME_HINTS.acp48kFallbackHint,
+        updatedAt: null,
+      };
+    }
+    if (typeof file.mode === "number" && (file.mode & 0o022) !== 0) {
+      return {
+        trusted: false,
+        exists: true,
+        corrupted: true,
+        fallback: true,
+        warning: "unsafe_permissions",
+        enabled: false,
+        planUpdateHint: "",
+        acp48kFallbackHint: "",
+        updatedAt: null,
+      };
+    }
+    let doc;
+    try { doc = JSON.parse(file.text); }
+    catch {
+      return {
+        trusted: false,
+        exists: true,
+        corrupted: true,
+        fallback: true,
+        warning: "invalid_json",
+        enabled: false,
+        planUpdateHint: "",
+        acp48kFallbackHint: "",
+        updatedAt: null,
+      };
+    }
+    if (
+      !isPlainObject(doc) ||
+      doc.version !== CONFIG_VERSION ||
+      typeof doc.enabled !== "boolean" ||
+      (doc.scope !== undefined && doc.scope !== RUNTIME_HINTS_SCOPE) ||
+      typeof doc.planUpdateHint !== "string" ||
+      doc.planUpdateHint.includes("\0") ||
+      doc.planUpdateHint.length > RUNTIME_HINTS_MAX_LENGTH ||
+      typeof doc.acp48kFallbackHint !== "string" ||
+      doc.acp48kFallbackHint.includes("\0") ||
+      doc.acp48kFallbackHint.length > RUNTIME_HINTS_MAX_LENGTH
+    ) {
+      return {
+        trusted: false,
+        exists: true,
+        corrupted: true,
+        fallback: true,
+        warning: "invalid_schema",
+        enabled: false,
+        planUpdateHint: "",
+        acp48kFallbackHint: "",
+        updatedAt: null,
+      };
+    }
+    return {
+      trusted: true,
+      exists: true,
+      corrupted: false,
+      fallback: false,
+      warning: null,
+      enabled: doc.enabled,
+      planUpdateHint: doc.planUpdateHint,
+      acp48kFallbackHint: doc.acp48kFallbackHint,
+      updatedAt: typeof doc.updatedAt === "string" && doc.updatedAt.trim() ? doc.updatedAt.trim() : null,
+    };
+  }
+
+  function formatRuntimeHintsState(parsed) {
+    const isDefault =
+      parsed.trusted === true &&
+      parsed.enabled === DEFAULT_T3_RUNTIME_HINTS.enabled &&
+      parsed.planUpdateHint === DEFAULT_T3_RUNTIME_HINTS.planUpdateHint &&
+      parsed.acp48kFallbackHint === DEFAULT_T3_RUNTIME_HINTS.acp48kFallbackHint;
+    return {
+      ok: true,
+      trusted: parsed.trusted === true,
+      version: CONFIG_VERSION,
+      enabled: parsed.trusted === true ? parsed.enabled : false,
+      scope: RUNTIME_HINTS_SCOPE,
+      planUpdateHint: parsed.planUpdateHint,
+      acp48kFallbackHint: parsed.acp48kFallbackHint,
+      updatedAt: parsed.updatedAt,
+      persisted: parsed.exists === true && parsed.trusted === true,
+      isDefault,
+      fallback: parsed.fallback === true,
+      corrupted: parsed.corrupted === true,
+      ...(parsed.warning ? { warning: parsed.warning } : {}),
+      maxLength: RUNTIME_HINTS_MAX_LENGTH,
+      defaults: {
+        planUpdateHint: DEFAULT_T3_RUNTIME_HINTS.planUpdateHint,
+        acp48kFallbackHint: DEFAULT_T3_RUNTIME_HINTS.acp48kFallbackHint,
+      },
+    };
+  }
+
+  function getT3RuntimeHints() {
+    try {
+      const file = readRegular(runtimeHintsPath, RUNTIME_HINTS_MAX_BYTES, RUNTIME_HINTS_STRICT_READ);
+      return formatRuntimeHintsState(parseRuntimeHintsFile(file));
+    } catch (error) {
+      return formatRuntimeHintsState({
+        trusted: false,
+        exists: true,
+        corrupted: true,
+        fallback: true,
+        warning: safeReason(error?.message) || "runtime_hints_untrusted",
+        enabled: false,
+        planUpdateHint: "",
+        acp48kFallbackHint: "",
+        updatedAt: null,
+      });
+    }
+  }
+
+  function sleepSyncMs(ms) {
+    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
+  }
+
+  function isSqliteBusy(error) {
+    return error?.errcode === 5 || error?.errcode === 6 || /database is (locked|busy)/i.test(String(error?.message || ""));
+  }
+
+  function prepareRuntimeHintsLockFile() {
+    ensureDirectory(hubDir, 0o700);
+    assertNoSymlinkPath(hubDir, { includeTarget: true });
+    const existing = lstatOptional(runtimeHintsLockPath);
+    if (existing && (existing.isSymbolicLink() || !existing.isFile())) throw new Error("unsafe_lock_file");
+    const fd = fs.openSync(
+      runtimeHintsLockPath,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW || 0),
+      0o600,
+    );
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1) throw new Error("unsafe_lock_file");
+      if ((opened.mode & 0o077) !== 0) fs.fchmodSync(fd, 0o600);
+      return opened;
+    } finally { fs.closeSync(fd); }
+  }
+
+  // Cross-process mutex backed by SQLite's POSIX advisory lock (BEGIN IMMEDIATE).
+  // The kernel drops the lock when the holder exits, so a live holder can never be
+  // pre-empted by lock age; waiters give up at a strict wall-clock deadline.
+  function withRuntimeHintsLock(fn, timeoutMs = RUNTIME_HINTS_LOCK_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    const lockStat = prepareRuntimeHintsLockFile();
+    const { DatabaseSync } = require("node:sqlite");
+    let db = null, locked = false;
+    try {
+      db = new DatabaseSync(runtimeHintsLockPath, { timeout: 0 });
+      const current = lstatOptional(runtimeHintsLockPath);
+      if (!current || current.isSymbolicLink() || !current.isFile() || current.dev !== lockStat.dev || current.ino !== lockStat.ino) {
+        throw new Error("unsafe_lock_file");
+      }
+      // SQLite's own busy handler can overshoot coarse sleeps; poll against our deadline instead.
+      db.exec("PRAGMA busy_timeout = 0");
+      let attempts = 0;
+      while (!locked) {
+        if (attempts > 0 && Date.now() >= deadline) throw new Error("lock_timeout");
+        attempts += 1;
+        try {
+          db.exec("BEGIN IMMEDIATE");
+          if (attempts > 1 && Date.now() >= deadline) {
+            try { db.exec("ROLLBACK"); } catch {}
+            throw new Error("lock_timeout");
+          }
+          locked = true;
+        } catch (error) {
+          if (!isSqliteBusy(error)) throw error;
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error("lock_timeout");
+          sleepSyncMs(Math.min(10, remaining));
+        }
+      }
+      return fn();
+    } finally {
+      if (locked) { try { db.exec("ROLLBACK"); } catch {} }
+      try { db?.close(); } catch {}
+    }
+  }
+
+  function setT3RuntimeHints(payload = {}) {
+    if (payload != null && !isPlainObject(payload)) {
+      return { ok: false, error: "invalid_payload", hints: getT3RuntimeHints() };
+    }
+    const input = payload || {};
+    if (input.reset !== undefined && typeof input.reset !== "boolean") {
+      return { ok: false, error: "reset_must_be_boolean", hints: getT3RuntimeHints() };
+    }
+    if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
+      return { ok: false, error: "enabled_must_be_boolean", hints: getT3RuntimeHints() };
+    }
+    for (const field of ["planUpdateHint", "acp48kFallbackHint"]) {
+      if (input[field] === undefined) continue;
+      if (typeof input[field] !== "string") {
+        return { ok: false, error: `${field}_must_be_string`, hints: getT3RuntimeHints() };
+      }
+      if (input[field].includes("\0")) {
+        return { ok: false, error: `${field}_invalid_char`, hints: getT3RuntimeHints() };
+      }
+      if (input[field].length > RUNTIME_HINTS_MAX_LENGTH) {
+        return { ok: false, error: `${field}_too_long`, maxLength: RUNTIME_HINTS_MAX_LENGTH, hints: getT3RuntimeHints() };
+      }
+    }
+    const isReset = input.reset === true;
+    const hasEnabled = input.enabled !== undefined;
+    const hasPlan = input.planUpdateHint !== undefined;
+    const hasAcp = input.acp48kFallbackHint !== undefined;
+    try {
+      return withRuntimeHintsLock(() => {
+        const before = isReset
+          ? readRegular(runtimeHintsPath, MAX_CONFIG_BYTES)
+          : readRegular(runtimeHintsPath, RUNTIME_HINTS_MAX_BYTES, RUNTIME_HINTS_STRICT_READ);
+        const parsed = parseRuntimeHintsFile(before);
+        if (!isReset && !parsed.trusted) {
+          return { ok: false, error: parsed.warning || "runtime_hints_untrusted", hints: formatRuntimeHintsState(parsed) };
+        }
+        const documentObj = {
+          version: CONFIG_VERSION,
+          enabled: isReset ? DEFAULT_T3_RUNTIME_HINTS.enabled : hasEnabled ? input.enabled : parsed.enabled,
+          scope: RUNTIME_HINTS_SCOPE,
+          planUpdateHint: isReset
+            ? DEFAULT_T3_RUNTIME_HINTS.planUpdateHint
+            : hasPlan ? input.planUpdateHint.trim() : parsed.planUpdateHint,
+          acp48kFallbackHint: isReset
+            ? DEFAULT_T3_RUNTIME_HINTS.acp48kFallbackHint
+            : hasAcp ? input.acp48kFallbackHint.trim() : parsed.acp48kFallbackHint,
+          updatedAt: new Date(now()).toISOString(),
+        };
+        atomicWrite(runtimeHintsPath, JSON.stringify(documentObj, null, 2) + "\n", {
+          backup: false,
+          mode: 0o600,
+          preserveMode: false,
+          expectedText: before.text,
+          readOptions: isReset ? {} : RUNTIME_HINTS_STRICT_READ,
+        });
+        const after = getT3RuntimeHints();
+        if (!after.persisted || !after.trusted || after.fallback) {
+          return { ok: false, error: "readback_failed", hints: after };
+        }
+        return { ...after, ok: true };
+      });
+    } catch (error) {
+      return { ok: false, error: safeReason(error?.message), hints: getT3RuntimeHints() };
     }
   }
 
@@ -917,12 +1211,34 @@ function createMemoryAccessManager(options = {}) {
   }
 
   return {
-    homeDir, hubDir, configPath, settingsPath, routerBin,
+    homeDir, hubDir, configPath, runtimeHintsPath, settingsPath, routerBin,
     getAgentAccess, getSetupSummary, readMemoryOnlyStatus,
+    getT3RuntimeHints, setT3RuntimeHints,
     setAgentAccess, setup, reconcile, startWatching, stopWatching,
     isAccessEnabled: () => readAccess().state === "enabled",
     getAccessState: readAccess,
   };
 }
 
-module.exports = { createMemoryAccessManager, CONFIG_VERSION, ACCESS_FILE, MEMORY_ONLY_ARGS };
+function getT3RuntimeHints(options = {}) {
+  return createMemoryAccessManager(options).getT3RuntimeHints();
+}
+function setT3RuntimeHints(payload = {}, options = {}) {
+  return createMemoryAccessManager(options).setT3RuntimeHints(payload);
+}
+
+module.exports = {
+  createMemoryAccessManager,
+  CONFIG_VERSION,
+  ACCESS_FILE,
+  MEMORY_ONLY_ARGS,
+  RUNTIME_HINTS_FILE,
+  RUNTIME_HINTS_SCOPE,
+  RUNTIME_HINTS_MAX_LENGTH,
+  RUNTIME_HINTS_TRUNCATED_TOOLS,
+  RUNTIME_HINTS_LOCK_FILE,
+  RUNTIME_HINTS_LOCK_TIMEOUT_MS,
+  DEFAULT_T3_RUNTIME_HINTS,
+  getT3RuntimeHints,
+  setT3RuntimeHints,
+};

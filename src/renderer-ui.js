@@ -1217,7 +1217,7 @@
       "agentsMd:get", "mcp:list", "mcp:matrix", "plugins:list", "plugins:catalog",
       "hooks:list", "memory:overview", "memory:list", "memory:search",
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
-      "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
+      "memory:dream:get", "memory:runtimeHints:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
       "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
@@ -1278,7 +1278,7 @@
       "agentsMd:get", "mcp:list", "mcp:matrix", "plugins:list", "plugins:catalog",
       "hooks:list", "memory:overview", "memory:list", "memory:search",
       "memory:worktreeInfo", "memory:health", "memory:stats", "memory:vectorStats",
-      "memory:dream:get", "embed:status", "subagents:list", "subagents:resolveRoute",
+      "memory:dream:get", "memory:runtimeHints:get", "embed:status", "subagents:list", "subagents:resolveRoute",
       "subagents:resolve", "subagents:orchestration:get", "subagents:slashPrompt",
       "board:get", "board:readArtifact", "settings:get", "settings:getRule", "quota:external",
     ]);
