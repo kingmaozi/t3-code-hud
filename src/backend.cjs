@@ -3847,6 +3847,8 @@ async function hubCall(action, payload = {}) {
         if (!isTestEnv()) runtime.startWatching();
         return result;
       }
+      case "memory:runtimeHints:get": return getMemoryAccessRuntime().getT3RuntimeHints();
+      case "memory:runtimeHints:set": return getMemoryAccessRuntime().setT3RuntimeHints(payload || {});
       case "memory:overview": return memoryVault.getOverview(payload);
       case "memory:list":
       case "memory:search": return await memoryVault.listMemories(payload);

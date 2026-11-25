@@ -20,7 +20,7 @@
     let artifactDockTopPct = Number.isFinite(savedDockTop) && savedDockTop >= 8 && savedDockTop <= 92 ? savedDockTop : 44;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
-    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
+    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, memoryRuntimeHintsVersion = 0, memoryRuntimeHintsLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
     let lastRoute = "", lastBoardRoute = "", cachedRouter = null, unsubscribeRouter = null, routerProbeAt = 0;
     let boardDrag = null, contextLoading = true;
     const tabKeys = ["memory"];
@@ -28,7 +28,7 @@
     const storedTab = initial?.tab || storageGet("t3-hub-tab") || "memory";
     const restoredSubView = initial?.settingsSubView || (storedTab === "agents" ? "agents" : "native");
     const normalizedTab = tabAliases[storedTab] || storedTab;
-    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null, providerResources: null, guardian: null };
+    const cache = { hooks: null, skills: null, plugins: null, subagents: null, orchestration: null, mcp: null, connections: null, agentAccess: null, runtimeHints: null, overview: null, memory: null, worktree: null, embed: null, agents: null, board: null, settings: null, settingsRule: null, providerResources: null, guardian: null };
     const errors = {}, drafts = initial?.drafts || {};
     const officialTelemetry = { status: null, busy: false, error: "" };
     const state = {
@@ -36,7 +36,7 @@
  resourceFilters: initial?.resourceFilters || {}, memoryScope: ["smart", "project", "worktree"].includes(initial?.memoryScope) ? initial.memoryScope : "smart",
  boardExpanded: storageGet("t3-hub-dashboard-expanded-v1") === null ? true : (initial?.boardExpanded ?? storageGet("t3-hub-dashboard-expanded-v1") === "true"),
  boardBackground: initial?.boardBackground || false, artifact: null, boardDraft: initial?.boardDraft || "", orchestrationDraft: initial?.orchestrationDraft || null,
- planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
+ planOpen: false, planPinned: false, planHovering: false, memoryAgentAccessUpdating: false, memoryRuntimeHintsUpdating: false, memoryRuntimeHintsReading: false, memoryRuntimeHintsDraft: null, memoryRuntimeHintsNotice: "", memorySetupPromptVisible: false, memoryMcpConfigVisible: false, memorySetupNotice: "",
  artifactDockEnabled: storageGet("t3-hub-artifact-dock-v1") !== "false", artifactDockOpen: false, artifactMenuIndex: null, artifactApps: {}, artifactMenuLoading: false, dockPreview: null,
  hubSettingsOpen: false, hubSettingsTab: "general", providerResProvider: "codex", providerResKind: "mcp", providerResLoading: false, guardianLoading: false, guardianUpdating: false, skillSyncAllProviders: storageGet("t3-hub-skill-sync-all-v1") === "true", providerMemoryPrompt: null,
  memoryImporting: false, embedTrimming: false, memoryVectorTestRunning: false, memoryVectorTest: null,
@@ -267,12 +267,12 @@
 #t3-hub-live-board{border-radius:14px;padding:0;box-shadow:0 12px 36px #0f172a24,0 2px 8px #0f172a12;max-width:calc(100vw - 16px)}#t3-hub-live-board .hub-artifacts{display:grid;grid-template-columns:minmax(0,1fr);gap:7px}#t3-hub-live-board .hub-artifact-card{display:flex;align-items:center;gap:10px;min-width:0;width:100%;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg-subtle);color:var(--hub-ink);text-align:left;font-size:11px;cursor:pointer}#t3-hub-live-board .hub-artifact-card:hover{border-color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-icon{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:7px;background:var(--hub-bg);color:var(--hub-accent)}#t3-hub-live-board .hub-artifact-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hub-board-toolbar{gap:4px;flex-wrap:nowrap;padding:10px 10px 8px;border-bottom:1px solid var(--hub-border)}.hub-board-drag{display:flex;align-items:center;gap:7px;min-width:0;flex:1;cursor:grab;user-select:none;touch-action:none;-webkit-app-region:no-drag}.hub-board-drag:active{cursor:grabbing}.hub-board-grip{font-size:15px;letter-spacing:-3px;color:var(--hub-muted);padding-right:4px}.hub-board-drag strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.hub-board-drag .hub-board-status{font-size:10px;color:var(--hub-secondary);white-space:nowrap}.hub-board-toolbar .hub-icon-btn{width:25px;height:25px;flex:none}.hub-board-content{padding:10px 12px 12px}.hub-board-source{display:flex;justify-content:space-between;gap:6px;font-size:10px;color:var(--hub-secondary);margin-bottom:8px}.hub-board-meter{height:5px;border-radius:10px;background:var(--hub-border);overflow:hidden;margin:0 0 12px}.hub-board-meter>i{display:block;height:100%;border-radius:inherit;background:var(--hub-accent)}.hub-dashboard-links{display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid var(--hub-border);margin-top:12px;padding-top:10px}.hub-dashboard-links button{border:0;border-radius:7px;background:var(--hub-bg-subtle);padding:4px 7px;color:var(--hub-secondary);font-size:10px!important}.hub-dashboard-links button:hover{color:var(--hub-ink)}.hub-progress-ring{flex:none;transform:rotate(-90deg)}.hub-step-icon{width:16px;height:16px;border:1.5px solid var(--hub-muted);border-radius:50%;font-size:10px;line-height:1}.hub-board-step.is-completed .hub-step-icon{background:var(--hub-accent);border-color:var(--hub-accent);color:var(--hub-on-active)}.hub-board-step.is-in-progress .hub-step-icon{border-color:var(--hub-accent)}.hub-commander .hub-segments>button[aria-pressed=true],.hub-commander .hub-segments>button[aria-pressed=true]:hover{background:var(--hub-active);color:var(--hub-on-active)!important;font-weight:600}.hub-subagent-main{grid-template-columns:36px minmax(0,1fr)}#t3-hub-drawer.is-wide .hub-subagent-main{grid-template-columns:36px minmax(0,1fr) minmax(280px,1fr)}.hub-robot{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;background:var(--hub-bg-subtle);flex:none}.hub-robot-face{width:23px;height:23px;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:4px;background:var(--robot-color,#3980f6);box-shadow:inset 0 -2px #00000012}.hub-robot-face i{display:block;width:4px;height:7px;background:#fff;border-radius:4px}.hub-subagent-meta{margin-left:45px}#t3-hub-drawer.is-compact .hub-subagent-meta{margin-left:0}`;
       style.textContent += `#t3-hub-plan-handle{position:relative!important;right:auto!important;top:auto!important;padding:3px 7px!important;border-radius:7px!important;border-right:1px solid var(--hub-border)!important;background:var(--hub-bg)!important}#t3-hub-live-board{display:block;flex:none;min-height:0;padding:0;border-radius:11px;overflow:auto}#t3-hub-live-board[hidden]{display:none!important}.hub-connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:8px;margin:12px 0}.hub-connection-agent{min-width:0;padding:10px 12px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg)}.hub-connection-agent h3{margin:0 0 8px;font-size:11px}.hub-connection-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.hub-connection-cell{min-width:0;padding:7px;border-radius:7px;background:var(--hub-bg-subtle)}.hub-connection-cell>span,.hub-connection-cell>strong,.hub-connection-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-connection-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-connection-cell>strong{margin-top:2px;font-size:9px}.hub-connection-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:8px;line-height:1.45}.hub-connection-cell>strong[data-status="configured"]{color:#047857}.hub-connection-cell>strong[data-status="missing"]{color:var(--hub-secondary)}.hub-connection-cell>strong[data-status="unsupported"]{color:var(--hub-muted)}.hub-connection-cell>strong[data-status="unknown"]{color:#b45309}.hub-connection-note{align-items:center;flex-wrap:wrap}.hub-connection-error{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border:1px solid var(--hub-border);border-radius:8px;color:var(--hub-secondary);font-size:10px}@media(max-width:639px){.hub-connection-grid{grid-template-columns:minmax(0,1fr)}.hub-connection-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
       style.textContent += `#t3-hub-plan-handle{justify-content:flex-start!important;gap:7px!important;width:auto!important;min-width:0!important;height:27px!important;padding:4px 10px!important;border:1px solid #dbe4f0!important;border-radius:999px!important;background:#f8fafc!important;color:#253247!important;box-shadow:0 1px 4px #0f172a12!important;font-size:10px!important;font-weight:550!important;line-height:1!important;white-space:nowrap!important}#t3-hub-plan-handle:hover,#t3-hub-plan-handle:focus-visible{background:#f1f6ff!important;border-color:#c8dcff!important}.hub-plan-indicator{gap:7px!important;white-space:nowrap}.hub-plan-ring{display:block;flex:none;width:15px;height:15px;transform:rotate(-90deg)}.hub-plan-ring-track{fill:none;stroke:#dbeafe;stroke-width:2.4}.hub-plan-ring-progress{fill:none;stroke:#3980f6;stroke-width:2.4;stroke-linecap:round;transition:stroke-dashoffset .18s ease}.hub-plan-label{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-memory-access-switch{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;font-weight:550;color:var(--hub-ink)}.hub-memory-access-switch input{flex:none;width:15px;height:15px;accent-color:#3980f6}.hub-memory-access-state{font-size:10px;color:var(--hub-secondary);white-space:normal;text-align:right}.hub-memory-access-actions{flex-wrap:wrap;margin-top:10px}.hub-memory-access-summary{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hub-memory-access-summary>span{padding:2px 7px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary)}.hub-memory-access-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:6px;margin-top:9px}.hub-memory-access-provider{min-width:0;padding:7px 9px;border:1px solid var(--hub-border);border-radius:8px;font-size:9px}.hub-memory-access-provider strong,.hub-memory-access-provider small{display:block;overflow-wrap:anywhere}.hub-memory-access-provider small{margin-top:2px;color:var(--hub-secondary)}.hub-memory-access-prompt{margin-top:10px;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:120px;resize:vertical;white-space:pre-wrap}@media(max-width:639px){.hub-memory-access-switch{align-items:flex-start}.hub-memory-access-state{text-align:left}}`;
-      style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
+      style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}.hub-memory-runtime-hints-input{margin-top:6px;min-height:74px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;resize:vertical;white-space:pre-wrap}.hub-memory-runtime-hints-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}.hub-memory-runtime-hints-count{font-size:9px;color:var(--hub-muted);font-variant-numeric:tabular-nums}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
       style.textContent += "\n#t3-hub-settings-handle[aria-expanded=\"true\"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}\n#t3-hub-artifact-dock{position:fixed;right:0;top:44%;transform:translateY(-50%);z-index:2147482990;display:flex;align-items:center;pointer-events:auto;font:12px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-app-region:no-drag}\n#t3-hub-artifact-dock.is-dragging,#t3-hub-artifact-dock.is-dragging *{cursor:grabbing!important;user-select:none!important}\n#t3-hub-artifact-dock[hidden]{display:none!important}\n#t3-sidecar-hub-root.is-occluded #t3-hub-artifact-dock,#t3-sidecar-hub-root.is-occluded #t3-hub-settings-panel{visibility:hidden!important;pointer-events:none!important}\n.hub-arc-tab{width:26px;height:76px;padding:0 0 0 3px;border:1px solid var(--hub-border);border-right:0;border-radius:24px 0 0 24px;background:var(--hub-bg);color:var(--hub-secondary);box-shadow:-2px 4px 14px #0f172a14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-tab:hover{color:var(--hub-ink);border-color:var(--hub-ink)}\n.hub-arc-grip{font-size:10px;line-height:1;letter-spacing:-1px;color:var(--hub-muted);user-select:none}\n.hub-arc-drag{display:inline-flex;align-items:center;gap:5px;min-width:0;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}\n.hub-arc-sheet{width:296px;max-height:62vh;overflow:auto;border:1px solid var(--hub-border);border-right:0;border-radius:16px 0 0 16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:-8px 12px 32px #0f172a1c;padding:12px;display:flex;flex-direction:column;gap:8px}\n.hub-arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-arc-item{padding:8px 10px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:6px}\n.hub-arc-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}\n.hub-arc-name{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:550;color:var(--hub-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.hub-arc-meta{font-size:10px;color:var(--hub-secondary);flex:none}\n.hub-arc-actions{display:flex;gap:5px;flex-wrap:wrap}\n.hub-arc-btn{height:23px;padding:0 8px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg);color:var(--hub-ink);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-arc-btn:hover{background:var(--hud-hover)}\n.hub-arc-btn.is-primary{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:600}\n.hub-arc-menu{margin-top:3px;padding:4px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);display:flex;flex-direction:column;gap:2px}\n.hub-arc-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:5px;background:transparent;padding:5px 7px;text-align:left;font-size:11px!important;color:var(--hub-ink);cursor:pointer}\n.hub-arc-opt:hover{background:var(--hud-hover)}\n.hub-arc-opt small{color:var(--hub-secondary);font-size:10px}\n.hub-arc-preview{margin-top:4px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg);max-height:240px;overflow:auto}\n.hub-arc-preview pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:10.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-ink)}\n#t3-hub-settings-panel{position:fixed;right:12px;top:12px;bottom:12px;width:min(740px,92vw);max-height:calc(100dvh - 24px);z-index:2147482995;display:flex;flex-direction:column;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}\n#t3-hub-settings-panel[hidden]{display:none!important}\n.hub-set-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}\n@media(max-width:620px){.hub-set-grid-2{grid-template-columns:minmax(0,1fr)}}\n.hub-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--hub-border)}\n.hub-set-head strong{font-size:14px;font-weight:620}\n.hub-set-body{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}\n.hub-set-sec{border:1px solid var(--hub-border);border-radius:11px;padding:12px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:9px}\n.hub-set-sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg)}\n.hub-set-meta{min-width:0;flex:1}\n.hub-set-meta strong{display:block;font-size:11.5px;font-weight:600;overflow-wrap:anywhere}\n.hub-set-meta small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:2px;overflow-wrap:anywhere}\n.hub-set-pills{display:flex;gap:5px;flex-wrap:wrap}\n.hub-set-pill{height:25px;padding:0 9px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg);color:var(--hub-secondary);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-set-pill.is-active{background:var(--hub-active);color:var(--hub-on-active);border-color:var(--hub-active);font-weight:600}\n";
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime-hints"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
  handle = null;
@@ -1042,6 +1042,7 @@
  function renderMemory() {
  content.innerHTML = `<div class="hub-section-heading"><span>${esc(tr("记忆工作台", "Memory workspace"))}</span><span style="display:inline-flex;align-items:center;gap:8px;flex:none"><span class="hub-count" id="t3-hub-memory-total"></span><button type="button" class="hub-btn hub-small" data-action="open-hub-memory-settings" style="white-space:nowrap">${icon("settings", 12)}<span>${esc(tr("记忆设置", "Memory settings"))}</span></button></span></div><p class="hub-description">${esc(tr("只读取和维护当前确认项目的共享经验与工作树便签；本机记忆接入与向量模型配置已整合至顶栏「设置」。", "Read and maintain shared knowledge and worktree notes for the confirmed project. Local access and vector model settings live under Settings."))}</p><div id="t3-hub-worktree"></div><div id="t3-hub-memory-nav"></div><div id="t3-hub-new-memory"></div><div class="hub-search">${icon("search", 14)}<input class="hub-input" name="memoryQuery" aria-label="${esc(tr("搜索记忆", "Search memories"))}" placeholder="${esc(tr("搜索记忆", "Search memories"))}" value="${esc(state.memoryQuery)}" ${memoryProjectReady() ? "" : "disabled"}></div><div id="t3-hub-memory-filters" class="hub-filters hub-memory-filters"></div><div id="t3-hub-memory-list"></div>`;
  renderMemoryAgentAccess();
+ renderMemoryRuntimeHints();
  renderMemoryRuntime();
  renderEngine();
  renderMemoryConnections();
@@ -1061,6 +1062,7 @@
  "2. 运行固定命令 `~/.t3/bin/t3-memory-setup setup` 完成本机接入。",
  "3. 调用可用的 `memory_status` 工具核验记忆状态；如果当前会话没有这个工具，请说明可能需要新会话后再次验证，不要重启 T3。",
  "只改 Hub MCP 接入，保留已有正确的 Magpie 记忆条目和其他 MCP；不要修改认证、模型或原生路由。遇到检查失败、冲突、未知或待处理项时如实报告，不要声称接入成功。关闭 Agent 访问时保留所有记忆内容和手工维护的配置。",
+ "此外，可在 T3 Hub「设置 → 记忆与向量」的专属运行提示卡片中开关、编辑或恢复默认仅限 T3 Code 生效的 plan_update 打卡与 AGY 48KiB 截断 5 工具直连提示（不改动 AGENTS.md）。",
     ].join("\n");
     function memoryAccessIssues(summary = {}) {
  return ["missing", "conflict", "unsupported", "unknown", "pending"].some((key) => Number(summary[key]) > 0);
@@ -1248,6 +1250,208 @@
  } catch {
   state.memorySetupPromptVisible = true; renderMemoryAgentAccess();
   toast(tr("无法自动复制；已显示提示词供手动复制", "Clipboard unavailable; the prompt is shown for manual copy"), true);
+ }
+    }
+    const RUNTIME_HINTS_MAX_CHARS = 2000;
+    const RUNTIME_HINTS_FIELDS = [["planUpdateHint", "dirtyPlanUpdate"], ["acp48kFallbackHint", "dirtyAcp48k"]];
+    function runtimeHintsUntrusted(data) {
+ return Boolean(data && typeof data === "object" && (data.trusted === false || data.corrupted === true || data.fallback === true));
+    }
+    function runtimeHintsValid(data) {
+ return Boolean(data && typeof data === "object" && !Array.isArray(data) && data.ok === true && typeof data.enabled === "boolean" && typeof data.planUpdateHint === "string" && typeof data.acp48kFallbackHint === "string");
+    }
+    function runtimeHintsEditable() {
+ const saved = cache.runtimeHints;
+ return !disposed && !errors.runtimeHintsLoad && !state.memoryRuntimeHintsReading && !state.memoryRuntimeHintsUpdating && runtimeHintsValid(saved) && !runtimeHintsUntrusted(saved);
+    }
+    function runtimeHintsResettable() {
+ return !disposed && !errors.runtimeHintsLoad && !state.memoryRuntimeHintsReading && !state.memoryRuntimeHintsUpdating && runtimeHintsValid(cache.runtimeHints);
+    }
+    function runtimeHintsDirtyPayload() {
+ const draft = state.memoryRuntimeHintsDraft, payload = {};
+ for (const [field, flag] of RUNTIME_HINTS_FIELDS) if (draft?.[flag]) payload[field] = String(draft[field] ?? "");
+ return payload;
+    }
+    function runtimeHintsInvalidResponse() {
+ return new Error(tr("本机设置返回的数据结构无效", "Local settings returned an invalid response"));
+    }
+    function syncMemoryRuntimeHintsDraft(data, clearDirty = []) {
+ const usable = runtimeHintsValid(data) && !runtimeHintsUntrusted(data);
+ const next = { planUpdateHint: "", acp48kFallbackHint: "", dirtyPlanUpdate: false, dirtyAcp48k: false, ...(state.memoryRuntimeHintsDraft || {}) };
+ for (const [field, flag] of RUNTIME_HINTS_FIELDS) {
+  if (clearDirty.includes(field)) next[flag] = false;
+  else if (usable && next[flag] && String(next[field] ?? "") === data[field]) next[flag] = false;
+  if (!next[flag]) next[field] = usable ? data[field] : "";
+ }
+ state.memoryRuntimeHintsDraft = next;
+    }
+    async function refreshMemoryRuntimeHints(force = false) {
+ if (disposed) return cache.runtimeHints;
+ if (cache.runtimeHints && !force && !errors.runtimeHintsLoad) return cache.runtimeHints;
+ if (memoryRuntimeHintsLoading && !force) return memoryRuntimeHintsLoading;
+ const version = ++memoryRuntimeHintsVersion;
+ state.memoryRuntimeHintsReading = true;
+ delete errors.runtimeHintsLoad;
+ renderMemoryRuntimeHints();
+ const task = (async () => {
+  try {
+   const data = await request("memory:runtimeHints:get", {});
+   if (disposed || version !== memoryRuntimeHintsVersion) return cache.runtimeHints;
+   if (!runtimeHintsValid(data)) throw runtimeHintsInvalidResponse();
+   cache.runtimeHints = data;
+   syncMemoryRuntimeHintsDraft(data);
+  } catch (error) {
+   if (!disposed && version === memoryRuntimeHintsVersion) errors.runtimeHintsLoad = error;
+  } finally {
+   if (!disposed && version === memoryRuntimeHintsVersion) {
+    state.memoryRuntimeHintsReading = false;
+    if (state.tab === "memory" || state.hubSettingsOpen) renderMemoryRuntimeHints();
+   }
+  }
+  return cache.runtimeHints;
+ })();
+ memoryRuntimeHintsLoading = task;
+ try { return await task; }
+ finally { if (memoryRuntimeHintsLoading === task) memoryRuntimeHintsLoading = null; }
+    }
+    function renderMemoryRuntimeHints() {
+ const node = root.querySelector("#t3-hub-memory-runtime-hints");
+ if (!node) return;
+ const saved = cache.runtimeHints;
+ const valid = runtimeHintsValid(saved);
+ const untrusted = runtimeHintsUntrusted(saved);
+ if (valid && !state.memoryRuntimeHintsDraft) syncMemoryRuntimeHintsDraft(saved);
+ const draft = state.memoryRuntimeHintsDraft;
+ const reading = Boolean(state.memoryRuntimeHintsReading);
+ const loadError = errors.runtimeHintsLoad;
+ const editable = runtimeHintsEditable();
+ const editingDisabled = !editable;
+ const saveDisabled = !editable || !Object.keys(runtimeHintsDirtyPayload()).length;
+ const resetDisabled = !runtimeHintsResettable();
+ const enabled = valid && !untrusted && saved.enabled === true;
+ const planUpdateHint = draft ? String(draft.planUpdateHint ?? "") : "";
+ const acp48kFallbackHint = draft ? String(draft.acp48kFallbackHint ?? "") : "";
+ const maxLength = Number.isInteger(saved?.maxLength) && saved.maxLength > 0 ? saved.maxLength : RUNTIME_HINTS_MAX_CHARS;
+ const statusLabel = reading
+  ? tr("正在读取…", "Loading…")
+  : loadError
+  ? tr("读取失败", "Load failed")
+  : untrusted
+  ? tr("配置异常 · 已暂停下发", "Invalid config · delivery paused")
+  : errors.runtimeHintsSave
+  ? tr("无法保存本机设置", "Save failed")
+  : !valid
+  ? tr("正在读取…", "Loading…")
+  : enabled
+  ? tr("已启用", "Enabled")
+  : tr("已关闭", "Disabled");
+ const statusAttr = reading || loadError ? "unknown" : untrusted ? "pending" : errors.runtimeHintsSave || !valid ? "unknown" : enabled ? "configured" : "missing";
+ const feedbackHtml = !reading && loadError
+  ? `<p class="hub-hint" role="alert">${esc(tr("无法读取本机设置（为避免旧缓存或空草稿覆盖原配置，已禁止编辑、切换、保存与恢复默认；请点击重试）：", "Could not read local settings (editing, toggling, saving, and resetting are disabled to avoid overwriting existing config with stale or empty values; please retry): "))}${esc(errorText(loadError))} ${button("memory-runtime-hints-refresh", tr("重试", "Retry"), { small: true, icon: "refresh", disabled: state.memoryRuntimeHintsUpdating })}</p>`
+  : untrusted
+  ? `<p class="hub-hint" role="alert">${esc(tr(`检测到运行提示配置损坏或权限不安全（${saved?.warning || "invalid_config"}），已按 fail-closed 暂停下发；请点击「恢复默认」重写干净的 0600 配置。`, `Runtime hints config is corrupted or has unsafe permissions (${saved?.warning || "invalid_config"}). Delivery is paused (fail-closed); click Reset to defaults to rewrite a clean 0600 file.`))}</p>`
+  : errors.runtimeHintsSave
+  ? `<p class="hub-hint" role="alert">${esc(tr("无法保存本机设置：", "Could not save local settings: "))}${esc(errorText(errors.runtimeHintsSave))}</p>`
+  : state.memoryRuntimeHintsNotice
+  ? `<p class="hub-hint" role="status">${esc(state.memoryRuntimeHintsNotice)}</p>`
+  : "";
+ node.innerHTML = `<section class="hub-card hub-memory-runtime-hints"><div class="hub-row"><label class="hub-memory-access-switch"><input type="checkbox" name="memoryRuntimeHintsEnabled" aria-label="${esc(tr("T3 Code 专属运行提示（仅限 T3 Code 本机生效 · 不改动 AGENTS.md）", "T3 Code-only runtime hints (local T3 Code only · never edits AGENTS.md)"))}" aria-checked="${editable ? String(enabled) : "mixed"}" ${enabled ? "checked" : ""} ${editingDisabled ? "disabled" : ""}><span>${esc(tr("T3 Code 专属运行提示（仅限 T3 Code 本机生效 · 不改动 AGENTS.md）", "T3 Code-only runtime hints (local T3 Code only · never edits AGENTS.md)"))}</span></label><span class="hub-grow"></span><span class="hub-memory-access-state" data-status="${esc(statusAttr)}">${esc(statusLabel)}</span></div><p class="hub-card-description">${esc(tr("仅在 T3 Code 宿主环境下通过记忆 MCP 的 initialize.instructions 与 memory_status 注入；不会修改 AGENTS.md、AGY 原生配置或项目记忆库，也不对独立 Codex/AGY/Muse 或 Connect 远端生效。", "Injected only in T3 Code host sessions via Memory MCP initialize.instructions and memory_status. Never alters AGENTS.md, AGY native config, or project memory databases, and does not apply outside T3 Code or on Connect remote sessions."))}</p><label class="hub-field"><span class="hub-memory-runtime-hints-meta"><span>${esc(tr("AGY 顶栏 plan_update 打卡提示", "AGY top-bar plan_update hint"))}</span><span id="t3-hub-runtime-hints-plan-count" class="hub-memory-runtime-hints-count">${esc(`${planUpdateHint.length}/${maxLength}`)}</span></span><textarea class="hub-input hub-memory-runtime-hints-input" name="memoryRuntimeHintsPlanUpdate" maxlength="${esc(maxLength)}" spellcheck="false" ${editingDisabled ? "disabled" : ""}>${esc(planUpdateHint)}</textarea></label><label class="hub-field"><span class="hub-memory-runtime-hints-meta"><span>${esc(tr("AGY 48KiB 截断 5 个 t3-code 工具直连兜底提示", "AGY 48KiB truncated 5 t3-code tools direct fallback hint"))}</span><span id="t3-hub-runtime-hints-acp-count" class="hub-memory-runtime-hints-count">${esc(`${acp48kFallbackHint.length}/${maxLength}`)}</span></span><textarea class="hub-input hub-memory-runtime-hints-input" name="memoryRuntimeHintsAcp48k" maxlength="${esc(maxLength)}" spellcheck="false" ${editingDisabled ? "disabled" : ""}>${esc(acp48kFallbackHint)}</textarea></label><div class="hub-row hub-memory-access-actions">${button("memory-runtime-hints-save", tr("保存", "Save"), { primary: true, small: true, icon: "check", disabled: saveDisabled })}${button("memory-runtime-hints-reset", tr("恢复默认", "Reset to defaults"), { small: true, icon: "refresh", disabled: resetDisabled })}</div>${feedbackHtml}</section>`;
+    }
+    async function toggleMemoryRuntimeHintsEnabled(nextEnabled) {
+ if (typeof nextEnabled !== "boolean" || !runtimeHintsEditable()) { if (!disposed) renderMemoryRuntimeHints(); return; }
+ memoryRuntimeHintsVersion++;
+ state.memoryRuntimeHintsReading = false;
+ state.memoryRuntimeHintsUpdating = true;
+ state.memoryRuntimeHintsNotice = "";
+ delete errors.runtimeHintsSave;
+ renderMemoryRuntimeHints();
+ try {
+  const data = await request("memory:runtimeHints:set", { enabled: nextEnabled });
+  if (disposed) return;
+  if (!runtimeHintsValid(data)) throw runtimeHintsInvalidResponse();
+  memoryRuntimeHintsVersion++;
+  state.memoryRuntimeHintsReading = false;
+  cache.runtimeHints = data;
+  syncMemoryRuntimeHintsDraft(data);
+  state.memoryRuntimeHintsNotice = nextEnabled
+   ? tr("已启用 T3 Code 专属运行提示（新会话或重连 MCP 后生效）", "Enabled T3 Code runtime hints (applies on new session or MCP reconnect)")
+   : tr("已关闭 T3 Code 专属运行提示（已保留提示文本，新会话或重连 MCP 后停止下发）", "Disabled T3 Code runtime hints (hint text preserved; delivery stops on new session or MCP reconnect)");
+  toast(nextEnabled ? tr("T3 Code 运行提示已启用", "T3 Code runtime hints enabled") : tr("T3 Code 运行提示已关闭", "T3 Code runtime hints disabled"));
+ } catch (error) {
+  if (!disposed) {
+   errors.runtimeHintsSave = error;
+   toast(errorText(error), true);
+  }
+ } finally {
+  state.memoryRuntimeHintsUpdating = false;
+  if (!disposed) renderMemoryRuntimeHints();
+ }
+    }
+    async function saveMemoryRuntimeHints() {
+ if (!runtimeHintsEditable()) return;
+ const payload = runtimeHintsDirtyPayload();
+ const fields = Object.keys(payload);
+ if (!fields.length) return;
+ if (fields.some((field) => payload[field].length > RUNTIME_HINTS_MAX_CHARS)) {
+  const msg = tr(`单条运行提示不能超过 ${RUNTIME_HINTS_MAX_CHARS} 字符`, `Each runtime hint must be at most ${RUNTIME_HINTS_MAX_CHARS} characters`);
+  state.memoryRuntimeHintsNotice = msg;
+  renderMemoryRuntimeHints();
+  toast(msg, true);
+  return;
+ }
+ memoryRuntimeHintsVersion++;
+ state.memoryRuntimeHintsReading = false;
+ state.memoryRuntimeHintsUpdating = true;
+ state.memoryRuntimeHintsNotice = "";
+ delete errors.runtimeHintsSave;
+ renderMemoryRuntimeHints();
+ try {
+  const data = await request("memory:runtimeHints:set", payload);
+  if (disposed) return;
+  if (!runtimeHintsValid(data)) throw runtimeHintsInvalidResponse();
+  memoryRuntimeHintsVersion++;
+  state.memoryRuntimeHintsReading = false;
+  cache.runtimeHints = data;
+  syncMemoryRuntimeHintsDraft(data, fields);
+  state.memoryRuntimeHintsNotice = tr("已保存（仅对 T3 Code 本机生效；新会话或重连 MCP 后读取）", "Saved (T3 Code local only; applies on new session or MCP reconnect)");
+  toast(tr("T3 Code 运行提示已保存", "T3 Code runtime hints saved"));
+ } catch (error) {
+  if (!disposed) {
+   errors.runtimeHintsSave = error;
+   toast(errorText(error), true);
+  }
+ } finally {
+  state.memoryRuntimeHintsUpdating = false;
+  if (!disposed) renderMemoryRuntimeHints();
+ }
+    }
+    async function resetMemoryRuntimeHints() {
+ if (!runtimeHintsResettable()) return;
+ memoryRuntimeHintsVersion++;
+ state.memoryRuntimeHintsReading = false;
+ state.memoryRuntimeHintsUpdating = true;
+ state.memoryRuntimeHintsNotice = "";
+ delete errors.runtimeHintsSave;
+ renderMemoryRuntimeHints();
+ try {
+  const data = await request("memory:runtimeHints:set", { reset: true });
+  if (disposed) return;
+  if (!runtimeHintsValid(data)) throw runtimeHintsInvalidResponse();
+  memoryRuntimeHintsVersion++;
+  state.memoryRuntimeHintsReading = false;
+  cache.runtimeHints = data;
+  delete errors.runtimeHintsLoad;
+  syncMemoryRuntimeHintsDraft(data, RUNTIME_HINTS_FIELDS.map(([field]) => field));
+  state.memoryRuntimeHintsNotice = tr("已恢复默认提示", "Reset to default hints");
+  toast(tr("已恢复 T3 Code 默认运行提示", "T3 Code runtime hints reset to defaults"));
+ } catch (error) {
+  if (!disposed) {
+   errors.runtimeHintsSave = error;
+   toast(errorText(error), true);
+  }
+ } finally {
+  state.memoryRuntimeHintsUpdating = false;
+  if (!disposed) renderMemoryRuntimeHints();
  }
     }
     function connectionStatusLabel(status) {
@@ -2065,7 +2269,7 @@
     }
     async function ensureMemorySettingsLoaded(force = false) {
  const confirmedRoot = memoryProjectReady() ? state.projectRoot : null;
- const tasks = [refreshMemoryAgentAccess(force), refreshEmbed(true, force, confirmedRoot)];
+ const tasks = [refreshMemoryAgentAccess(force), refreshMemoryRuntimeHints(force), refreshEmbed(true, force, confirmedRoot)];
  if (!cache.connections || force) {
   tasks.push((async () => {
    try {
@@ -2079,6 +2283,7 @@
  await Promise.all(tasks);
  if (!disposed) {
   renderMemoryAgentAccess();
+  renderMemoryRuntimeHints();
   renderMemoryRuntime();
   renderEngine();
   renderMemoryConnections();
@@ -2241,6 +2446,7 @@
   }
   if (isMemTab) {
    renderMemoryAgentAccess();
+   renderMemoryRuntimeHints();
    renderMemoryRuntime();
    renderEngine();
    renderMemoryConnections();
@@ -3188,7 +3394,7 @@
  };
  if (tab === "memory") {
  const confirmedRoot = memoryProjectReady() ? state.projectRoot : null;
- const localStatus = [load("connections", "memory:connections", {}), refreshMemoryAgentAccess(force), refreshEmbed(false, force, confirmedRoot)];
+ const localStatus = [load("connections", "memory:connections", {}), refreshMemoryAgentAccess(force), refreshMemoryRuntimeHints(force), refreshEmbed(false, force, confirmedRoot)];
  if (confirmedRoot) {
   localStatus.push(load("overview", "memory:overview", { projectRoot: confirmedRoot }), load("worktree", "memory:worktreeInfo", { projectRoot: confirmedRoot }));
  } else {
@@ -3542,6 +3748,9 @@
  else if (action === "memory-access-setup") runMemorySetup();
  else if (action === "memory-access-copy-prompt") copyMemorySetupPrompt();
  else if (action === "memory-access-refresh") refreshMemoryAgentAccess(true);
+ else if (action === "memory-runtime-hints-save") saveMemoryRuntimeHints();
+ else if (action === "memory-runtime-hints-reset") resetMemoryRuntimeHints();
+ else if (action === "memory-runtime-hints-refresh") refreshMemoryRuntimeHints(true);
  else if (action === "copy-memory-mcp-config") copyMemoryMcpConfig();
  else if (action === "test-memory-vector") runMemoryVectorTest();
  else if (action === "refresh-memory-runtime") refreshEmbed(true, true);
@@ -3598,12 +3807,26 @@
  drafts[key][name === "memory-title" ? "title" : "content"] = input.value;
  } else if (name?.startsWith("new-memory-")) { drafts.__new ||= {}; drafts.__new[name.slice(11)] = input.value; }
  else if (name === "agents-content") { const draft = agentDraft(); if (draft) { draft.content = input.value; updateAgentCounter(); } }
+ else if (name === "memoryRuntimeHintsPlanUpdate" || name === "memoryRuntimeHintsAcp48k") {
+  if (!runtimeHintsEditable()) return;
+  const saved = cache.runtimeHints;
+  if (!state.memoryRuntimeHintsDraft) syncMemoryRuntimeHintsDraft(saved);
+  const [field, flag] = RUNTIME_HINTS_FIELDS[name === "memoryRuntimeHintsPlanUpdate" ? 0 : 1];
+  state.memoryRuntimeHintsDraft[field] = input.value;
+  state.memoryRuntimeHintsDraft[flag] = input.value !== saved[field];
+  state.memoryRuntimeHintsNotice = "";
+  const counter = root.querySelector(name === "memoryRuntimeHintsPlanUpdate" ? "#t3-hub-runtime-hints-plan-count" : "#t3-hub-runtime-hints-acp-count");
+  if (counter) counter.textContent = `${input.value.length}/${RUNTIME_HINTS_MAX_CHARS}`;
+  const saveButton = root.querySelector('#t3-hub-memory-runtime-hints [data-action="memory-runtime-hints-save"]');
+  if (saveButton) saveButton.disabled = !Object.keys(runtimeHintsDirtyPayload()).length;
+ }
  else if (name?.startsWith("mcp-")) state.mcpForm[name.slice(4)] = input.value;
     }
     function onChange(event) {
  const input = event.target;
  const name = input.name;
  if (name === "memoryAgentAccess") { setMemoryAgentAccess(!!input.checked); return; }
+ if (name === "memoryRuntimeHintsEnabled") { toggleMemoryRuntimeHintsEnabled(!!input.checked); return; }
  if (name === "resource-status") { resourceFilter(input.dataset.domain).status = input.value; renderTab(); return; }
  if (name === "mcp-mode-scope") {
  if (!["project", "global"].includes(input.value)) return;
@@ -4022,7 +4245,7 @@
  if (disposed) return;
  disposed = true;
  artifactDockSig = "";
- contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; embedVersion++; boardVersion++;
+ contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; memoryRuntimeHintsVersion++; embedVersion++; boardVersion++;
  clearInterval(routeTimer); timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();
  if (updateFrame) cancelAnimationFrame(updateFrame);

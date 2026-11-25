@@ -15,6 +15,25 @@ const SCHEMA_CACHE_PATH = path.join(HUB_DIR, "mcp-schema-cache.json");
 const IDLE_MS = 3 * 60 * 1000;
 const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 const SKILL_READ_MAX_BYTES = 64 * 1024;
+const T3_RUNTIME_HINTS_FILE = "t3-runtime-hints.json";
+const T3_RUNTIME_HINTS_SCOPE = "t3-code-only";
+const T3_RUNTIME_HINTS_MAX_LENGTH = 2000;
+const T3_RUNTIME_HINTS_MAX_BYTES = 32 * 1024;
+const T3_TRUNCATED_TOOLS = Object.freeze([
+  "delegate_task",
+  "html_render",
+  "t3_thread_launch",
+  "schedule_task",
+  "t3_project_update",
+]);
+const DEFAULT_T3_RUNTIME_HINTS_FALLBACK = Object.freeze({
+  version: 1,
+  enabled: true,
+  scope: T3_RUNTIME_HINTS_SCOPE,
+  planUpdateHint: "仅 T3 Code 顶层主会话执行 >=3 步复杂多步任务时，开干前及关键阶段变化时顺手调一次 plan_update(title, steps:[{text,status}])（status 用 pending|in_progress|completed）点亮顶栏蓝环进度；简单问答、<=2 步小活及所有子代理不调。",
+  acp48kFallbackHint: "若 antigravity-acp 因 48KiB 上限截断 t3-code 原生工具（delegate_task / html_render / t3_thread_launch / schedule_task / t3_project_update），必须以单条直连命令直接执行 ELECTRON_RUN_AS_NODE=1 \"$T3_ACP_MCP_NODE\" ${T3_ACP_MCP_ENTRYPOINT:+\"$T3_ACP_MCP_ENTRYPOINT\"} acp-mcp-call <tool> '<json>'（严禁外包 node -e / python3 / 脚本套壳或尾部串联其他命令，否则 T3 正则失配、html_render 不会内嵌卡片；按需读 <appDataDir>/mcp/t3-code/<tool>.json 核对参数）。",
+});
+let memoryAccessMod = null;
 let memoryAccess = null;
 for (const cand of [
   process.env.T3_HUB_MEMORY_ACCESS ? path.resolve(process.env.T3_HUB_MEMORY_ACCESS) : null,
@@ -22,9 +41,212 @@ for (const cand of [
   path.join(__dirname, "..", "hud-plugin", "hub-memory-access.cjs"),
   path.join(HOME_DIR, ".t3", "hud-plugin", "hub-memory-access.cjs"),
 ].filter(Boolean)) {
-  try { memoryAccess = require(cand).createMemoryAccessManager({ homeDir: HOME_DIR, hubDir: HUB_DIR, userDataDir: process.env.T3CODE_HOME || path.join(HOME_DIR, ".t3", "userdata") }); break; } catch {}
+  try {
+    memoryAccessMod = require(cand);
+    memoryAccess = memoryAccessMod.createMemoryAccessManager({ homeDir: HOME_DIR, hubDir: HUB_DIR, userDataDir: process.env.T3CODE_HOME || path.join(HOME_DIR, ".t3", "userdata") });
+    break;
+  } catch {}
 }
 const MEMORY_ONLY_MODE = process.argv.includes("--memory-only");
+
+const METADATA_TRUSTED_TOP_LEVEL_KEYS = Object.freeze([
+  "path", "sourcePath", "sourceDir", "configDir", "configPath", "providerDir",
+  "profileDir", "homeDir", "dataDir", "userDataDir", "appDataDir", "metadataPath",
+]);
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+function isLoopbackEndpoint(raw) {
+  if (typeof raw !== "string" || /[\r\n\t\0]/.test(raw)) return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      ["127.0.0.1", "localhost", "[::1]", "::1"].includes(host) &&
+      !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
+}
+function resolveProvidersRoot(env = process.env) {
+  const rawHome = typeof env?.HOME === "string" ? env.HOME.trim() : "";
+  const envHome = rawHome && !/[\r\n\t\0]/.test(rawHome) && path.isAbsolute(rawHome)
+    ? path.resolve(rawHome)
+    : path.resolve(HOME_DIR);
+  return path.resolve(path.join(envHome, ".t3", "userdata", "providers"));
+}
+function realpathOrNull(target) {
+  try { return fs.realpathSync(target); } catch { return null; }
+}
+function isStrictlyInside(base, candidate) {
+  const rel = path.relative(base, candidate);
+  return Boolean(rel) && rel !== "." && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
+}
+function isTrustedT3ProviderPath(raw, providersRoot = resolveProvidersRoot(process.env), { expectDirectory = false } = {}) {
+  if (typeof raw !== "string" || /[\r\n\t\0]/.test(raw)) return false;
+  const trimmed = raw.trim();
+  if (!trimmed || !path.isAbsolute(trimmed)) return false;
+  if (trimmed.split(/[\\/]+/).includes("..")) return false;
+  let origSt;
+  try { origSt = fs.statSync(trimmed); } catch { return false; }
+  if (expectDirectory ? !origSt.isDirectory() : !origSt.isDirectory() && !origSt.isFile()) return false;
+  const resolvedBase = path.resolve(providersRoot);
+  const resolvedCand = path.resolve(trimmed);
+  if (!isStrictlyInside(resolvedBase, resolvedCand) || /\s/.test(path.relative(resolvedBase, resolvedCand))) return false;
+  const realBase = realpathOrNull(resolvedBase);
+  const realCand = realpathOrNull(trimmed);
+  if (!realBase || !realCand || !isStrictlyInside(realBase, realCand)) return false;
+  let st;
+  try { st = fs.statSync(realCand); } catch { return false; }
+  return expectDirectory ? st.isDirectory() : st.isDirectory() || st.isFile();
+}
+function metadataPointsUnderT3Providers(raw, providersRoot) {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (!trimmed.startsWith("{")) return isTrustedT3ProviderPath(raw, providersRoot);
+  let parsed;
+  try { parsed = JSON.parse(trimmed); } catch { return false; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  return METADATA_TRUSTED_TOP_LEVEL_KEYS.some((key) =>
+    Object.hasOwn(parsed, key) && typeof parsed[key] === "string" && isTrustedT3ProviderPath(parsed[key], providersRoot));
+}
+function isT3CodeRuntime(env = process.env) {
+  if (!env || typeof env !== "object") return false;
+  if (typeof env.T3_ACP_MCP_NODE === "string" && env.T3_ACP_MCP_NODE.trim() !== "" && !/[\r\n\0]/.test(env.T3_ACP_MCP_NODE)) return true;
+  if (isLoopbackEndpoint(env.T3_ACP_MCP_ENDPOINT)) return true;
+  for (const key of ["T3CODE_THREAD_ID", "T3_THREAD_ID"]) {
+    if (typeof env[key] === "string" && env[key].trim() !== "" && !/[\s\0]/.test(env[key].trim())) return true;
+  }
+  if (typeof env.T3_CODE_ENV === "string" && ["1", "true"].includes(env.T3_CODE_ENV.trim().toLowerCase())) return true;
+  const providersRoot = resolveProvidersRoot(env);
+  if (isTrustedT3ProviderPath(env.CODEX_HOME, providersRoot, { expectDirectory: true })) return true;
+  if (metadataPointsUnderT3Providers(env.ANTIGRAVITY_SOURCE_METADATA, providersRoot)) return true;
+  return false;
+}
+function isTrustedMacAliasBin(target) {
+  const expected = target === "/tmp" ? "/private/tmp" : target === "/var" ? "/private/var" : null;
+  if (!expected) return false;
+  try { return fs.realpathSync(target) === expected; } catch { return false; }
+}
+function isDirectoryEntryBin(target, stat) {
+  if (stat.isDirectory()) return true;
+  if (!stat.isSymbolicLink() || !isTrustedMacAliasBin(target)) return false;
+  try { return fs.statSync(target).isDirectory(); } catch { return false; }
+}
+function assertNoSymlinkPathBin(target, { allowMissing = true, includeTarget = true } = {}) {
+  const absolute = path.resolve(target);
+  const parsed = path.parse(absolute);
+  let current = parsed.root;
+  const parts = absolute.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  const limit = includeTarget ? parts.length : Math.max(0, parts.length - 1);
+  for (let i = 0; i < limit; i += 1) {
+    current = path.join(current, parts[i]);
+    let st;
+    try { st = fs.lstatSync(current); }
+    catch (error) {
+      if (error?.code === "ENOENT" && allowMissing) break;
+      throw error;
+    }
+    if (st.isSymbolicLink() && !isTrustedMacAliasBin(current)) throw new Error("unsafe_symlink");
+    if (i < limit - 1 && !isDirectoryEntryBin(current, st)) throw new Error("unsafe_path");
+  }
+  return absolute;
+}
+function readT3RuntimeHintsFallback(hintsPath = path.join(HUB_DIR, T3_RUNTIME_HINTS_FILE)) {
+  const defaults = memoryAccessMod?.DEFAULT_T3_RUNTIME_HINTS || DEFAULT_T3_RUNTIME_HINTS_FALLBACK;
+  const untrusted = (warning) => ({
+    trusted: false,
+    enabled: false,
+    planUpdateHint: "",
+    acp48kFallbackHint: "",
+    corrupted: true,
+    fallback: true,
+    warning,
+  });
+  let fd = null;
+  try {
+    assertNoSymlinkPathBin(hintsPath, { allowMissing: true, includeTarget: true });
+    let st;
+    try { st = fs.lstatSync(hintsPath); }
+    catch (error) {
+      if (error?.code === "ENOENT") {
+        return { ...defaults, trusted: true, enabled: true, corrupted: false, fallback: false };
+      }
+      return untrusted("runtime_hints_unreadable");
+    }
+    if (st.isSymbolicLink() || !st.isFile() || st.size > T3_RUNTIME_HINTS_MAX_BYTES) return untrusted("unsafe_file");
+    fd = fs.openSync(hintsPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino) return untrusted("file_changed");
+    if ((opened.mode & 0o777 & 0o022) !== 0) return untrusted("unsafe_permissions");
+    if (opened.size > T3_RUNTIME_HINTS_MAX_BYTES) return untrusted("unsafe_file");
+    const buf = fs.readFileSync(fd);
+    if (buf.length > T3_RUNTIME_HINTS_MAX_BYTES) return untrusted("unsafe_file");
+    let text;
+    try { text = STRICT_UTF8_DECODER.decode(buf); } catch { return untrusted("invalid_utf8"); }
+    let doc;
+    try { doc = JSON.parse(text); } catch { return untrusted("invalid_json"); }
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) return untrusted("invalid_schema");
+    if (doc.version !== 1 || typeof doc.enabled !== "boolean") return untrusted("invalid_schema");
+    if (doc.scope !== undefined && doc.scope !== T3_RUNTIME_HINTS_SCOPE) return untrusted("invalid_schema");
+    if (typeof doc.planUpdateHint !== "string" || doc.planUpdateHint.includes("\0") || doc.planUpdateHint.length > T3_RUNTIME_HINTS_MAX_LENGTH) {
+      return untrusted("invalid_schema");
+    }
+    if (typeof doc.acp48kFallbackHint !== "string" || doc.acp48kFallbackHint.includes("\0") || doc.acp48kFallbackHint.length > T3_RUNTIME_HINTS_MAX_LENGTH) {
+      return untrusted("invalid_schema");
+    }
+    return {
+      ...defaults,
+      trusted: true,
+      enabled: doc.enabled,
+      planUpdateHint: doc.planUpdateHint,
+      acp48kFallbackHint: doc.acp48kFallbackHint,
+      corrupted: false,
+      fallback: false,
+    };
+  } catch (error) {
+    return untrusted(error?.message === "unsafe_symlink" ? "unsafe_symlink" : "runtime_hints_untrusted");
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch {}
+  }
+}
+function readT3RuntimeHints() {
+  if (memoryAccess && typeof memoryAccess.getT3RuntimeHints === "function") {
+    try {
+      const res = memoryAccess.getT3RuntimeHints();
+      if (res && typeof res === "object") return res;
+    } catch {}
+    return {
+      trusted: false,
+      enabled: false,
+      planUpdateHint: "",
+      acp48kFallbackHint: "",
+      corrupted: true,
+      fallback: true,
+      warning: "runtime_hints_untrusted",
+    };
+  }
+  return readT3RuntimeHintsFallback();
+}
+function buildT3RuntimeHintsPayload(env = process.env) {
+  if (!isT3CodeRuntime(env)) return null;
+  const hints = readT3RuntimeHints();
+  if (!hints || hints.trusted !== true || hints.enabled !== true || hints.corrupted === true || hints.fallback === true) return null;
+  const planUpdate = typeof hints.planUpdateHint === "string" ? hints.planUpdateHint.trim() : "";
+  const acp48kFallback = typeof hints.acp48kFallbackHint === "string" ? hints.acp48kFallbackHint.trim() : "";
+  if (!planUpdate && !acp48kFallback) return null;
+  const sections = [];
+  if (planUpdate) sections.push("[T3 Code plan_update] " + planUpdate);
+  if (acp48kFallback) sections.push("[T3 Code 48KiB fallback] " + acp48kFallback);
+  const t3RuntimeHints = { scope: T3_RUNTIME_HINTS_SCOPE };
+  if (planUpdate) t3RuntimeHints.planUpdate = planUpdate;
+  if (acp48kFallback) {
+    t3RuntimeHints.acp48kFallback = acp48kFallback;
+    t3RuntimeHints.truncatedTools = [...(memoryAccessMod?.RUNTIME_HINTS_TRUNCATED_TOOLS || T3_TRUNCATED_TOOLS)];
+  }
+  return { instructions: sections.join("\n"), t3RuntimeHints };
+}
 
 function memoryAccessStatus() {
   try { return memoryAccess ? memoryAccess.readMemoryOnlyStatus() : { ok: false, enabled: false, state: "unknown", serverVersion: "1", vaultAvailable: false }; }
@@ -906,7 +1128,10 @@ async function handleToolsCall(params) {
     throw new Error("tool unavailable in memory-only mode");
   }
   if (name === "memory_status") {
-    return { content: [{ type: "text", text: JSON.stringify({ ...memoryAccessStatus(), ...memoryProjectBindingStatus() }) }] };
+    const statusPayload = { ...memoryAccessStatus(), ...memoryProjectBindingStatus() };
+    const runtimeHints = buildT3RuntimeHintsPayload(process.env);
+    if (runtimeHints?.t3RuntimeHints) statusPayload.t3RuntimeHints = runtimeHints.t3RuntimeHints;
+    return { content: [{ type: "text", text: JSON.stringify(statusPayload) }] };
   }
   if ((isMemoryTool(name) || name === "context_search") && !agentMemoryEnabled()) {
     throw new Error("Agent memory access is disabled or unavailable");
@@ -1080,7 +1305,10 @@ async function handleMessage(msg, framed) {
   try {
     if (msg.method === "initialize") {
       const ver = msg.params?.protocolVersion || "2024-11-05";
-      reply({ protocolVersion: ver, capabilities: { tools: {} }, serverInfo: { name: "t3-mcp-router", version: "1.0.0" } });
+      const initResult = { protocolVersion: ver, capabilities: { tools: {} }, serverInfo: { name: "t3-mcp-router", version: "1.0.0" } };
+      const runtimeHints = buildT3RuntimeHintsPayload(process.env);
+      if (runtimeHints?.instructions) initResult.instructions = runtimeHints.instructions;
+      reply(initResult);
     } else if (msg.method === "ping") { reply({}); }
     else if (msg.method === "tools/list") { reply(await handleToolsList()); }
     else if (msg.method === "tools/call") { reply(await handleToolsCall(msg.params || {})); }
@@ -1129,7 +1357,7 @@ if (require.main === module) {
   process.stdin.on("end", () => { for (const k of [...stdioPool.keys()]) killPoolEntry(k); });
 }
 if (require.main !== module) {
-  module.exports = { handleToolsCall, handleToolsList, handleMessage, memoryTools, withTimeout, spawnStdioUpstream, killPoolEntry, sendToStdio, stdioPool, discoverSkills, findSkill, MAX_BUFFER_BYTES, SKILL_READ_MAX_BYTES };
+  module.exports = { handleToolsCall, handleToolsList, handleMessage, memoryTools, withTimeout, spawnStdioUpstream, killPoolEntry, sendToStdio, stdioPool, discoverSkills, findSkill, isT3CodeRuntime, isTrustedT3ProviderPath, metadataPointsUnderT3Providers, readT3RuntimeHints, readT3RuntimeHintsFallback, buildT3RuntimeHintsPayload, MAX_BUFFER_BYTES, SKILL_READ_MAX_BYTES };
 }
 
 
