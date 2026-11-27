@@ -997,3 +997,332 @@ test("an old CDP poll suspended in detach leaves the reconnected targets intact"
   assert.deepEqual(status.windows.map((w) => w.id), [second.targetId]);
   assert.equal(host.getState().targetCount, 1);
 });
+
+test("CDP CORS responds with verified desktop origin when Origin header is stripped, while rejecting disallowed origins and non-desktop targets", async (t) => {
+  // 1. Verified t3code://app main window
+  {
+    const { host } = await cdpFixture(
+      t,
+      [{ targetId: "main-desktop", type: "page", title: "T3 Code", url: "t3code://app/" }],
+      { backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) } }
+    );
+    const info = await host.start();
+    assert.equal(await waitFor(() => host.getState().capturedT3Origin === "t3code://app"), true);
+
+    const optStripped = await fetch(`${info.url}/rpc`, { method: "OPTIONS" });
+    assert.equal(optStripped.status, 204);
+    assert.equal(optStripped.headers.get("access-control-allow-origin"), "t3code://app");
+    assert.equal(optStripped.headers.get("vary"), "Origin");
+    assert.equal(optStripped.headers.get("access-control-allow-private-network"), "true");
+
+    const postStripped = await fetch(`${info.url}/rpc`, {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": info.rpcToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "hubCall", args: ["ping", { stripped: true }] }),
+    });
+    assert.equal(postStripped.status, 200);
+    assert.equal(postStripped.headers.get("access-control-allow-origin"), "t3code://app");
+    assert.equal(postStripped.headers.get("vary"), "Origin");
+    assert.deepEqual(await postStripped.json(), { ok: true, action: "ping", payload: { stripped: true } });
+
+    for (const badOrigin of ["https://evil.com", "null", "t3code://other"]) {
+      const optBad = await fetch(`${info.url}/rpc`, {
+        method: "OPTIONS",
+        headers: { Origin: badOrigin },
+      });
+      assert.equal(optBad.status, 204);
+      assert.equal(optBad.headers.get("access-control-allow-origin"), null, `OPTIONS must reject ${badOrigin}`);
+
+      const postBad = await fetch(`${info.url}/rpc`, {
+        method: "POST",
+        headers: {
+          "X-T3-Hud-Token": info.rpcToken,
+          "Content-Type": "application/json",
+          Origin: badOrigin,
+        },
+        body: JSON.stringify({ method: "hubCall", args: ["ping"] }),
+      });
+      assert.equal(postBad.headers.get("access-control-allow-origin"), null, `POST must reject ${badOrigin}`);
+    }
+  }
+
+  // 2. Verified loopback-only main window -> stripped Origin must NOT receive ACAO
+  {
+    const loopbackOrigin = "http://127.0.0.1:8080";
+    const { host } = await cdpFixture(
+      t,
+      [{ targetId: "main-loopback", type: "page", title: "T3 Code", url: `${loopbackOrigin}/` }],
+      { backend: { hubCall: async () => ({ ok: true }) } }
+    );
+    const info = await host.start();
+    assert.equal(await waitFor(() => host.getState().capturedT3Origin === loopbackOrigin), true);
+
+    const optNoOrigin = await fetch(`${info.url}/rpc`, { method: "OPTIONS" });
+    assert.equal(optNoOrigin.status, 204);
+    assert.equal(optNoOrigin.headers.get("access-control-allow-origin"), null);
+
+    const postNoOrigin = await fetch(`${info.url}/rpc`, {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": info.rpcToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "hubCall", args: ["ping"] }),
+    });
+    assert.equal(postNoOrigin.status, 200);
+    assert.equal(postNoOrigin.headers.get("access-control-allow-origin"), null);
+  }
+
+  // 3. No verified desktop main window -> stripped Origin must NOT receive ACAO
+  {
+    const { host } = await cdpFixture(
+      t,
+      [],
+      { backend: { hubCall: async () => ({ ok: true }) } }
+    );
+    const info = await host.start();
+
+    const optNoOrigin = await fetch(`${info.url}/rpc`, { method: "OPTIONS" });
+    assert.equal(optNoOrigin.status, 204);
+    assert.equal(optNoOrigin.headers.get("access-control-allow-origin"), null);
+
+    const postNoOrigin = await fetch(`${info.url}/rpc`, {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": info.rpcToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "hubCall", args: ["ping"] }),
+    });
+    assert.equal(postNoOrigin.status, 200);
+    assert.equal(postNoOrigin.headers.get("access-control-allow-origin"), null);
+  }
+});
+
+test("CDP cold start defers bridge launch until main window verification, ignores inherited origin env, and syncs reused bridge origin", async (t) => {
+  const { spawn } = require("node:child_process");
+  const { readLiveBridgeRecord } = require("../src/hud-runtime.cjs");
+  const srcDir = path.resolve(__dirname, "../src");
+  const bridgePids = new Set();
+  const prevDesktopEnv = process.env.T3_DESKTOP_ORIGIN;
+  const prevLoopbackEnv = process.env.T3_ALLOWED_LOOPBACK_ORIGIN;
+
+  t.after(() => {
+    if (prevDesktopEnv === undefined) delete process.env.T3_DESKTOP_ORIGIN;
+    else process.env.T3_DESKTOP_ORIGIN = prevDesktopEnv;
+    if (prevLoopbackEnv === undefined) delete process.env.T3_ALLOWED_LOOPBACK_ORIGIN;
+    else process.env.T3_ALLOWED_LOOPBACK_ORIGIN = prevLoopbackEnv;
+    for (const pid of bridgePids) {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+  });
+
+  function setupRealBridgePlugin(pluginDir) {
+    fs.copyFileSync(path.join(srcDir, "hub-bridge.cjs"), path.join(pluginDir, "hub-bridge.cjs"));
+    fs.copyFileSync(path.join(srcDir, "hud-runtime.cjs"), path.join(pluginDir, "hud-runtime.cjs"));
+    fs.writeFileSync(
+      path.join(pluginDir, "backend.cjs"),
+      "module.exports = { hubCall: async (action, payload) => ({ ok: true, action, payload }) };\n"
+    );
+  }
+
+  // Case 1: t3code://app cold start while parent process inherited conflicting T3_DESKTOP_ORIGIN=t3code-dev://app
+  {
+    process.env.T3_DESKTOP_ORIGIN = "t3code-dev://app";
+    process.env.T3_ALLOWED_LOOPBACK_ORIGIN = "http://127.0.0.1:4100";
+    const { server, host, pluginDir, runDir } = await cdpFixture(
+      t,
+      [{ targetId: "main-prod", type: "page", title: "T3 Code", url: "t3code://app/" }],
+      {
+        skipSidecarBridge: false,
+        backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) },
+      }
+    );
+    setupRealBridgePlugin(pluginDir);
+    server.setPageState("main-prod", { hasRoot: false });
+    const info = await host.start();
+
+    // Before #root mounts, bridge must NOT be launched prematurely
+    await new Promise((r) => setTimeout(r, 140));
+    assert.equal(readLiveBridgeRecord(runDir, process.pid), null, "sidecar bridge must wait for verified main window");
+
+    // Mount #root -> host verifies t3code://app and spawns bridge with exact verified origin
+    server.setPageState("main-prod", { hasRoot: true });
+    assert.equal(await waitFor(() => server.injectedTargetIds.length >= 1 && Boolean(readLiveBridgeRecord(runDir, process.pid)), 5000), true);
+    const bridge = readLiveBridgeRecord(runDir, process.pid).record;
+    bridgePids.add(bridge.pid);
+    assert.equal(bridge.desktopOrigin, "t3code://app");
+    assert.equal(bridge.loopbackOrigin, null);
+
+    // Both /rpc and /hub-rpc must respond with t3code://app (never inherited t3code-dev://app)
+    for (const reqSpec of [
+      { url: `${info.url}/rpc`, token: info.rpcToken, body: { method: "hubCall", args: ["ping", { via: "rpc" }] } },
+      { url: `${bridge.url}/hub-rpc`, token: bridge.token, body: { action: "ping", payload: { via: "bridge" } } },
+    ]) {
+      const opt = await fetch(reqSpec.url, { method: "OPTIONS" });
+      assert.equal(opt.status, 204);
+      assert.equal(opt.headers.get("access-control-allow-origin"), "t3code://app");
+      assert.equal(opt.headers.get("vary"), "Origin");
+
+      const post = await fetch(reqSpec.url, {
+        method: "POST",
+        headers: { "X-T3-Hud-Token": reqSpec.token, "Content-Type": "application/json" },
+        body: JSON.stringify(reqSpec.body),
+      });
+      assert.equal(post.status, 200);
+      assert.equal(post.headers.get("access-control-allow-origin"), "t3code://app");
+      assert.equal(post.headers.get("vary"), "Origin");
+
+      // Inherited loopback env must NOT leak into allowed CORS origins
+      const badLoop = await fetch(reqSpec.url, {
+        method: "OPTIONS",
+        headers: { Origin: "http://127.0.0.1:4100" },
+      });
+      assert.equal(badLoop.headers.get("access-control-allow-origin"), null);
+    }
+  }
+
+  // Case 2: t3code-dev://app cold start with NO T3_DESKTOP_ORIGIN in environment
+  {
+    delete process.env.T3_DESKTOP_ORIGIN;
+    delete process.env.T3_ALLOWED_LOOPBACK_ORIGIN;
+    const { server, host, pluginDir, runDir } = await cdpFixture(
+      t,
+      [{ targetId: "main-dev", type: "page", title: "T3 Code (Beta)", url: "t3code-dev://app/" }],
+      {
+        skipSidecarBridge: false,
+        backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) },
+      }
+    );
+    setupRealBridgePlugin(pluginDir);
+    const info = await host.start();
+    assert.equal(await waitFor(() => server.injectedTargetIds.length >= 1 && Boolean(readLiveBridgeRecord(runDir, process.pid)), 5000), true);
+    const bridge = readLiveBridgeRecord(runDir, process.pid).record;
+    bridgePids.add(bridge.pid);
+    assert.equal(bridge.desktopOrigin, "t3code-dev://app");
+
+    for (const reqSpec of [
+      { url: `${info.url}/rpc`, token: info.rpcToken, body: { method: "hubCall", args: ["ping", { via: "rpc" }] } },
+      { url: `${bridge.url}/hub-rpc`, token: bridge.token, body: { action: "ping", payload: { via: "bridge" } } },
+    ]) {
+      const opt = await fetch(reqSpec.url, { method: "OPTIONS" });
+      assert.equal(opt.status, 204);
+      assert.equal(opt.headers.get("access-control-allow-origin"), "t3code-dev://app");
+      assert.equal(opt.headers.get("vary"), "Origin");
+
+      const post = await fetch(reqSpec.url, {
+        method: "POST",
+        headers: { "X-T3-Hud-Token": reqSpec.token, "Content-Type": "application/json" },
+        body: JSON.stringify(reqSpec.body),
+      });
+      assert.equal(post.status, 200);
+      assert.equal(post.headers.get("access-control-allow-origin"), "t3code-dev://app");
+      assert.equal(post.headers.get("vary"), "Origin");
+    }
+  }
+
+  // Case 3: Reusing a live bridge with mismatched desktopOrigin syncs it via authenticated /reload before injection
+  {
+    delete process.env.T3_DESKTOP_ORIGIN;
+    delete process.env.T3_ALLOWED_LOOPBACK_ORIGIN;
+    const { server, host, pluginDir, runDir } = await cdpFixture(
+      t,
+      [{ targetId: "main-dev-reuse", type: "page", title: "T3 Code (Beta)", url: "t3code-dev://app/" }],
+      {
+        skipSidecarBridge: false,
+        backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) },
+      }
+    );
+    setupRealBridgePlugin(pluginDir);
+
+    // Pre-start a live bridge configured for t3code://app
+    const preBridge = spawn(process.execPath, [path.join(pluginDir, "hub-bridge.cjs")], {
+      env: {
+        HOME: pluginDir,
+        PATH: process.env.PATH || "/usr/bin:/bin",
+        T3_HUD_DIR: pluginDir,
+        T3_WATCH_PID: String(process.pid),
+        T3_DESKTOP_ORIGIN: "t3code://app",
+      },
+      stdio: "ignore",
+    });
+    bridgePids.add(preBridge.pid);
+    assert.equal(await waitFor(() => readLiveBridgeRecord(runDir, process.pid)?.record?.pid === preBridge.pid, 4000), true);
+    assert.equal(readLiveBridgeRecord(runDir, process.pid).record.desktopOrigin, "t3code://app");
+
+    await host.start();
+    assert.equal(await waitFor(() => server.injectedTargetIds.length >= 1, 5000), true);
+
+    const synced = readLiveBridgeRecord(runDir, process.pid).record;
+    assert.equal(synced.pid, preBridge.pid, "existing healthy bridge should be synced in place");
+    assert.equal(synced.desktopOrigin, "t3code-dev://app");
+    const optSynced = await fetch(`${synced.url}/hub-rpc`, { method: "OPTIONS" });
+    assert.equal(optSynced.headers.get("access-control-allow-origin"), "t3code-dev://app");
+    assert.equal(optSynced.headers.get("vary"), "Origin");
+  }
+
+  // Case 4: Stale bridge record with recycled PID belonging to an unrelated live process must NEVER be signaled
+  {
+    delete process.env.T3_DESKTOP_ORIGIN;
+    delete process.env.T3_ALLOWED_LOOPBACK_ORIGIN;
+    const { server, host, pluginDir, runDir } = await cdpFixture(
+      t,
+      [{ targetId: "main-dev-recycled", type: "page", title: "T3 Code (Beta)", url: "t3code-dev://app/" }],
+      {
+        skipSidecarBridge: false,
+        backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) },
+      }
+    );
+    setupRealBridgePlugin(pluginDir);
+
+    // Reserve an unused loopback port that immediately refuses connections
+    const probeServer = http.createServer();
+    await new Promise((r) => probeServer.listen(0, "127.0.0.1", r));
+    const closedPort = probeServer.address().port;
+    await new Promise((r) => probeServer.close(r));
+
+    // Spawn an unrelated live process whose PID appears in the stale bridge record
+    const unrelated = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    bridgePids.add(unrelated.pid);
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(runDir, `hub-bridge-${process.pid}.json`),
+      JSON.stringify({
+        url: `http://127.0.0.1:${closedPort}`,
+        token: "a".repeat(64),
+        pid: unrelated.pid,
+        watchPid: process.pid,
+        desktopOrigin: "t3code://app",
+        loopbackOrigin: null,
+      }),
+      { mode: 0o600 }
+    );
+
+    const origKill = process.kill;
+    const nonZeroSignals = [];
+    process.kill = function patchedKill(pid, signal) {
+      if (signal !== 0) nonZeroSignals.push({ pid, signal });
+      return origKill.call(process, pid, signal);
+    };
+    try {
+      await host.start();
+      assert.equal(
+        await waitFor(
+          () => server.injectedTargetIds.length >= 1 && readLiveBridgeRecord(runDir, process.pid)?.record?.pid !== unrelated.pid,
+          5000
+        ),
+        true
+      );
+    } finally {
+      process.kill = origKill;
+    }
+
+    const fresh = readLiveBridgeRecord(runDir, process.pid).record;
+    bridgePids.add(fresh.pid);
+    assert.deepEqual(nonZeroSignals, [], "must never send non-zero kill signals to a PID from a stale bridge record");
+    assert.equal(unrelated.exitCode, null);
+    assert.equal(unrelated.signalCode, null);
+    assert.doesNotThrow(() => process.kill(unrelated.pid, 0), "unrelated process must remain alive");
+    assert.notEqual(fresh.pid, unrelated.pid);
+    assert.equal(fresh.desktopOrigin, "t3code-dev://app");
+
+    const optFresh = await fetch(`${fresh.url}/hub-rpc`, { method: "OPTIONS" });
+    assert.equal(optFresh.status, 204);
+    assert.equal(optFresh.headers.get("access-control-allow-origin"), "t3code-dev://app");
+    assert.equal(optFresh.headers.get("vary"), "Origin");
+  }
+});

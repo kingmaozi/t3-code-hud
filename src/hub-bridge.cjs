@@ -79,20 +79,51 @@ function loadBackend() {
 }
 backend = loadBackend();
 
+const EXACT_T3_ORIGINS = new Set(["t3code://app", "t3code-dev://app"]);
+const LOOPBACK_ORIGIN_RE = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
+
+function normalizeDesktopOrigin(value) {
+  return typeof value === "string" && EXACT_T3_ORIGINS.has(value) ? value : null;
+}
+
+function normalizeLoopbackOrigin(value) {
+  if (typeof value !== "string" || !LOOPBACK_ORIGIN_RE.test(value)) return null;
+  try {
+    const u = new URL(value);
+    if (u.username || u.password) return null;
+    if ((u.protocol === "http:" || u.protocol === "https:") &&
+        (u.hostname === "127.0.0.1" || u.hostname === "localhost")) {
+      return u.origin;
+    }
+  } catch {}
+  return null;
+}
+
+let desktopOrigin = normalizeDesktopOrigin(process.env.T3_DESKTOP_ORIGIN);
+let allowedLoopbackOrigin = normalizeLoopbackOrigin(process.env.T3_ALLOWED_LOOPBACK_ORIGIN);
+
+function strippedDesktopOrigin() {
+  if (desktopOrigin) return desktopOrigin;
+  if (allowedLoopbackOrigin) return null;
+  return "t3code://app";
+}
+
 function allowedOrigin(origin) {
   if (!origin || origin === "null") return null;
-  if (origin === "t3code://app" || origin === "t3code-dev://app") return origin;
-  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return origin;
+  if (EXACT_T3_ORIGINS.has(origin)) return origin;
+  if (allowedLoopbackOrigin && origin === allowedLoopbackOrigin) return origin;
   return null;
 }
 
 const server = http.createServer((req, res) => {
-  const cors = allowedOrigin(req.headers.origin || "");
+  const reqOrigin = req.headers.origin || "";
+  const cors = reqOrigin ? allowedOrigin(reqOrigin) : strippedDesktopOrigin();
   if (cors) {
     res.setHeader("Access-Control-Allow-Origin", cors);
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
     res.setHeader("Access-Control-Allow-Private-Network", "true");
+    res.setHeader("Vary", "Origin");
   }
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
   if (req.headers["x-t3-hud-token"] !== token) {
@@ -105,9 +136,36 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       if (req.method === "POST" && req.url === "/reload") {
-        backend = loadBackend();
+        const parsed = body.trim() ? JSON.parse(body) : {};
+        let originChanged = false;
+        if (parsed && typeof parsed === "object") {
+          if (Object.prototype.hasOwnProperty.call(parsed, "desktopOrigin")) {
+            const nextDesktop = normalizeDesktopOrigin(parsed.desktopOrigin);
+            if (nextDesktop !== desktopOrigin) {
+              desktopOrigin = nextDesktop;
+              originChanged = true;
+            }
+          }
+          if (Object.prototype.hasOwnProperty.call(parsed, "loopbackOrigin")) {
+            const nextLoopback = normalizeLoopbackOrigin(parsed.loopbackOrigin);
+            if (nextLoopback !== allowedLoopbackOrigin) {
+              allowedLoopbackOrigin = nextLoopback;
+              originChanged = true;
+            }
+          }
+        }
+        if (parsed?.originOnly !== true) {
+          backend = loadBackend();
+        }
+        if (originChanged) {
+          publishBridgeRecords();
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({
+          ok: true,
+          desktopOrigin: strippedDesktopOrigin(),
+          loopbackOrigin: allowedLoopbackOrigin,
+        }));
         return;
       }
       if (req.method === "POST" && req.url === "/hub-rpc") {
@@ -172,21 +230,28 @@ function canUpdateSharedBridge() {
   return existing.watchPid > 0 && !isPidAlive(existing.watchPid);
 }
 
-server.listen(0, "127.0.0.1", () => {
+function publishBridgeRecords() {
   const addr = server.address();
+  if (!addr || typeof addr !== "object") return false;
   const payload = JSON.stringify({
     url: "http://127.0.0.1:" + addr.port,
     token,
     pid: process.pid,
     watchPid,
+    desktopOrigin: strippedDesktopOrigin(),
+    loopbackOrigin: allowedLoopbackOrigin,
   });
+  return withBridgeLock(() => {
+    if (instanceBridgeFile !== sharedBridgeFile) writeFileAtomicNoFollow(instanceBridgeFile, payload);
+    const canPublishShared = canUpdateSharedBridge();
+    if (canPublishShared) writeFileAtomicNoFollow(sharedBridgeFile, payload);
+    return canPublishShared || instanceBridgeFile !== sharedBridgeFile;
+  });
+}
+
+server.listen(0, "127.0.0.1", () => {
   try {
-    const published = withBridgeLock(() => {
-      if (instanceBridgeFile !== sharedBridgeFile) writeFileAtomicNoFollow(instanceBridgeFile, payload);
-      const canPublishShared = canUpdateSharedBridge();
-      if (canPublishShared) writeFileAtomicNoFollow(sharedBridgeFile, payload);
-      return canPublishShared || instanceBridgeFile !== sharedBridgeFile;
-    });
+    const published = publishBridgeRecords();
     if (!published) shutdown(1);
   } catch (err) {
     console.error("[t3-hub-bridge] failed to write bridge record:", err?.message || err);

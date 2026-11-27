@@ -437,17 +437,18 @@ test('normal start preserves an existing unmounted T3 instead of restarting it',
  const script=`set -eu\ncmd=start\nget_main_pid(){ echo 123; }\nis_hud_mounted(){ return 1; }\nactivate_t3(){ :; }\nquit_t3_gracefully(){ touch "$FIXTURE_QUIT"; }\nlaunch_enhanced(){ touch "$FIXTURE_QUIT"; }\n${bin.slice(bin.indexOf('case "$cmd" in'))}`;
  await assert.rejects(run('bash',['-c',script],{env:{...process.env,FIXTURE_QUIT:path.join(root,'quit')}}));assert.equal(fs.existsSync(path.join(root,'quit')),false);
 });
-function hookFixture(t, root, pid, env = {}) {
+function hookFixture(t, root, pid, env = {}, opts = {}) {
  const source=fs.readFileSync(path.join(repo,'src/main-hook.cjs'),'utf8');const servers=[];
  let mounted=false,loading=false,delayed=false;
- const win={id:1,isDestroyed:()=>false,getTitle:()=> 'T3 Code',webContents:{isDestroyed:()=>false,isLoading:()=>loading,getURL:()=> 't3code://app/',executeJavaScript:()=>delayed?new Promise(()=>{}):Promise.resolve(mounted)}};
+ const winUrl=opts.url||'t3code://app/';
+ const win={id:1,isDestroyed:()=>false,getTitle:()=> 'T3 Code',webContents:{isDestroyed:()=>false,isLoading:()=>loading,getURL:()=> winUrl,executeJavaScript:()=>delayed?new Promise(()=>{}):Promise.resolve(mounted)}};
  const app=new EventEmitter();app.whenReady=()=>new Promise(()=>{});
  const factory=vm.runInNewContext(`(function(require,process,__dirname,setTimeout,clearTimeout,setInterval,URL){${source}\nreturn {startLoopbackFallbackServer, ensureSidecarBridge};})`);
  const hooks=factory(id=>{
    if(id==='electron')return {app,BrowserWindow:{getAllWindows:()=>[win]}};
    if(id==='node:os')return {...os,homedir:()=>root};
    if(id==='node:http')return {...http,createServer(...args){const s=http.createServer(...args);servers.push(s);return s;}};
-   if(id.endsWith('/backend.cjs'))return {};
+   if(id.endsWith('/backend.cjs'))return opts.backend||{};
    if(id==='./hud-runtime.cjs')return require('../src/hud-runtime.cjs');
    return require(id);
  },{pid,env,versions:{electron:'fixture'},type:'browser',execPath:'/fixture/T3 Code'},path.join(repo,'src'),setTimeout,clearTimeout,setInterval,URL);
@@ -568,4 +569,50 @@ test('installer capability preflight preserves SHA-256 of installed files', {ski
  assert.deepEqual(hashes(), before);
  assert.equal(fs.existsSync(unexpectedProbe), false);
  assert.deepEqual(fs.readdirSync(path.join(root, '.t3')).sort(), ['bin', 'hud-plugin']);
+});
+
+test('main hook parses t3code://app and t3code-dev://app origins for stripped-Origin CORS and enforces RPC token', async t => {
+  for (const { url, expectedOrigin, pid } of [
+    { url: 't3code://app/', expectedOrigin: 't3code://app', pid: 30301 },
+    { url: 't3code-dev://app/thread/1', expectedOrigin: 't3code-dev://app', pid: 30302 },
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hud-hook-cors-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const h = hookFixture(t, root, pid, {}, {
+      url,
+      backend: { hubCall: async (action, payload) => ({ ok: true, action, payload }) },
+    });
+    await h.startLoopbackFallbackServer();
+    const cfg = JSON.parse(fs.readFileSync(path.join(root, `.t3/hud-plugin/run/rpc-${pid}.json`), 'utf8'));
+
+    const optRes = await fetch(cfg.url + '/rpc', { method: 'OPTIONS' });
+    assert.equal(optRes.status, 204);
+    assert.equal(optRes.headers.get('access-control-allow-origin'), expectedOrigin);
+    assert.equal(optRes.headers.get('vary'), 'Origin');
+
+    const postRes = await fetch(cfg.url + '/rpc', {
+      method: 'POST',
+      headers: { 'X-T3-Hud-Token': cfg.rpcToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'hubCall', args: ['ping', { expectedOrigin }] }),
+    });
+    assert.equal(postRes.status, 200);
+    assert.equal(postRes.headers.get('access-control-allow-origin'), expectedOrigin);
+    assert.equal(postRes.headers.get('vary'), 'Origin');
+    assert.deepEqual(await postRes.json(), { ok: true, action: 'ping', payload: { expectedOrigin } });
+
+    const badTokenRes = await fetch(cfg.url + '/rpc', {
+      method: 'POST',
+      headers: { 'X-T3-Hud-Token': 'wrong-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'hubCall', args: ['ping'] }),
+    });
+    assert.equal(badTokenRes.status, 403);
+
+    for (const badOrigin of ['https://evil.com', 'null', 't3code://other', 'http://localhost:4100']) {
+      const badOpt = await fetch(cfg.url + '/rpc', {
+        method: 'OPTIONS',
+        headers: { Origin: badOrigin },
+      });
+      assert.equal(badOpt.headers.get('access-control-allow-origin'), null, `${expectedOrigin} must reject ${badOrigin}`);
+    }
+  }
 });

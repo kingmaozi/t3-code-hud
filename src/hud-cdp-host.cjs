@@ -381,6 +381,14 @@ function createCdpHost(options = {}) {
     });
   }
 
+  function strippedDesktopOrigin() {
+    for (const info of getMainTargets()) {
+      const origin = extractT3CandidateOrigin(info.url);
+      if (origin && EXACT_T3_ORIGINS.has(origin)) return origin;
+    }
+    return null;
+  }
+
   function allowedOrigin(origin) {
     if (isAllowedT3Origin(origin)) return origin;
     const mainOrigin = getMainTargets().find((info) => extractT3CandidateOrigin(info.url) === origin);
@@ -405,13 +413,89 @@ function createCdpHost(options = {}) {
     return true;
   }
 
+  function resolveBridgeOriginConfig(verifiedOrigin = null) {
+    const primary = verifiedOrigin || strippedDesktopOrigin() || null;
+    let desktopOrigin = null;
+    let loopbackOrigin = null;
+    if (primary && EXACT_T3_ORIGINS.has(primary)) {
+      desktopOrigin = primary;
+    } else if (primary) {
+      loopbackOrigin = primary;
+    }
+    for (const info of getMainTargets()) {
+      const origin = extractT3CandidateOrigin(info.url);
+      if (!origin) continue;
+      if (!desktopOrigin && EXACT_T3_ORIGINS.has(origin)) desktopOrigin = origin;
+      else if (!loopbackOrigin && !EXACT_T3_ORIGINS.has(origin)) loopbackOrigin = origin;
+    }
+    return { desktopOrigin, loopbackOrigin };
+  }
+
+  function syncBridgeOrigins(record, desired) {
+    return new Promise((resolve) => {
+      let u;
+      try { u = new URL("/reload", record.url); } catch { resolve(false); return; }
+      const body = JSON.stringify({
+        desktopOrigin: desired.desktopOrigin,
+        loopbackOrigin: desired.loopbackOrigin,
+        originOnly: true,
+      });
+      const req = http.request({
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          "X-T3-Hud-Token": record.token,
+        },
+        timeout: 2000,
+      }, (res) => {
+        let raw = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { raw += chunk; });
+        res.on("end", () => {
+          if (res.statusCode !== 200) { resolve(false); return; }
+          try {
+            const parsed = JSON.parse(raw || "{}");
+            const expectedDesktop = desired.desktopOrigin ?? (desired.loopbackOrigin ? null : "t3code://app");
+            resolve(
+              parsed?.ok === true &&
+              (parsed.desktopOrigin ?? null) === expectedDesktop &&
+              (parsed.loopbackOrigin ?? null) === (desired.loopbackOrigin ?? null)
+            );
+          } catch {
+            resolve(false);
+          }
+        });
+      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", () => resolve(false));
+      req.end(body);
+    });
+  }
+
   let sidecarBridgePromise = null;
-  async function ensureSidecarBridge() {
+  async function ensureSidecarBridge(verifiedOrigin = null) {
     if (skipSidecarBridge) return null;
-    if (sidecarBridgePromise) return sidecarBridgePromise;
-    sidecarBridgePromise = (async () => {
+    if (sidecarBridgePromise) {
+      await sidecarBridgePromise;
+    }
+    const desired = resolveBridgeOriginConfig(verifiedOrigin);
+    const expectedDesktop = desired.desktopOrigin ?? (desired.loopbackOrigin ? null : "t3code://app");
+    const run = (async () => {
       const existing = readLiveBridgeRecord(runDir, targetPid, { checkAlive: isPidAlive });
-      if (existing) return existing.record;
+      if (existing) {
+        const recDesktop = existing.record.desktopOrigin ?? null;
+        const recLoopback = existing.record.loopbackOrigin ?? null;
+        if (recDesktop === expectedDesktop && recLoopback === (desired.loopbackOrigin ?? null)) {
+          return existing.record;
+        }
+        if (await syncBridgeOrigins(existing.record, desired)) {
+          return readLiveBridgeRecord(runDir, targetPid, { checkAlive: isPidAlive })?.record || existing.record;
+        }
+      }
 
       const bridgePath = path.join(pluginDir, "hub-bridge.cjs");
       if (!fs.existsSync(bridgePath)) return null;
@@ -421,6 +505,10 @@ function createCdpHost(options = {}) {
       if (!runtime) return null;
       const childEnv = { ...(process.env || {}), T3_HUD_DIR: pluginDir, T3_WATCH_PID: String(targetPid) };
       delete childEnv.NODE_OPTIONS;
+      delete childEnv.T3_DESKTOP_ORIGIN;
+      delete childEnv.T3_ALLOWED_LOOPBACK_ORIGIN;
+      if (desired.desktopOrigin) childEnv.T3_DESKTOP_ORIGIN = desired.desktopOrigin;
+      if (desired.loopbackOrigin) childEnv.T3_ALLOWED_LOOPBACK_ORIGIN = desired.loopbackOrigin;
       if (runtime.useRunAsNode) childEnv.ELECTRON_RUN_AS_NODE = "1";
       else delete childEnv.ELECTRON_RUN_AS_NODE;
       const child = spawn(runtime.bin, [bridgePath], {
@@ -434,11 +522,15 @@ function createCdpHost(options = {}) {
         if (shuttingDown) return null;
         await new Promise((resolve) => setTimeout(resolve, 80));
         const live = readLiveBridgeRecord(runDir, targetPid, { checkAlive: isPidAlive });
-        if (live) return live.record;
+        if (live && (!child.pid || live.record.pid === child.pid)) return live.record;
       }
       return null;
-    })().catch(() => null).finally(() => { sidecarBridgePromise = null; });
-    return sidecarBridgePromise;
+    })().catch(() => null);
+    const tracked = run.finally(() => {
+      if (sidecarBridgePromise === tracked) sidecarBridgePromise = null;
+    });
+    sidecarBridgePromise = tracked;
+    return tracked;
   }
 
   function readValidBridge() {
@@ -555,7 +647,7 @@ function createCdpHost(options = {}) {
       sess.verifiedContext = isMainPage === true ? context : null;
       if (!sess.verifiedContext) return false;
 
-      await ensureSidecarBridge();
+      await ensureSidecarBridge(context.origin);
       if (!isCurrentContext(sess, context)) return false;
       const validBridge = readValidBridge();
 
@@ -1012,12 +1104,13 @@ function createCdpHost(options = {}) {
 
       const server = http.createServer(async (req, res) => {
         const reqOrigin = req.headers.origin || "";
-        const corsOrigin = allowedOrigin(reqOrigin);
+        const corsOrigin = reqOrigin ? allowedOrigin(reqOrigin) : strippedDesktopOrigin();
         if (corsOrigin) {
           res.setHeader("Access-Control-Allow-Origin", corsOrigin);
           res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
           res.setHeader("Access-Control-Allow-Private-Network", "true");
+          res.setHeader("Vary", "Origin");
         }
 
         if (req.method === "OPTIONS") {
@@ -1169,7 +1262,6 @@ function createCdpHost(options = {}) {
       loadBackend();
     }
     const info = await startHttpServer();
-    await ensureSidecarBridge();
     await connectCdp();
 
     pollTimer = setInterval(() => {

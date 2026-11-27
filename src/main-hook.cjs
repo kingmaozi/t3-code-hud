@@ -107,6 +107,32 @@ async function isWindowMounted(win) {
   finally { clearTimeout(timer); }
 }
 
+const EXACT_T3_ORIGINS = new Set(["t3code://app", "t3code-dev://app"]);
+
+function extractT3CandidateOrigin(urlOrOrigin) {
+  if (!urlOrOrigin || typeof urlOrOrigin !== "string") return null;
+  let u;
+  try {
+    u = new URL(urlOrOrigin);
+  } catch {
+    return null;
+  }
+  if (u.username || u.password) return null;
+  if (u.protocol === "t3code:" || u.protocol === "t3code-dev:") {
+    if (u.hostname === "app" && !u.port) {
+      return `${u.protocol}//app`;
+    }
+    return null;
+  }
+  if (u.protocol === "http:" || u.protocol === "https:") {
+    if (u.hostname === "127.0.0.1" || u.hostname === "localhost") {
+      return u.origin;
+    }
+    return null;
+  }
+  return null;
+}
+
 function captureT3Origin() {
   if (capturedT3Origin) return capturedT3Origin;
   try {
@@ -116,24 +142,18 @@ function captureT3Origin() {
       if (!wc || wc.isDestroyed()) continue;
       const url = wc.getURL();
       if (!url) continue;
+      const candidateOrigin = extractT3CandidateOrigin(url);
+      if (!candidateOrigin) continue;
+      if (EXACT_T3_ORIGINS.has(candidateOrigin)) {
+        capturedT3Origin = candidateOrigin;
+        return capturedT3Origin;
+      }
       const title = win.getTitle() || "";
       const isT3Title = title === "T3 Code" || title === "T3 Code (Beta)";
       const urlHasT3 = url.includes("t3code");
-      if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) {
-        try {
-          capturedT3Origin = new URL(url).origin;
-        } catch {
-          capturedT3Origin = url.split("/").slice(0, 3).join("/");
-        }
-        return capturedT3Origin;
-      }
       if (isT3Title || urlHasT3) {
-        if (url.match(/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/)) {
-          try {
-            capturedT3Origin = new URL(url).origin;
-          } catch {}
-          if (capturedT3Origin) return capturedT3Origin;
-        }
+        capturedT3Origin = candidateOrigin;
+        return capturedT3Origin;
       }
     }
   } catch {}
@@ -141,23 +161,14 @@ function captureT3Origin() {
 }
 
 function isMainT3Url(url) {
-  if (!url || typeof url !== "string") return false;
-  if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) return true;
+  const candidateOrigin = extractT3CandidateOrigin(url);
+  if (!candidateOrigin) return false;
+  if (EXACT_T3_ORIGINS.has(candidateOrigin)) return true;
   // For http(s) loopback URLs, strictly require match to captured origin or t3code marker,
   // and reject arbitrary localhost preview windows.
-  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) {
-    if (capturedT3Origin) {
-      try {
-        const u = new URL(url);
-        return u.origin === capturedT3Origin;
-      } catch {
-        return false;
-      }
-    }
-    // No capture yet: only accept if URL itself mentions t3code (heuristic upgrade path).
-    return url.includes("t3code");
-  }
-  return false;
+  if (capturedT3Origin) return candidateOrigin === capturedT3Origin;
+  // No capture yet: only accept if URL itself mentions t3code (heuristic upgrade path).
+  return url.includes("t3code");
 }
 
 function isHelperWindow(win) {
@@ -190,8 +201,22 @@ async function ensureSidecarBridge() {
     if (previous) return previous;
     const bridgePath = path.join(__dirname, "hub-bridge.cjs");
     if (!fs.existsSync(bridgePath)) return null;
+    const origin = captureT3Origin();
+    const childEnv = {
+      ...(process.env || {}),
+      ELECTRON_RUN_AS_NODE: "1",
+      T3_HUD_DIR: path.dirname(HUD_RUN_DIR),
+      T3_WATCH_PID: String(process.pid),
+    };
+    delete childEnv.T3_DESKTOP_ORIGIN;
+    delete childEnv.T3_ALLOWED_LOOPBACK_ORIGIN;
+    if (origin && EXACT_T3_ORIGINS.has(origin)) {
+      childEnv.T3_DESKTOP_ORIGIN = origin;
+    } else if (origin) {
+      childEnv.T3_ALLOWED_LOOPBACK_ORIGIN = origin;
+    }
     const child = spawn(process.execPath, [bridgePath], {
-      env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: path.dirname(HUD_RUN_DIR), T3_WATCH_PID: String(process.pid) },
+      env: childEnv,
       detached: true,
       stdio: "ignore",
     });
@@ -258,10 +283,18 @@ async function injectHudIntoWindow(win, forceReload = false) {
   }
 }
 
+function strippedDesktopOrigin() {
+  if (!capturedT3Origin) captureT3Origin();
+  return capturedT3Origin && EXACT_T3_ORIGINS.has(capturedT3Origin) ? capturedT3Origin : null;
+}
+
 function allowedOrigin(origin) {
-  if (!origin || origin === "null") return null;
-  if (origin.startsWith("t3code://") || origin.startsWith("t3code-dev://")) return origin;
-  if (capturedT3Origin && origin === capturedT3Origin) return origin;
+  if (!origin || typeof origin !== "string" || origin === "null") return null;
+  const canonical = extractT3CandidateOrigin(origin);
+  if (!canonical || canonical !== origin) return null;
+  if (EXACT_T3_ORIGINS.has(canonical)) return canonical;
+  if (!capturedT3Origin) captureT3Origin();
+  if (capturedT3Origin && canonical === capturedT3Origin) return canonical;
   return null;
 }
 
@@ -272,12 +305,13 @@ function startLoopbackFallbackServer() {
       adminToken = crypto.randomBytes(32).toString("hex");
       const server = http.createServer(async (req, res) => {
         const reqOrigin = req.headers.origin || "";
-        const corsOrigin = allowedOrigin(reqOrigin);
+        const corsOrigin = reqOrigin ? allowedOrigin(reqOrigin) : strippedDesktopOrigin();
         if (corsOrigin) {
           res.setHeader("Access-Control-Allow-Origin", corsOrigin);
           res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
           res.setHeader("Access-Control-Allow-Private-Network", "true");
+          res.setHeader("Vary", "Origin");
         }
 
         if (req.method === "OPTIONS") {

@@ -198,3 +198,144 @@ test("simultaneous bridge publishers keep distinct private records and old clean
   const remaining = entries.find((entry) => entry !== oldest);
   assert.equal(readLiveBridgeRecord(runDir, remaining.watched.pid).record.pid, remaining.owner.pid);
 });
+
+test("bridge CORS sets verified desktop origin and Vary: Origin when Origin is stripped, and rejects disallowed origins", async (t) => {
+  async function startBridge(extraEnv = {}) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "hub-bridge-cors-"));
+    const pluginDir = path.join(home, ".t3", "hud-plugin");
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, "backend.cjs"),
+      "module.exports = { hubCall: async (action, payload) => ({ ok: true, action, payload }) };\n"
+    );
+    const child = spawn(process.execPath, [BRIDGE], {
+      env: { HOME: home, PATH: process.env.PATH || "/usr/bin:/bin", T3_HUD_DIR: pluginDir, T3_WATCH_PID: "0", ...extraEnv },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const exit = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await Promise.race([exit, new Promise((r) => setTimeout(r, 1500))]);
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+    let rpc;
+    const deadline = Date.now() + 3000;
+    while (!rpc && Date.now() < deadline) {
+      try { rpc = JSON.parse(fs.readFileSync(path.join(pluginDir, "run", "hub-bridge.json"), "utf8")); }
+      catch { await new Promise((r) => setTimeout(r, 20)); }
+    }
+    assert.ok(rpc, "bridge did not publish RPC settings");
+    return rpc;
+  }
+
+  // Default desktop origin (t3code://app)
+  const rpcDefault = await startBridge();
+  const optMissing = await fetch(rpcDefault.url + "/hub-rpc", { method: "OPTIONS" });
+  assert.equal(optMissing.status, 204);
+  assert.equal(optMissing.headers.get("access-control-allow-origin"), "t3code://app");
+  assert.equal(optMissing.headers.get("vary"), "Origin");
+  assert.equal(optMissing.headers.get("access-control-allow-private-network"), "true");
+
+  const postMissing = await fetch(rpcDefault.url + "/hub-rpc", {
+    method: "POST",
+    headers: { "X-T3-Hud-Token": rpcDefault.token, "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "ping", payload: { ok: 1 } }),
+  });
+  assert.equal(postMissing.status, 200);
+  assert.equal(postMissing.headers.get("access-control-allow-origin"), "t3code://app");
+  assert.equal(postMissing.headers.get("vary"), "Origin");
+  assert.deepEqual(await postMissing.json(), { ok: true, action: "ping", payload: { ok: 1 } });
+
+  for (const badOrigin of ["https://evil.com", "null", "t3code://other", "http://localhost:4100", "http://127.0.0.1:4100"]) {
+    const optBad = await fetch(rpcDefault.url + "/hub-rpc", {
+      method: "OPTIONS",
+      headers: { Origin: badOrigin },
+    });
+    assert.equal(optBad.status, 204);
+    assert.equal(optBad.headers.get("access-control-allow-origin"), null, `OPTIONS must reject ${badOrigin}`);
+
+    const postBad = await fetch(rpcDefault.url + "/hub-rpc", {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": rpcDefault.token, "Content-Type": "application/json", Origin: badOrigin },
+      body: JSON.stringify({ action: "ping" }),
+    });
+    assert.equal(postBad.headers.get("access-control-allow-origin"), null, `POST must reject ${badOrigin}`);
+  }
+
+  // Valid T3_DESKTOP_ORIGIN override (t3code-dev://app)
+  const rpcDev = await startBridge({ T3_DESKTOP_ORIGIN: "t3code-dev://app" });
+  assert.equal(rpcDev.desktopOrigin, "t3code-dev://app");
+  assert.equal(rpcDev.loopbackOrigin, null);
+  const optDev = await fetch(rpcDev.url + "/hub-rpc", { method: "OPTIONS" });
+  assert.equal(optDev.headers.get("access-control-allow-origin"), "t3code-dev://app");
+  assert.equal(optDev.headers.get("vary"), "Origin");
+
+  // Single verified loopback origin allowed; other loopback ports remain blocked
+  const rpcLoop = await startBridge({ T3_ALLOWED_LOOPBACK_ORIGIN: "http://127.0.0.1:5173" });
+  assert.equal(rpcLoop.desktopOrigin, null);
+  assert.equal(rpcLoop.loopbackOrigin, "http://127.0.0.1:5173");
+  const optLoopNoOrigin = await fetch(rpcLoop.url + "/hub-rpc", { method: "OPTIONS" });
+  assert.equal(optLoopNoOrigin.headers.get("access-control-allow-origin"), null);
+
+  const optLoopOk = await fetch(rpcLoop.url + "/hub-rpc", {
+    method: "OPTIONS",
+    headers: { Origin: "http://127.0.0.1:5173" },
+  });
+  assert.equal(optLoopOk.status, 204);
+  assert.equal(optLoopOk.headers.get("access-control-allow-origin"), "http://127.0.0.1:5173");
+  assert.equal(optLoopOk.headers.get("vary"), "Origin");
+
+  const postLoopOk = await fetch(rpcLoop.url + "/hub-rpc", {
+    method: "POST",
+    headers: { "X-T3-Hud-Token": rpcLoop.token, "Content-Type": "application/json", Origin: "http://127.0.0.1:5173" },
+    body: JSON.stringify({ action: "ping", payload: { loop: 1 } }),
+  });
+  assert.equal(postLoopOk.status, 200);
+  assert.equal(postLoopOk.headers.get("access-control-allow-origin"), "http://127.0.0.1:5173");
+  assert.deepEqual(await postLoopOk.json(), { ok: true, action: "ping", payload: { loop: 1 } });
+
+  const postLoopWrongToken = await fetch(rpcLoop.url + "/hub-rpc", {
+    method: "POST",
+    headers: { "X-T3-Hud-Token": "wrong-token", "Content-Type": "application/json", Origin: "http://127.0.0.1:5173" },
+    body: JSON.stringify({ action: "ping" }),
+  });
+  assert.equal(postLoopWrongToken.status, 403);
+
+  for (const unverifiedLoop of ["http://localhost:4100", "http://127.0.0.1:4100"]) {
+    const optUnverified = await fetch(rpcLoop.url + "/hub-rpc", {
+      method: "OPTIONS",
+      headers: { Origin: unverifiedLoop },
+    });
+    assert.equal(optUnverified.headers.get("access-control-allow-origin"), null);
+    const postUnverified = await fetch(rpcLoop.url + "/hub-rpc", {
+      method: "POST",
+      headers: { "X-T3-Hud-Token": rpcLoop.token, "Content-Type": "application/json", Origin: unverifiedLoop },
+      body: JSON.stringify({ action: "ping" }),
+    });
+    assert.equal(postUnverified.headers.get("access-control-allow-origin"), null);
+  }
+
+  // Authenticated /reload can update origin policy without reloading backend
+  const syncRes = await fetch(rpcLoop.url + "/reload", {
+    method: "POST",
+    headers: { "X-T3-Hud-Token": rpcLoop.token, "Content-Type": "application/json" },
+    body: JSON.stringify({ desktopOrigin: "t3code-dev://app", loopbackOrigin: null, originOnly: true }),
+  });
+  assert.equal(syncRes.status, 200);
+  assert.deepEqual(await syncRes.json(), { ok: true, desktopOrigin: "t3code-dev://app", loopbackOrigin: null });
+  const optAfterSync = await fetch(rpcLoop.url + "/hub-rpc", { method: "OPTIONS" });
+  assert.equal(optAfterSync.headers.get("access-control-allow-origin"), "t3code-dev://app");
+  const optOldLoopAfterSync = await fetch(rpcLoop.url + "/hub-rpc", {
+    method: "OPTIONS",
+    headers: { Origin: "http://127.0.0.1:5173" },
+  });
+  assert.equal(optOldLoopAfterSync.headers.get("access-control-allow-origin"), null);
+
+  // Invalid T3_DESKTOP_ORIGIN falls back safely to t3code://app (never wildcard or untrusted origin)
+  const rpcSanitized = await startBridge({ T3_DESKTOP_ORIGIN: "https://evil.com" });
+  const optSanitized = await fetch(rpcSanitized.url + "/hub-rpc", { method: "OPTIONS" });
+  assert.equal(optSanitized.headers.get("access-control-allow-origin"), "t3code://app");
+  assert.equal(optSanitized.headers.get("vary"), "Origin");
+});
