@@ -241,7 +241,7 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$DEST_DIR/"
 
 # Ensure sidecar modules present (explicit list for older clones)
-for f in hud-cdp-host.cjs hud-runtime.cjs hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs hub-memory-access.cjs hub-memory-connections.cjs hub-provider-resources.cjs hub-devin-quota.cjs hub-agy-quota.cjs update-guardian.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
+for f in hub-plugins.cjs hud-cdp-host.cjs hud-runtime.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs hub-memory-access.cjs hub-memory-connections.cjs hub-provider-resources.cjs hub-devin-quota.cjs hub-agy-quota.cjs update-guardian.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
   if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
 done
 
