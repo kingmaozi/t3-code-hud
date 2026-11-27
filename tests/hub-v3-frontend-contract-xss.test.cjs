@@ -62,7 +62,7 @@ function harness(rpc = async () => ({}), environment = {}) {
       normalizeRemoteThreadPlan, normalizeRemotePlanMirror, newestRemotePlan, planMirrorRelativePath, remotePlanEnvironmentId, remotePlanContextReady, resetProjectData,
       switchTab,
       runImport, setSkillScope, saveMcpMode, renderChrome, renderTab, parseScopeParts,
-      renderMemoryAgentAccess, setMemoryAgentAccess, runMemorySetup, copyMemorySetupPrompt, renderMemoryRuntime, memoryMcpConfigText, copyMemoryMcpConfig, refreshMemoryAgentAccess, openMemoryFromTitle, toggleMemoryAccessFromTitle, renderMemoryTitleControls,
+      renderMemoryAgentAccess, setMemoryAgentAccess, runMemorySetup, copyMemorySetupPrompt, providerMemorySetupPrompt, copyProviderMemorySetupPrompt, renderMemoryRuntime, memoryMcpConfigText, copyMemoryMcpConfig, refreshMemoryAgentAccess, openMemoryFromTitle, toggleMemoryAccessFromTitle, renderMemoryTitleControls,
       memoryPayload, memoryProjectReady, selectedMemoryRoot, selectedMemoryProject, loadMemories, refreshMemoryOverview, renderMemoryNav, renderMemoryList, renderNewMemory, memorySelection, runMemoryVectorTest,
       planStepProgress,
       saveMemory, deleteMemory, promoteMemory, consolidateMemory, rollbackMemory,
@@ -2939,4 +2939,87 @@ test("restored global memory draft is rebound to the confirmed current project b
   assert.equal(write.payload.projectRoot, "/project-current");
   assert.equal(write.payload.scope, "project");
   assert.equal("projectSlug" in write.payload, false);
+});
+
+test("provider setup prompt routes by detected host, binds custom Claude config dirs, and warns on Magpie/conflict", async () => {
+  const copied = [];
+  const ui = harness(undefined, { window: { navigator: { clipboard: { writeText: async (value) => copied.push(value) } } } });
+  ui.cache.agentAccess = {
+    enabled: true,
+    setupSummary: {
+      configured: 0, missing: 1, conflict: 1, unsupported: 0, unknown: 0, pending: 1, runtime: "unverified",
+      providers: [
+        { instanceId: "personal", displayName: "Personal", host: "claude", customConfigDir: false, status: "missing", reason: "entry_missing" },
+        { instanceId: "work", displayName: "Work", host: "claude", customConfigDir: true, status: "pending", reason: "claude_home_not_ready" },
+        { instanceId: "magpieClaude", displayName: '<img src=x onerror=alert(1)>', host: "claude", customConfigDir: true, status: "pending", reason: "managed_by_magpie" },
+        { instanceId: "conflictClaude", displayName: "Conflict Claude", host: "claude", customConfigDir: false, status: "conflict", reason: "hub_entry_custom_options" },
+      ],
+    },
+  };
+  ui.renderMemoryAgentAccess();
+  const html = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.match(html, /data-provider-id="personal"[^>]*data-provider-host="claude"[^>]*data-provider-custom-dir="false"/);
+  assert.match(html, /data-provider-id="work"[^>]*data-provider-host="claude"[^>]*data-provider-custom-dir="true"/);
+  assert.match(html, /Claude 配置目录尚未就绪/);
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(1\)>/);
+
+  // 1. Custom instanceId "personal" with host:"claude" gets Claude-specific prompt
+  await ui.copyProviderMemorySetupPrompt("personal", "Personal");
+  assert.match(copied.at(-1), /claude mcp add -s user/);
+  assert.match(copied.at(-1), /~\/\.claude\.json/);
+  assert.doesNotMatch(copied.at(-1), /\/Users\//);
+
+  // 2. Custom config dir Claude instance must not offer bare `claude mcp add -s user` as a direct command
+  await ui.copyProviderMemorySetupPrompt("work", "Work");
+  assert.match(copied.at(-1), /CLAUDE_CONFIG_DIR=/);
+  assert.match(copied.at(-1), /请勿在默认终端直接运行不带目录绑定的/);
+  assert.doesNotMatch(copied.at(-1), /^\s*`claude mcp add -s user/m);
+
+  // 3. Magpie-managed & conflict states explicitly warn to preserve existing entries
+  await ui.copyProviderMemorySetupPrompt("magpieClaude", "Magpie Claude");
+  assert.match(copied.at(-1), /Magpie/);
+  assert.match(copied.at(-1), /保留原有 Magpie/);
+
+  await ui.copyProviderMemorySetupPrompt("conflictClaude", "Conflict Claude");
+  assert.match(copied.at(-1), /冲突/);
+  assert.match(copied.at(-1), /保留原条目/);
+});
+
+test("selected_provider_disabled hides setup prompt button and never emits claude mcp add or ~/.claude.json steps", async () => {
+  const copied = [];
+  const ui = harness(undefined, { window: { navigator: { clipboard: { writeText: async (value) => copied.push(value) } } } });
+  ui.cache.agentAccess = {
+    enabled: true,
+    setupSummary: {
+      configured: 0, missing: 1, conflict: 0, unsupported: 0, unknown: 1, pending: 0, runtime: "unverified",
+      providers: [
+        { instanceId: "personal", displayName: "Personal", host: "claude", customConfigDir: false, status: "unknown", reason: "selected_provider_disabled" },
+        { instanceId: "work", displayName: "Work", host: "claude", customConfigDir: false, status: "missing", reason: "entry_missing" },
+      ],
+    },
+  };
+  ui.renderMemoryAgentAccess();
+  const zhHtml = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.match(zhHtml, /该实例已在 T3 设置中禁用，未执行自动接入/);
+  assert.doesNotMatch(zhHtml, /data-action="copy-provider-memory-prompt"[^>]*data-provider-id="personal"/);
+  assert.match(zhHtml, /data-action="copy-provider-memory-prompt"[^>]*data-provider-id="work"/);
+
+  // Direct call to providerMemorySetupPrompt and copyProviderMemorySetupPrompt returns status-only guidance
+  const directZh = ui.providerMemorySetupPrompt("personal", "Personal", { host: "claude", status: "unknown", reason: "selected_provider_disabled", customConfigDir: false });
+  assert.match(directZh, /已在 T3 设置中禁用/);
+  assert.match(directZh, /启用/);
+  assert.doesNotMatch(directZh, /claude mcp add|~\/\.claude\.json|\.claude\.json|mcpServers|t3-mcp-router/);
+
+  await ui.copyProviderMemorySetupPrompt("personal", "Personal");
+  assert.equal(copied.at(-1), directZh);
+
+  // English localization also renders disabled issue text and status-only prompt without executable steps
+  ui.state.lang = "en";
+  ui.renderMemoryAgentAccess();
+  const enHtml = ui.nodes.get("#t3-hub-memory-access").innerHTML;
+  assert.match(enHtml, /Disabled in T3 settings; skipped/);
+  assert.doesNotMatch(enHtml, /data-action="copy-provider-memory-prompt"[^>]*data-provider-id="personal"/);
+  const directEn = ui.providerMemorySetupPrompt("personal", "Personal", { host: "claude", status: "unknown", reason: "selected_provider_disabled", customConfigDir: true });
+  assert.match(directEn, /disabled in T3 settings/i);
+  assert.doesNotMatch(directEn, /claude mcp add|~\/\.claude\.json|\.claude\.json|mcpServers|t3-mcp-router|CLAUDE_CONFIG_DIR/);
 });

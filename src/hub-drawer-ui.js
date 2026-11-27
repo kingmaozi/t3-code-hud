@@ -1071,17 +1071,66 @@
  return ({
   managed_by_magpie: tr("由 Magpie 管理，保留原条目并等待同步", "Magpie-managed; preserved and pending sync"),
   agy_native_helper_compatibility: tr("保留 AGY 原生兼容设置，暂列待处理", "Preserved for AGY compatibility; pending"),
+  claude_home_not_ready: tr("Claude 配置目录尚未就绪，待创建后再接入", "Claude config directory not ready yet; pending"),
+  selected_provider_disabled: tr("该实例已在 T3 设置中禁用，未执行自动接入", "Disabled in T3 settings; skipped"),
+  json_duplicate_keys: tr("配置文件存在重复 JSON 键，未做自动改写", "Duplicate JSON keys detected; left untouched"),
   unsupported_driver: tr("自动写入暂不支持，可复制专属接入提示词交由该 Agent 配置", "Auto-write not supported; copy the tailored setup prompt for this Agent"),
   entry_missing: tr("尚未发现 Hub MCP", "Hub MCP not found"),
   unknown: tr("状态无法确认", "Status could not be confirmed"),
  })[String(reason || "")] || tr("需要进一步检查", "Needs review");
     }
-    function providerMemorySetupPrompt(providerId, displayName) {
+    function providerMemorySetupPrompt(providerId, displayName, meta = {}) {
  const idLow = String(providerId || "").toLowerCase();
+ const hostLow = String(meta?.host || "").toLowerCase();
  const name = String(displayName || providerId || "Agent").trim();
- if (idLow.includes("opencode")) {
+ if (String(meta?.reason || "") === "selected_provider_disabled") {
+  return tr(
+   `${name} 当前已在 T3 设置中禁用，未执行自动接入。如需接入本项目记忆，请先在 T3 设置中启用该实例，然后重新点击「检查并接入」。`,
+   `${name} is disabled in T3 settings, so automatic onboarding was skipped. To connect project memory, enable this instance in T3 settings first and run Check and set up again.`,
+  );
+ }
+ const isMagpie = String(meta?.reason || "") === "managed_by_magpie";
+ const isConflict = String(meta?.status || "") === "conflict";
+ const isCustomDir = Boolean(meta?.customConfigDir);
+ const caution = isMagpie
+  ? ["0. 检测到该实例当前由 Magpie 管理：请先保留原有 Magpie 配置及已有 `t3_hub` 条目，核对无冲突后再在 Magpie 侧或对应配置中同步调整，不要直接覆盖现有自定义项。"]
+  : isConflict
+   ? ["0. 检测到已有冲突的 `t3_hub` / `t3-hub` 条目：请先保留原条目并做好备份，核对自定义配置（如 env/type/禁用或重复条目）确认无冲突后再调整，不要直接覆盖现有自定义项。"]
+   : [];
+ if (hostLow === "claude" || (!hostLow && idLow.includes("claude"))) {
+  const stepLines = isCustomDir
+   ? [
+    "1. 该实例使用自定义配置目录（`homePath` 或 `CLAUDE_CONFIG_DIR`），请勿在默认终端直接运行不带目录绑定的 `claude mcp add`；请先确认该实例对应的配置目录，备份并编辑该目录下的 `.claude.json`（或先显式绑定该实例目录后执行：`CLAUDE_CONFIG_DIR=\"<该实例配置目录>\" claude mcp add -s user -t stdio t3_hub -- \"$HOME/.t3/bin/t3-mcp-router\" --memory-only`）。",
+    "2. 若手工编辑该实例配置目录下的 `.claude.json`，请在顶层 `mcpServers` 对象下仅新增或更新 `t3_hub` 条目（保持文件权限为 0600）：",
+   ]
+   : [
+    "1. 方式 A（使用 Claude CLI）：运行固定命令仅注册用户级 stdio MCP：",
+    '   `claude mcp add -s user -t stdio t3_hub -- "$HOME/.t3/bin/t3-mcp-router" --memory-only`',
+    "2. 方式 B（手工编辑）：先备份 `~/.claude.json`，在顶层 `mcpServers` 对象下仅新增或更新 `t3_hub` 条目（保持文件权限为 0600）：",
+   ];
+  return [
+   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、路由和其他 MCP）：`,
+   ...caution,
+   ...stepLines,
+   '```json',
+   '{',
+   '  "mcpServers": {',
+   '    "t3_hub": {',
+   '      "type": "stdio",',
+   '      "command": "/bin/sh",',
+   '      "args": ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]',
+   '    }',
+   '  }',
+   '}',
+   '```',
+   "3. 保留文件中所有其他顶层字段（如认证账号、项目记录）、已有 MCP、模型与原生路由设置，不要重启 T3。",
+   "4. 在新会话或重新加载 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
+  ].join("\n");
+ }
+ if (hostLow === "opencode" || (!hostLow && idLow.includes("opencode"))) {
   return [
    `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   ...caution,
    "1. 打开 `~/.config/opencode/opencode.json`（先备份原文件），在顶层 `mcp` 对象下仅新增或更新 `t3_hub` 条目：",
    '```json',
    '{',
@@ -1098,9 +1147,10 @@
    "3. 在新会话或重新加载 MCP 后调用 `memory_status` 核验当前项目绑定与向量服务状态；每次读写记忆都只绑定当前确认项目，不读写全局记忆。",
   ].join("\n");
  }
- if (idLow.includes("devin")) {
+ if (hostLow === "devin" || (!hostLow && idLow.includes("devin"))) {
   return [
    `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型、插件和其他 MCP）：`,
+   ...caution,
    "1. 打开 `~/.config/devin/mcp_config.json`（先备份原文件），在顶层 `mcpServers` 对象下仅新增或更新 `t3_hub` 条目：",
    '```json',
    '{',
@@ -1118,6 +1168,7 @@
  }
  return [
   `请帮我为 ${name} 配置本机 T3 Hub 项目记忆 MCP（仅修改记忆 MCP，不改动认证、模型与其他 MCP）：`,
+  ...caution,
   `1. 检查 ${name} 的本机原生 MCP 配置文件并先做好备份。`,
   "2. 仅新增或更新名为 `t3_hub` 的本机 stdio MCP 服务，启动命令为：",
   '   `command: "/bin/sh"`, `args: ["-c", "exec \\"$HOME/.t3/bin/t3-mcp-router\\" --memory-only"]`',
@@ -1125,9 +1176,17 @@
   "4. 配置完成后调用 `memory_status` 核验当前项目记忆是否就绪；若当前会话尚未加载新 MCP，请提示在新会话中再核验。",
  ].join("\n");
     }
-    async function copyProviderMemorySetupPrompt(providerId, displayName) {
+    async function copyProviderMemorySetupPrompt(providerId, displayName, meta = {}) {
+ const providers = Array.isArray(cache.agentAccess?.setupSummary?.providers) ? cache.agentAccess.setupSummary.providers : [];
+ const matched = providers.find((item) => String(item?.instanceId || "") === String(providerId || ""));
+ const resolvedMeta = {
+  host: meta?.host || matched?.host || "",
+  status: meta?.status || matched?.status || "",
+  reason: meta?.reason || matched?.reason || "",
+  customConfigDir: meta?.customConfigDir !== undefined ? Boolean(meta.customConfigDir) : Boolean(matched?.customConfigDir),
+ };
  const label = String(displayName || providerId || "Agent").trim();
- const text = providerMemorySetupPrompt(providerId, label);
+ const text = providerMemorySetupPrompt(providerId, label, resolvedMeta);
  state.providerMemoryPrompt = { id: String(providerId || label), label, text };
  try {
   const clipboard = window.navigator?.clipboard;
@@ -1191,8 +1250,8 @@
   const stateName = ["configured", "missing", "conflict", "unsupported", "unknown", "pending"].includes(provider?.status) ? provider.status : "unknown";
   const label = provider?.displayName || provider?.instanceId || tr("Agent", "Agent");
   const detail = stateName === "configured" ? tr("已找到 Hub MCP 配置", "Hub MCP configuration found") : memoryAccessIssueText(provider?.reason);
-  const promptBtn = stateName !== "configured"
-   ? `<div style="margin-top:6px"><button type="button" class="hub-arc-btn" data-action="copy-provider-memory-prompt" data-provider-id="${esc(provider?.instanceId || label)}" data-provider-name="${esc(label)}">${esc(tr("复制接入提示词", "Copy setup prompt"))}</button></div>`
+  const promptBtn = stateName !== "configured" && String(provider?.reason || "") !== "selected_provider_disabled"
+   ? `<div style="margin-top:6px"><button type="button" class="hub-arc-btn" data-action="copy-provider-memory-prompt" data-provider-id="${esc(provider?.instanceId || label)}" data-provider-name="${esc(label)}" data-provider-host="${esc(provider?.host || "")}" data-provider-status="${esc(stateName)}" data-provider-reason="${esc(provider?.reason || "")}" data-provider-custom-dir="${provider?.customConfigDir ? "true" : "false"}">${esc(tr("复制接入提示词", "Copy setup prompt"))}</button></div>`
    : "";
   return `<div class="hub-memory-access-provider"><strong data-status="${stateName}">${esc(label)} · ${esc(connectionStatusLabel(stateName))}</strong><small>${esc(detail)}</small>${promptBtn}</div>`;
  }).join("");
@@ -3621,7 +3680,12 @@
  else if (action === "refresh-official-telemetry") refreshOfficialTelemetry();
  else if (action === "toggle-official-telemetry") refreshOfficialTelemetry({ disableOfficialTelemetry: target.getAttribute("aria-checked") !== "true" });
  else if (action === "close-hub-settings") setHubSettingsOpen(false);
- else if (action === "copy-provider-memory-prompt") copyProviderMemorySetupPrompt(target.dataset.providerId, target.dataset.providerName);
+ else if (action === "copy-provider-memory-prompt") copyProviderMemorySetupPrompt(target.dataset.providerId, target.dataset.providerName, {
+  host: target.dataset.providerHost || "",
+  status: target.dataset.providerStatus || "",
+  reason: target.dataset.providerReason || "",
+  customConfigDir: target.dataset.providerCustomDir === "true",
+ });
  else if (action === "close-provider-memory-prompt") { state.providerMemoryPrompt = null; renderMemoryAgentAccess(); }
  else if (action === "toggle-skill-sync-all") { state.skillSyncAllProviders = !state.skillSyncAllProviders; storageSet("t3-hub-skill-sync-all-v1", state.skillSyncAllProviders ? "true" : "false"); renderHubSettingsPanel(); }
  else if (action === "toggle-artifact-dock-setting") setArtifactDockEnabled(!state.artifactDockEnabled);
