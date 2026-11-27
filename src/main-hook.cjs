@@ -19,6 +19,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const electron = require("electron");
+const { readLiveBridgeRecord } = require("./hud-runtime.cjs");
 if (process.env) {
   process.env.PATH = [...new Set([
     path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
@@ -184,29 +185,13 @@ let sidecarBridgePromise = null;
 async function ensureSidecarBridge() {
   if (sidecarBridgePromise) return sidecarBridgePromise;
   sidecarBridgePromise = (async () => {
-    const bridgeFile = path.join(HUD_RUN_DIR, "hub-bridge.json");
-    const readRecord = () => {
-      try { return JSON.parse(fs.readFileSync(bridgeFile, "utf8")); } catch { return null; }
-    };
-    const isOwnedLiveBridge = (b) => {
-      if (!b || !Number.isInteger(b.pid) || b.pid <= 0 || typeof b.url !== "string" || !b.url ||
-          typeof b.token !== "string" || !b.token || !(process.pid > 0) || Number(b.watchPid) !== process.pid) return false;
-      try { process.kill(b.pid, 0); return true; } catch { return false; }
-    };
+    const readRecord = () => readLiveBridgeRecord(HUD_RUN_DIR, process.pid)?.record || null;
     const previous = readRecord();
-    if (isOwnedLiveBridge(previous)) return previous;
-    if (previous?.pid > 0 && Number(previous.watchPid) > 0 && Number(previous.watchPid) !== process.pid) {
-      let ownerDead = false;
-      try { process.kill(Number(previous.watchPid), 0); } catch { ownerDead = true; }
-      if (ownerDead) {
-        try { process.kill(previous.pid, "SIGTERM"); } catch {}
-        try { fs.unlinkSync(bridgeFile); } catch {}
-      }
-    }
+    if (previous) return previous;
     const bridgePath = path.join(__dirname, "hub-bridge.cjs");
     if (!fs.existsSync(bridgePath)) return null;
     const child = spawn(process.execPath, [bridgePath], {
-      env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: __dirname, T3_WATCH_PID: String(process.pid) },
+      env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: path.dirname(HUD_RUN_DIR), T3_WATCH_PID: String(process.pid) },
       detached: true,
       stdio: "ignore",
     });
@@ -215,7 +200,7 @@ async function ensureSidecarBridge() {
     for (let attempt = 0; attempt < 30; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 80));
       const b = readRecord();
-      if (isOwnedLiveBridge(b)) return b;
+      if (b) return b;
     }
     return null;
   })().catch(() => null).finally(() => { sidecarBridgePromise = null; });
@@ -232,15 +217,8 @@ async function injectHudIntoWindow(win, forceReload = false) {
 
   try {
     if (typeof ensureSidecarBridge === "function") await ensureSidecarBridge();
-    let validBridge = null;
-    try {
-      const b = JSON.parse(fs.readFileSync(path.join(HUD_RUN_DIR, "hub-bridge.json"), "utf8"));
-      if (b && Number.isInteger(b.pid) && b.pid > 0 && typeof b.url === "string" && b.url && typeof b.token === "string" && b.token &&
-          process.pid > 0 && Number(b.watchPid) === process.pid) {
-        process.kill(b.pid, 0);
-        validBridge = { url: b.url, token: b.token };
-      }
-    } catch {}
+    const bridge = readLiveBridgeRecord(HUD_RUN_DIR, process.pid)?.record;
+    const validBridge = bridge ? { url: bridge.url, token: bridge.token } : null;
     if (!forceReload) {
       const bridgeMatches = validBridge
         ? `window.__t3HubSidecarBridge?.url === ${JSON.stringify(validBridge.url)} && window.__t3HubSidecarBridge?.token === ${JSON.stringify(validBridge.token)}`

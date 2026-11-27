@@ -134,14 +134,41 @@ async function lookupRelease(fetchImpl, currentVersion) {
   };
 }
 
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+
+function readRegularNoFollow(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    if (!fs.fstatSync(fd).isFile()) throw unavailable();
+    return fs.readFileSync(fd, "utf8");
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
 function readRuntime(pluginDir, expectedPid) {
   const runDir = path.join(pluginDir, "run");
   try {
-    const pidText = fs.readFileSync(path.join(runDir, "active.pid"), "utf8").trim();
+    const runStat = fs.lstatSync(runDir);
+    if (runStat.isSymbolicLink() || !runStat.isDirectory()) throw unavailable();
+    const pidText = readRegularNoFollow(path.join(runDir, "active.pid")).trim();
     if (!/^\d{1,10}$/.test(pidText)) throw unavailable();
     const pid = Number(pidText);
-    const main = JSON.parse(fs.readFileSync(path.join(runDir, `rpc-${pid}.json`), "utf8"));
-    const bridge = JSON.parse(fs.readFileSync(path.join(runDir, "hub-bridge.json"), "utf8"));
+    const main = JSON.parse(readRegularNoFollow(path.join(runDir, `rpc-${pid}.json`)));
+    let bridge = null;
+    for (const candidate of [path.join(runDir, `hub-bridge-${pid}.json`), path.join(runDir, "hub-bridge.json")]) {
+      try {
+        const parsed = JSON.parse(readRegularNoFollow(candidate));
+        if (parsed && parsed.watchPid === pid) {
+          bridge = parsed;
+          break;
+        }
+      } catch {}
+    }
+    if (!bridge) throw unavailable();
     function validEndpoint(endpoint, token) {
       const url = new URL(endpoint.url);
       return /^http:\/\/127\.0\.0\.1:\d+$/.test(endpoint.url) && Number(url.port) > 0 &&

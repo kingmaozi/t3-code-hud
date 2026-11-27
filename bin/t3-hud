@@ -21,6 +21,11 @@ RPC_FILE="$RUN_DIR/rpc.json"
 CONFIG_FILE="$PLUGIN_DIR/config.json"
 
 resolve_t3_app() {
+  if [[ "$cmd" == guardian && -n "${T3_APP_PATH:-}" ]]; then
+    [[ -d "$T3_APP_PATH/Contents/MacOS" ]] || return 1
+    echo "$T3_APP_PATH"
+    return 0
+  fi
   local candidates=(
     "${T3_APP_PATH:-}"
     "/Applications/T3 Code (Beta).app"
@@ -38,19 +43,22 @@ resolve_t3_app() {
   return 1
 }
 
-T3_APP="$(resolve_t3_app || true)"
-if [[ -z "$T3_APP" ]]; then
-  echo "[t3-hud] 未找到 T3 Code.app 或 T3 Code (Beta).app，可通过 T3_APP_PATH 指定路径。" >&2
-  exit 1
-fi
-
-T3_BIN="$(find "$T3_APP/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
-if [[ -z "$T3_BIN" || ! -x "$T3_BIN" ]]; then
-  echo "[t3-hud] 未找到可执行文件: $T3_APP/Contents/MacOS" >&2
-  exit 1
-fi
-
 cmd="${1:-launch}"
+T3_APP="$(resolve_t3_app || true)"
+T3_BIN=""
+if [[ -n "$T3_APP" ]]; then
+  T3_BIN="$(find "$T3_APP/Contents/MacOS" -maxdepth 1 -type f -perm +111 2>/dev/null | head -n 1 || true)"
+fi
+if [[ "$cmd" != guardian ]]; then
+  if [[ -z "$T3_APP" ]]; then
+    echo "[t3-hud] 未找到 T3 Code.app 或 T3 Code (Beta).app，可通过 T3_APP_PATH 指定路径。" >&2
+    exit 1
+  fi
+  if [[ -z "$T3_BIN" || ! -x "$T3_BIN" ]]; then
+    echo "[t3-hud] 未找到可执行文件: $T3_APP/Contents/MacOS" >&2
+    exit 1
+  fi
+fi
 
 get_main_pid() {
   # Scripts and inline evaluations use the same executable as a Node runtime.
@@ -70,10 +78,142 @@ rpc_file_for_pid() {
   if [[ -f "$candidate" ]]; then echo "$candidate"; else echo "$RUN_DIR/rpc.json"; fi
 }
 
+_T3_HUD_NODE_CHECKED=0
+_T3_HUD_RESOLVED_BIN=""
+_T3_HUD_RESOLVED_RUN_AS_NODE=0
+
+is_electron_run_as_node_disabled() {
+  local app="${T3_APP:-}"
+  [[ -n "$app" ]] || return 1
+  local fw="$app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+  [[ -f "$fw" ]] || fw="$app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+  [[ -f "$fw" ]] || return 1
+  local probe_node="" cand
+  for cand in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null || true)"; do
+    if [[ -n "$cand" && -x "$cand" ]]; then probe_node="$cand"; break; fi
+  done
+  if [[ -n "$probe_node" ]]; then
+    "$probe_node" -e '
+      const fs = require("node:fs");
+      const sentinel = Buffer.from("dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX", "ascii");
+      const fd = fs.openSync(process.argv[1], "r");
+      try {
+        const chunk = Buffer.allocUnsafe(4 * 1024 * 1024);
+        let tail = Buffer.alloc(0);
+        for (;;) {
+          const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+          if (n <= 0) break;
+          const view = tail.length ? Buffer.concat([tail, chunk.subarray(0, n)]) : chunk.subarray(0, n);
+          const idx = view.indexOf(sentinel);
+          if (idx >= 0) {
+            const after = idx + sentinel.length;
+            if (after + 3 <= view.length) {
+              const b0 = view[after];
+              const fuse0 = (b0 === 0x30 || b0 === 0x31) ? b0 : (b0 === 1 && view[after + 1] >= 1 ? view[after + 2] : 0x31);
+              process.exit(fuse0 === 0x30 ? 0 : 1);
+            }
+          }
+          const keep = Math.min(view.length, sentinel.length + 16);
+          tail = Buffer.from(view.subarray(view.length - keep));
+        }
+      } finally { fs.closeSync(fd); }
+      process.exit(1);
+    ' "$fw" 2>/dev/null
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import sys
+s = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX"
+with open(sys.argv[1], "rb") as f:
+    tail = b""
+    while True:
+        c = f.read(4 * 1024 * 1024)
+        if not c: break
+        v = tail + c
+        i = v.find(s)
+        if i >= 0 and i + len(s) + 3 <= len(v):
+            a = v[i + len(s)]
+            f0 = a if a in (48, 49) else (v[i + len(s) + 2] if a == 1 and v[i + len(s) + 1] >= 1 else 49)
+            sys.exit(0 if f0 == 48 else 1)
+        tail = v[-(len(s) + 16):]
+sys.exit(1)
+' "$fw" 2>/dev/null
+    return $?
+  fi
+  return 1
+}
+
+node_has_hud_capabilities() {
+  local bin="$1"
+  local use_run_as_node="$2"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  if [[ "$use_run_as_node" == 1 ]]; then
+    env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$bin" -e 'require("node:sqlite"); if (typeof WebSocket !== "function") process.exit(2);' >/dev/null 2>&1
+  else
+    env -u NODE_OPTIONS -u ELECTRON_RUN_AS_NODE "$bin" -e 'require("node:sqlite"); if (typeof WebSocket !== "function") process.exit(2);' >/dev/null 2>&1
+  fi
+}
+
+resolve_node_runtime() {
+  if [[ "$_T3_HUD_NODE_CHECKED" == 1 ]]; then
+    [[ -n "$_T3_HUD_RESOLVED_BIN" ]]
+    return $?
+  fi
+  _T3_HUD_NODE_CHECKED=1
+  _T3_HUD_RESOLVED_BIN=""
+  _T3_HUD_RESOLVED_RUN_AS_NODE=0
+
+  if [[ "${cmd:-}" != guardian ]] && ! is_electron_run_as_node_disabled; then
+    if [[ -n "${T3_BIN:-}" ]] && node_has_hud_capabilities "$T3_BIN" 1; then
+      _T3_HUD_RESOLVED_BIN="$T3_BIN"
+      _T3_HUD_RESOLVED_RUN_AS_NODE=1
+      return 0
+    fi
+  fi
+
+  local cand
+  local -a sys_candidates=()
+  if [[ -n "${T3_HUD_NODE_BIN:-}" ]]; then
+    sys_candidates+=("$T3_HUD_NODE_BIN")
+  else
+    sys_candidates+=("/opt/homebrew/bin/node" "/usr/local/bin/node")
+    local path_node
+    path_node="$(command -v node 2>/dev/null || true)"
+    [[ -n "$path_node" ]] && sys_candidates+=("$path_node")
+  fi
+  for cand in "${sys_candidates[@]}"; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    if node_has_hud_capabilities "$cand" 0; then
+      _T3_HUD_RESOLVED_BIN="$cand"
+      _T3_HUD_RESOLVED_RUN_AS_NODE=0
+      return 0
+    fi
+  done
+
+  if [[ "${cmd:-}" == guardian && -n "$T3_BIN" ]] &&
+     ! is_electron_run_as_node_disabled && node_has_hud_capabilities "$T3_BIN" 1; then
+    _T3_HUD_RESOLVED_BIN="$T3_BIN"
+    _T3_HUD_RESOLVED_RUN_AS_NODE=1
+    return 0
+  fi
+
+  echo "[t3-hud] 未找到可用的 Node 运行时（需支持 node:sqlite 与 WebSocket；当前 T3 的 RunAsNode 已禁用或系统 Node 版本过低）。" >&2
+  return 1
+}
+
+run_node_script() {
+  resolve_node_runtime || return 1
+  if [[ "$_T3_HUD_RESOLVED_RUN_AS_NODE" == 1 ]]; then
+    env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$_T3_HUD_RESOLVED_BIN" "$@"
+  else
+    env -u NODE_OPTIONS -u ELECTRON_RUN_AS_NODE "$_T3_HUD_RESOLVED_BIN" "$@"
+  fi
+}
+
 # A marker is only a hint; require a live, authenticated main-process RPC.
 is_hud_mounted() {
-  env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" \
-    "$PLUGIN_DIR/hud-health.cjs" "$(rpc_file_for_pid "$1")" "$MARKER_FILE" "$1"
+  run_node_script "$PLUGIN_DIR/hud-health.cjs" "$(rpc_file_for_pid "$1")" "$MARKER_FILE" "$1"
 }
 
 activate_t3() {
@@ -98,7 +238,7 @@ quit_t3_gracefully() {
 }
 
 launch_enhanced() {
-  T3_HUD_DIR="$PLUGIN_DIR" T3_APP_PATH="$T3_APP" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$BOOTSTRAP_PATH"
+  T3_HUD_DIR="$PLUGIN_DIR" T3_APP_PATH="$T3_APP" run_node_script "$BOOTSTRAP_PATH"
   sleep 0.8
   activate_t3
 }
@@ -113,41 +253,59 @@ do_reload() {
     echo "[t3-hud] 未找到活跃的 HUD RPC ($RPC_FILE)，请先执行 t3-hud restart" >&2
     exit 1
   fi
-  ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
+  run_node_script -e '
     const fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process");
     const [pluginDir, rpcFile, expectedPid] = process.argv.slice(1);
     const { assembleRenderer, readInstalledVersion } = require(path.resolve(pluginDir, "hud-release.cjs"));
-    (async () => {
-      const cfg = JSON.parse(fs.readFileSync(rpcFile, "utf8"));
-      if (cfg.pid !== Number(expectedPid)) throw new Error("HUD RPC PID mismatch");
-      const admTok = cfg.adminToken || cfg.token;
-      // Always ensure hub-bridge is running and hot-reloaded, regardless of probe.
-      const bridgeFile = path.join(pluginDir, "run", "hub-bridge.json");
-      let bridge = null;
+    const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+    const readJsonNoFollow = (file) => {
+      let fd = null;
       try {
-        const b = JSON.parse(fs.readFileSync(bridgeFile, "utf8"));
-        process.kill(b.pid, 0);
-        if (Number(cfg.pid || 0) > 0 && Number(b.watchPid || 0) !== Number(cfg.pid || 0)) {
-          try { process.kill(b.pid, "SIGTERM"); } catch {}
-          throw new Error("bridge watchPid mismatch");
-        }
-        const r = await fetch(b.url + "/reload", { method: "POST", headers: { "X-T3-Hud-Token": b.token } });
-        const rj = await r.json();
-        if (!r.ok || !rj || rj.ok !== true) throw new Error("bridge reload failed");
-        bridge = b;
-      } catch { bridge = null; }
+        fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
+        if (!fs.fstatSync(fd).isFile()) return null;
+        return JSON.parse(fs.readFileSync(fd, "utf8"));
+      } catch { return null; }
+      finally { if (fd !== null) try { fs.closeSync(fd); } catch {} }
+    };
+    (async () => {
+      const cfg = readJsonNoFollow(rpcFile);
+      if (!cfg || cfg.pid !== Number(expectedPid)) throw new Error("HUD RPC PID mismatch");
+      const admTok = cfg.adminToken || cfg.token;
+      const runDir = path.join(pluginDir, "run");
+      const perPidBridge = path.join(runDir, `hub-bridge-${cfg.pid}.json`);
+      const sharedBridge = path.join(runDir, "hub-bridge.json");
+      let bridge = null;
+      for (const candidate of [perPidBridge, sharedBridge]) {
+        const b = readJsonNoFollow(candidate);
+        if (!b || Number(b.watchPid || 0) !== Number(cfg.pid || 0)) continue;
+        try {
+          process.kill(b.pid, 0);
+          const r = await fetch(b.url + "/reload", { method: "POST", headers: { "X-T3-Hud-Token": b.token } });
+          const rj = await r.json();
+          if (!r.ok || !rj || rj.ok !== true) throw new Error("bridge reload failed");
+          bridge = b;
+          break;
+        } catch { bridge = null; }
+      }
       if (!bridge) {
-        try { fs.unlinkSync(bridgeFile); } catch {}
         try {
           const child = spawn(process.execPath, [path.join(pluginDir, "hub-bridge.cjs")], {
-            env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: pluginDir, T3_WATCH_PID: String(cfg.pid || 0) },
+            env: {
+              ...process.env,
+              ...(process.versions && process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+              T3_HUD_DIR: pluginDir,
+              T3_WATCH_PID: String(cfg.pid || 0),
+            },
             detached: true,
             stdio: "ignore",
           });
           child.unref();
           for (let i = 0; i < 40; i++) {
             await new Promise(r => setTimeout(r, 80));
-            if (fs.existsSync(bridgeFile)) { try { bridge = JSON.parse(fs.readFileSync(bridgeFile, "utf8")); break; } catch {} }
+            const b = readJsonNoFollow(perPidBridge) || readJsonNoFollow(sharedBridge);
+            if (b && Number(b.watchPid || 0) === Number(cfg.pid || 0)) {
+              try { process.kill(b.pid, 0); bridge = b; break; } catch {}
+            }
           }
         } catch {}
       }
@@ -165,11 +323,16 @@ do_reload() {
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
-      const j = await fetch(cfg.url + "/admin/reload-ui", {
+      const response = await fetch(cfg.url + "/admin/reload-ui", {
         method: "POST",
         headers: { "X-T3-Hud-Token": admTok },
-      }).then(r => r.json());
-      console.log("[t3-hud] 热重载完成:", JSON.stringify(j));
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true || !result.results?.length ||
+          result.results.some(window => !window.injected) || result.lastInjectError) {
+        throw new Error(result.error || result.lastInjectError || "HUD 挂载未确认");
+      }
+      console.log("[t3-hud] 热重载完成:", JSON.stringify(result));
     })().catch(e => { console.error(e); process.exit(1); });
   ' "$PLUGIN_DIR" "$RPC_FILE" "$main_pid"
 }
@@ -181,7 +344,7 @@ do_lang() {
     exit 1
   fi
   mkdir -p "$PLUGIN_DIR"
-  ELECTRON_RUN_AS_NODE=1 "$T3_BIN" -e '
+  run_node_script -e '
     const path = require("node:path");
     const [cfgFile, arg] = process.argv.slice(1);
     const { updateHudLanguage } = require(path.resolve(path.dirname(cfgFile), "hud-config.cjs"));
@@ -207,11 +370,13 @@ case "$cmd" in
         exit 1
       fi
     else
+      resolve_node_runtime || exit 1
       launch_enhanced
       echo "[t3-hud] 已启动 T3 Code (HUD 悬浮窗 + Git 图谱已挂载)"
     fi
     ;;
   restart)
+    resolve_node_runtime || exit 1
     echo "[t3-hud] 正在优雅重启 T3 Code 并挂载 HUD..."
     quit_t3_gracefully
     launch_enhanced
@@ -224,16 +389,25 @@ case "$cmd" in
     do_lang "${2:-}"
     ;;
   telemetry)
-    T3_HUD_DIR="$PLUGIN_DIR" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" \
+    T3_HUD_DIR="$PLUGIN_DIR" run_node_script \
       "$PLUGIN_DIR/hub-telemetry-guard.cjs" "${2:-status}" "$(get_main_pid)"
     ;;
   guardian)
-    gcmd="${2:-status}"
-    if [[ "$gcmd" != "enable" && "$gcmd" != "disable" && "$gcmd" != "status" ]]; then
-      echo "用法: t3-hud guardian [enable|disable|status]" >&2
-      exit 1
-    fi
-    T3_HUD_DIR="$PLUGIN_DIR" env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$T3_BIN" "$PLUGIN_DIR/update-guardian.cjs" "--mode=$gcmd"
+    garg="${2:-status}"
+    shift 2 2>/dev/null || shift $# 2>/dev/null || true
+    case "$garg" in
+      enable|disable|status|plist-changed|upgrade-handoff)
+        gmode="--mode=$garg"
+        ;;
+      --mode=enable|--mode=disable|--mode=status|--mode=plist-changed|--mode=upgrade-handoff)
+        gmode="$garg"
+        ;;
+      *)
+        echo "用法: t3-hud guardian [enable|disable|status|plist-changed|upgrade-handoff]" >&2
+        exit 1
+        ;;
+    esac
+    T3_HUD_DIR="$PLUGIN_DIR" run_node_script "$PLUGIN_DIR/update-guardian.cjs" "$gmode" "$@"
     ;;
   status)
     MAIN_PID="$(get_main_pid)"
@@ -253,7 +427,7 @@ case "$cmd" in
     fi
     ;;
   *)
-    echo "用法: t3-hud [start|restart|reload|status|lang zh|en|auto|telemetry status|off|on]"
+    echo "用法: t3-hud [start|restart|reload|status|lang zh|en|auto|telemetry status|off|on|guardian enable|disable|status]"
     exit 1
     ;;
 esac

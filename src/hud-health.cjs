@@ -1,5 +1,5 @@
 'use strict';
-const fs = require('node:fs');
+const { readRegularFileNoFollow } = require('./hud-runtime.cjs');
 const http = require('node:http');
 
 // Check the authenticated main-process endpoint, never send its token off-host.
@@ -7,9 +7,9 @@ async function checkHud({rpcFile, markerFile, pid, timeoutMs = 750}) {
   try {
     pid = Number(pid);
     if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-    if (markerFile && fs.readFileSync(markerFile, 'utf8').trim() !== String(pid)) return false;
+    if (markerFile && readRegularFileNoFollow(markerFile, { maxBytes: 64 }).trim() !== String(pid)) return false;
     process.kill(pid, 0);
-    const cfg = JSON.parse(fs.readFileSync(rpcFile, 'utf8'));
+    const cfg = JSON.parse(readRegularFileNoFollow(rpcFile, { maxBytes: 65536 }));
     if (cfg.pid !== pid || typeof cfg.adminToken !== 'string' || !cfg.adminToken) return false;
     const url = new URL(cfg.url);
     if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port ||

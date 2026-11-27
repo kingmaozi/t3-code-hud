@@ -63,6 +63,9 @@ function fixture(t, options = {}) {
     if (url.pathname === "/admin/reload-ui") {
       const version = JSON.parse(read("hud-release.json")).version;
       versionsAtReload.push(version);
+      if (options.backendReloadFailure && version === target) {
+        return Response.json({ ok: false, error: "Backend reload failed" }, { status: 500 });
+      }
       const injected = !(options.reloadFailure && version === target);
       return Response.json({ ok: true, results: [{ injected }] });
     }
@@ -158,7 +161,7 @@ test("rejects a corrupt asset and an untrusted redirect before local changes", a
 });
 
 test("failed renderer injection or backend replacement rolls back bytes and version", async t => {
-  for (const options of [{ reloadFailure: true }, { backendMismatch: true }]) {
+  for (const options of [{ reloadFailure: true }, { backendReloadFailure: true }, { backendMismatch: true }]) {
     const f = fixture(t, options);
     const before = f.read("backend.cjs");
     assert.equal((await f.updater.apply(target)).code, "UPDATE_FAILED");
@@ -167,6 +170,22 @@ test("failed renderer injection or backend replacement rolls back bytes and vers
     assert.equal(f.read("hud-release.json"), '{"version":"1.0.9"}');
     assert.equal(f.read("renderer-base.js"), "window.original = true;");
     assert.equal(fs.existsSync(path.join(f.pluginDir, "hub-update.cjs")), false);
+    assert.equal(fs.existsSync(path.join(f.pluginDir, "run", "hud-update-pending.json")), false);
     assert.equal(fs.readdirSync(path.join(f.pluginDir, "backups")).length, 1);
   }
+});
+
+test("updater prefers per-instance hub-bridge-<pid>.json and refuses symlinked run records", async t => {
+  const f = fixture(t);
+  // Put a stale/wrong shared hub-bridge.json and a valid per-instance hub-bridge-<pid>.json
+  f.put("run/hub-bridge.json", JSON.stringify({ watchPid: process.pid + 1, pid: process.ppid, url: bridge, token: bridgeToken }));
+  f.put(`run/hub-bridge-${process.pid}.json`, JSON.stringify({ watchPid: process.pid, pid: process.ppid, url: bridge, token: bridgeToken }));
+  assert.deepEqual(await f.updater.apply(target), { ok: true, status: "updated", currentVersion: target });
+
+  // Symlinked active.pid must be rejected
+  const realActive = path.join(f.root, "real-active.pid");
+  fs.writeFileSync(realActive, String(process.pid));
+  fs.unlinkSync(path.join(f.pluginDir, "run", "active.pid"));
+  fs.symlinkSync(realActive, path.join(f.pluginDir, "run", "active.pid"));
+  assert.equal((await f.updater.apply("1.0.11")).code, "HUD_UNAVAILABLE");
 });

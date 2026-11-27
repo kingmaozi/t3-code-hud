@@ -5,8 +5,16 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 
+const {
+  acquireExclusiveLock,
+  isPidAlive,
+  readRegularFileNoFollow,
+  unlinkIfRegular,
+  writeFileAtomicNoFollow,
+} = require("./hud-runtime.cjs");
+
 // GUI launches do not inherit the user's shell PATH. Set this before loading
-// backend modules so every Dream subprocess sees the same executable search.
+// backend modules so every subprocess sees the same executable search.
 process.env.PATH = [...new Set([
   path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
   "/opt/homebrew/bin", "/usr/local/bin",
@@ -17,10 +25,38 @@ process.env.PATH = [...new Set([
 const watchPid = Number(process.env.T3_WATCH_PID || 0);
 const pluginDir = process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin");
 const runDir = path.join(pluginDir, "run");
-const bridgeFile = path.join(runDir, "hub-bridge.json");
+const sharedBridgeFile = path.join(runDir, "hub-bridge.json");
+const instanceBridgeFile = watchPid > 0 ? path.join(runDir, `hub-bridge-${watchPid}.json`) : sharedBridgeFile;
 const token = crypto.randomBytes(32).toString("hex");
+const bridgeLockFile = path.join(runDir, "hub-bridge.lock");
+const waitWord = new Int32Array(new SharedArrayBuffer(4));
 let backend = null;
+let shuttingDown = false;
+let watchTimer = null;
 const disposedBackends = new WeakSet();
+
+function readJsonNoFollow(filePath) {
+  try { return JSON.parse(readRegularFileNoFollow(filePath)); }
+  catch { return null; }
+}
+
+function withBridgeLock(action) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const lock = acquireExclusiveLock(bridgeLockFile);
+    if (lock.acquired) {
+      try { return action(); }
+      finally { lock.release(); }
+    }
+    if (lock.reason === "invalid_lock") break;
+    Atomics.wait(waitWord, 0, 0, 10);
+  }
+  throw new Error("Bridge record lock unavailable");
+}
+
+function unlinkIfOwned(filePath) {
+  const record = readJsonNoFollow(filePath);
+  if (record?.pid === process.pid && record.token === token) unlinkIfRegular(filePath);
+}
 
 function stopBackendScheduler(target = backend) {
   if (!target || (typeof target !== "object" && typeof target !== "function") || disposedBackends.has(target)) return;
@@ -45,7 +81,7 @@ backend = loadBackend();
 
 function allowedOrigin(origin) {
   if (!origin || origin === "null") return null;
-  if (origin.startsWith("t3code://") || origin.startsWith("t3code-dev://")) return origin;
+  if (origin === "t3code://app" || origin === "t3code-dev://app") return origin;
   if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return origin;
   return null;
 }
@@ -90,34 +126,81 @@ const server = http.createServer((req, res) => {
   });
 });
 
+function cleanupFiles() {
+  try {
+    withBridgeLock(() => {
+      if (instanceBridgeFile !== sharedBridgeFile) unlinkIfOwned(instanceBridgeFile);
+      unlinkIfOwned(sharedBridgeFile);
+    });
+  } catch {}
+}
+
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (watchTimer) {
+    clearInterval(watchTimer);
+    watchTimer = null;
+  }
+  stopBackendScheduler();
+  cleanupFiles();
+  try {
+    if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+    server.close(() => {
+      process.exitCode = exitCode;
+    });
+  } catch {
+    process.exitCode = exitCode;
+  }
+}
+
 server.once("close", () => {
   stopBackendScheduler();
 });
 process.once("beforeExit", () => {
   stopBackendScheduler();
+  cleanupFiles();
 });
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, () => {
-    stopBackendScheduler();
-    server.close(() => { process.exitCode = 0; });
-  });
+  process.once(signal, () => shutdown(0));
+}
+
+function canUpdateSharedBridge() {
+  const existing = readJsonNoFollow(sharedBridgeFile);
+  if (!existing || !isPidAlive(existing.pid)) return true;
+  if (watchPid > 0 && existing.watchPid === watchPid) return true;
+  return existing.watchPid > 0 && !isPidAlive(existing.watchPid);
 }
 
 server.listen(0, "127.0.0.1", () => {
   const addr = server.address();
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(
-    bridgeFile,
-    JSON.stringify({ url: "http://127.0.0.1:" + addr.port, token, pid: process.pid, watchPid }),
-    { mode: 0o600 }
-  );
+  const payload = JSON.stringify({
+    url: "http://127.0.0.1:" + addr.port,
+    token,
+    pid: process.pid,
+    watchPid,
+  });
+  try {
+    const published = withBridgeLock(() => {
+      if (instanceBridgeFile !== sharedBridgeFile) writeFileAtomicNoFollow(instanceBridgeFile, payload);
+      const canPublishShared = canUpdateSharedBridge();
+      if (canPublishShared) writeFileAtomicNoFollow(sharedBridgeFile, payload);
+      return canPublishShared || instanceBridgeFile !== sharedBridgeFile;
+    });
+    if (!published) shutdown(1);
+  } catch (err) {
+    console.error("[t3-hub-bridge] failed to write bridge record:", err?.message || err);
+    shutdown(1);
+  }
 });
 
 if (watchPid > 0) {
-  setInterval(() => {
-    try { process.kill(watchPid, 0); } catch {
-      try { fs.unlinkSync(bridgeFile); } catch {}
-      process.exit(0);
+  const rawWatchMs = Number(process.env.T3_BRIDGE_WATCH_MS || 0);
+  const watchMs = Number.isFinite(rawWatchMs) && rawWatchMs >= 50 && rawWatchMs <= 60000 ? rawWatchMs : 10000;
+  watchTimer = setInterval(() => {
+    if (!isPidAlive(watchPid)) {
+      shutdown(0);
     }
-  }, 10000).unref();
+  }, watchMs);
+  watchTimer.unref();
 }

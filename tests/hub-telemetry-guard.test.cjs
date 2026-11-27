@@ -5,9 +5,20 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { execFile, execFileSync } = require("node:child_process");
+const { execFile, execFileSync, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
-const { buildTelemetryLaunch, optOutFlags, processStart, recordTelemetryLaunch, verifyLegacyTelemetryLaunch, createTelemetryGuard } = require("../src/hub-telemetry-guard.cjs");
+const {
+  buildTelemetryLaunch,
+  optOutFlags,
+  parseKernProcargs2Buffer,
+  parseNulEnvironBuffer,
+  readProcessEnv,
+  observeProcessTelemetry,
+  processStart,
+  recordTelemetryLaunch,
+  verifyLegacyTelemetryLaunch,
+  createTelemetryGuard,
+} = require("../src/hub-telemetry-guard.cjs");
 
 const run = promisify(execFile);
 const repo = path.resolve(__dirname, "..");
@@ -218,7 +229,7 @@ test("the real bootstrap passes telemetry flags to a newly spawned desktop execu
   fs.mkdirSync(asar, { recursive: true });
   fs.writeFileSync(path.join(asar, "package.json"), "{}");
   fs.writeFileSync(bin, '#!/bin/sh\nprintf "%s\\n" "${T3CODE_TELEMETRY_ENABLED-unset}" "${T3CODE_OTEL_SDK_DISABLED-unset}" "${OTEL_SDK_DISABLED-unset}" > "$TEST_TELEMETRY_FLAGS"\n', { mode: 0o700 });
-  for (const mod of ["bootstrap.cjs", "hud-health.cjs", "hub-telemetry-guard.cjs", "hud-config.cjs", "hub-host-settings.cjs"]) {
+  for (const mod of ["bootstrap.cjs", "hud-health.cjs", "hud-runtime.cjs", "hub-telemetry-guard.cjs", "hud-config.cjs", "hub-host-settings.cjs"]) {
     fs.copyFileSync(path.join(repo, "src", mod), path.join(pluginDir, mod));
   }
   const output = path.join(homeDir, "flags.txt");
@@ -321,4 +332,139 @@ test("ZDOTDIR probe targets startup .zshrc before .zshrc mutates ZDOTDIR and sta
   const hungGuard = createTelemetryGuard({ homeDir: hungHome, pluginDir, policyPath: path.join(hungHome, "policy.json"), env: { HOME: hungHome, PATH: process.env.PATH || "/usr/bin:/bin" } });
   assert.equal(hungGuard.status().profile, "unconfigured");
   assert.ok(Date.now() - start < 2200, "ZDOTDIR probe must terminate promptly via SIGKILL");
+});
+
+function buildKernProcargs2(execPath, argv, envp) {
+  const argcBuf = Buffer.alloc(4);
+  argcBuf.writeInt32LE(argv.length, 0);
+  const executable = Buffer.from(execPath + "\0", "utf8");
+  const padded = Buffer.alloc(Math.ceil(executable.length / 8) * 8);
+  executable.copy(padded);
+  const parts = [argcBuf, padded];
+  for (const a of argv) parts.push(Buffer.from(a + "\0", "utf8"));
+  for (const e of envp) parts.push(Buffer.from(e + "\0", "utf8"));
+  parts.push(Buffer.from("\0", "utf8"));
+  return Buffer.concat(parts);
+}
+
+test("kernel process env parser separates argv from envp, handles spaces, rejects truncation and PID reuse", () => {
+  // 1. Pure argv masquerading with empty envp -> null
+  const argvOnly = buildKernProcargs2("/Applications/T3 Code.app/Contents/MacOS/T3 Code", [
+    "/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+    "T3CODE_TELEMETRY_ENABLED=false",
+    "T3CODE_OTEL_SDK_DISABLED=true",
+  ], []);
+  assert.equal(parseKernProcargs2Buffer(argvOnly), null);
+  assert.equal(observeProcessTelemetry(1234, { rawProcargs2: argvOnly, processStartImpl: () => "t1" }), null);
+
+  // 2. argv masquerading with real envp -> ignores argv, reads only real envp (including spaces)
+  const realEnv = buildKernProcargs2("/Applications/T3 Code.app/Contents/MacOS/T3 Code", [
+    "/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+    "T3CODE_TELEMETRY_ENABLED=false",
+  ], [
+    "PATH=/usr/bin:/bin",
+    "GREETING=hello world with spaces",
+    "T3CODE_HOME=/Users/demo/My App Data",
+    "SECRET_TOKEN=must-not-leak",
+  ]);
+  const info = readProcessEnv(1234, { rawProcargs2: realEnv, processStartImpl: () => "t1" });
+  assert.equal(info.env.T3CODE_HOME, "/Users/demo/My App Data");
+  assert.equal(info.env.SECRET_TOKEN, undefined, "unlisted env vars must never be exposed");
+  assert.deepEqual(
+    observeProcessTelemetry(1234, { rawProcargs2: realEnv, processStartImpl: () => "t1" }),
+    { pid: 1234, productOff: false, otelOff: false }
+  );
+
+  // 3. Truncated buffer (missing trailing NUL in envp) -> null
+  const truncated = realEnv.subarray(0, realEnv.length - 5);
+  assert.equal(parseKernProcargs2Buffer(truncated), null);
+  assert.equal(parseNulEnvironBuffer(Buffer.from("T3CODE_TELEMETRY_ENABLED=false")), null);
+  assert.equal(parseNulEnvironBuffer(Buffer.from("T3CODE_TELEMETRY_ENABLED=false\0")).env.T3CODE_TELEMETRY_ENABLED, "false");
+
+  assert.equal(parseKernProcargs2Buffer(realEnv.subarray(0, -1)), null,
+    "EOF immediately after a whole variable is not an envp boundary");
+  const emptyArg0 = buildKernProcargs2("/bin/node", ["", "--test"], [
+    "T3CODE_HOME=/tmp/isolated home", "PATH=/usr/bin",
+  ]);
+  assert.equal(parseKernProcargs2Buffer(emptyArg0).env.T3CODE_HOME, "/tmp/isolated home");
+  assert.equal(parseKernProcargs2Buffer(emptyArg0.subarray(0, -1)), null);
+
+  // 4. PID reuse (processStart changes between before and after read) -> null
+  let call = 0;
+  assert.equal(
+    readProcessEnv(1234, { rawProcargs2: realEnv, processStartImpl: () => (++call === 1 ? "t1" : "t2") }),
+    null
+  );
+
+  // 5. Exec path mismatch -> null
+  assert.equal(
+    readProcessEnv(1234, { rawProcargs2: realEnv, processStartImpl: () => "t1", expectedExecPath: "/other/bin" }),
+    null
+  );
+});
+
+test("live KERN_PROCARGS2 observation distinguishes real env from argv and writes 0600 non-symlink receipt", { skip: process.platform !== "darwin" }, async (t) => {
+  const { runDir, pluginDir } = fixture(t);
+  const child = spawn(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 5000)", "T3CODE_OTEL_SDK_DISABLED=false"],
+    {
+      env: {
+        PATH: process.env.PATH || "/usr/bin:/bin",
+        T3CODE_TELEMETRY_ENABLED: "false",
+        T3CODE_OTEL_SDK_DISABLED: "true",
+        OTEL_SDK_DISABLED: "true",
+        T3CODE_HOME: "/tmp/t3 space dir",
+        PRIVATE_KEY: "do-not-expose",
+      },
+      stdio: "ignore",
+    }
+  );
+  t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+  await new Promise((r) => setTimeout(r, 80));
+
+  const envInfo = readProcessEnv(child.pid, { expectedExecPath: process.execPath });
+  assert.ok(envInfo, "live macOS KERN_PROCARGS2 probe must succeed");
+  assert.equal(envInfo.env.T3CODE_HOME, "/tmp/t3 space dir");
+  assert.equal(envInfo.env.PRIVATE_KEY, undefined);
+
+  const observed = observeProcessTelemetry(child.pid, { expectedExecPath: process.execPath });
+  assert.deepEqual(observed, { pid: child.pid, productOff: true, otelOff: true });
+
+  const started = processStart(child.pid);
+  recordTelemetryLaunch(runDir, child.pid, started, buildTelemetryLaunch({}, pluginDir), observed);
+  const receiptPath = path.join(runDir, "official-telemetry-launch.json");
+  assert.equal(fs.statSync(receiptPath).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(fs.readFileSync(receiptPath, "utf8")).observed, true);
+
+  // Symlink at official-telemetry-launch.json must be refused
+  const victim = path.join(runDir, "victim.txt");
+  fs.writeFileSync(victim, "preserve");
+  fs.unlinkSync(receiptPath);
+  fs.symlinkSync(victim, receiptPath);
+  assert.throws(() => recordTelemetryLaunch(runDir, child.pid, started, buildTelemetryLaunch({}, pluginDir), observed), /symlink/);
+  assert.equal(fs.readFileSync(victim, "utf8"), "preserve");
+});
+
+test("live macOS probe keeps the first environment value after an empty argv[0]", {
+  skip: process.platform !== "darwin",
+}, async (t) => {
+  const child = spawn("/usr/bin/python3", ["-c", `
+import ctypes, os, sys
+lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+program = os.fsencode(sys.argv[1])
+argv = (ctypes.c_char_p * 4)(b"", b"-e", b"console.log('ready'); setInterval(() => {}, 1000)", None)
+envp = (ctypes.c_char_p * 3)(b"T3CODE_HOME=/tmp/fixture with spaces", b"FIXTURE=second", None)
+lib.execve(program, argv, envp)
+sys.exit(1)
+`, process.execPath], { stdio: ["ignore", "pipe", "inherit"] });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  const ready = await new Promise((resolve) => {
+    child.stdout.once("data", (data) => resolve(data.toString().trim()));
+    child.once("exit", () => resolve(null));
+  });
+  assert.equal(ready, "ready");
+  const info = readProcessEnv(child.pid, { expectedExecPath: process.execPath });
+  assert.equal(info?.env.T3CODE_HOME, "/tmp/fixture with spaces");
+  assert.equal(info.env.FIXTURE, undefined);
 });
