@@ -23,11 +23,15 @@ const { createDevinQuotaReader } = require("./hub-devin-quota.cjs");
 const { createGuardianManager } = require("./update-guardian.cjs");
 const hubHostSettings = require("./hub-host-settings.cjs");
 const { createHudUpdater, sha256 } = require("./hub-update.cjs");
+const { readInstalledVersion } = require("./hud-release.cjs");
 const { createDreamScheduler, beginDreamRun } = require("./hub-dream-scheduler.cjs");
 
 const execFileAsync = promisify(execFile);
 const loadedBackendHash = sha256(fs.readFileSync(__filename));
-const hudUpdater = createHudUpdater({ installLock: path.join(os.homedir(), ".t3", "hud-install.lock") });
+const hudUpdater = createHudUpdater({
+  installLock: path.join(os.homedir(), ".t3", "hud-install.lock"),
+  configPath: path.join(process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin"), "config.json"),
+});
 
 // Hub v3 engines (lazy singletons respecting process.env.HOME for tests)
 let _taskBoardInstance = null;
@@ -202,7 +206,8 @@ const CODEX_HOME_ROOT = process.env.CODEX_HOME
   : path.join(HOME_DIR, ".codex");
 const CODEX_SESSIONS_ROOT = path.join(CODEX_HOME_ROOT, "sessions");
 const AGY_PROVIDERS_ROOT = path.join(T3_USERDATA, "providers", "antigravity");
-const HUD_CONFIG_PATH = path.join(process.env.T3_HUD_DIR || path.join(HOME_DIR, ".t3", "hud-plugin"), "config.json");
+const HUD_PLUGIN_DIR = process.env.T3_HUD_DIR || path.join(HOME_DIR, ".t3", "hud-plugin");
+const HUD_CONFIG_PATH = path.join(HUD_PLUGIN_DIR, "config.json");
 // Older HUD hot-update bundles replace this file without installing new siblings.
 const hudConfigModule = path.join(__dirname, "hud-config.cjs");
 const telemetryGuardModule = path.join(__dirname, "hub-telemetry-guard.cjs");
@@ -3845,12 +3850,83 @@ function readHudLocalEnvironmentId() {
   }
 }
 
+function assertHudConfigNoSymlink(filePath) {
+  const st = fs.lstatSync(filePath, { throwIfNoEntry: false });
+  if (st && (st.isSymbolicLink() || !st.isFile())) {
+    throw new Error("Refusing symlink or non-regular HUD config file");
+  }
+}
+
 async function hubCall(action, payload = {}) {
   try {
     if (PROJECT_MEMORY_ACTIONS.has(action)) payload = projectMemoryPayload(payload);
     switch (action) {
-      case "hub:update:check": return await hudUpdater.check();
-      case "hub:update:apply": return await hudUpdater.apply(payload?.expectedVersion);
+      case "hub:update:check": return await hudUpdater.check({ background: payload?.background === true });
+      case "hub:update:apply": return await hudUpdater.apply(payload?.expectedVersion, { auto: payload?.auto === true });
+      case "hub:update:config:get": {
+        try {
+          assertHudConfigNoSymlink(HUD_CONFIG_PATH);
+          let cfg = {};
+          if (fs.existsSync(hudConfigModule)) {
+            cfg = require(hudConfigModule).readHudConfig(HUD_CONFIG_PATH) || {};
+          } else {
+            let fd = null;
+            try {
+              fd = fs.openSync(HUD_CONFIG_PATH, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+              if (!fs.fstatSync(fd).isFile()) throw new Error("HUD config is not a regular file");
+              const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
+              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new Error("HUD config root must be a plain object");
+              }
+              cfg = parsed;
+            } catch (err) {
+              if (err?.code !== "ENOENT") throw err;
+              cfg = {};
+            } finally {
+              if (fd !== null) try { fs.closeSync(fd); } catch {}
+            }
+          }
+          return {
+            ok: true,
+            autoHotUpdate: cfg.autoHotUpdate === true,
+            currentVersion: readInstalledVersion(HUD_PLUGIN_DIR),
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            autoHotUpdate: false,
+            currentVersion: readInstalledVersion(HUD_PLUGIN_DIR),
+            error: err?.message || "HUD config is unreadable",
+          };
+        }
+      }
+      case "hub:update:config:set": {
+        if (typeof payload?.autoHotUpdate !== "boolean") {
+          return { ok: false, error: "autoHotUpdate must be boolean" };
+        }
+        const enabled = payload.autoHotUpdate;
+        try {
+          assertHudConfigNoSymlink(HUD_CONFIG_PATH);
+          if (!fs.existsSync(hudConfigModule)) {
+            return { ok: false, error: "Safe HUD config writer is unavailable" };
+          }
+          const mod = require(hudConfigModule);
+          if (typeof mod.updateHudConfig === "function") {
+            mod.updateHudConfig(HUD_CONFIG_PATH, (current) => {
+              assertHudConfigNoSymlink(HUD_CONFIG_PATH);
+              return { ...current, autoHotUpdate: enabled };
+            });
+          } else if (typeof mod.updateHudAutoHotUpdate === "function") {
+            mod.updateHudAutoHotUpdate(enabled, { pluginDir: HUD_PLUGIN_DIR });
+          } else {
+            return { ok: false, error: "Safe HUD config writer is unavailable" };
+          }
+          const saved = mod.readHudConfig(HUD_CONFIG_PATH);
+          return { ok: true, autoHotUpdate: Boolean(saved?.autoHotUpdate) };
+        } catch (err) {
+          return { ok: false, error: err?.message || "Failed to update HUD config" };
+        }
+      }
       case "hub:update:runtime": return { ok: true, backendHash: loadedBackendHash };
       case "hub:getDrawerScript": {
         const code = fs.readFileSync(path.join(__dirname, "hub-drawer-ui.js"), "utf8");

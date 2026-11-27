@@ -21,6 +21,13 @@ const HOT_SOURCES = Object.freeze({
 });
 const OPTIONAL_HOT_SOURCES = Object.freeze({
   "hub-agy-quota.cjs": "src/hub-agy-quota.cjs",
+  "hub-drawer-ui.js": "src/hub-drawer-ui.js",
+  "hub-memory-access.cjs": "src/hub-memory-access.cjs",
+  "hub-memory-connections.cjs": "src/hub-memory-connections.cjs",
+  "hub-task-board.cjs": "src/hub-task-board.cjs",
+  "hub-telemetry-guard.cjs": "src/hub-telemetry-guard.cjs",
+  "hub-devin-quota.cjs": "src/hub-devin-quota.cjs",
+  "hud-config.cjs": "src/hud-config.cjs",
 });
 const ALL_HOT_SOURCES = Object.freeze({
   ...HOT_SOURCES,
@@ -311,15 +318,22 @@ async function recoverUpdate(pluginDir, pending, journal, runtime) {
   }
 }
 
-async function activateBundle(bundle, pluginDir, runtime, pending, currentVersion) {
+async function activateBundle(bundle, pluginDir, runtime, pending, currentVersion, { beforeWrite } = {}) {
   await runtime.ready();
-  const drawer = readOriginal(path.join(pluginDir, "hub-drawer-ui.js"));
-  if (!drawer) throw unavailable();
-  const renderer = assembleRenderer(bundle.files["renderer-base.js"], drawer.data.toString("utf8"), {
+  let drawerCode;
+  if (Object.hasOwn(bundle.files, "hub-drawer-ui.js")) {
+    drawerCode = bundle.files["hub-drawer-ui.js"];
+  } else {
+    const drawer = readOriginal(path.join(pluginDir, "hub-drawer-ui.js"));
+    if (!drawer) throw unavailable();
+    drawerCode = drawer.data.toString("utf8");
+  }
+  const renderer = assembleRenderer(bundle.files["renderer-base.js"], drawerCode, {
     version: bundle.version, bridge: runtime.bridge,
   });
   try { new Script(renderer, { filename: "renderer-ui.js" }); }
   catch { throw invalidPackage(); }
+  if (typeof beforeWrite === "function") beforeWrite();
   const files = {
     ...bundle.files,
     "renderer-ui.js": renderer,
@@ -414,11 +428,118 @@ function takeLock(lock) {
   }
 }
 
+const DEFAULT_BACKGROUND_CACHE_MS = 6 * 60 * 60 * 1000;
+const MAX_AUTO_ATTEMPT_VERSIONS = 32;
+
+function readAutoHotUpdateEnabled(configPath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(configPath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    if (!fs.fstatSync(fd).isFile()) return false;
+    const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
+    return Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.autoHotUpdate === true);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function readAutoAttempt(attemptFile) {
+  const st = fs.lstatSync(attemptFile, { throwIfNoEntry: false });
+  if (!st) return Object.create(null);
+  if (st.isSymbolicLink() || !st.isFile()) throw unavailable();
+  try {
+    const parsed = JSON.parse(readRegularNoFollow(attemptFile));
+    const versions = Object.create(null);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return versions;
+    if (parsed.versions && typeof parsed.versions === "object" && !Array.isArray(parsed.versions)) {
+      for (const [ver, ts] of Object.entries(parsed.versions)) {
+        if (isStable(ver)) {
+          const num = Number(ts);
+          versions[ver] = Number.isFinite(num) && num >= 0 ? num : 0;
+        }
+      }
+    }
+    if (isStable(parsed.version) && !Object.hasOwn(versions, parsed.version)) {
+      const num = Number(parsed.attemptedAt);
+      versions[parsed.version] = Number.isFinite(num) && num >= 0 ? num : 0;
+    }
+    return versions;
+  } catch (err) {
+    if (err instanceof UpdateError) throw err;
+    return Object.create(null);
+  }
+}
+
+function writeAutoAttempt(attemptFile, expectedVersion, attemptedAt) {
+  const runDir = path.dirname(attemptFile);
+  const runStat = fs.lstatSync(runDir, { throwIfNoEntry: false });
+  if (!runStat || runStat.isSymbolicLink() || !runStat.isDirectory()) throw unavailable();
+  const existing = fs.lstatSync(attemptFile, { throwIfNoEntry: false });
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) throw unavailable();
+  const ts = Number.isFinite(Number(attemptedAt)) && Number(attemptedAt) >= 0 ? Number(attemptedAt) : Date.now();
+  const prev = readAutoAttempt(attemptFile);
+  prev[expectedVersion] = ts;
+  const entries = Object.entries(prev);
+  if (entries.length > MAX_AUTO_ATTEMPT_VERSIONS) {
+    entries.sort((a, b) => {
+      if (a[0] === expectedVersion) return -1;
+      if (b[0] === expectedVersion) return 1;
+      return b[1] - a[1];
+    });
+    entries.length = MAX_AUTO_ATTEMPT_VERSIONS;
+  }
+  const versions = {};
+  for (const [ver, time] of entries) versions[ver] = time;
+  const tmp = path.join(runDir, `.hud-auto-attempt-${process.pid}-${randomUUID()}.tmp`);
+  let fd = null;
+  let created = false;
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+    created = true;
+    fs.writeFileSync(fd, JSON.stringify({ version: expectedVersion, attemptedAt: ts, versions }) + "\n", "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, attemptFile);
+    created = false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    if (created) {
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+  }
+}
+
+function clearAutoAttempt(attemptFile) {
+  try {
+    const st = fs.lstatSync(attemptFile, { throwIfNoEntry: false });
+    if (st && !st.isSymbolicLink() && st.isFile()) fs.unlinkSync(attemptFile);
+  } catch {}
+}
+
 function createHudUpdater({ pluginDir = __dirname, fetchImpl = globalThis.fetch,
   installLock = path.join(path.dirname(pluginDir), "hud-install.lock"),
-  getRuntime = (pid) => runtimeController(fetchImpl, pluginDir, pid) } = {}) {
+  configPath = path.join(pluginDir, "config.json"),
+  getRuntime = (pid) => runtimeController(fetchImpl, pluginDir, pid),
+  backgroundCacheMs = DEFAULT_BACKGROUND_CACHE_MS,
+  now = () => Date.now() } = {}) {
   const lock = path.join(pluginDir, "run", "hud-update.lock");
   const pending = path.join(pluginDir, "run", "hud-update-pending.json");
+  const autoAttemptFile = path.join(pluginDir, "run", "hud-auto-update-attempted.json");
+  let cachedCheck = null;
+  let inFlightCheck = null;
+  let cacheGen = 0;
+  const invalidateCheckCache = () => {
+    cacheGen += 1;
+    cachedCheck = null;
+    inFlightCheck = null;
+  };
   const version = () => {
     const value = readInstalledVersion(pluginDir);
     if (!isStable(value)) throw unavailable();
@@ -440,49 +561,136 @@ function createHudUpdater({ pluginDir = __dirname, fetchImpl = globalThis.fetch,
     finally { release(); }
   };
   return {
-    async check() {
+    async check({ background = false } = {}) {
       try {
         if (fs.lstatSync(installLock, { throwIfNoEntry: false }) || lockOwner(lock)?.alive) throw busy();
         const interrupted = loadJournal(pending);
         if (interrupted) {
+          invalidateCheckCache();
           return { ok: true, status: "recoverable", currentVersion: interrupted.version, availableVersion: interrupted.version };
         }
-        const { asset: _asset, ...release } = await lookupRelease(fetchImpl, version());
-        return { ok: true, ...release };
+        const currentVersion = version();
+        const cacheWindow = Number.isFinite(backgroundCacheMs) && backgroundCacheMs > 0 ? backgroundCacheMs : 0;
+        const nowMs = now();
+        if (background === true && cachedCheck &&
+            cachedCheck.gen === cacheGen &&
+            cachedCheck.currentVersion === currentVersion &&
+            cacheWindow > 0 &&
+            nowMs >= cachedCheck.checkedAt &&
+            (nowMs - cachedCheck.checkedAt) < cacheWindow) {
+          return { ...cachedCheck.result, cached: true };
+        }
+        const gen = cacheGen;
+        if (background === true && inFlightCheck &&
+            inFlightCheck.gen === gen &&
+            inFlightCheck.currentVersion === currentVersion) {
+          const shared = await inFlightCheck.promise;
+          return { ...shared };
+        }
+        const run = { gen, currentVersion, promise: null };
+        run.promise = (async () => {
+          try {
+            const { asset: _asset, ...release } = await lookupRelease(fetchImpl, currentVersion);
+            const result = { ok: true, ...release };
+            if (gen === cacheGen) {
+              cachedCheck = { gen, checkedAt: now(), currentVersion, result };
+            }
+            return result;
+          } finally {
+            if (inFlightCheck === run) inFlightCheck = null;
+          }
+        })();
+        if (background === true) inFlightCheck = run;
+        const result = await run.promise;
+        return { ...result };
       } catch (error) {
         return presentError(error);
       }
     },
-    async apply(expectedVersion) {
+    async apply(expectedVersion, { auto = false } = {}) {
       if (!isStable(expectedVersion)) return presentError(invalidPackage());
       return locked(async () => {
-        const runtime = getRuntime(process.pid);
-        const interrupted = loadJournal(pending);
-        if (interrupted) await recoverUpdate(pluginDir, pending, interrupted, runtime);
-        const current = version();
-        if (current === expectedVersion) return { ok: true, status: "current", currentVersion: current };
-        if (!isNewer(expectedVersion, current)) throw new UpdateError("UPDATE_CHANGED", "The installed HUD version has changed.");
-        const release = await lookupRelease(fetchImpl, current);
-        if (release.status !== "available" || release.availableVersion !== expectedVersion) {
-          throw new UpdateError("UPDATE_CHANGED", "The available HUD release changed. Check for updates again.");
+        invalidateCheckCache();
+        try {
+          if (auto === true) {
+            const ensureAutoEnabled = () => {
+              if (!readAutoHotUpdateEnabled(configPath)) {
+                throw new UpdateError("AUTO_UPDATE_DISABLED", "Automatic hot updates are disabled.");
+              }
+            };
+            ensureAutoEnabled();
+            const attemptedVersions = readAutoAttempt(autoAttemptFile);
+            if (Object.hasOwn(attemptedVersions, expectedVersion)) {
+              throw new UpdateError("AUTO_UPDATE_ALREADY_ATTEMPTED", "Automatic hot update was already attempted for this version.");
+            }
+            const interrupted = loadJournal(pending);
+            if (interrupted) {
+              throw new UpdateError("UPDATE_BUSY", "An interrupted HUD update requires manual recovery.");
+            }
+            const current = version();
+            if (current === expectedVersion) {
+              clearAutoAttempt(autoAttemptFile);
+              return { ok: true, status: "current", currentVersion: current };
+            }
+            if (!isNewer(expectedVersion, current)) throw new UpdateError("UPDATE_CHANGED", "The installed HUD version has changed.");
+            const runtime = getRuntime(process.pid);
+            const release = await lookupRelease(fetchImpl, current);
+            if (release.status !== "available" || release.availableVersion !== expectedVersion) {
+              throw new UpdateError("UPDATE_CHANGED", "The available HUD release changed. Check for updates again.");
+            }
+            ensureAutoEnabled();
+            writeAutoAttempt(autoAttemptFile, expectedVersion, now());
+            const bytes = await download(fetchImpl, release.asset.url, {
+              maxBytes: release.asset.size, accept: "application/octet-stream", redirect: true, timeout: 25000,
+            });
+            if (bytes.length !== release.asset.size || sha256(bytes) !== release.asset.digest) throw invalidPackage();
+            const bundle = validateBundle(parseJson(bytes), expectedVersion);
+            const result = await activateBundle(bundle, pluginDir, runtime, pending, current, { beforeWrite: ensureAutoEnabled });
+            clearAutoAttempt(autoAttemptFile);
+            return result;
+          }
+          const runtime = getRuntime(process.pid);
+          const interrupted = loadJournal(pending);
+          if (interrupted) await recoverUpdate(pluginDir, pending, interrupted, runtime);
+          const current = version();
+          if (current === expectedVersion) {
+            clearAutoAttempt(autoAttemptFile);
+            return { ok: true, status: "current", currentVersion: current };
+          }
+          if (!isNewer(expectedVersion, current)) throw new UpdateError("UPDATE_CHANGED", "The installed HUD version has changed.");
+          const release = await lookupRelease(fetchImpl, current);
+          if (release.status !== "available" || release.availableVersion !== expectedVersion) {
+            throw new UpdateError("UPDATE_CHANGED", "The available HUD release changed. Check for updates again.");
+          }
+          const bytes = await download(fetchImpl, release.asset.url, {
+            maxBytes: release.asset.size, accept: "application/octet-stream", redirect: true, timeout: 25000,
+          });
+          if (bytes.length !== release.asset.size || sha256(bytes) !== release.asset.digest) throw invalidPackage();
+          const bundle = validateBundle(parseJson(bytes), expectedVersion);
+          const result = await activateBundle(bundle, pluginDir, runtime, pending, current);
+          clearAutoAttempt(autoAttemptFile);
+          return result;
+        } finally {
+          invalidateCheckCache();
         }
-        const bytes = await download(fetchImpl, release.asset.url, {
-          maxBytes: release.asset.size, accept: "application/octet-stream", redirect: true, timeout: 25000,
-        });
-        if (bytes.length !== release.asset.size || sha256(bytes) !== release.asset.digest) throw invalidPackage();
-        const bundle = validateBundle(parseJson(bytes), expectedVersion);
-        return activateBundle(bundle, pluginDir, runtime, pending, current);
       });
     },
     // For the local, already-reviewed bootstrap and offline fixture verification.
     async activateLocal(bundle, expectedVersion) {
       return locked(async () => {
-        const runtime = getRuntime(null);
-        const interrupted = loadJournal(pending);
-        if (interrupted) await recoverUpdate(pluginDir, pending, interrupted, runtime);
-        const current = version();
-        if (!isStable(expectedVersion) || !isNewer(expectedVersion, current)) throw invalidPackage();
-        return activateBundle(validateBundle(bundle, expectedVersion), pluginDir, runtime, pending, current);
+        invalidateCheckCache();
+        try {
+          const runtime = getRuntime(null);
+          const interrupted = loadJournal(pending);
+          if (interrupted) await recoverUpdate(pluginDir, pending, interrupted, runtime);
+          const current = version();
+          if (!isStable(expectedVersion) || !isNewer(expectedVersion, current)) throw invalidPackage();
+          const result = await activateBundle(validateBundle(bundle, expectedVersion), pluginDir, runtime, pending, current);
+          clearAutoAttempt(autoAttemptFile);
+          return result;
+        } finally {
+          invalidateCheckCache();
+        }
       });
     },
   };

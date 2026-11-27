@@ -9,7 +9,17 @@ function hudPluginDir() {
   return process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin");
 }
 
+function assertRegularOrMissingNoFollow(file) {
+  const st = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!st) return false;
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`Refusing symlink or non-regular HUD config: ${file}`);
+  }
+  return true;
+}
+
 function readHudConfig(file) {
+  assertRegularOrMissingNoFollow(file);
   return readJsonFileStrict(file).data;
 }
 
@@ -59,4 +69,14 @@ function updateHudLanguage(file, patch) {
   });
 }
 
-module.exports = { hudPluginDir, readHudConfig, updateHudConfig, updateHudLanguage };
+function updateHudAutoHotUpdate(enabled, { pluginDir } = {}) {
+  if (typeof enabled !== "boolean") {
+    throw new TypeError("autoHotUpdate must be boolean");
+  }
+  const dir = pluginDir || hudPluginDir();
+  const file = path.join(dir, "config.json");
+  updateHudConfig(file, (current) => ({ ...current, autoHotUpdate: enabled }));
+  return readHudConfig(file);
+}
+
+module.exports = { hudPluginDir, readHudConfig, updateHudConfig, updateHudLanguage, updateHudAutoHotUpdate };

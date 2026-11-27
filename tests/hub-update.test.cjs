@@ -36,7 +36,7 @@ function fixture(t, options = {}) {
   put("hub-drawer-ui.js", "window.localDrawer = true;");
   put("config.json", '{"memory":"disabled","custom":"keep"}');
   put("backend.cjs", "module.exports = { original: true };\n");
-  const bytes = Buffer.from(JSON.stringify({ ...createBundle(repo), version: target }));
+  const bytes = Buffer.from(JSON.stringify({ ...createBundle(repo, { includeOptional: false }), version: target }));
   const asset = {
     name: ASSET_NAME, state: "uploaded", browser_download_url: assetUrl,
     digest: "sha256:" + sha256(bytes), size: bytes.length,
@@ -212,7 +212,7 @@ test("a four-file transition upgrades the baseline validator before optional AGY
   const transition = { ...createBundle(repo, { includeOptional: false }), version: target };
   const full = { ...createBundle(repo), version: "1.0.11" };
   assert.equal(Object.keys(transition.files).length, 4);
-  assert.equal(Object.keys(full.files).length, 5);
+  assert.equal(Object.keys(full.files).length, 12);
 
   const updaterPath = path.join(f.pluginDir, "hub-update.cjs");
   const includedUpdater = transition.files["hub-update.cjs"];
@@ -372,4 +372,612 @@ test("a four-file transition upgrades the baseline validator before optional AGY
     ["gemini-5h", 300, 40], ["gemini-weekly", 10080, 20],
     ["3p-5h", 300, 50], ["3p-weekly", 10080, 30],
   ]);
+});
+
+test("full hot-update bundle updates hub-drawer-ui.js and optional modules, assembles new drawer, and rolls back on failure", async t => {
+  const f = fixture(t);
+  const fullBundle = createBundle(repo, { includeOptional: true });
+  assert.ok(Object.hasOwn(fullBundle.files, "hub-drawer-ui.js"));
+  assert.ok(Object.hasOwn(fullBundle.files, "hub-memory-access.cjs"));
+  assert.ok(Object.hasOwn(fullBundle.files, "hud-config.cjs"));
+  const customDrawer = "window.upgradedDrawerMarker = 'v1.0.10-hot';\n";
+  const candidate = {
+    ...fullBundle,
+    version: target,
+    files: { ...fullBundle.files, "hub-drawer-ui.js": customDrawer },
+  };
+  let failReload = true;
+  const runtime = {
+    bridge: { url: bridge, token: bridgeToken },
+    async ready() {},
+    async reload(expectedHash) {
+      if (expectedHash) assert.equal(expectedHash, sha256(f.read("backend.cjs")));
+      if (failReload && JSON.parse(f.read("hud-release.json")).version === target) {
+        throw new Error("simulated reload failure");
+      }
+    },
+  };
+  const updater = createHudUpdater({ pluginDir: f.pluginDir, getRuntime: () => runtime });
+
+  // Failed activation rolls back hub-drawer-ui.js and removes newly-added optional modules
+  assert.equal((await updater.activateLocal(candidate, target)).code, "UPDATE_FAILED");
+  assert.equal(f.read("hub-drawer-ui.js"), "window.localDrawer = true;");
+  assert.equal(fs.existsSync(path.join(f.pluginDir, "hub-memory-access.cjs")), false);
+  assert.equal(f.read("hud-release.json"), '{"version":"1.0.9"}');
+
+  // Successful activation updates hub-drawer-ui.js + hub-memory-access.cjs and assembles new drawer
+  failReload = false;
+  assert.deepEqual(await updater.activateLocal(candidate, target), {
+    ok: true, status: "updated", currentVersion: target,
+  });
+  assert.equal(f.read("hub-drawer-ui.js"), customDrawer);
+  assert.equal(f.read("hub-memory-access.cjs"), fullBundle.files["hub-memory-access.cjs"]);
+  assert.match(f.read("renderer-ui.js"), /window\.upgradedDrawerMarker = 'v1\.0\.10-hot';/);
+  assert.doesNotMatch(f.read("renderer-ui.js"), /window\.localDrawer = true;/);
+});
+
+test("autoHotUpdate config persists atomically, defaults to false, rejects non-booleans, and preserves other keys", t => {
+  const { readHudConfig, updateHudAutoHotUpdate } = require("../src/hud-config.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "t3-hud-cfg-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pluginDir = path.join(root, "hud-plugin");
+  const configFile = path.join(pluginDir, "config.json");
+  fs.mkdirSync(pluginDir, { recursive: true });
+
+  // Missing config returns {} safely
+  assert.deepEqual(readHudConfig(configFile), {});
+
+  // Preserves existing keys across atomic update
+  fs.writeFileSync(configFile, JSON.stringify({
+    defaultLang: "en",
+    userLang: "zh",
+    syncShellProfileTelemetryOptOut: true,
+    customKey: "keep-me",
+  }, null, 2));
+  assert.throws(() => updateHudAutoHotUpdate("true", { pluginDir }), /boolean/i);
+  assert.throws(() => updateHudAutoHotUpdate(1, { pluginDir }), /boolean/i);
+  assert.throws(() => updateHudAutoHotUpdate(null, { pluginDir }), /boolean/i);
+
+  const savedTrue = updateHudAutoHotUpdate(true, { pluginDir });
+  assert.equal(savedTrue.autoHotUpdate, true);
+  assert.equal(savedTrue.defaultLang, "en");
+  assert.equal(savedTrue.userLang, "zh");
+  assert.equal(savedTrue.syncShellProfileTelemetryOptOut, true);
+  assert.equal(savedTrue.customKey, "keep-me");
+  assert.equal(readHudConfig(configFile).autoHotUpdate, true);
+
+  const savedFalse = updateHudAutoHotUpdate(false, { pluginDir });
+  assert.equal(savedFalse.autoHotUpdate, false);
+  assert.equal(readHudConfig(configFile).defaultLang, "en");
+
+  // Symlinked config.json is refused and its target is untouched
+  const targetFile = path.join(root, "outside.json");
+  fs.writeFileSync(targetFile, '{"autoHotUpdate":false,"untouched":true}');
+  fs.unlinkSync(configFile);
+  fs.symlinkSync(targetFile, configFile);
+  assert.throws(() => readHudConfig(configFile), /symlink|non-regular/i);
+  assert.throws(() => updateHudAutoHotUpdate(true, { pluginDir }), /symlink|non-regular/i);
+  assert.equal(fs.readFileSync(targetFile, "utf8"), '{"autoHotUpdate":false,"untouched":true}');
+
+  // Backend RPC contract via isolated subprocess
+  fs.unlinkSync(configFile);
+  fs.writeFileSync(path.join(pluginDir, "hud-release.json"), '{"version":"1.2.3"}\n');
+  fs.writeFileSync(configFile, JSON.stringify({ defaultLang: "zh", syncShellProfileTelemetryOptOut: false }));
+  const rpcScript = `
+    const assert = require("node:assert/strict");
+    const { hubCall } = require(${JSON.stringify(path.join(repo, "src/backend.cjs"))});
+    (async () => {
+      const initial = await hubCall("hub:update:config:get", {});
+      assert.deepEqual(initial, { ok: true, autoHotUpdate: false, currentVersion: "1.2.3" });
+      const bad = await hubCall("hub:update:config:set", { autoHotUpdate: "yes" });
+      assert.equal(bad.ok, false);
+      assert.match(bad.error, /boolean/);
+      const enabled = await hubCall("hub:update:config:set", { autoHotUpdate: true });
+      assert.deepEqual(enabled, { ok: true, autoHotUpdate: true });
+      const after = await hubCall("hub:update:config:get", {});
+      assert.deepEqual(after, { ok: true, autoHotUpdate: true, currentVersion: "1.2.3" });
+    })().catch(err => { console.error(err); process.exitCode = 1; });
+  `;
+  const run = spawnSync(process.execPath, ["-e", rpcScript], {
+    env: { ...process.env, T3_HUD_DIR: pluginDir, T3_HUB_DIR: path.join(root, "hub"), T3_HUB_TEST: "1" },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(run.status, 0, run.stderr || String(run.error || ""));
+  const onDisk = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  assert.equal(onDisk.autoHotUpdate, true);
+  assert.equal(onDisk.defaultLang, "zh");
+  assert.equal(onDisk.syncShellProfileTelemetryOptOut, false);
+});
+
+test("background check caches for 6h, deduplicates concurrent background checks, manual bypasses cache, and apply clears cache", async t => {
+  const f = fixture(t);
+  let clock = 1_000_000;
+  let releaseGate = null;
+  let fetchCount = 0;
+  const bytes = Buffer.from(JSON.stringify({ ...createBundle(repo, { includeOptional: false }), version: target }));
+  const release = {
+    tag_name: "v" + target,
+    draft: false,
+    prerelease: false,
+    assets: [{
+      name: ASSET_NAME, state: "uploaded", browser_download_url: assetUrl,
+      digest: "sha256:" + sha256(bytes), size: bytes.length,
+    }],
+  };
+  const fetchImpl = async (url) => {
+    const address = String(url);
+    if (address === latest) {
+      fetchCount++;
+      if (releaseGate) await releaseGate.promise;
+      return Response.json(release);
+    }
+    if (address === assetUrl) return new Response(null, { status: 302, headers: { Location: cdn } });
+    if (address === cdn) return new Response(bytes);
+    if (url.pathname === "/admin/status") return Response.json({ ok: true, pid: process.pid, mounted: true, windows: [{ loading: false }] });
+    if (url.pathname === "/admin/reload-ui") return Response.json({ ok: true, results: [{ injected: true }] });
+    if (url.pathname === "/reload") return Response.json({ ok: true });
+    if (url.pathname === "/rpc" || url.pathname === "/hub-rpc") return Response.json({ ok: true, backendHash: sha256(f.read("backend.cjs")) });
+    throw new Error("Unexpected URL: " + address);
+  };
+  const updater = createHudUpdater({
+    pluginDir: f.pluginDir,
+    fetchImpl,
+    backgroundCacheMs: 6 * 60 * 60 * 1000,
+    now: () => clock,
+  });
+
+  // 1. Concurrent background checks share one single-flight lookupRelease call
+  releaseGate = Promise.withResolvers();
+  const c1 = updater.check({ background: true });
+  const c2 = updater.check({ background: true });
+  assert.equal(fetchCount, 1);
+  releaseGate.resolve();
+  releaseGate = null;
+  const [r1, r2] = await Promise.all([c1, c2]);
+  assert.equal(r1.status, "available");
+  assert.equal(r2.status, "available");
+  assert.equal(fetchCount, 1);
+
+  // 2. Background check within 6h hits memory cache with zero network requests
+  clock += 5 * 60 * 60 * 1000;
+  const cached = await updater.check({ background: true });
+  assert.equal(cached.ok, true);
+  assert.equal(cached.status, "available");
+  assert.equal(cached.cached, true);
+  assert.equal(fetchCount, 1);
+
+  // 3. Manual check bypasses cache and refreshes it
+  const manual = await updater.check({ background: false });
+  assert.equal(manual.ok, true);
+  assert.equal(manual.cached, undefined);
+  assert.equal(fetchCount, 2);
+
+  // 4. Advancing clock past 6h invalidates background cache
+  clock += 6 * 60 * 60 * 1000 + 1;
+  const expired = await updater.check({ background: true });
+  assert.equal(expired.ok, true);
+  assert.equal(expired.cached, undefined);
+  assert.equal(fetchCount, 3);
+
+  // 5. apply() clears check cache so subsequent background check never returns stale available
+  const applied = await updater.apply(target);
+  assert.deepEqual(applied, { ok: true, status: "updated", currentVersion: target });
+  const postApply = await updater.check({ background: true });
+  assert.equal(postApply.ok, true);
+  assert.equal(postApply.status, "current");
+  assert.equal(postApply.cached, undefined);
+});
+
+test("P0 #1: auto apply re-verifies persisted autoHotUpdate under lock and persists per-version attempt dedup across remounts", async t => {
+  // Part A: Cross-window race — both windows saw true, Window 1 turns it off, Window 2 triggers auto apply -> 0 actual applies
+  const f1 = fixture(t);
+  f1.put("config.json", JSON.stringify({ autoHotUpdate: true }));
+  // Window 1 flips persisted setting to false before Window 2's auto apply enters lock
+  f1.put("config.json", JSON.stringify({ autoHotUpdate: false }));
+  const disabledRes = await f1.updater.apply(target, { auto: true });
+  assert.equal(disabledRes.ok, false);
+  assert.equal(disabledRes.code, "AUTO_UPDATE_DISABLED");
+  assert.deepEqual(f1.paths, [], "zero network or reload calls when autoHotUpdate is disabled on disk");
+  assert.deepEqual(f1.versionsAtReload, []);
+
+  // Part B: Auto update failure persists attempt record (0600); subsequent auto attempt after remount is rejected, manual still succeeds
+  let failReload = true;
+  const f2 = fixture(t, { reloadFailure: true });
+  f2.put("config.json", JSON.stringify({ autoHotUpdate: true }));
+  const firstFail = await f2.updater.apply(target, { auto: true });
+  assert.equal(firstFail.ok, false);
+  assert.equal(firstFail.code, "UPDATE_FAILED");
+  const attemptPath = path.join(f2.pluginDir, "run", "hud-auto-update-attempted.json");
+  assert.equal(fs.existsSync(attemptPath), true);
+  assert.equal(fs.lstatSync(attemptPath).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(fs.readFileSync(attemptPath, "utf8")).version, target);
+
+  // Simulate remount / fresh updater instance on the same pluginDir
+  const pathsBeforeRetry = f2.paths.length;
+  const secondAuto = await f2.updater.apply(target, { auto: true });
+  assert.equal(secondAuto.ok, false);
+  assert.equal(secondAuto.code, "AUTO_UPDATE_ALREADY_ATTEMPTED");
+  assert.equal(f2.paths.length, pathsBeforeRetry, "second auto attempt must not re-fetch or re-apply");
+
+  // Manual apply on a healthy runtime succeeds and clears the persisted attempt file
+  const f3 = fixture(t);
+  f3.put("config.json", JSON.stringify({ autoHotUpdate: true }));
+  f3.put("run/hud-auto-update-attempted.json", JSON.stringify({ version: target, attemptedAt: Date.now() }));
+  const blockedAuto = await f3.updater.apply(target, { auto: true });
+  assert.equal(blockedAuto.code, "AUTO_UPDATE_ALREADY_ATTEMPTED");
+  const manualOk = await f3.updater.apply(target);
+  assert.deepEqual(manualOk, { ok: true, status: "updated", currentVersion: target });
+  assert.equal(fs.existsSync(path.join(f3.pluginDir, "run", "hud-auto-update-attempted.json")), false);
+  void failReload;
+});
+
+test("P0 #2: backend config RPC stays compatible with v1.1.5 hud-config.cjs, serializes concurrent writes, and rejects symlink/corrupt config", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "t3-v115-cfg-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pluginDir = path.join(root, "hud-plugin");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  const srcDir = path.join(repo, "src");
+  for (const name of fs.readdirSync(srcDir)) {
+    if (name.endsWith(".cjs") || name === "hub-drawer-ui.js") {
+      fs.copyFileSync(path.join(srcDir, name), path.join(pluginDir, name));
+    }
+  }
+  // Overwrite installed hud-config.cjs with v1.1.5-shaped module (only readHudConfig(filePath), updateHudConfig, updateHudLanguage)
+  const v115HudConfig = `"use strict";
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { readJsonFileStrict, writeTextAtomic } = require("./hub-host-settings.cjs");
+function hudPluginDir() { return process.env.T3_HUD_DIR || path.join(os.homedir(), ".t3", "hud-plugin"); }
+function readHudConfig(file) { return readJsonFileStrict(file).data; }
+function updateHudConfig(file, edit, beforeSave = () => {}) {
+  const { DatabaseSync } = require("node:sqlite");
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(dir, ".config-write-lock.sqlite");
+  const fd = fs.openSync(lockPath, fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+  try { if (!fs.fstatSync(fd).isFile()) throw new Error("Invalid lock"); } finally { fs.closeSync(fd); }
+  const db = new DatabaseSync(lockPath);
+  try {
+    db.exec("PRAGMA busy_timeout=750; BEGIN IMMEDIATE");
+    const current = readHudConfig(file);
+    const next = edit(current);
+    beforeSave(current, next);
+    if (JSON.stringify(next) !== JSON.stringify(current)) writeTextAtomic(file, JSON.stringify(next, null, 2) + "\\n");
+  } finally { db.close(); }
+}
+function updateHudLanguage(file, patch) {
+  updateHudConfig(file, (current) => ({ defaultLang: "zh", ...current, ...(patch.userLang ? { userLang: patch.userLang } : {}) }));
+}
+module.exports = { hudPluginDir, readHudConfig, updateHudConfig, updateHudLanguage };
+`;
+  fs.writeFileSync(path.join(pluginDir, "hud-config.cjs"), v115HudConfig);
+  fs.writeFileSync(path.join(pluginDir, "hud-release.json"), '{"version":"1.1.5"}\n');
+
+  const script = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const pluginDir = process.env.T3_HUD_DIR;
+    const configFile = path.join(pluginDir, "config.json");
+    const { hubCall, setConfig } = require(path.join(pluginDir, "backend.cjs"));
+    const { createTelemetryGuard } = require(path.join(pluginDir, "hub-telemetry-guard.cjs"));
+    (async () => {
+      // 1. v1.1.5 hud-config.cjs set(true) + get() returns true
+      assert.deepEqual(await hubCall("hub:update:config:set", { autoHotUpdate: true }), { ok: true, autoHotUpdate: true });
+      assert.deepEqual(await hubCall("hub:update:config:get", {}), { ok: true, autoHotUpdate: true, currentVersion: "1.1.5" });
+
+      // 2. Concurrent / interleaved writes with language & telemetry preserve all keys
+      const guard = createTelemetryGuard({ homeDir: path.dirname(pluginDir), pluginDir });
+      await Promise.all([
+        hubCall("hub:update:config:set", { autoHotUpdate: true }),
+        Promise.resolve().then(() => setConfig({ defaultLang: "en", userLang: "en" })),
+        Promise.resolve().then(() => guard.update({ disableOfficialTelemetry: false })),
+      ]);
+      const saved = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      assert.equal(saved.autoHotUpdate, true);
+      assert.equal(saved.userLang, "en");
+      assert.equal(saved.disableOfficialTelemetry, false);
+
+      // 3. Symlink config.json must fail closed and leave symlink target untouched
+      const outside = path.join(path.dirname(pluginDir), "outside-secret.json");
+      fs.writeFileSync(outside, '{"secret":true}');
+      fs.unlinkSync(configFile);
+      fs.symlinkSync(outside, configFile);
+      const symSet = await hubCall("hub:update:config:set", { autoHotUpdate: false });
+      assert.equal(symSet.ok, false);
+      assert.equal(fs.readFileSync(outside, "utf8"), '{"secret":true}');
+      const symGet = await hubCall("hub:update:config:get", {});
+      assert.equal(symGet.ok, false);
+
+      // 4. Corrupt JSON config.json must fail closed and keep original bytes untouched
+      fs.unlinkSync(configFile);
+      fs.writeFileSync(configFile, "{corrupt json");
+      const corruptSet = await hubCall("hub:update:config:set", { autoHotUpdate: false });
+      assert.equal(corruptSet.ok, false);
+      assert.equal(fs.readFileSync(configFile, "utf8"), "{corrupt json");
+    })().catch(err => { console.error(err); process.exitCode = 1; });
+  `;
+  const run = spawnSync(process.execPath, ["-e", script], {
+    env: { ...process.env, HOME: root, T3_HUD_DIR: pluginDir, T3_HUB_DIR: path.join(root, "hub"), T3_HUB_TEST: "1" },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(run.status, 0, run.stderr || String(run.error || ""));
+});
+
+test("P1 #3: check() produces zero unhandled rejections under strict mode and isolates generations across apply()", async t => {
+  // Part A: --unhandled-rejections=strict subprocess with rejected fetch exits 0
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "t3-strict-rej-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pluginDir = path.join(root, "hud-plugin");
+  fs.mkdirSync(path.join(pluginDir, "run"), { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "hud-release.json"), '{"version":"1.0.9"}');
+  const strictScript = `
+    const assert = require("node:assert/strict");
+    const { createHudUpdater } = require(${JSON.stringify(path.join(repo, "src/hub-update.cjs"))});
+    const updater = createHudUpdater({
+      pluginDir: ${JSON.stringify(pluginDir)},
+      fetchImpl: async () => { throw new TypeError("offline network failure"); },
+    });
+    (async () => {
+      const res = await updater.check({ background: true });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, "UPDATE_UNAVAILABLE");
+    })();
+  `;
+  const run = spawnSync(process.execPath, ["--unhandled-rejections=strict", "-e", strictScript], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(run.status, 0, run.stderr || String(run.error || ""));
+
+  // Part B: Same-version apply during pending check bumps cacheGen; manual check issues fresh 2nd fetch
+  const f = fixture(t);
+  let fetchCount = 0;
+  const gate1 = Promise.withResolvers();
+  const fetchImpl = async (url) => {
+    const address = String(url);
+    if (address === latest) {
+      fetchCount++;
+      const callNum = fetchCount;
+      if (callNum === 1) await gate1.promise;
+      return Response.json({
+        tag_name: callNum === 1 ? "v1.0.10" : "v1.0.9",
+        draft: false,
+        prerelease: false,
+        assets: [],
+      });
+    }
+    if (url.pathname === "/admin/status") return Response.json({ ok: true, pid: process.pid, mounted: true, windows: [{ loading: false }] });
+    if (url.pathname === "/admin/reload-ui") return Response.json({ ok: true, results: [{ injected: true }] });
+    if (url.pathname === "/reload") return Response.json({ ok: true });
+    if (url.pathname === "/rpc" || url.pathname === "/hub-rpc") return Response.json({ ok: true, backendHash: sha256(f.read("backend.cjs")) });
+    throw new Error("Unexpected URL: " + address);
+  };
+  const updater = createHudUpdater({ pluginDir: f.pluginDir, fetchImpl });
+
+  const stalePending = updater.check({ background: true });
+  assert.equal(fetchCount, 1);
+  // Complete same-version apply ("1.0.9") while stalePending is still in flight
+  const sameApply = await updater.apply("1.0.9");
+  assert.deepEqual(sameApply, { ok: true, status: "current", currentVersion: "1.0.9" });
+
+  // Manual check must issue a 2nd fresh fetch and not reuse stalePending
+  const freshManual = await updater.check();
+  assert.equal(fetchCount, 2);
+  assert.equal(freshManual.status, "current");
+
+  // Letting the old generation resolve must not overwrite cachedCheck with stale unsupported/v1.0.10
+  gate1.resolve();
+  await stalePending;
+  const afterBg = await updater.check({ background: true });
+  assert.equal(afterBg.status, "current");
+  assert.equal(afterBg.cached, true);
+});
+
+test("P1 #4: build-hud-update.cjs --transition builds a v1.1.5-compatible 4-file bundle and enables two-step upgrade to full bundle", async t => {
+  const f = fixture(t);
+  const outTransition = path.join(f.root, "transition-update.json");
+  const outFull = path.join(f.root, "full-update.json");
+  const scriptPath = path.join(repo, "scripts", "build-hud-update.cjs");
+
+  const r1 = spawnSync(process.execPath, [scriptPath, "--transition", outTransition], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(r1.status, 0, r1.stderr);
+  const r2 = spawnSync(process.execPath, [scriptPath, outFull], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(r2.status, 0, r2.stderr);
+
+  const builtTransition = JSON.parse(fs.readFileSync(outTransition, "utf8"));
+  const builtFull = JSON.parse(fs.readFileSync(outFull, "utf8"));
+  assert.equal(Object.keys(builtTransition.files).length, 4);
+  assert.equal(Object.keys(builtFull.files).length, 12);
+  assert.ok(Object.hasOwn(builtFull.files, "hub-drawer-ui.js"));
+  assert.ok(Object.hasOwn(builtFull.files, "hud-config.cjs"));
+
+  // Exercise real two-step upgrade from v1.1.5 baseline 4-file validator
+  const step1 = { ...builtTransition, version: "1.0.10" };
+  const step2 = { ...builtFull, version: "1.0.11" };
+  const updaterPath = path.join(f.pluginDir, "hub-update.cjs");
+  const includedUpdater = step1.files["hub-update.cjs"];
+  const validatorStart = includedUpdater.indexOf("function validateBundle(");
+  const validatorEnd = includedUpdater.indexOf("\n// Publish", validatorStart);
+  f.put("hub-update.cjs", includedUpdater.slice(0, validatorStart) + baselineValidateBundle + includedUpdater.slice(validatorEnd));
+  f.put("hud-release.cjs", step1.files["hud-release.cjs"]);
+
+  const runtime = {
+    bridge: { url: bridge, token: bridgeToken },
+    async ready() {},
+    async reload(expectedHash) {
+      if (expectedHash) assert.equal(expectedHash, sha256(f.read("backend.cjs")));
+    },
+  };
+  const baselineUpdater = require(updaterPath).createHudUpdater({ pluginDir: f.pluginDir, getRuntime: () => runtime });
+  assert.equal((await baselineUpdater.activateLocal(step2, step2.version)).code, "UPDATE_INVALID");
+  assert.deepEqual(await baselineUpdater.activateLocal(step1, step1.version), {
+    ok: true, status: "updated", currentVersion: step1.version,
+  });
+
+  delete require.cache[updaterPath];
+  const upgradedUpdater = require(updaterPath).createHudUpdater({ pluginDir: f.pluginDir, getRuntime: () => runtime });
+  assert.deepEqual(await upgradedUpdater.activateLocal(step2, step2.version), {
+    ok: true, status: "updated", currentVersion: step2.version,
+  });
+  assert.equal(f.read("hub-drawer-ui.js"), step2.files["hub-drawer-ui.js"]);
+  assert.equal(f.read("hud-config.cjs"), step2.files["hud-config.cjs"]);
+});
+
+test("P0 #1a: disabling autoHotUpdate while download is suspended aborts before any disk write or reload", async t => {
+  const f = fixture(t);
+  f.put("config.json", JSON.stringify({ autoHotUpdate: true }));
+  const bytes = Buffer.from(JSON.stringify({ ...createBundle(repo, { includeOptional: false }), version: target }));
+  const release = {
+    tag_name: "v" + target,
+    draft: false,
+    prerelease: false,
+    assets: [{
+      name: ASSET_NAME, state: "uploaded", browser_download_url: assetUrl,
+      digest: "sha256:" + sha256(bytes), size: bytes.length,
+    }],
+  };
+  const downloadStarted = Promise.withResolvers();
+  const downloadGate = Promise.withResolvers();
+  let reloadCount = 0;
+  const fetchImpl = async (url) => {
+    const address = String(url);
+    if (address === latest) return Response.json(release);
+    if (address === assetUrl) return new Response(null, { status: 302, headers: { Location: cdn } });
+    if (address === cdn) {
+      downloadStarted.resolve();
+      await downloadGate.promise;
+      return new Response(bytes);
+    }
+    if (url.pathname === "/admin/status") {
+      return Response.json({ ok: true, pid: process.pid, mounted: true, windows: [{ loading: false }] });
+    }
+    if (url.pathname === "/reload" || url.pathname === "/admin/reload-ui") {
+      reloadCount += 1;
+      return Response.json({ ok: true, results: [{ injected: true }] });
+    }
+    if (url.pathname === "/rpc" || url.pathname === "/hub-rpc") {
+      return Response.json({ ok: true, backendHash: sha256(f.read("backend.cjs")) });
+    }
+    throw new Error("Unexpected URL: " + address);
+  };
+  const updater = createHudUpdater({ pluginDir: f.pluginDir, fetchImpl });
+
+  const pending = updater.apply(target, { auto: true });
+  await downloadStarted.promise;
+
+  // User turns off autoHotUpdate while the bundle download is still in flight
+  f.put("config.json", JSON.stringify({ autoHotUpdate: false }));
+  downloadGate.resolve();
+
+  const res = await pending;
+  assert.equal(res.ok, false);
+  assert.equal(res.code, "AUTO_UPDATE_DISABLED");
+  assert.equal(reloadCount, 0);
+  assert.equal(f.read("hud-release.json"), '{"version":"1.0.9"}');
+  assert.equal(f.read("renderer-base.js"), "window.original = true;");
+  assert.equal(fs.existsSync(path.join(f.pluginDir, "backups")), false);
+  assert.equal(fs.existsSync(path.join(f.pluginDir, "run", "hud-update-pending.json")), false);
+});
+
+test("P0 #1b: multi-version auto attempt dedup survives UPDATE_CHANGED across separate updater instances while manual apply still works", async t => {
+  const f = fixture(t);
+  f.put("hud-release.json", '{"version":"1.1.5"}');
+  f.put("config.json", JSON.stringify({ autoHotUpdate: true }));
+
+  const v117 = "1.1.7";
+  const v117AssetUrl = `${releaseRoot}/v${v117}/${ASSET_NAME}`;
+  const v117Bytes = Buffer.from(JSON.stringify({ ...createBundle(repo, { includeOptional: false }), version: v117 }));
+  const v118 = "1.1.8";
+  const v118AssetUrl = `${releaseRoot}/v${v118}/${ASSET_NAME}`;
+  const v118Bytes = Buffer.from(JSON.stringify({ ...createBundle(repo, { includeOptional: false }), version: v118 }));
+
+  let activeVersion = v117;
+  let failReload = true;
+  let v117Activations = 0;
+
+  const fetchImpl = async (url) => {
+    const address = String(url);
+    const bytes = activeVersion === v118 ? v118Bytes : v117Bytes;
+    const dlUrl = activeVersion === v118 ? v118AssetUrl : v117AssetUrl;
+    if (address === latest) {
+      return Response.json({
+        tag_name: "v" + activeVersion,
+        draft: false,
+        prerelease: false,
+        assets: [{
+          name: ASSET_NAME, state: "uploaded", browser_download_url: dlUrl,
+          digest: "sha256:" + sha256(bytes), size: bytes.length,
+        }],
+      });
+    }
+    if (address === dlUrl) return new Response(null, { status: 302, headers: { Location: cdn } });
+    if (address === cdn) return new Response(bytes);
+    if (url.pathname === "/admin/status") {
+      return Response.json({ ok: true, pid: process.pid, mounted: true, windows: [{ loading: false }] });
+    }
+    if (url.pathname === "/reload") return Response.json({ ok: true });
+    if (url.pathname === "/admin/reload-ui") {
+      const installed = JSON.parse(f.read("hud-release.json")).version;
+      if (installed === v117) v117Activations += 1;
+      const injected = !(failReload && installed === activeVersion);
+      return Response.json({ ok: true, results: [{ injected }] });
+    }
+    if (url.pathname === "/rpc" || url.pathname === "/hub-rpc") {
+      return Response.json({ ok: true, backendHash: sha256(f.read("backend.cjs")) });
+    }
+    throw new Error("Unexpected URL: " + address);
+  };
+
+  const attemptPath = path.join(f.pluginDir, "run", "hud-auto-update-attempted.json");
+
+  // Instance 1: requests 1.1.7 -> activation fails and records 1.1.7
+  const updater1 = createHudUpdater({ pluginDir: f.pluginDir, fetchImpl, now: () => 1_700_000_000_000 });
+  const r1 = await updater1.apply(v117, { auto: true });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, "UPDATE_FAILED");
+  assert.equal(v117Activations, 1);
+  const record1 = JSON.parse(fs.readFileSync(attemptPath, "utf8"));
+  assert.equal(record1.versions[v117], 1_700_000_000_000);
+
+  // Instance 2: stale window requests 1.1.6 -> UPDATE_CHANGED without polluting attempt record
+  const updater2 = createHudUpdater({ pluginDir: f.pluginDir, fetchImpl, now: () => 1_700_000_001_000 });
+  const r2 = await updater2.apply("1.1.6", { auto: true });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, "UPDATE_CHANGED");
+  const record2 = JSON.parse(fs.readFileSync(attemptPath, "utf8"));
+  assert.equal(record2.versions[v117], 1_700_000_000_000);
+  assert.equal(Object.hasOwn(record2.versions, "1.1.6"), false);
+
+  // Instance 3: requests 1.1.7 again -> AUTO_UPDATE_ALREADY_ATTEMPTED, 1.1.7 activation count stays 1
+  const updater3 = createHudUpdater({ pluginDir: f.pluginDir, fetchImpl, now: () => 1_700_000_002_000 });
+  const r3 = await updater3.apply(v117, { auto: true });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, "AUTO_UPDATE_ALREADY_ATTEMPTED");
+  assert.equal(v117Activations, 1);
+
+  // Another version failure merges into versions map without overwriting 1.1.7
+  activeVersion = v118;
+  const r4 = await updater3.apply(v118, { auto: true });
+  assert.equal(r4.ok, false);
+  assert.equal(r4.code, "UPDATE_FAILED");
+  const record4 = JSON.parse(fs.readFileSync(attemptPath, "utf8"));
+  assert.equal(record4.versions[v117], 1_700_000_000_000);
+  assert.equal(record4.versions[v118], 1_700_000_002_000);
+
+  // Switching back to 1.1.7 still rejects auto apply, while manual apply succeeds and clears record
+  activeVersion = v117;
+  const r5 = await updater3.apply(v117, { auto: true });
+  assert.equal(r5.ok, false);
+  assert.equal(r5.code, "AUTO_UPDATE_ALREADY_ATTEMPTED");
+  assert.equal(v117Activations, 1);
+
+  failReload = false;
+  const manualOk = await updater3.apply(v117);
+  assert.deepEqual(manualOk, { ok: true, status: "updated", currentVersion: v117 });
+  assert.equal(v117Activations, 2);
+  assert.equal(fs.existsSync(attemptPath), false);
 });
