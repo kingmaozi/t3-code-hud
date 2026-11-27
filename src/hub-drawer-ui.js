@@ -11,16 +11,16 @@
     if (existing) { restored = existing.snapshot?.() || restored; try { existing.destroy?.(); } catch {} }
     const initial = restored; restored = null;
     const disposers = [], timers = new Set(), pending = new Set(), inFlightNativeSaves = new Map(), subagentSaves = new Map(), boardViewSnapshots = new WeakMap();
-    let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, observer = null;
+    let disposed = false, routeTimer = null, embedTimer = null, searchTimer = null, toastTimer = null, updateBgTimer = null, observer = null;
     let anchorCache = null, anchorRoute = "", anchorScanAt = 0, anchorResize = null, updateFrame = 0;
-    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, settingsHandle, settingsPanel, artifactDock, style, liveBoard, occlusionBoardRect = null;
+    let root, drawer, content, handle, planHandle, titleControls, memoryHandle, memoryToggle, settingsHandle, updateHandle, settingsPanel, artifactDock, style, liveBoard, occlusionBoardRect = null;
     let boardTimer = null, boardLoading = false, boardVersion = 0, boardScopeVersion = 0, artifactVersion = 0, artifactDockSig = "";
     let dockDrag = null, dockSuppressClickUntil = 0;
     const savedDockTop = Number(storageGet("t3-hub-artifact-dock-top-v1"));
     let artifactDockTopPct = Number.isFinite(savedDockTop) && savedDockTop >= 8 && savedDockTop <= 92 ? savedDockTop : 44;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
-    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, memoryRuntimeHintsVersion = 0, memoryRuntimeHintsLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
+    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, memoryRuntimeHintsVersion = 0, memoryRuntimeHintsLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0, hudUpdateConfigVersion = 0, hudUpdateConfigLoading = null, autoHotUpdateChecking = false;
     let lastRoute = "", lastBoardRoute = "", cachedRouter = null, unsubscribeRouter = null, routerProbeAt = 0;
     let boardDrag = null, contextLoading = true;
     const tabKeys = ["memory"];
@@ -52,6 +52,8 @@
  subagentDrafts: initial?.subagentDrafts || {}, subagentExpanded: initial?.subagentExpanded || {}, subagentCustom: initial?.subagentCustom || {},
  modelChoice: "", customModel: "", useMirror: false, mcpAddOpen: false, mcpForm: { kind: "form", name: "", transport: "stdio", command: "", args: "", url: "", json: "" },
  syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
+ hudUpdateStatus: "idle", hudUpdateBusy: false, hudUpdateBusyKind: "", hudUpdateVersion: "", hudUpdateAvailableVersion: "", hudUpdateReleaseUrl: "", hudUpdateErrorCode: "", hudUpdateFailedAction: "", hudUpdateCheckedAt: 0,
+ autoHotUpdate: true, autoHotUpdateLoaded: false, autoHotUpdateSaving: false, autoAttemptedVersion: "",
     };
  if (!tabKeys.includes(state.tab)) state.tab = "memory";
  if (storedTab !== state.tab) storageSet("t3-hub-tab", state.tab);
@@ -268,11 +270,11 @@
       style.textContent += `#t3-hub-plan-handle{position:relative!important;right:auto!important;top:auto!important;padding:3px 7px!important;border-radius:7px!important;border-right:1px solid var(--hub-border)!important;background:var(--hub-bg)!important}#t3-hub-live-board{display:block;flex:none;min-height:0;padding:0;border-radius:11px;overflow:auto}#t3-hub-live-board[hidden]{display:none!important}.hub-connection-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:8px;margin:12px 0}.hub-connection-agent{min-width:0;padding:10px 12px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg)}.hub-connection-agent h3{margin:0 0 8px;font-size:11px}.hub-connection-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.hub-connection-cell{min-width:0;padding:7px;border-radius:7px;background:var(--hub-bg-subtle)}.hub-connection-cell>span,.hub-connection-cell>strong,.hub-connection-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-connection-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-connection-cell>strong{margin-top:2px;font-size:9px}.hub-connection-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:8px;line-height:1.45}.hub-connection-cell>strong[data-status="configured"]{color:#047857}.hub-connection-cell>strong[data-status="missing"]{color:var(--hub-secondary)}.hub-connection-cell>strong[data-status="unsupported"]{color:var(--hub-muted)}.hub-connection-cell>strong[data-status="unknown"]{color:#b45309}.hub-connection-note{align-items:center;flex-wrap:wrap}.hub-connection-error{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border:1px solid var(--hub-border);border-radius:8px;color:var(--hub-secondary);font-size:10px}@media(max-width:639px){.hub-connection-grid{grid-template-columns:minmax(0,1fr)}.hub-connection-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}`;
       style.textContent += `#t3-hub-plan-handle{justify-content:flex-start!important;gap:7px!important;width:auto!important;min-width:0!important;height:27px!important;padding:4px 10px!important;border:1px solid #dbe4f0!important;border-radius:999px!important;background:#f8fafc!important;color:#253247!important;box-shadow:0 1px 4px #0f172a12!important;font-size:10px!important;font-weight:550!important;line-height:1!important;white-space:nowrap!important}#t3-hub-plan-handle:hover,#t3-hub-plan-handle:focus-visible{background:#f1f6ff!important;border-color:#c8dcff!important}.hub-plan-indicator{gap:7px!important;white-space:nowrap}.hub-plan-ring{display:block;flex:none;width:15px;height:15px;transform:rotate(-90deg)}.hub-plan-ring-track{fill:none;stroke:#dbeafe;stroke-width:2.4}.hub-plan-ring-progress{fill:none;stroke:#3980f6;stroke-width:2.4;stroke-linecap:round;transition:stroke-dashoffset .18s ease}.hub-plan-label{white-space:nowrap;font-variant-numeric:tabular-nums}.hub-memory-access-switch{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;font-weight:550;color:var(--hub-ink)}.hub-memory-access-switch input{flex:none;width:15px;height:15px;accent-color:#3980f6}.hub-memory-access-state{font-size:10px;color:var(--hub-secondary);white-space:normal;text-align:right}.hub-memory-access-actions{flex-wrap:wrap;margin-top:10px}.hub-memory-access-summary{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hub-memory-access-summary>span{padding:2px 7px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg-subtle);font-size:9px;color:var(--hub-secondary)}.hub-memory-access-providers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,180px),1fr));gap:6px;margin-top:9px}.hub-memory-access-provider{min-width:0;padding:7px 9px;border:1px solid var(--hub-border);border-radius:8px;font-size:9px}.hub-memory-access-provider strong,.hub-memory-access-provider small{display:block;overflow-wrap:anywhere}.hub-memory-access-provider small{margin-top:2px;color:var(--hub-secondary)}.hub-memory-access-prompt{margin-top:10px;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace!important;min-height:120px;resize:vertical;white-space:pre-wrap}@media(max-width:639px){.hub-memory-access-switch{align-items:flex-start}.hub-memory-access-state{text-align:left}}`;
       style.textContent += `.hub-memory-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:7px;margin-top:10px}.hub-memory-runtime-cell{min-width:0;padding:8px 9px;border-radius:8px;background:var(--hub-bg-subtle)}.hub-memory-runtime-cell>span,.hub-memory-runtime-cell>strong,.hub-memory-runtime-cell>small{display:block;min-width:0;overflow-wrap:anywhere}.hub-memory-runtime-cell>span{font-size:9px;color:var(--hub-secondary)}.hub-memory-runtime-cell>strong{margin-top:3px;font-size:10px;font-weight:550}.hub-memory-runtime-cell>small{margin-top:3px;color:var(--hub-secondary);font-size:9px}.hub-memory-mcp{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--hub-border)}.hub-memory-mcp>div{display:flex;flex-direction:column;gap:4px;min-width:0}.hub-memory-mcp strong{font-size:10px}.hub-memory-mcp code{font:9px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-secondary);overflow-wrap:anywhere}.hub-memory-mcp-config{margin-top:10px;min-height:100px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;white-space:pre-wrap;resize:vertical}.hub-memory-runtime-hints-input{margin-top:6px;min-height:74px;font:10px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace!important;resize:vertical;white-space:pre-wrap}.hub-memory-runtime-hints-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}.hub-memory-runtime-hints-count{font-size:9px;color:var(--hub-muted);font-variant-numeric:tabular-nums}@media(max-width:639px){#t3-hub-title-controls{gap:4px;margin-left:5px}#t3-hub-title-controls>button{height:25px;padding:3px 7px;font-size:9px}.hub-memory-runtime-grid{grid-template-columns:minmax(0,1fr)}}`;
-      style.textContent += "\n#t3-hub-settings-handle[aria-expanded=\"true\"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}\n#t3-hub-artifact-dock{position:fixed;right:0;top:44%;transform:translateY(-50%);z-index:2147482990;display:flex;align-items:center;pointer-events:auto;font:12px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-app-region:no-drag}\n#t3-hub-artifact-dock.is-dragging,#t3-hub-artifact-dock.is-dragging *{cursor:grabbing!important;user-select:none!important}\n#t3-hub-artifact-dock[hidden]{display:none!important}\n#t3-sidecar-hub-root.is-occluded #t3-hub-artifact-dock,#t3-sidecar-hub-root.is-occluded #t3-hub-settings-panel{visibility:hidden!important;pointer-events:none!important}\n.hub-arc-tab{width:26px;height:76px;padding:0 0 0 3px;border:1px solid var(--hub-border);border-right:0;border-radius:24px 0 0 24px;background:var(--hub-bg);color:var(--hub-secondary);box-shadow:-2px 4px 14px #0f172a14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-tab:hover{color:var(--hub-ink);border-color:var(--hub-ink)}\n.hub-arc-grip{font-size:10px;line-height:1;letter-spacing:-1px;color:var(--hub-muted);user-select:none}\n.hub-arc-drag{display:inline-flex;align-items:center;gap:5px;min-width:0;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}\n.hub-arc-sheet{width:296px;max-height:62vh;overflow:auto;border:1px solid var(--hub-border);border-right:0;border-radius:16px 0 0 16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:-8px 12px 32px #0f172a1c;padding:12px;display:flex;flex-direction:column;gap:8px}\n.hub-arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-arc-item{padding:8px 10px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:6px}\n.hub-arc-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}\n.hub-arc-name{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:550;color:var(--hub-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.hub-arc-meta{font-size:10px;color:var(--hub-secondary);flex:none}\n.hub-arc-actions{display:flex;gap:5px;flex-wrap:wrap}\n.hub-arc-btn{height:23px;padding:0 8px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg);color:var(--hub-ink);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-arc-btn:hover{background:var(--hud-hover)}\n.hub-arc-btn.is-primary{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:600}\n.hub-arc-menu{margin-top:3px;padding:4px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);display:flex;flex-direction:column;gap:2px}\n.hub-arc-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:5px;background:transparent;padding:5px 7px;text-align:left;font-size:11px!important;color:var(--hub-ink);cursor:pointer}\n.hub-arc-opt:hover{background:var(--hud-hover)}\n.hub-arc-opt small{color:var(--hub-secondary);font-size:10px}\n.hub-arc-preview{margin-top:4px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg);max-height:240px;overflow:auto}\n.hub-arc-preview pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:10.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-ink)}\n#t3-hub-settings-panel{position:fixed;right:12px;top:12px;bottom:12px;width:min(740px,92vw);max-height:calc(100dvh - 24px);z-index:2147482995;display:flex;flex-direction:column;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}\n#t3-hub-settings-panel[hidden]{display:none!important}\n.hub-set-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}\n@media(max-width:620px){.hub-set-grid-2{grid-template-columns:minmax(0,1fr)}}\n.hub-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--hub-border)}\n.hub-set-head strong{font-size:14px;font-weight:620}\n.hub-set-body{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}\n.hub-set-sec{border:1px solid var(--hub-border);border-radius:11px;padding:12px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:9px}\n.hub-set-sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg)}\n.hub-set-meta{min-width:0;flex:1}\n.hub-set-meta strong{display:block;font-size:11.5px;font-weight:600;overflow-wrap:anywhere}\n.hub-set-meta small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:2px;overflow-wrap:anywhere}\n.hub-set-pills{display:flex;gap:5px;flex-wrap:wrap}\n.hub-set-pill{height:25px;padding:0 9px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg);color:var(--hub-secondary);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-set-pill.is-active{background:var(--hub-active);color:var(--hub-on-active);border-color:var(--hub-active);font-weight:600}\n";
+      style.textContent += "\n#t3-hub-settings-handle[aria-expanded=\"true\"]{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8}\n#t3-hub-update-handle.is-available{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}\n#t3-hub-update-handle.is-available:hover,#t3-hub-update-handle.is-available:focus-visible{border-color:#60a5fa;background:#dbeafe}\n#t3-hub-update-handle.is-recoverable{border-color:#fcd34d;background:#fffbeb;color:#b45309}\n#t3-hub-update-handle.is-recoverable:hover,#t3-hub-update-handle.is-recoverable:focus-visible{border-color:#f59e0b;background:#fef3c7}\n#t3-hub-update-handle.is-manual{border-color:#cbd5e1;background:#f8fafc;color:#334155}\n#t3-hub-update-handle.is-manual:hover,#t3-hub-update-handle.is-manual:focus-visible{border-color:#94a3b8;background:#f1f5f9}\n#t3-hub-update-handle[aria-disabled=\"true\"]{opacity:.68;cursor:wait}\n#t3-hub-update-handle .hub-spinner{width:10px;height:10px;border-width:1.4px}\n.hub-update-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}\n.hub-update-link{font-size:10.5px;color:var(--hub-active);text-decoration:underline;text-underline-offset:2px}\n.hub-update-link:hover{opacity:.8}\n#t3-hub-artifact-dock{position:fixed;right:0;top:44%;transform:translateY(-50%);z-index:2147482990;display:flex;align-items:center;pointer-events:auto;font:12px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;-webkit-app-region:no-drag}\n#t3-hub-artifact-dock.is-dragging,#t3-hub-artifact-dock.is-dragging *{cursor:grabbing!important;user-select:none!important}\n#t3-hub-artifact-dock[hidden]{display:none!important}\n#t3-sidecar-hub-root.is-occluded #t3-hub-artifact-dock,#t3-sidecar-hub-root.is-occluded #t3-hub-settings-panel{visibility:hidden!important;pointer-events:none!important}\n.hub-arc-tab{width:26px;height:76px;padding:0 0 0 3px;border:1px solid var(--hub-border);border-right:0;border-radius:24px 0 0 24px;background:var(--hub-bg);color:var(--hub-secondary);box-shadow:-2px 4px 14px #0f172a14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-tab:hover{color:var(--hub-ink);border-color:var(--hub-ink)}\n.hub-arc-grip{font-size:10px;line-height:1;letter-spacing:-1px;color:var(--hub-muted);user-select:none}\n.hub-arc-drag{display:inline-flex;align-items:center;gap:5px;min-width:0;cursor:grab;touch-action:none;user-select:none}\n.hub-arc-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}\n.hub-arc-sheet{width:296px;max-height:62vh;overflow:auto;border:1px solid var(--hub-border);border-right:0;border-radius:16px 0 0 16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:-8px 12px 32px #0f172a1c;padding:12px;display:flex;flex-direction:column;gap:8px}\n.hub-arc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-arc-item{padding:8px 10px;border:1px solid var(--hub-border);border-radius:10px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:6px}\n.hub-arc-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}\n.hub-arc-name{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:550;color:var(--hub-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.hub-arc-meta{font-size:10px;color:var(--hub-secondary);flex:none}\n.hub-arc-actions{display:flex;gap:5px;flex-wrap:wrap}\n.hub-arc-btn{height:23px;padding:0 8px;border:1px solid var(--hub-border);border-radius:6px;background:var(--hub-bg);color:var(--hub-ink);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-arc-btn:hover{background:var(--hud-hover)}\n.hub-arc-btn.is-primary{border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-weight:600}\n.hub-arc-menu{margin-top:3px;padding:4px;border:1px solid var(--hub-border);border-radius:8px;background:var(--hub-bg);display:flex;flex-direction:column;gap:2px}\n.hub-arc-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;border-radius:5px;background:transparent;padding:5px 7px;text-align:left;font-size:11px!important;color:var(--hub-ink);cursor:pointer}\n.hub-arc-opt:hover{background:var(--hud-hover)}\n.hub-arc-opt small{color:var(--hub-secondary);font-size:10px}\n.hub-arc-preview{margin-top:4px;padding:10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg);max-height:240px;overflow:auto}\n.hub-arc-preview pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:10.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--hub-ink)}\n#t3-hub-settings-panel{position:fixed;right:12px;top:12px;bottom:12px;width:min(740px,92vw);max-height:calc(100dvh - 24px);z-index:2147482995;display:flex;flex-direction:column;border:1px solid var(--hub-border);border-radius:16px;background:var(--hub-bg);color:var(--hub-ink);box-shadow:var(--hud-shadow);overflow:hidden;pointer-events:auto;-webkit-app-region:no-drag}\n#t3-hub-settings-panel[hidden]{display:none!important}\n.hub-set-grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}\n@media(max-width:620px){.hub-set-grid-2{grid-template-columns:minmax(0,1fr)}}\n.hub-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--hub-border)}\n.hub-set-head strong{font-size:14px;font-weight:620}\n.hub-set-body{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}\n.hub-set-sec{border:1px solid var(--hub-border);border-radius:11px;padding:12px;background:var(--hub-bg-subtle);display:flex;flex-direction:column;gap:9px}\n.hub-set-sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600}\n.hub-set-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--hub-border);border-radius:9px;background:var(--hub-bg)}\n.hub-set-meta{min-width:0;flex:1}\n.hub-set-meta strong{display:block;font-size:11.5px;font-weight:600;overflow-wrap:anywhere}\n.hub-set-meta small{display:block;font-size:10px;color:var(--hub-secondary);margin-top:2px;overflow-wrap:anywhere}\n.hub-set-pills{display:flex;gap:5px;flex-wrap:wrap}\n.hub-set-pill{height:25px;padding:0 9px;border:1px solid var(--hub-border);border-radius:999px;background:var(--hub-bg);color:var(--hub-secondary);font-size:10.5px!important;font-weight:500;cursor:pointer}\n.hub-set-pill.is-active{background:var(--hub-active);color:var(--hub-on-active);border-color:var(--hub-active);font-weight:600}\n";
       document.head.appendChild(style);
       root = document.createElement("div");
  root.id = "t3-sidecar-hub-root";
- root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime-hints"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
+ root.innerHTML = `<div id="t3-hub-title-controls" role="group" aria-label="本机记忆、设置与当前计划" hidden><button type="button" id="t3-hub-plan-handle" aria-controls="t3-hub-live-board" aria-expanded="false" hidden></button><span class="hub-memory-combo" role="group" aria-label="本机记忆与开关"><button type="button" id="t3-hub-memory-handle" data-action="open-memory" aria-controls="t3-hub-drawer">${icon("memory", 13)}<span>记忆</span></button><button type="button" id="t3-hub-memory-toggle" role="switch" aria-checked="mixed" aria-label="允许本机 T3 Agent 使用记忆"><span aria-hidden="true">◉</span><span>未知</span></button></span><button type="button" id="t3-hub-settings-handle" data-action="open-hub-settings" aria-controls="t3-hub-settings-panel" aria-expanded="false">${icon("settings", 12)}<span>设置</span></button><button type="button" id="t3-hub-update-handle" data-action="hud-update-pill" hidden></button></div><aside id="t3-hub-drawer" role="complementary" aria-labelledby="t3-hub-title" aria-hidden="true" inert><div id="t3-hub-resize-handle" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整 Hub 宽度"></div><header class="hub-header"></header><nav class="hub-tabs" role="tablist" aria-label="Hub 设置"></nav><section id="t3-hub-panel" class="hub-content" role="tabpanel" tabindex="0"></section><footer class="hub-footer"></footer></aside><aside id="t3-hub-settings-panel" role="complementary" aria-label="T3 Hub 设置" hidden><div id="t3-hub-settings-chrome"></div><div id="t3-hub-settings-general-pane" class="hub-set-body"></div><div id="t3-hub-settings-memory-pane" class="hub-set-body" hidden><div id="t3-hub-settings-memory-quickbar"></div><div id="t3-hub-memory-access"></div><div id="t3-hub-memory-runtime-hints"></div><div id="t3-hub-memory-runtime"></div><div id="t3-hub-engine"></div><div id="t3-hub-memory-connections"></div></div></aside><aside id="t3-hub-artifact-dock" aria-label="当前会话产物悬浮框" hidden></aside><section id="t3-hub-live-board" aria-label="当前会话计划进度" hidden></section><div class="hub-toast" role="status" aria-live="polite" hidden></div>`;
  document.body.appendChild(root);
  drawer = root.querySelector("#t3-hub-drawer");
  handle = null;
@@ -280,6 +282,7 @@
  memoryHandle = root.querySelector("#t3-hub-memory-handle");
  memoryToggle = root.querySelector("#t3-hub-memory-toggle");
  settingsHandle = root.querySelector("#t3-hub-settings-handle");
+ updateHandle = root.querySelector("#t3-hub-update-handle");
  settingsPanel = root.querySelector("#t3-hub-settings-panel");
  artifactDock = root.querySelector("#t3-hub-artifact-dock");
  planHandle = root.querySelector("#t3-hub-plan-handle");
@@ -325,10 +328,12 @@
  listen(memoryHandle, "click", openMemoryFromTitle);
  listen(memoryToggle, "click", toggleMemoryAccessFromTitle);
  if (settingsHandle) listen(settingsHandle, "click", () => setHubSettingsOpen(!state.hubSettingsOpen));
+ if (updateHandle) listen(updateHandle, "click", (event) => { event?.stopPropagation?.(); handleHudUpdatePillClick(); });
  listen(window, "keydown", onKeydown);
  listen(window, "resize", positionHandle);
  listen(window, "resize", () => { applyWidth(); positionConversationTools(); });
  listen(window, "t3-hud-popover-change", positionConversationTools);
+ listen(window, "t3-hud-update-state", onExternalHudUpdateState);
  listen(window, "hashchange", checkRoute);
  listen(window, "popstate", checkRoute);
  listen(window, "storage", checkRoute);
@@ -363,6 +368,11 @@
  refreshMemoryAgentAccess(false);
  refreshContext();
  scheduleBoardPoll();
+ if (!opts.__testHarness) {
+  restoreHudUpdateCache();
+  loadHudUpdateConfig();
+  scheduleHudUpdateCheck();
+ }
     }
 
     function renderChrome() {
@@ -377,6 +387,7 @@
  const model = typeof context.activeModel === "object" ? context.activeModel?.name || context.activeModel?.id : context.activeModel;
  const cliName = [cliNames[String(cli)] || cli, model].filter(Boolean).join(" · ") || tr("本地工作区就绪", "Workspace ready");
  renderMemoryTitleControls();
+ renderHudUpdatePill();
  root.querySelector(".hub-header").innerHTML = `<div class="hub-title-row"><span class="hub-brand">${icon("hub", 18)}</span><div class="hub-grow"><div id="t3-hub-title" class="hub-title">Hub Studio <span class="hub-version">v3</span></div><div class="hub-kicker">${esc(tr("一个工作台，连接所有 AI 搭档。", "One workspace for all your agents."))}</div></div>${themeSwitcher()}<div class="hub-widths" aria-label="${esc(tr("工作台宽度", "Studio width"))}">${[[520, "紧凑", "Compact"], [880, "标准", "Standard"], [1140, "超宽", "Wide"]].map(([width, zh, en]) => `<button type="button" data-action="set-width" data-width="${width}" class="${Math.abs(state.width - width) < 8 ? "is-active" : ""}" aria-pressed="${Math.abs(state.width - width) < 8}">${esc(tr(zh, en))}</button>`).join("")}</div><button type="button" class="hub-icon-btn" data-action="refresh" title="${esc(tr("刷新当前页", "Refresh tab"))}" aria-label="${esc(tr("刷新当前页", "Refresh tab"))}">${state.refreshing ? spinner() : icon("refresh", 15)}</button><button type="button" class="hub-icon-btn" data-action="close" aria-label="${esc(tr("关闭", "Close"))}">${icon("close", 16)}</button></div><div class="hub-scope-bar"><select class="hub-select hub-scope-select" name="hub-scope" aria-label="${esc(tr("当前项目", "Current project"))}" disabled><option value="project" selected>${esc(projectName)}</option></select><span class="hub-shortcut">⌘ ⇧ K</span></div><div class="hub-context"><span class="hub-context-status"><i class="hub-dot"></i><span>${esc(state.contextError ? tr("工作区连接暂不可用", "Workspace unavailable") : cliName)}</span></span></div>`;
  const tabs = [["memory", "memory", tr("记忆", "Memory")]];
  drawer?.classList.toggle("is-single-tab", tabs.length <= 1);
@@ -2323,7 +2334,7 @@
   if (!cache.providerResources && !state.providerResLoading) loadProviderResources();
   if (!cache.guardian && !state.guardianLoading) loadGuardianStatus();
   if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded();
-  else refreshOfficialTelemetry();
+  else { refreshOfficialTelemetry(); if (!state.autoHotUpdateLoaded) loadHudUpdateConfig(); }
  }
     }
     async function ensureMemorySettingsLoaded(force = false) {
@@ -2467,6 +2478,589 @@
   <p class="hub-hint">${esc(tr("运行状态依据本机桌面进程的关闭设置。HUD 启动会关闭官方遥测上报、账号哈希归因、本机 Relay 和 OTLP 导出。模型请求、手机活动通知和其他设备的 Relay 追踪走各自的通道。", "Runtime status is based on opt-out flags verified in this desktop process. HUD launches disable official telemetry reporting, hashed account attribution, local Relay tracing and OTLP export. Model requests, mobile activity notifications and Relay traces on other devices use separate channels."))}</p></details>
  </section>`;
     }
+    const HUD_UPDATE_STABLE_RE = /^(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})$/;
+    const HUD_UPDATE_RELEASE_URL_RE = /^https:\/\/github\.com\/kingmaozi\/t3-code-hud\/releases(?:\/|$)/;
+    const HUD_UPDATE_DEFAULT_RELEASES_URL = "https://github.com/kingmaozi/t3-code-hud/releases";
+    const HUD_UPDATE_MANUAL_CMD = "git pull && bash ./install.sh";
+    const HUD_UPDATE_BG_CHECK_KEY = "t3-hub-update-bg-check-v1";
+    const HUD_UPDATE_BG_DELAY_MS = 15 * 1000;
+    const HUD_UPDATE_BG_INTERVAL_MS = 6 * 60 * 60 * 1000;
+    const HUD_UPDATE_BG_FAIL_BACKOFF_MS = 30 * 60 * 1000;
+    const HUD_UPDATE_CACHE_STATUSES = new Set(["current", "available", "recoverable", "unsupported", "error"]);
+    function readHudUpdateCache() {
+ const raw = storageGet(HUD_UPDATE_BG_CHECK_KEY);
+ if (!raw) return null;
+ try {
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const checkedAt = Number(parsed.checkedAt);
+  if (!Number.isFinite(checkedAt) || checkedAt <= 0) return null;
+  if (typeof parsed.ok !== "boolean") return null;
+  const installedVersion = typeof parsed.installedVersion === "string" && HUD_UPDATE_STABLE_RE.test(parsed.installedVersion) ? parsed.installedVersion : "";
+  const status = typeof parsed.status === "string" && HUD_UPDATE_CACHE_STATUSES.has(parsed.status) ? parsed.status : (parsed.ok ? "" : "error");
+  if (!status) return null;
+  const availableVersion = typeof parsed.availableVersion === "string" && HUD_UPDATE_STABLE_RE.test(parsed.availableVersion) ? parsed.availableVersion : "";
+  if ((status === "available" || status === "recoverable") && !availableVersion) return null;
+  const releaseUrl = sanitizeHudReleaseUrl(parsed.releaseUrl);
+  return { checkedAt, installedVersion, ok: parsed.ok, status, availableVersion, releaseUrl };
+ } catch {
+  return null;
+ }
+    }
+    function writeHudUpdateCache(entry) {
+ const installedVersion = HUD_UPDATE_STABLE_RE.test(String(entry.installedVersion || "")) ? String(entry.installedVersion) : "";
+ const status = HUD_UPDATE_CACHE_STATUSES.has(entry.status) ? entry.status : (entry.ok ? "current" : "error");
+ const availableVersion = HUD_UPDATE_STABLE_RE.test(String(entry.availableVersion || "")) ? String(entry.availableVersion) : "";
+ const record = {
+  checkedAt: Number.isFinite(entry.checkedAt) && entry.checkedAt > 0 ? entry.checkedAt : Date.now(),
+  installedVersion,
+  ok: entry.ok === true,
+  status,
+  availableVersion,
+  releaseUrl: sanitizeHudReleaseUrl(entry.releaseUrl),
+ };
+ storageSet(HUD_UPDATE_BG_CHECK_KEY, JSON.stringify(record));
+    }
+    function clearHudUpdateCache() {
+ try { localStorage.removeItem(HUD_UPDATE_BG_CHECK_KEY); }
+ catch { storageSet(HUD_UPDATE_BG_CHECK_KEY, ""); }
+    }
+    function restoreHudUpdateCache() {
+ if (disposed) return null;
+ const cached = readHudUpdateCache();
+ const installed = currentHudVersion();
+ if (!cached || !installed || cached.installedVersion !== installed) return null;
+ const elapsed = Date.now() - cached.checkedAt;
+ if (elapsed < 0) return null;
+ if (cached.ok === true && elapsed < HUD_UPDATE_BG_INTERVAL_MS) {
+  if (cached.status === "available" || cached.status === "recoverable" || cached.status === "unsupported") {
+   state.hudUpdateStatus = cached.status;
+   state.hudUpdateAvailableVersion = cached.availableVersion;
+   state.hudUpdateReleaseUrl = cached.releaseUrl;
+   state.hudUpdateErrorCode = "";
+   state.hudUpdateFailedAction = "";
+   state.hudUpdateCheckedAt = cached.checkedAt;
+   renderHudUpdatePill();
+   if (state.hubSettingsOpen) renderHubSettingsPanel();
+   emitHudUpdateState();
+  } else if (cached.status === "current") {
+   state.hudUpdateStatus = "current";
+   state.hudUpdateAvailableVersion = "";
+   state.hudUpdateReleaseUrl = "";
+   state.hudUpdateErrorCode = "";
+   state.hudUpdateFailedAction = "";
+   state.hudUpdateCheckedAt = cached.checkedAt;
+   renderHudUpdatePill();
+  }
+  return cached;
+ }
+ if (cached.ok === false && elapsed < HUD_UPDATE_BG_FAIL_BACKOFF_MS) {
+  return cached;
+ }
+ return null;
+    }
+    function sanitizeHudReleaseUrl(url) {
+ if (typeof url !== "string") return "";
+ const trimmed = url.trim();
+ if (!trimmed || /[\s"'<>\\]/.test(trimmed) || !HUD_UPDATE_RELEASE_URL_RE.test(trimmed)) return "";
+ if (typeof URL === "function") {
+  try {
+   const parsed = new URL(trimmed);
+   if (parsed.protocol !== "https:" || parsed.hostname !== "github.com" || parsed.port || parsed.username || parsed.password) return "";
+   if (!/^\/kingmaozi\/t3-code-hud\/releases(?:\/|$)/.test(parsed.pathname)) return "";
+   return parsed.href;
+  } catch {
+   return "";
+  }
+ }
+ if (!/^https:\/\/github\.com\/kingmaozi\/t3-code-hud\/releases(?:\/[^\s"'<>\\?#]*)?(?:\?[^\s"'<>\\#]*)?(?:#[^\s"'<>\\]*)?$/.test(trimmed)) return "";
+ if (trimmed.includes("..")) return "";
+ return trimmed;
+    }
+    function currentHudVersion() {
+ if (typeof window.__t3HudReleaseVersion === "string" && window.__t3HudReleaseVersion.trim()) {
+  return window.__t3HudReleaseVersion.trim();
+ }
+ return state.hudUpdateVersion || "";
+    }
+    function emitHudUpdateState() {
+ if (typeof window.dispatchEvent !== "function" || typeof CustomEvent !== "function") return;
+ try {
+  window.dispatchEvent(new CustomEvent("t3-hud-update-state", {
+   detail: {
+    source: "drawer",
+    status: state.hudUpdateStatus,
+    busy: state.hudUpdateBusy,
+    busyKind: state.hudUpdateBusyKind,
+    currentVersion: currentHudVersion(),
+    availableVersion: state.hudUpdateAvailableVersion,
+    releaseUrl: state.hudUpdateReleaseUrl,
+    errorCode: state.hudUpdateErrorCode,
+    failedAction: state.hudUpdateFailedAction,
+   },
+  }));
+ } catch {}
+    }
+    function onExternalHudUpdateState(event) {
+ if (disposed) return;
+ const detail = event?.detail;
+ if (!detail || typeof detail !== "object" || detail.source === "drawer") return;
+ state.hudUpdateBusy = detail.busy === true;
+ state.hudUpdateBusyKind = state.hudUpdateBusy ? String(detail.busyKind || "") : "";
+ if (typeof detail.currentVersion === "string" && detail.currentVersion.trim()) {
+  state.hudUpdateVersion = detail.currentVersion.trim();
+ }
+ if (!state.hudUpdateBusy && typeof detail.status === "string" && detail.status) {
+  state.hudUpdateStatus = detail.status;
+  state.hudUpdateAvailableVersion = typeof detail.availableVersion === "string" && HUD_UPDATE_STABLE_RE.test(detail.availableVersion) ? detail.availableVersion : "";
+  state.hudUpdateReleaseUrl = sanitizeHudReleaseUrl(detail.releaseUrl);
+  state.hudUpdateErrorCode = typeof detail.errorCode === "string" ? detail.errorCode : "";
+  state.hudUpdateFailedAction = typeof detail.failedAction === "string" ? detail.failedAction : "";
+  state.hudUpdateCheckedAt = Date.now();
+  if (detail.status === "updated" || detail.status === "recovered") {
+   state.hudUpdateAvailableVersion = "";
+   state.hudUpdateReleaseUrl = "";
+   clearHudUpdateCache();
+  } else if (detail.status === "current" || detail.status === "available" || detail.status === "recoverable" || detail.status === "unsupported") {
+   writeHudUpdateCache({
+    checkedAt: state.hudUpdateCheckedAt,
+    installedVersion: currentHudVersion(),
+    ok: true,
+    status: detail.status,
+    availableVersion: detail.status === "current" ? "" : state.hudUpdateAvailableVersion,
+    releaseUrl: detail.status === "current" ? "" : state.hudUpdateReleaseUrl,
+   });
+  }
+ } else if (state.hudUpdateBusy && typeof detail.availableVersion === "string" && HUD_UPDATE_STABLE_RE.test(detail.availableVersion)) {
+  state.hudUpdateAvailableVersion = detail.availableVersion;
+ }
+ renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+    }
+    function renderHudUpdatePill() {
+ if (!updateHandle || disposed) return;
+ const applying = state.hudUpdateBusy && (state.hudUpdateBusyKind === "apply" || state.hudUpdateBusyKind === "recover");
+ const status = state.hudUpdateStatus;
+ const av = HUD_UPDATE_STABLE_RE.test(state.hudUpdateAvailableVersion) ? state.hudUpdateAvailableVersion : "";
+ updateHandle.classList.remove("is-available", "is-recoverable", "is-manual");
+ if (applying) {
+  const recovering = state.hudUpdateBusyKind === "recover";
+  updateHandle.hidden = false;
+  updateHandle.setAttribute("aria-disabled", "true");
+  updateHandle.classList.add(recovering ? "is-recoverable" : "is-available");
+  const label = recovering ? tr("恢复中...", "Recovering...") : tr("更新中...", "Updating...");
+  updateHandle.innerHTML = `${spinner()}<span>${esc(label)}</span>`;
+  updateHandle.title = label;
+  updateHandle.setAttribute("aria-label", label);
+  return;
+ }
+ updateHandle.setAttribute("aria-disabled", "false");
+ if (status === "available" && av) {
+  updateHandle.hidden = false;
+  updateHandle.classList.add("is-available");
+  const text = `↑ v${av}`;
+  updateHandle.innerHTML = `<span>${esc(text)}</span>`;
+  const title = tr(`点击零重启热更新至 v${av}`, `Click to hot-update to v${av} without restarting`);
+  updateHandle.title = title;
+  updateHandle.setAttribute("aria-label", title);
+  return;
+ }
+ if (status === "recoverable") {
+  updateHandle.hidden = false;
+  updateHandle.classList.add("is-recoverable");
+  const text = tr("↻ 恢复更新", "↻ Recover update");
+  updateHandle.innerHTML = `<span>${esc(text)}</span>`;
+  const title = tr("点击恢复上次中断的 HUD 更新", "Click to recover the interrupted HUD update");
+  updateHandle.title = title;
+  updateHandle.setAttribute("aria-label", title);
+  return;
+ }
+ if (status === "unsupported") {
+  updateHandle.hidden = false;
+  updateHandle.classList.add("is-manual");
+  const text = av ? `↑ v${av}` : tr("↑ 新版本", "↑ Update");
+  updateHandle.innerHTML = `<span>${esc(text)}</span>`;
+  const title = tr("发现新版本（无热更包），点击打开设置查看升级指引", "New version available (no hot bundle); click for upgrade instructions");
+  updateHandle.title = title;
+  updateHandle.setAttribute("aria-label", title);
+  return;
+ }
+ updateHandle.hidden = true;
+ updateHandle.innerHTML = "";
+ updateHandle.title = "";
+ updateHandle.removeAttribute("aria-label");
+    }
+    function hudUpdateStatusText() {
+ const av = HUD_UPDATE_STABLE_RE.test(state.hudUpdateAvailableVersion) ? state.hudUpdateAvailableVersion : "";
+ const ver = currentHudVersion();
+ if (state.hudUpdateBusy) {
+  if (state.hudUpdateBusyKind === "recover") return tr("正在恢复上次中断的更新…", "Recovering interrupted update…");
+  if (state.hudUpdateBusyKind === "apply") return tr("正在执行零重启热加载更新…", "Applying zero-restart hot update…");
+  return tr("正在检查更新…", "Checking for updates…");
+ }
+ switch (state.hudUpdateStatus) {
+  case "available":
+   return av ? tr(`发现新版本 v${av}，支持零重启热加载。`, `New version v${av} is available for zero-restart hot reload.`) : tr("发现可用热更新版本。", "A hot-reload update is available.");
+  case "recoverable":
+   return tr("检测到上次中断的更新，可一键恢复到先前版本。", "An interrupted update was detected and can be recovered safely.");
+  case "unsupported":
+   return tr(
+    `发现新版本${av ? ` v${av}` : ""}，但该版本暂无热更包；可通过下方命令或 GitHub Release 手动升级。`,
+    `New version${av ? ` v${av}` : ""} has no hot-update package; upgrade via the CLI command or GitHub Releases below.`
+   );
+  case "current":
+   return tr("当前已是最新版本。", "You are on the latest version.");
+  case "updated":
+   return tr(`已热更新至${ver ? ` v${ver}` : "最新版本"}，无需重启 T3。`, `Hot-updated to${ver ? ` v${ver}` : " the latest version"} without restarting T3.`);
+  case "recovered":
+   return tr("已恢复上次中断的更新。", "The interrupted update was recovered.");
+  case "error":
+   switch (state.hudUpdateErrorCode) {
+    case "UPDATE_BUSY": return tr("另一个更新正在进行，请稍后重试。", "Another update is in progress. Please try again shortly.");
+    case "UPDATE_CHANGED": return tr("可用版本已变更，请重新检查更新。", "The available release changed. Check for updates again.");
+    case "UPDATE_INVALID": return tr("更新包未通过校验，请重新检查更新。", "The update package failed verification. Check again.");
+    case "HUD_UNAVAILABLE":
+    case "UPDATE_UNAVAILABLE": return tr("暂时无法连接或热更新 HUD，请稍后重试。", "HUD update service is currently unavailable. Try again later.");
+    default: return state.hudUpdateFailedAction === "apply"
+     ? tr("热更新未完成，原有文件已保留。", "Hot update did not complete; previous files were kept.")
+     : tr("检查更新失败，请稍后重试。", "Could not check for updates. Please try again later.");
+   }
+  default:
+   return tr("尚未检查更新。", "Not checked yet.");
+ }
+    }
+    function renderHudUpdateSection() {
+ const ver = currentHudVersion();
+ const av = HUD_UPDATE_STABLE_RE.test(state.hudUpdateAvailableVersion) ? state.hudUpdateAvailableVersion : "";
+ const safeReleaseUrl = sanitizeHudReleaseUrl(state.hudUpdateReleaseUrl) || HUD_UPDATE_DEFAULT_RELEASES_URL;
+ const status = state.hudUpdateStatus;
+ const toggleLabel = tr("发现热更版本时空闲自动热加载", "Auto hot-reload on idle when available");
+ const actionButtons = [];
+ if (status === "available" && av) {
+  actionButtons.push(`<button type="button" class="hub-arc-btn is-primary" data-action="hud-update-apply" ${state.hudUpdateBusy ? "disabled" : ""}>${esc(tr(`立即热更新至 v${av}`, `Hot-update to v${av}`))}</button>`);
+ } else if (status === "recoverable") {
+  actionButtons.push(`<button type="button" class="hub-arc-btn is-primary" data-action="hud-update-apply" ${state.hudUpdateBusy ? "disabled" : ""}>${esc(tr("恢复更新", "Recover update"))}</button>`);
+ } else if (status === "unsupported") {
+  actionButtons.push(`<button type="button" class="hub-arc-btn" data-action="hud-update-copy-cmd">${esc(tr("复制升级命令", "Copy upgrade command"))}</button>`);
+  actionButtons.push(`<a class="hub-update-link" data-hud-update-release href="${esc(safeReleaseUrl)}" target="_blank" rel="noopener noreferrer">${esc(tr("查看 GitHub Release", "View GitHub Release"))}</a>`);
+ }
+ return `<section id="t3-hub-update-section" class="hub-set-sec" tabindex="-1" aria-labelledby="t3-hub-update-title"><div class="hub-set-sec-title"><span id="t3-hub-update-title">${esc(tr("HUD 版本与热更新", "HUD Version & Hot Reload"))}</span><div style="display:flex;align-items:center;gap:6px"><span class="hub-badge">${esc(ver ? `v${ver}` : tr("版本未知", "Unknown"))}</span><button type="button" class="hub-arc-btn" data-action="hud-update-check" ${state.hudUpdateBusy ? "disabled" : ""}>${esc(tr("检查更新", "Check for updates"))}</button></div></div>
+  <div class="hub-set-row"><div class="hub-set-meta"><strong role="status">${esc(hudUpdateStatusText())}</strong>${status === "unsupported" ? `<small><code>${esc(HUD_UPDATE_MANUAL_CMD)}</code></small>` : ""}</div>${actionButtons.length ? `<div class="hub-update-actions">${actionButtons.join("")}</div>` : ""}</div>
+  <div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(toggleLabel)}</strong><small>${esc(tr("默认开启。仅在空闲（抽屉与设置均关闭、窗口可见）且新版本支持热更包时自动静默热加载，绝不重启 T3。", "On by default. Silently hot-reloads compatible updates only while idle (drawer and settings closed, window visible), never restarting T3."))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-auto-hot-update" aria-label="${esc(toggleLabel)}" aria-checked="${state.autoHotUpdate === true}" ${state.autoHotUpdateSaving ? "disabled" : ""}><span></span></button></div>
+ </section>`;
+    }
+    async function loadHudUpdateConfig({ triggerAuto = true } = {}) {
+ if (disposed) return null;
+ if (hudUpdateConfigLoading) return hudUpdateConfigLoading;
+ const ver = hudUpdateConfigVersion;
+ const run = (async () => {
+  try {
+   const res = await hubRpc("hub:update:config:get", {});
+   if (disposed || ver !== hudUpdateConfigVersion) return res || null;
+   if (!res || typeof res !== "object") {
+    state.autoHotUpdate = false;
+    state.autoHotUpdateLoaded = false;
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+    return null;
+   }
+   if (typeof res.currentVersion === "string" && res.currentVersion.trim()) {
+    state.hudUpdateVersion = res.currentVersion.trim();
+   }
+   if (res.ok === true && typeof res.autoHotUpdate === "boolean") {
+    state.autoHotUpdate = res.autoHotUpdate;
+    state.autoHotUpdateLoaded = true;
+    if (state.hudUpdateStatus === "idle") restoreHudUpdateCache();
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+    if (triggerAuto) maybeTriggerAutoHotUpdate();
+    return res;
+   }
+   state.autoHotUpdate = false;
+   state.autoHotUpdateLoaded = false;
+   if (state.hubSettingsOpen) renderHubSettingsPanel();
+   return res;
+  } catch {
+   if (!disposed && ver === hudUpdateConfigVersion) {
+    state.autoHotUpdate = false;
+    state.autoHotUpdateLoaded = false;
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+   }
+   return null;
+  } finally {
+   if (hudUpdateConfigLoading === run) hudUpdateConfigLoading = null;
+  }
+ })();
+ hudUpdateConfigLoading = run;
+ return run;
+    }
+    async function setAutoHotUpdate(enabled) {
+ if (disposed || state.autoHotUpdateSaving) return;
+ const next = Boolean(enabled);
+ hudUpdateConfigVersion++;
+ state.autoHotUpdateSaving = true;
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ try {
+  const res = await hubRpc("hub:update:config:set", { autoHotUpdate: next });
+  if (disposed) return;
+  if (res?.ok !== true) throw new Error(res?.error || tr("保存自动热加载设置失败", "Could not save auto hot-reload setting"));
+  state.autoHotUpdate = res.autoHotUpdate === true;
+  state.autoHotUpdateLoaded = true;
+  toast(state.autoHotUpdate
+   ? tr("已开启空闲自动热加载（绝不重启 T3）", "Idle auto hot-reload enabled (never restarts T3)")
+   : tr("已关闭空闲自动热加载", "Idle auto hot-reload disabled"));
+ } catch (error) {
+  if (!disposed) toast(errorText(error), true);
+ } finally {
+  state.autoHotUpdateSaving = false;
+  if (!disposed && state.hubSettingsOpen) renderHubSettingsPanel();
+ }
+    }
+    function canAutoHotUpdate(availableVersion = state.hudUpdateAvailableVersion) {
+ return !disposed &&
+  state.autoHotUpdateLoaded === true &&
+  state.autoHotUpdate === true &&
+  !state.autoHotUpdateSaving &&
+  state.hudUpdateStatus === "available" &&
+  HUD_UPDATE_STABLE_RE.test(availableVersion) &&
+  !state.open &&
+  !state.hubSettingsOpen &&
+  !document.hidden &&
+  !state.hudUpdateBusy &&
+  state.autoAttemptedVersion !== availableVersion;
+    }
+    async function maybeTriggerAutoHotUpdate() {
+ if (disposed || autoHotUpdateChecking || state.autoHotUpdateSaving) return null;
+ if (state.hudUpdateStatus !== "available" ||
+     !HUD_UPDATE_STABLE_RE.test(state.hudUpdateAvailableVersion) ||
+     state.open ||
+     state.hubSettingsOpen ||
+     document.hidden ||
+     state.hudUpdateBusy ||
+     state.autoAttemptedVersion === state.hudUpdateAvailableVersion) {
+  return null;
+ }
+ if (!state.autoHotUpdateLoaded) {
+  autoHotUpdateChecking = true;
+  try {
+   await loadHudUpdateConfig({ triggerAuto: false });
+  } finally {
+   autoHotUpdateChecking = false;
+  }
+  if (disposed) return null;
+ }
+ if (!canAutoHotUpdate()) return null;
+ const version = state.hudUpdateAvailableVersion;
+ state.autoAttemptedVersion = version;
+ return applyHudUpdate(version, false, { silent: true, auto: true });
+    }
+    async function checkHudUpdate({ background = false } = {}) {
+ if (disposed || state.hudUpdateBusy) return null;
+ state.hudUpdateBusy = true;
+ state.hudUpdateBusyKind = "check";
+ state.hudUpdateErrorCode = "";
+ state.hudUpdateFailedAction = "";
+ renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ emitHudUpdateState();
+ let res = null;
+ try {
+  res = await hubRpc("hub:update:check", { background: background === true });
+ } catch {
+  res = { ok: false, code: "UPDATE_UNAVAILABLE" };
+ }
+ if (disposed) return null;
+ state.hudUpdateBusy = false;
+ state.hudUpdateBusyKind = "";
+ state.hudUpdateCheckedAt = Date.now();
+ if (res?.ok === true) {
+  if (typeof res.currentVersion === "string" && res.currentVersion.trim()) {
+   state.hudUpdateVersion = res.currentVersion.trim();
+  }
+  const av = typeof res.availableVersion === "string" && HUD_UPDATE_STABLE_RE.test(res.availableVersion) ? res.availableVersion : "";
+  state.hudUpdateReleaseUrl = sanitizeHudReleaseUrl(res.releaseUrl);
+  state.hudUpdateErrorCode = "";
+  state.hudUpdateFailedAction = "";
+  if (res.status === "available" && av) {
+   state.hudUpdateStatus = "available";
+   state.hudUpdateAvailableVersion = av;
+  } else if (res.status === "recoverable" && av) {
+   state.hudUpdateStatus = "recoverable";
+   state.hudUpdateAvailableVersion = av;
+  } else if (res.status === "unsupported") {
+   state.hudUpdateStatus = "unsupported";
+   state.hudUpdateAvailableVersion = av;
+  } else if (res.status === "current") {
+   state.hudUpdateStatus = "current";
+   state.hudUpdateAvailableVersion = "";
+  } else {
+   state.hudUpdateStatus = "error";
+   state.hudUpdateAvailableVersion = "";
+   state.hudUpdateFailedAction = "check";
+  }
+  writeHudUpdateCache({
+   checkedAt: state.hudUpdateCheckedAt,
+   installedVersion: currentHudVersion(),
+   ok: state.hudUpdateStatus !== "error",
+   status: state.hudUpdateStatus,
+   availableVersion: state.hudUpdateAvailableVersion,
+   releaseUrl: state.hudUpdateReleaseUrl,
+  });
+ } else {
+  state.hudUpdateStatus = "error";
+  state.hudUpdateAvailableVersion = "";
+  state.hudUpdateReleaseUrl = "";
+  state.hudUpdateErrorCode = typeof res?.code === "string" ? res.code : "";
+  state.hudUpdateFailedAction = "check";
+  writeHudUpdateCache({
+   checkedAt: state.hudUpdateCheckedAt,
+   installedVersion: currentHudVersion(),
+   ok: false,
+   status: "error",
+   availableVersion: "",
+   releaseUrl: "",
+  });
+ }
+ renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ emitHudUpdateState();
+ if (background === true && state.hudUpdateStatus === "available") {
+  maybeTriggerAutoHotUpdate();
+ }
+ return res;
+    }
+    async function applyHudUpdate(expectedVersion, recovering = false, { silent = false, auto = false } = {}) {
+ if (disposed || state.hudUpdateBusy) return null;
+ if (!HUD_UPDATE_STABLE_RE.test(String(expectedVersion || ""))) return null;
+ state.hudUpdateBusy = true;
+ state.hudUpdateBusyKind = recovering ? "recover" : "apply";
+ state.hudUpdateErrorCode = "";
+ state.hudUpdateFailedAction = "";
+ renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ emitHudUpdateState();
+ let res = null;
+ try {
+  res = await hubRpc("hub:update:apply", auto === true ? { expectedVersion, auto: true } : { expectedVersion });
+ } catch {
+  res = { ok: false, code: "UPDATE_UNAVAILABLE" };
+ }
+ const confirmedApplySuccess = Boolean(
+  res?.ok === true &&
+  res.currentVersion === expectedVersion &&
+  (res.status === "updated" || res.status === "current")
+ );
+ if (disposed) {
+  if (confirmedApplySuccess) {
+   clearHudUpdateCache();
+   const completionStatus = res.status === "updated" ? "updated" : recovering ? "recovered" : "current";
+   if ((completionStatus === "updated" || completionStatus === "recovered") &&
+       typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
+    try {
+     window.dispatchEvent(new CustomEvent("t3-hud-update-state", {
+      detail: {
+       source: "drawer-disposed",
+       status: completionStatus,
+       busy: false,
+       busyKind: "",
+       currentVersion: expectedVersion,
+       availableVersion: "",
+       releaseUrl: "",
+       errorCode: "",
+       failedAction: "",
+      },
+     }));
+    } catch {}
+   }
+  }
+  return res;
+ }
+ state.hudUpdateBusy = false;
+ state.hudUpdateBusyKind = "";
+ if (confirmedApplySuccess) {
+  clearHudUpdateCache();
+  state.hudUpdateVersion = expectedVersion;
+  state.hudUpdateAvailableVersion = "";
+  state.hudUpdateReleaseUrl = "";
+  state.hudUpdateErrorCode = "";
+  state.hudUpdateFailedAction = "";
+  if (res.status === "updated") {
+   state.hudUpdateStatus = "updated";
+   if (!silent) toast(tr(`已热更新至 v${expectedVersion}，界面正在刷新`, `Hot-updated to v${expectedVersion}; refreshing HUD`));
+  } else {
+   state.hudUpdateStatus = recovering ? "recovered" : "current";
+   if (!silent) toast(recovering ? tr("已恢复上次中断的更新", "Interrupted update recovered") : tr("当前已是最新版本", "Already up to date"));
+  }
+ } else if (auto === true && (res?.code === "AUTO_UPDATE_DISABLED" || res?.code === "AUTO_UPDATE_ALREADY_ATTEMPTED")) {
+  if (res.code === "AUTO_UPDATE_DISABLED") state.autoHotUpdate = false;
+  state.hudUpdateStatus = "available";
+  state.hudUpdateAvailableVersion = expectedVersion;
+  state.hudUpdateErrorCode = "";
+  state.hudUpdateFailedAction = "";
+ } else {
+  state.hudUpdateStatus = "error";
+  state.hudUpdateAvailableVersion = "";
+  state.hudUpdateErrorCode = typeof res?.code === "string" ? res.code : "";
+  state.hudUpdateFailedAction = "apply";
+  if (!silent) toast(hudUpdateStatusText(), true);
+ }
+ renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
+ emitHudUpdateState();
+ return res;
+    }
+    function handleHudUpdatePillClick() {
+ if (disposed || state.hudUpdateBusy) return;
+ if (updateHandle?.getAttribute?.("aria-disabled") === "true") return;
+ if (state.hudUpdateStatus === "available" || state.hudUpdateStatus === "recoverable") {
+  return applyHudUpdate(state.hudUpdateAvailableVersion, state.hudUpdateStatus === "recoverable");
+ }
+ if (state.hudUpdateStatus === "unsupported") {
+  setHubSettingsOpen(true, "general");
+  const section = settingsPanel?.querySelector?.("#t3-hub-update-section");
+  section?.scrollIntoView?.({ block: "nearest" });
+  section?.focus?.({ preventScroll: true });
+ }
+    }
+    async function copyHudUpdateCommand() {
+ try {
+  const clipboard = window.navigator?.clipboard;
+  if (typeof clipboard?.writeText !== "function") throw new Error("clipboard_unavailable");
+  await clipboard.writeText(HUD_UPDATE_MANUAL_CMD);
+  toast(tr("已复制升级命令", "Upgrade command copied"));
+ } catch {
+  toast(tr(`请手动运行：${HUD_UPDATE_MANUAL_CMD}`, `Run manually: ${HUD_UPDATE_MANUAL_CMD}`), true);
+ }
+    }
+    function scheduleHudUpdateCheck(initial = true, lastResult = null) {
+ cancelTimer(updateBgTimer);
+ updateBgTimer = null;
+ if (disposed) return;
+ let delay = HUD_UPDATE_BG_INTERVAL_MS;
+ if (initial) {
+  const cached = restoreHudUpdateCache() || readHudUpdateCache();
+  const installed = currentHudVersion();
+  const matchesVersion = Boolean(cached && installed && cached.installedVersion === installed);
+  const elapsed = matchesVersion ? (Date.now() - cached.checkedAt) : -1;
+  if (matchesVersion && elapsed >= 0) {
+   const windowMs = cached.ok === true ? HUD_UPDATE_BG_INTERVAL_MS : HUD_UPDATE_BG_FAIL_BACKOFF_MS;
+   delay = elapsed < windowMs
+    ? Math.max(HUD_UPDATE_BG_DELAY_MS, windowMs - elapsed)
+    : HUD_UPDATE_BG_DELAY_MS;
+  } else {
+   delay = HUD_UPDATE_BG_DELAY_MS;
+  }
+ } else if (lastResult?.ok === false || state.hudUpdateStatus === "error") {
+  delay = HUD_UPDATE_BG_FAIL_BACKOFF_MS;
+ }
+ updateBgTimer = later(async () => {
+  updateBgTimer = null;
+  if (disposed) return;
+  let res = null;
+  if (!document.hidden) {
+   res = await checkHudUpdate({ background: true });
+  }
+  if (!disposed) scheduleHudUpdateCheck(false, res);
+ }, delay);
+    }
     function renderHubSettingsPanel() {
  if (!settingsPanel || disposed) return;
  settingsPanel.hidden = !state.hubSettingsOpen;
@@ -2495,7 +3089,7 @@
  const memoryPane = settingsPanel.querySelector?.("#t3-hub-settings-memory-pane");
  if (chromeNode && generalPane && memoryPane) {
   chromeNode.innerHTML = chromeHtml;
-  generalPane.innerHTML = renderOfficialTelemetry() + generalHtml;
+  generalPane.innerHTML = renderOfficialTelemetry() + renderHudUpdateSection() + generalHtml;
   generalPane.hidden = isMemTab;
   memoryPane.hidden = !isMemTab;
   const quickbar = settingsPanel.querySelector?.("#t3-hub-settings-memory-quickbar");
@@ -2511,7 +3105,7 @@
    renderMemoryConnections();
   }
  } else {
-  settingsPanel.innerHTML = `${chromeHtml}<div class="hub-set-body">${generalHtml}</div>`;
+  settingsPanel.innerHTML = `${chromeHtml}<div class="hub-set-body">${renderOfficialTelemetry()}${renderHudUpdateSection()}${generalHtml}</div>`;
  }
     }
     function applyArtifactDockPosition() {
@@ -3598,7 +4192,8 @@
  const lang = detectLang();
  if (lang !== state.lang) {
  state.lang = lang;
- renderChrome(); renderLiveBoard();
+ renderChrome(); renderLiveBoard(); renderHudUpdatePill();
+ if (state.hubSettingsOpen) renderHubSettingsPanel();
  if (state.open) renderTab();
  }
     }
@@ -3676,7 +4271,12 @@
  else if (action === "open-hub-settings") setHubSettingsOpen(!state.hubSettingsOpen);
  else if (action === "open-hub-memory-settings") setHubSettingsOpen(true, "memory");
  else if (action === "open-memory-from-settings") { setHubSettingsOpen(false); openMemoryFromTitle(); }
- else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); else refreshOfficialTelemetry(); }
+ else if (action === "hub-settings-tab") { state.hubSettingsTab = target.dataset.tab === "memory" ? "memory" : "general"; renderHubSettingsPanel(); if (state.hubSettingsTab === "memory") ensureMemorySettingsLoaded(); else { refreshOfficialTelemetry(); if (!state.autoHotUpdateLoaded) loadHudUpdateConfig(); } }
+ else if (action === "hud-update-pill") handleHudUpdatePillClick();
+ else if (action === "hud-update-check") checkHudUpdate({ background: false });
+ else if (action === "hud-update-apply") applyHudUpdate(state.hudUpdateAvailableVersion, state.hudUpdateStatus === "recoverable");
+ else if (action === "hud-update-copy-cmd") copyHudUpdateCommand();
+ else if (action === "toggle-auto-hot-update") setAutoHotUpdate(target.getAttribute("aria-checked") !== "true");
  else if (action === "refresh-official-telemetry") refreshOfficialTelemetry();
  else if (action === "toggle-official-telemetry") refreshOfficialTelemetry({ disableOfficialTelemetry: target.getAttribute("aria-checked") !== "true" });
  else if (action === "close-hub-settings") setHubSettingsOpen(false);
@@ -4309,8 +4909,8 @@
  if (disposed) return;
  disposed = true;
  artifactDockSig = "";
- contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; memoryRuntimeHintsVersion++; embedVersion++; boardVersion++;
- clearInterval(routeTimer); timers.forEach(clearTimeout); timers.clear();
+ contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; memoryRuntimeHintsVersion++; embedVersion++; boardVersion++; hudUpdateConfigVersion++; hudUpdateConfigLoading = null; autoHotUpdateChecking = false;
+ clearInterval(routeTimer); cancelTimer(updateBgTimer); updateBgTimer = null; timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();
  if (updateFrame) cancelAnimationFrame(updateFrame);
  try { unsubscribeRouter?.(); } catch {}

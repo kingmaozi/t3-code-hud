@@ -5,7 +5,7 @@
  *
  * Invokes ONLY a verified T3-managed `agy`/`antigravity` binary with:
  *   -p /usage --output-format json --print-timeout 20s --log-file /dev/null
- * under a hard 5-minute (300s) low-frequency TTL cache / backoff, single-flight
+ * under a hard 10-minute (600s) low-frequency TTL cache / backoff, single-flight
  * deduplication, non-blocking RPC wait budget, and 4-layer safety guards:
  *   1. Strict version gate: <bin> --version must match official CLI version >= 1.1.11
  *      and binary canonical identity is re-verified immediately before /usage
@@ -29,7 +29,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const MIN_USAGE_CLI_VERSION = "1.1.11";
-const DEFAULT_CACHE_TTL_MS = 300_000;
+const DEFAULT_CACHE_TTL_MS = 600_000;
 const DEFAULT_ERROR_BACKOFF_MS = 300_000;
 const DEFAULT_SIGNED_OUT_BACKOFF_MS = 600_000;
 const DEFAULT_RPC_WAIT_MS = 3_500;

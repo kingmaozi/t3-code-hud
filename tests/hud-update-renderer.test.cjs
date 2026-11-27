@@ -210,3 +210,91 @@ test("the mutating RPC sends one authenticated local request even if a response 
   assert.equal(unavailable.code, "HUD_UNAVAILABLE");
   assert.equal(requests.length, 1);
 });
+
+test("renderer update footer syncs bidirectionally via t3-hud-update-state without extra RPCs", async () => {
+  const dispatched = [];
+  const calls = [];
+  const document = { activeElement: null };
+  const window = {
+    __t3HubRpc: async (action, payload) => {
+      calls.push([action, { ...payload }]);
+      return {
+        ok: true, status: "available", currentVersion: "1.0.9", availableVersion: "1.0.11",
+        releaseUrl: "https://github.com/kingmaozi/t3-code-hud/releases/tag/v1.0.11",
+      };
+    },
+    __t3HudReleaseVersion: "1.0.9",
+    dispatchEvent(evt) { dispatched.push(evt); },
+  };
+  const controls = {};
+  const makeButton = action => ({
+    hidden: action === "apply",
+    attributes: {},
+    closest: () => controls[action],
+    getAttribute: () => action,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    focus() { document.activeElement = this; },
+  });
+  const popover = {
+    style: {},
+    classList: { contains: key => key === "visible" },
+    set innerHTML(value) {
+      this.markup = value;
+      controls.check = value.includes('data-t3-hud-update="check"') ? makeButton("check") : null;
+      controls.apply = value.includes('data-t3-hud-update="apply"') ? makeButton("apply") : null;
+      controls.status = value.includes("data-t3-hud-update-status") ? { textContent: "" } : null;
+      controls.releases = value.includes("data-t3-hud-update-release") ? { hidden: true } : null;
+    },
+    querySelector(selector) {
+      switch (selector) {
+        case '[data-t3-hud-update="check"]': return controls.check;
+        case '[data-t3-hud-update="apply"]': return controls.apply;
+        case "[data-t3-hud-update-status]": return controls.status;
+        case "[data-t3-hud-update-release]": return controls.releases;
+        default: return null;
+      }
+    },
+  };
+  const sandbox = {
+    document, window, popover, hudLang: "zh",
+    latestStats: null, disposed: false, currentPopoverMode: "stats", hudUpdateState: {},
+    CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
+    langSwitchLabel: () => "EN",
+    computeQuotaAndContext: () => ({ currentWindows: [], otherWindows: [] }),
+  };
+  vm.runInNewContext(
+    sourceBetween("  function escapeHtml(", "  // Bilingual i18n") +
+    sourceBetween("  const I18N = {", "  let hudLang = null;") +
+    sourceBetween("  function t(key)", "  function detectLangFromDom(") +
+    sourceBetween("  function syncHudUpdateFooter(", "  function showPopoverAbove("),
+    sandbox,
+  );
+  sandbox.renderStatsPopover();
+  assert.equal(calls.length, 0);
+
+  // Incoming state from drawer updates footer without RPC
+  sandbox.onExternalHudUpdateState({
+    detail: { source: "drawer", busy: false, status: "available", availableVersion: "1.0.10", currentVersion: "1.0.9" },
+  });
+  assert.equal(controls.apply.hidden, false);
+  assert.equal(controls.apply.textContent, "更新至 v1.0.10");
+  assert.equal(controls.status.textContent, "有可用更新");
+  assert.equal(calls.length, 0);
+
+  // Own-source events are ignored
+  sandbox.onExternalHudUpdateState({
+    detail: { source: "renderer", busy: false, status: "current", currentVersion: "1.0.9" },
+  });
+  assert.equal(controls.apply.hidden, false);
+
+  // Clicking check broadcasts busy + final state with source: "renderer"
+  await sandbox.onHudUpdateClick({ target: controls.check, stopPropagation() {} });
+  assert.equal(dispatched.length, 2);
+  assert.equal(dispatched[0].type, "t3-hud-update-state");
+  assert.equal(dispatched[0].detail.source, "renderer");
+  assert.equal(dispatched[0].detail.busy, true);
+  assert.equal(dispatched[1].detail.source, "renderer");
+  assert.equal(dispatched[1].detail.busy, false);
+  assert.equal(dispatched[1].detail.status, "available");
+  assert.equal(dispatched[1].detail.availableVersion, "1.0.11");
+});

@@ -2787,6 +2787,7 @@
   }
   syncHudTheme();
   window.addEventListener("t3-hub-theme-change", syncHudTheme);
+  window.addEventListener("t3-hud-update-state", onExternalHudUpdateState);
   window.addEventListener("storage", syncHudTheme);
   document.querySelectorAll(".t3-hud-details-section").forEach((el) => el.remove());
 
@@ -4500,6 +4501,57 @@
     return { message: expectedVersion ? "hudUpdateUnconfirmed" : "hudUpdateCheckFailed" };
   }
 
+  function emitHudUpdateState(detail) {
+    if (typeof window.dispatchEvent !== "function" || typeof CustomEvent !== "function") return;
+    try {
+      window.dispatchEvent(new CustomEvent("t3-hud-update-state", { detail: { source: "renderer", ...detail } }));
+    } catch {}
+  }
+
+  function onExternalHudUpdateState(event) {
+    if (disposed) return;
+    const detail = event?.detail;
+    if (!detail || typeof detail !== "object" || detail.source === "renderer") return;
+    if (detail.busy) {
+      const recovering = detail.busyKind === "recover";
+      const applying = detail.busyKind === "apply" || recovering;
+      hudUpdateState = {
+        busy: true,
+        availableVersion: detail.availableVersion || undefined,
+        recoverable: recovering,
+        message: applying ? (recovering ? "hudUpdateRecovering" : "hudUpdateApplying") : "hudUpdateChecking",
+      };
+      syncHudUpdateFooter();
+      return;
+    }
+    const status = detail.status;
+    const semverOk = typeof detail.availableVersion === "string" &&
+      /^(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})$/.test(detail.availableVersion);
+    if (status === "current") hudUpdateState = { message: "hudUpdateCurrent" };
+    else if (status === "unsupported") hudUpdateState = { message: "hudUpdateUnsupported" };
+    else if (status === "available" && semverOk) {
+      hudUpdateState = { message: "hudUpdateAvailable", availableVersion: detail.availableVersion, recoverable: false };
+    } else if (status === "recoverable" && semverOk) {
+      hudUpdateState = { message: "hudUpdateInterrupted", availableVersion: detail.availableVersion, recoverable: true };
+    } else if (status === "updated") {
+      hudUpdateState = { message: "hudUpdateDone", installedVersion: detail.currentVersion || "" };
+    } else if (status === "recovered") {
+      hudUpdateState = { message: "hudUpdateRecovered" };
+    } else if (status === "error") {
+      switch (detail.errorCode) {
+        case "UPDATE_BUSY": hudUpdateState = { message: "hudUpdateBusy" }; break;
+        case "UPDATE_CHANGED": hudUpdateState = { message: "hudUpdateChanged" }; break;
+        case "UPDATE_INVALID": hudUpdateState = { message: "hudUpdateInvalid" }; break;
+        case "HUD_UNAVAILABLE":
+        case "UPDATE_UNAVAILABLE": hudUpdateState = { message: "hudUpdateUnavailable" }; break;
+        default: hudUpdateState = { message: detail.failedAction === "apply" ? "hudUpdateFailed" : "hudUpdateCheckFailed" }; break;
+      }
+    } else {
+      return;
+    }
+    syncHudUpdateFooter();
+  }
+
   async function onHudUpdateClick(event) {
     const button = event.target.closest?.("[data-t3-hud-update]");
     if (!button || currentPopoverMode !== "stats" || !popover.classList.contains("visible")) return;
@@ -4517,17 +4569,44 @@
       message: apply ? applyMessage : "hudUpdateChecking",
     };
     syncHudUpdateFooter();
+    emitHudUpdateState({
+      busy: true,
+      busyKind: apply ? (recovering ? "recover" : "apply") : "check",
+      availableVersion: expectedVersion || "",
+      currentVersion: window.__t3HudReleaseVersion || "",
+    });
     const action = apply ? "hub:update:apply" : "hub:update:check";
     let next;
+    let rawResult = null;
     try {
-      const result = await window.__t3HubRpc(action, apply ? { expectedVersion } : {});
-      next = hudUpdateResult(result, expectedVersion, recovering);
+      rawResult = await window.__t3HubRpc(action, apply ? { expectedVersion } : {});
+      next = hudUpdateResult(rawResult, expectedVersion, recovering);
     } catch {
       next = { message: apply ? "hudUpdateUnconfirmed" : "hudUpdateConnectionFailed" };
     }
-    if (disposed) return;
-    hudUpdateState = next;
-    syncHudUpdateFooter();
+    let broadcastStatus = "error";
+    if (next.message === "hudUpdateCurrent") broadcastStatus = "current";
+    else if (next.message === "hudUpdateUnsupported") broadcastStatus = "unsupported";
+    else if (next.message === "hudUpdateAvailable") broadcastStatus = "available";
+    else if (next.message === "hudUpdateInterrupted") broadcastStatus = "recoverable";
+    else if (next.message === "hudUpdateDone") broadcastStatus = "updated";
+    else if (next.message === "hudUpdateRecovered") broadcastStatus = "recovered";
+    const confirmedCompletion = apply && (broadcastStatus === "updated" || broadcastStatus === "recovered");
+    if (disposed && !confirmedCompletion) return;
+    if (!disposed) {
+      hudUpdateState = next;
+      syncHudUpdateFooter();
+    }
+    emitHudUpdateState({
+      busy: false,
+      busyKind: "",
+      status: broadcastStatus,
+      currentVersion: rawResult?.currentVersion || next.installedVersion || window.__t3HudReleaseVersion || "",
+      availableVersion: next.availableVersion || (broadcastStatus === "unsupported" && typeof rawResult?.availableVersion === "string" ? rawResult.availableVersion : ""),
+      releaseUrl: typeof rawResult?.releaseUrl === "string" ? rawResult.releaseUrl : "",
+      errorCode: rawResult?.ok === false && typeof rawResult.code === "string" ? rawResult.code : "",
+      failedAction: apply ? "apply" : "check",
+    });
   }
 
   function renderStatsPopover() {
@@ -5969,6 +6048,7 @@
     window.removeEventListener("storage", onRouteMaybeChanged);
     window.removeEventListener("resize", scheduleLayoutSync);
     window.removeEventListener("t3-hub-theme-change", syncHudTheme);
+    window.removeEventListener("t3-hud-update-state", onExternalHudUpdateState);
     window.removeEventListener("storage", syncHudTheme);
     history.pushState = origPushState;
     history.replaceState = origReplaceState;

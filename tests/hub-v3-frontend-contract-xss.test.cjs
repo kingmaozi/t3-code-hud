@@ -50,9 +50,10 @@ function harness(rpc = async () => ({}), environment = {}) {
   const expose = `if (opts.__testHarness) {
     root = opts.root; content = opts.content;
     settingsPanel = root.querySelector("#t3-hub-settings-panel"); settingsPanel.querySelector = root.querySelector;
-    handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
+    handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); settingsHandle = root.querySelector("#t3-hub-settings-handle"); updateHandle = root.querySelector("#t3-hub-update-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings, renderHubSettingsPanel, refreshOfficialTelemetry,
+      renderHudUpdatePill, renderHudUpdateSection, checkHudUpdate, applyHudUpdate, handleHudUpdatePillClick, loadHudUpdateConfig, setAutoHotUpdate, maybeTriggerAutoHotUpdate, scheduleHudUpdateCheck, restoreHudUpdateCache, readHudUpdateCache, onExternalHudUpdateState, sanitizeHudReleaseUrl, copyHudUpdateCommand,
       onInput, onChange, onClick, onEditorKeydown, renderMemory, renderMemoryConnections, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
       renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
@@ -70,8 +71,8 @@ function harness(rpc = async () => ({}), environment = {}) {
       snapshot: ${drawerSource.match(/snapshot: (.*),\n destroy:/)[1]}, ready: () => { contextLoading = false; },
       setCurrentRoute: () => { lastRoute = routeKey(); lastBoardRoute = boardScopeRoute(); },
       routeScope: () => ({ cached: lastBoardRoute, current: boardScopeRoute() }),
-      titleControls, memoryHandle, memoryToggle,
-      setStyle: (fn) => { getComputedStyle = fn; }, destroy: () => { disposed = true; liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); }};
+      titleControls, memoryHandle, memoryToggle, settingsHandle, updateHandle, timers,
+      setStyle: (fn) => { getComputedStyle = fn; }, destroy: () => { disposed = true; cancelTimer(updateBgTimer); updateBgTimer = null; timers.forEach(clearTimeout); timers.clear(); liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); }};
   }`;
   vm.runInNewContext(drawerSource.replace("    const api = {", expose + "\n    const api = {"), sandbox, { filename: "hub-drawer-ui.js" });
   const ui = sandbox.window.__t3MountSidecarHub({ __testHarness: true, root, content, hubRpc: rpc });
@@ -3022,4 +3023,707 @@ test("selected_provider_disabled hides setup prompt button and never emits claud
   const directEn = ui.providerMemorySetupPrompt("personal", "Personal", { host: "claude", status: "unknown", reason: "selected_provider_disabled", customConfigDir: true });
   assert.match(directEn, /disabled in T3 settings/i);
   assert.doesNotMatch(directEn, /claude mcp add|~\/\.claude\.json|\.claude\.json|mcpServers|t3-mcp-router|CLAUDE_CONFIG_DIR/);
+});
+
+test("topbar update pill hides on current/error, shows available/recoverable/unsupported states, and sanitizes release URLs against XSS", async () => {
+  const calls = [];
+  const copied = [];
+  let applyGate = null;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:update:check") {
+      return ui.__nextCheck;
+    }
+    if (action === "hub:update:apply") {
+      if (applyGate) return applyGate.promise;
+      return { ok: true, status: "updated", currentVersion: payload.expectedVersion };
+    }
+    if (action === "hub:update:config:get") {
+      return { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+    }
+    if (action === "hub:update:config:set") {
+      return { ok: true, autoHotUpdate: payload.autoHotUpdate };
+    }
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0", navigator: { clipboard: { writeText: async (v) => copied.push(v) } } } });
+
+  // Hidden on idle and current
+  ui.renderHudUpdatePill();
+  assert.equal(ui.updateHandle.hidden, true);
+  ui.__nextCheck = { ok: true, status: "current", currentVersion: "1.1.0" };
+  await ui.checkHudUpdate({ background: true });
+  assert.equal(ui.updateHandle.hidden, true);
+
+  // Hidden on error
+  ui.__nextCheck = { ok: false, code: "UPDATE_UNAVAILABLE" };
+  await ui.checkHudUpdate({ background: true });
+  assert.equal(ui.updateHandle.hidden, true);
+
+  // Available shows ↑ v1.2.0 and clicking applies once while ignoring duplicate clicks
+  ui.__nextCheck = {
+    ok: true, status: "available", currentVersion: "1.1.0", availableVersion: "1.2.0",
+    releaseUrl: "https://github.com/kingmaozi/t3-code-hud/releases/tag/v1.2.0",
+  };
+  await ui.checkHudUpdate({ background: false });
+  assert.equal(ui.updateHandle.hidden, false);
+  assert.equal(ui.updateHandle.classList.contains("is-available"), true);
+  assert.match(ui.updateHandle.innerHTML, /↑ v1\.2\.0/);
+
+  applyGate = Promise.withResolvers();
+  const pendingApply = ui.handleHudUpdatePillClick();
+  assert.equal(ui.updateHandle.getAttribute("aria-disabled"), "true");
+  assert.match(ui.updateHandle.innerHTML, /hub-spinner/);
+  assert.match(ui.updateHandle.innerHTML, /更新中\.\.\./);
+  ui.handleHudUpdatePillClick(); // duplicate click ignored
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+  applyGate.resolve({ ok: true, status: "updated", currentVersion: "1.2.0" });
+  applyGate = null;
+  await pendingApply;
+  assert.equal(ui.updateHandle.hidden, true);
+
+  // Recoverable shows amber ↻ 恢复更新 and clicking triggers apply with expectedVersion
+  ui.__nextCheck = { ok: true, status: "recoverable", currentVersion: "1.1.0", availableVersion: "1.1.0" };
+  await ui.checkHudUpdate({ background: false });
+  assert.equal(ui.updateHandle.hidden, false);
+  assert.equal(ui.updateHandle.classList.contains("is-recoverable"), true);
+  assert.match(ui.updateHandle.innerHTML, /↻ 恢复更新/);
+
+  // Unsupported with malicious XSS releaseUrl opens settings General tab and blocks unsafe href
+  for (const badUrl of [
+    "javascript:alert(1)",
+    "https://evil.example/kingmaozi/t3-code-hud/releases/tag/v2.0.0",
+    'https://github.com/kingmaozi/t3-code-hud/releases/tag/v2.0.0" onclick="alert(1)',
+    "data:text/html,<script>alert(1)</script>",
+  ]) {
+    assert.equal(ui.sanitizeHudReleaseUrl(badUrl), "");
+  }
+  assert.equal(
+    ui.sanitizeHudReleaseUrl("https://github.com/kingmaozi/t3-code-hud/releases/tag/v2.0.0"),
+    "https://github.com/kingmaozi/t3-code-hud/releases/tag/v2.0.0"
+  );
+
+  ui.__nextCheck = {
+    ok: true, status: "unsupported", currentVersion: "1.1.0", availableVersion: "2.0.0",
+    releaseUrl: "javascript:alert(1)",
+  };
+  await ui.checkHudUpdate({ background: false });
+  assert.equal(ui.updateHandle.hidden, false);
+  assert.equal(ui.updateHandle.classList.contains("is-manual"), true);
+  assert.match(ui.updateHandle.innerHTML, /↑ v2\.0\.0/);
+
+  ui.handleHudUpdatePillClick();
+  assert.equal(ui.state.hubSettingsOpen, true);
+  assert.equal(ui.state.hubSettingsTab, "general");
+  const generalHtml = ui.nodes.get("#t3-hub-settings-general-pane").innerHTML;
+  assert.match(generalHtml, /HUD 版本与热更新/);
+  assert.match(generalHtml, /默认开启。仅在空闲（抽屉与设置均关闭、窗口可见）且新版本支持热更包时自动静默热加载，绝不重启 T3。/);
+  assert.match(generalHtml, /git pull &amp;&amp; bash \.\/install\.sh/);
+  assert.match(generalHtml, /href="https:\/\/github\.com\/kingmaozi\/t3-code-hud\/releases"/);
+  assert.doesNotMatch(generalHtml, /javascript:/i);
+
+  await ui.copyHudUpdateCommand();
+  assert.equal(copied.at(-1), "git pull && bash ./install.sh");
+
+  // Toggle autoHotUpdate persists via hub:update:config:set (opt-out false, then back to true)
+  assert.equal(ui.state.autoHotUpdate, true);
+  await ui.setAutoHotUpdate(false);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.ok(calls.some(c => c.action === "hub:update:config:set" && c.payload.autoHotUpdate === false));
+  await ui.setAutoHotUpdate(true);
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.ok(calls.some(c => c.action === "hub:update:config:set" && c.payload.autoHotUpdate === true));
+
+  // External event from renderer updates topbar pill without RPC
+  const beforeCalls = calls.length;
+  ui.onExternalHudUpdateState({
+    detail: { source: "renderer", busy: false, status: "available", availableVersion: "1.3.0", currentVersion: "1.1.0" },
+  });
+  assert.equal(calls.length, beforeCalls);
+  assert.equal(ui.updateHandle.hidden, false);
+  assert.match(ui.updateHandle.innerHTML, /↑ v1\.3\.0/);
+});
+
+test("autoHotUpdate defaults to true, loads disk config before auto-apply, fails closed on error, triggers only when idle, never retries same version after failure, and destroy clears timers", async () => {
+  const scheduled = [];
+  const cleared = [];
+  let nextTimerId = 10;
+  const calls = [];
+  let configGetReply = { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+  let configGetGate = null;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:update:config:get") {
+      if (configGetGate) await configGetGate.promise;
+      return configGetReply;
+    }
+    if (action === "hub:update:check") {
+      return { ok: true, status: "available", currentVersion: "1.1.0", availableVersion: "1.2.0" };
+    }
+    if (action === "hub:update:apply") {
+      return { ok: false, code: "UPDATE_FAILED" };
+    }
+    return {};
+  });
+  ui.sandbox.setTimeout = (fn, delay) => {
+    const id = nextTimerId++;
+    scheduled.push({ id, fn, delay });
+    return id;
+  };
+  ui.sandbox.clearTimeout = (id) => { cleared.push(id); };
+
+  // 1. Default state is autoHotUpdate === true (unloaded until verified from disk)
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, false);
+
+  // 1a. If disk explicitly turned autoHotUpdate off, maybeTriggerAutoHotUpdate loads config first and sends 0 apply calls
+  configGetReply = { ok: true, autoHotUpdate: false, currentVersion: "1.1.0" };
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(calls.filter(c => c.action === "hub:update:config:get").length, 1);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
+
+  // 1b. If hub:update:config:get fails closed (ok: false, e.g. symlink/corrupt/non-boolean), state fails closed to false and sends 0 apply calls
+  ui.state.autoHotUpdate = true;
+  ui.state.autoHotUpdateLoaded = false;
+  configGetReply = { ok: false, autoHotUpdate: false, currentVersion: "1.1.0", error: "autoHotUpdate must be boolean" };
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(ui.state.autoHotUpdateLoaded, false);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
+
+  // 2. When drawer or settings is open or document is hidden, autoHotUpdate === true does not trigger
+  configGetReply = { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+  await ui.loadHudUpdateConfig();
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+  // Loading valid disk config while idle & available immediately triggers one auto-apply for v1.2.0
+  const applyAfterLoad = calls.filter(c => c.action === "hub:update:apply").length;
+  assert.equal(applyAfterLoad, 1);
+  assert.equal(ui.state.autoAttemptedVersion, "1.2.0");
+
+  // Reset attempted version to verify non-idle guards and idle auto-trigger with loaded config
+  ui.state.autoAttemptedVersion = "";
+  ui.state.open = true;
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+
+  ui.state.open = false;
+  ui.state.hubSettingsOpen = true;
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+
+  ui.state.hubSettingsOpen = false;
+  ui.sandbox.document.hidden = true;
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+
+  // 3. Re-entrancy guard: concurrent maybeTriggerAutoHotUpdate while config:get is pending sends only 1 config:get and 1 apply
+  ui.sandbox.document.hidden = false;
+  ui.state.autoHotUpdateLoaded = false;
+  const configCallsBefore = calls.filter(c => c.action === "hub:update:config:get").length;
+  const applyCallsBefore = calls.filter(c => c.action === "hub:update:apply").length;
+  configGetGate = Promise.withResolvers();
+  const p1 = ui.maybeTriggerAutoHotUpdate();
+  const p2 = ui.maybeTriggerAutoHotUpdate();
+  configGetGate.resolve();
+  configGetGate = null;
+  await Promise.all([p1, p2]);
+  assert.equal(calls.filter(c => c.action === "hub:update:config:get").length, configCallsBefore + 1);
+  const autoApplyCalls = calls.filter(c => c.action === "hub:update:apply");
+  assert.equal(autoApplyCalls.length, applyCallsBefore + 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(autoApplyCalls.at(-1).payload)), { expectedVersion: "1.2.0", auto: true });
+  assert.equal(ui.state.autoAttemptedVersion, "1.2.0");
+
+  // 4. Same version is never auto-retried after a failed auto attempt
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, applyCallsBefore + 1);
+
+  // 5. destroy() while config:get is pending prevents any post-dispose apply, and cancels scheduled timers
+  ui.state.autoAttemptedVersion = "";
+  ui.state.autoHotUpdateLoaded = false;
+  configGetGate = Promise.withResolvers();
+  const disposedPending = ui.maybeTriggerAutoHotUpdate();
+  ui.scheduleHudUpdateCheck(true);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 15000);
+  const timerId = scheduled[0].id;
+  ui.destroy();
+  configGetGate.resolve();
+  configGetGate = null;
+  await disposedPending;
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, applyCallsBefore + 1);
+  assert.ok(cleared.includes(timerId));
+  assert.equal(ui.timers.size, 0);
+  const countBefore = calls.length;
+  await scheduled[0].fn();
+  assert.equal(calls.length, countBefore);
+});
+
+test("P1 #5 + P0 #1: structured background check cache restores pill on remount with zero extra checks, applies failure backoff, and keeps manual check immediate", async () => {
+  const store = new Map();
+  const sharedStorage = {
+    getItem: (k) => store.has(k) ? store.get(k) : null,
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+
+  // Mount #1: background check discovers available v1.2.0
+  const calls1 = [];
+  const ui1 = harness(async (action, payload) => {
+    calls1.push({ action, payload });
+    if (action === "hub:update:check") {
+      return {
+        ok: true, status: "available", currentVersion: "1.1.0", availableVersion: "1.2.0",
+        releaseUrl: "https://github.com/kingmaozi/t3-code-hud/releases/tag/v1.2.0",
+      };
+    }
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  await ui1.checkHudUpdate({ background: true });
+  assert.equal(calls1.filter(c => c.action === "hub:update:check").length, 1);
+  assert.equal(ui1.updateHandle.hidden, false);
+  ui1.destroy();
+
+  // Mount #2: destroys & remounts with same localStorage -> pill immediately visible, 0 immediate checks, delay > 15s (6h window)
+  const calls2 = [];
+  const scheduled2 = [];
+  const ui2 = harness(async (action, payload) => {
+    calls2.push({ action, payload });
+    if (action === "hub:update:apply") return { ok: false, code: "AUTO_UPDATE_DISABLED" };
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  ui2.sandbox.setTimeout = (fn, delay) => { scheduled2.push({ fn, delay }); return scheduled2.length; };
+  ui2.scheduleHudUpdateCheck(true);
+  assert.equal(ui2.updateHandle.hidden, false);
+  assert.match(ui2.updateHandle.innerHTML, /↑ v1\.2\.0/);
+  assert.equal(calls2.length, 0);
+  assert.equal(scheduled2.length, 1);
+  assert.ok(scheduled2[0].delay > 60 * 60 * 1000, "should defer next check for remaining 6h window");
+
+  // Auto-apply rejected with AUTO_UPDATE_DISABLED turns local autoHotUpdate off while keeping pill visible
+  ui2.state.autoHotUpdate = true;
+  await ui2.applyHudUpdate("1.2.0", false, { silent: true, auto: true });
+  assert.equal(ui2.state.autoHotUpdate, false);
+  assert.equal(ui2.updateHandle.hidden, false);
+  assert.match(ui2.updateHandle.innerHTML, /↑ v1\.2\.0/);
+  ui2.destroy();
+
+  // Mount #3: failed background check persists backoff -> remount does NOT schedule 15s retry; manual check still fires immediately
+  store.clear();
+  const ui3 = harness(async (action) => {
+    if (action === "hub:update:check") return { ok: false, code: "UPDATE_UNAVAILABLE" };
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  await ui3.checkHudUpdate({ background: true });
+  assert.equal(ui3.updateHandle.hidden, true);
+  ui3.destroy();
+
+  const calls4 = [];
+  const scheduled4 = [];
+  const ui4 = harness(async (action, payload) => {
+    calls4.push({ action, payload });
+    if (action === "hub:update:check") return { ok: true, status: "current", currentVersion: "1.1.0" };
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  ui4.sandbox.setTimeout = (fn, delay) => { scheduled4.push({ fn, delay }); return scheduled4.length; };
+  ui4.scheduleHudUpdateCheck(true);
+  assert.equal(scheduled4.length, 1);
+  assert.ok(scheduled4[0].delay > 20 * 60 * 1000, "failed background check backs off (~30m) instead of 15s");
+  assert.equal(calls4.length, 0);
+
+  // Manual check bypasses backoff immediately
+  await ui4.checkHudUpdate({ background: false });
+  assert.equal(calls4.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls4[0])), { action: "hub:update:check", payload: { background: false } });
+  ui4.destroy();
+});
+
+test("P1 #5a: steady mounted session backs off 30m after background failure, returns to 6h after success, and keeps manual check immediate", async () => {
+  const store = new Map();
+  const sharedStorage = {
+    getItem: (k) => store.has(k) ? store.get(k) : null,
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  const calls = [];
+  const scheduled = [];
+  let nextCheckResult = { ok: false, code: "UPDATE_UNAVAILABLE" };
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:update:check") return nextCheckResult;
+    return {};
+  }, { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  ui.sandbox.setTimeout = (fn, delay) => {
+    scheduled.push({ fn, delay });
+    return scheduled.length;
+  };
+
+  // Initial mount schedules 15s check
+  ui.scheduleHudUpdateCheck(true);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 15_000);
+
+  // First background check returns UPDATE_UNAVAILABLE -> next timer uses 30m backoff (1_800_000 ms)
+  scheduled[0].fn();
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 1);
+  assert.equal(ui.state.hudUpdateStatus, "error");
+  assert.equal(scheduled.length, 2);
+  assert.equal(scheduled[1].delay, 1_800_000);
+
+  // Manual check still runs immediately while backoff timer is pending
+  nextCheckResult = { ok: true, status: "current", currentVersion: "1.1.0" };
+  await ui.checkHudUpdate({ background: false });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1])), { action: "hub:update:check", payload: { background: false } });
+
+  // Next scheduled background check succeeds -> restores 6h interval (21_600_000 ms)
+  scheduled[1].fn();
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 3);
+  assert.equal(ui.state.hudUpdateStatus, "current");
+  assert.equal(scheduled.length, 3);
+  assert.equal(scheduled[2].delay, 21_600_000);
+
+  // When document.hidden is true, check is skipped and reasonable 6h interval is preserved
+  ui.sandbox.document.hidden = true;
+  scheduled[2].fn();
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 3);
+  assert.equal(scheduled.length, 4);
+  assert.equal(scheduled[3].delay, 21_600_000);
+
+  ui.destroy();
+});
+
+test("P1 #5b: external recovered/updated broadcast clears persisted recoverable cache and prevents stale recovery pill on remount", async () => {
+  const store = new Map();
+  const sharedStorage = {
+    getItem: (k) => store.has(k) ? store.get(k) : null,
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  const cacheKey = "t3-hub-update-bg-check-v1";
+  store.set(cacheKey, JSON.stringify({
+    checkedAt: Date.now(),
+    installedVersion: "1.1.0",
+    ok: true,
+    status: "recoverable",
+    availableVersion: "1.1.0",
+    releaseUrl: "",
+  }));
+
+  // Mount #1 restores recoverable pill from cache
+  const ui1 = harness(async () => ({}), { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  ui1.renderHudUpdatePill();
+  ui1.restoreHudUpdateCache();
+  assert.equal(ui1.updateHandle.hidden, false);
+  assert.equal(ui1.updateHandle.classList.contains("is-recoverable"), true);
+
+  // Renderer stats panel broadcasts recovered -> clears localStorage cache and hides pill
+  ui1.onExternalHudUpdateState({
+    detail: {
+      source: "renderer",
+      status: "recovered",
+      busy: false,
+      busyKind: "",
+      currentVersion: "1.1.0",
+      availableVersion: "1.1.0",
+    },
+  });
+  assert.equal(store.has(cacheKey), false);
+  assert.equal(ui1.readHudUpdateCache(), null);
+  assert.equal(ui1.state.hudUpdateAvailableVersion, "");
+  assert.equal(ui1.state.hudUpdateReleaseUrl, "");
+  assert.equal(ui1.updateHandle.hidden, true);
+  ui1.destroy();
+
+  // Mount #2 remounts drawer (initial pill starts hidden as in DOM) -> recovery pill must not reappear
+  const ui2 = harness(async () => ({}), { window: { __t3HudReleaseVersion: "1.1.0" }, localStorage: sharedStorage });
+  ui2.renderHudUpdatePill();
+  ui2.scheduleHudUpdateCheck(true);
+  assert.equal(ui2.state.hudUpdateStatus, "idle");
+  assert.equal(ui2.updateHandle.hidden, true);
+  assert.equal(ui2.updateHandle.classList.contains("is-recoverable"), false);
+
+  // External available status refreshes persisted cache for remount, then updated clears it
+  ui2.onExternalHudUpdateState({
+    detail: {
+      source: "renderer",
+      status: "available",
+      busy: false,
+      currentVersion: "1.1.0",
+      availableVersion: "1.2.0",
+      releaseUrl: "https://github.com/kingmaozi/t3-code-hud/releases/tag/v1.2.0",
+    },
+  });
+  assert.equal(store.has(cacheKey), true);
+  const synced = ui2.readHudUpdateCache();
+  assert.equal(synced?.status, "available");
+  assert.equal(synced?.availableVersion, "1.2.0");
+
+  ui2.onExternalHudUpdateState({
+    detail: {
+      source: "renderer",
+      status: "updated",
+      busy: false,
+      currentVersion: "1.2.0",
+      availableVersion: "1.2.0",
+    },
+  });
+  assert.equal(store.has(cacheKey), false);
+  assert.equal(ui2.state.hudUpdateAvailableVersion, "");
+  assert.equal(ui2.state.hudUpdateReleaseUrl, "");
+  ui2.destroy();
+});
+
+test("reload-before-RPC-return still emits confirmed recovered/updated completion to new drawer and clears cache", async () => {
+  const rendererSrc = fs.readFileSync(path.join(__dirname, "../src/renderer-ui.js"), "utf8");
+  const sliceBetween = (start, end) => {
+    const a = rendererSrc.indexOf(start);
+    const b = rendererSrc.indexOf(end, a);
+    assert.ok(a >= 0 && b > a, `missing renderer slice: ${start}`);
+    return rendererSrc.slice(a, b);
+  };
+  const cacheKey = "t3-hub-update-bg-check-v1";
+  const store = new Map();
+  const sharedStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  const listeners = new Map();
+  const sharedWindow = {
+    __t3HubDrawerEmbedded: true,
+    __t3HudReleaseVersion: "1.1.0",
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      listeners.get(type)?.delete(fn);
+    },
+    dispatchEvent(evt) {
+      for (const fn of [...(listeners.get(evt.type) || [])]) fn(evt);
+    },
+  };
+  const mountDrawer = (rpc) => {
+    const ui = harness(rpc, {
+      window: { ...sharedWindow, __t3HubRpc: undefined },
+      document: { addEventListener() {}, removeEventListener() {} },
+      localStorage: sharedStorage,
+      CustomEvent: TestCustomEvent,
+    });
+    sharedWindow.addEventListener("t3-hud-update-state", ui.onExternalHudUpdateState);
+    const origDestroy = ui.destroy;
+    ui.destroy = () => {
+      sharedWindow.removeEventListener("t3-hud-update-state", ui.onExternalHudUpdateState);
+      origDestroy();
+    };
+    return ui;
+  };
+  class TestCustomEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.detail = init.detail;
+    }
+  }
+
+  // Case A: Stats panel initiates recovery, backend reloads UI (disposing old stats panel & drawer) before RPC resolves
+  store.set(cacheKey, JSON.stringify({
+    checkedAt: Date.now(),
+    installedVersion: "1.1.0",
+    ok: true,
+    status: "recoverable",
+    availableVersion: "1.1.0",
+    releaseUrl: "",
+  }));
+  let resolveRecoveryRpc;
+  sharedWindow.__t3HubRpc = (action) => {
+    assert.equal(action, "hub:update:apply");
+    return new Promise((resolve) => { resolveRecoveryRpc = resolve; });
+  };
+  const controls = {};
+  const makeButton = (action) => ({
+    hidden: action === "apply",
+    attributes: {},
+    closest: () => controls[action],
+    getAttribute: () => action,
+    setAttribute(name, value) { this.attributes[name] = value; },
+    focus() {},
+  });
+  let domUpdatesAfterDispose = 0;
+  const rendererDoc = { activeElement: null };
+  const popover = {
+    style: {},
+    classList: { contains: (key) => key === "visible" },
+    set innerHTML(value) {
+      controls.check = value.includes('data-t3-hud-update="check"') ? makeButton("check") : null;
+      controls.apply = value.includes('data-t3-hud-update="apply"') ? makeButton("apply") : null;
+      controls.status = value.includes("data-t3-hud-update-status") ? {
+        _text: "",
+        get textContent() { return this._text; },
+        set textContent(v) {
+          if (rendererSandbox.disposed) domUpdatesAfterDispose += 1;
+          this._text = v;
+        },
+      } : null;
+      controls.releases = value.includes("data-t3-hud-update-release") ? { hidden: true } : null;
+    },
+    querySelector(selector) {
+      switch (selector) {
+        case '[data-t3-hud-update="check"]': return controls.check;
+        case '[data-t3-hud-update="apply"]': return controls.apply;
+        case "[data-t3-hud-update-status]": return controls.status;
+        case "[data-t3-hud-update-release]": return controls.releases;
+        default: return null;
+      }
+    },
+  };
+  const rendererSandbox = {
+    document: rendererDoc,
+    window: sharedWindow,
+    popover,
+    hudLang: "zh",
+    latestStats: null,
+    disposed: false,
+    currentPopoverMode: "stats",
+    hudUpdateState: { message: "hudUpdateInterrupted", availableVersion: "1.1.0", recoverable: true },
+    CustomEvent: TestCustomEvent,
+    langSwitchLabel: () => "EN",
+    computeQuotaAndContext: () => ({ currentWindows: [], otherWindows: [] }),
+  };
+  vm.runInNewContext(
+    sliceBetween("  function escapeHtml(", "  // Bilingual i18n") +
+    sliceBetween("  const I18N = {", "  let hudLang = null;") +
+    sliceBetween("  function t(key)", "  function detectLangFromDom(") +
+    sliceBetween("  function syncHudUpdateFooter(", "  function showPopoverAbove("),
+    rendererSandbox,
+  );
+  rendererSandbox.renderStatsPopover();
+  const uiOld = mountDrawer(async () => ({}));
+  uiOld.renderHudUpdatePill();
+  uiOld.restoreHudUpdateCache();
+  assert.equal(uiOld.updateHandle.hidden, false);
+
+  // Start recovery click (RPC remains pending)
+  const recoveryPromise = rendererSandbox.onHudUpdateClick({ target: controls.apply, stopPropagation() {} });
+  // Simulate backend /admin/reload-ui: old stats panel & old drawer disposed, new drawer mounted while RPC still in-flight
+  rendererSandbox.disposed = true;
+  uiOld.destroy();
+  const uiReloaded = mountDrawer(async () => ({}));
+  uiReloaded.renderHudUpdatePill();
+  uiReloaded.restoreHudUpdateCache();
+  assert.equal(uiReloaded.updateHandle.hidden, false, "new drawer initially sees recoverable cache before RPC resolves");
+
+  // RPC resolves with confirmed recovery after reload
+  resolveRecoveryRpc({ ok: true, status: "current", currentVersion: "1.1.0" });
+  await recoveryPromise;
+
+  assert.equal(domUpdatesAfterDispose, 0, "disposed stats panel must not mutate its dead DOM");
+  assert.equal(store.has(cacheKey), false, "confirmed recovered completion must clear persisted cache");
+  assert.equal(uiReloaded.updateHandle.hidden, true, "currently mounted drawer must immediately hide recovery pill");
+  assert.equal(uiReloaded.state.hudUpdateStatus, "recovered");
+  uiReloaded.destroy();
+
+  // Remounting again must not revive recovery prompt
+  const uiAfterRemount = mountDrawer(async () => ({}));
+  uiAfterRemount.renderHudUpdatePill();
+  uiAfterRemount.scheduleHudUpdateCheck(true);
+  assert.equal(uiAfterRemount.updateHandle.hidden, true);
+  assert.equal(uiAfterRemount.state.hudUpdateStatus, "idle");
+  uiAfterRemount.destroy();
+
+  // Case B: Drawer pill initiates update, backend reloads (disposing old drawer) before RPC resolves
+  store.set(cacheKey, JSON.stringify({
+    checkedAt: Date.now(),
+    installedVersion: "1.1.0",
+    ok: true,
+    status: "available",
+    availableVersion: "1.2.0",
+    releaseUrl: "",
+  }));
+  let resolveDrawerApply;
+  const uiDrawer1 = mountDrawer(async (action) => {
+    if (action === "hub:update:apply") {
+      return await new Promise((resolve) => { resolveDrawerApply = resolve; });
+    }
+    return { ok: true };
+  });
+  uiDrawer1.renderHudUpdatePill();
+  uiDrawer1.restoreHudUpdateCache();
+  const applyPromise = uiDrawer1.applyHudUpdate("1.2.0", false);
+  // Backend reloads UI before RPC returns
+  uiDrawer1.destroy();
+  sharedWindow.__t3HudReleaseVersion = "1.2.0";
+  const uiDrawer2 = mountDrawer(async () => ({}));
+  uiDrawer2.renderHudUpdatePill();
+  resolveDrawerApply({ ok: true, status: "updated", currentVersion: "1.2.0" });
+  await applyPromise;
+  assert.equal(store.has(cacheKey), false, "disposed drawer confirmed update must clear cache");
+  assert.equal(uiDrawer2.updateHandle.hidden, true);
+  uiDrawer2.destroy();
+});
+
+test("v1.1.6 P1 #1 + NOTE: autoHotUpdateSaving blocks auto apply while disabling, and failed config reads clear switch state for retry", async () => {
+  const calls = [];
+  let resolveCheck;
+  let resolveSave;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:update:config:get") return { ok: true, autoHotUpdate: true, currentVersion: "1.1.5" };
+    if (action === "hub:update:check") return await new Promise((resolve) => { resolveCheck = resolve; });
+    if (action === "hub:update:config:set") return await new Promise((resolve) => { resolveSave = resolve; });
+    if (action === "hub:update:apply") return { ok: true, status: "updated", currentVersion: payload.expectedVersion };
+    return { ok: true };
+  }, { window: { __t3HudReleaseVersion: "1.1.5" } });
+
+  await ui.loadHudUpdateConfig({ triggerAuto: false });
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+
+  // Start background check (held pending), then user disables autoHotUpdate and closes settings before save finishes
+  const checkPromise = ui.checkHudUpdate({ background: true });
+  ui.state.hubSettingsOpen = true;
+  const savePromise = ui.setAutoHotUpdate(false);
+  assert.equal(ui.state.autoHotUpdateSaving, true);
+  ui.state.hubSettingsOpen = false;
+
+  // Background check completes while save is still in flight -> must NOT fire auto apply
+  resolveCheck({ ok: true, status: "available", currentVersion: "1.1.5", availableVersion: "1.1.6" });
+  await checkPromise;
+  assert.equal(calls.filter((c) => c.action === "hub:update:apply").length, 0);
+  assert.equal(ui.state.autoAttemptedVersion, "");
+
+  // Save resolves with autoHotUpdate: false -> still 0 auto apply calls
+  resolveSave({ ok: true, autoHotUpdate: false });
+  await savePromise;
+  assert.equal(ui.state.autoHotUpdateSaving, false);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(calls.filter((c) => c.action === "hub:update:apply").length, 0);
+  ui.destroy();
+
+  // NOTE: config read returning null, missing boolean, or throwing clears switch to false and keeps autoHotUpdateLoaded false for retry
+  for (const mode of ["null", "missing-bool", "throw"]) {
+    const uiErr = harness(async (action) => {
+      if (action === "hub:update:config:get") {
+        if (mode === "null") return null;
+        if (mode === "missing-bool") return { ok: true, currentVersion: "1.1.5" };
+        throw new Error("rpc offline");
+      }
+      return { ok: true };
+    }, { window: { __t3HudReleaseVersion: "1.1.5" } });
+    assert.equal(uiErr.state.autoHotUpdate, true);
+    await uiErr.loadHudUpdateConfig({ triggerAuto: false });
+    assert.equal(uiErr.state.autoHotUpdate, false, `mode=${mode} must clear switch to false`);
+    assert.equal(uiErr.state.autoHotUpdateLoaded, false, `mode=${mode} must remain unloaded for retry`);
+    uiErr.destroy();
+  }
 });
