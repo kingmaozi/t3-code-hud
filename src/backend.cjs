@@ -3886,9 +3886,21 @@ async function hubCall(action, payload = {}) {
               if (fd !== null) try { fs.closeSync(fd); } catch {}
             }
           }
+          if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+            throw new Error("HUD config root must be a plain object");
+          }
+          const hasAutoHotUpdate = Object.hasOwn(cfg, "autoHotUpdate") && cfg.autoHotUpdate !== undefined;
+          if (hasAutoHotUpdate && typeof cfg.autoHotUpdate !== "boolean") {
+            return {
+              ok: false,
+              autoHotUpdate: false,
+              currentVersion: readInstalledVersion(HUD_PLUGIN_DIR),
+              error: "autoHotUpdate must be boolean",
+            };
+          }
           return {
             ok: true,
-            autoHotUpdate: cfg.autoHotUpdate === true,
+            autoHotUpdate: hasAutoHotUpdate ? cfg.autoHotUpdate : true,
             currentVersion: readInstalledVersion(HUD_PLUGIN_DIR),
           };
         } catch (err) {

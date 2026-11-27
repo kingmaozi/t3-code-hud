@@ -434,11 +434,14 @@ const MAX_AUTO_ATTEMPT_VERSIONS = 32;
 function readAutoHotUpdateEnabled(configPath) {
   let fd = null;
   try {
-    fd = fs.openSync(configPath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    fd = fs.openSync(configPath, fs.constants.O_RDONLY | O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0));
     if (!fs.fstatSync(fd).isFile()) return false;
     const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
-    return Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.autoHotUpdate === true);
-  } catch {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    if (!Object.hasOwn(parsed, "autoHotUpdate") || parsed.autoHotUpdate === undefined) return true;
+    return typeof parsed.autoHotUpdate === "boolean" ? parsed.autoHotUpdate : false;
+  } catch (err) {
+    if (err?.code === "ENOENT") return true;
     return false;
   } finally {
     if (fd !== null) {

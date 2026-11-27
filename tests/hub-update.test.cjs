@@ -416,7 +416,7 @@ test("full hot-update bundle updates hub-drawer-ui.js and optional modules, asse
   assert.doesNotMatch(f.read("renderer-ui.js"), /window\.localDrawer = true;/);
 });
 
-test("autoHotUpdate config persists atomically, defaults to false, rejects non-booleans, and preserves other keys", t => {
+test("autoHotUpdate config persists atomically, defaults to true, fails closed on invalid/corrupt/symlink, rejects non-booleans, and preserves other keys", t => {
   const { readHudConfig, updateHudAutoHotUpdate } = require("../src/hud-config.cjs");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "t3-hud-cfg-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -462,16 +462,64 @@ test("autoHotUpdate config persists atomically, defaults to false, rejects non-b
   // Backend RPC contract via isolated subprocess
   fs.unlinkSync(configFile);
   fs.writeFileSync(path.join(pluginDir, "hud-release.json"), '{"version":"1.2.3"}\n');
-  fs.writeFileSync(configFile, JSON.stringify({ defaultLang: "zh", syncShellProfileTelemetryOptOut: false }));
   const rpcScript = `
     const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const pluginDir = process.env.T3_HUD_DIR;
+    const configFile = path.join(pluginDir, "config.json");
     const { hubCall } = require(${JSON.stringify(path.join(repo, "src/backend.cjs"))});
     (async () => {
+      // Missing config.json defaults to autoHotUpdate: true
+      const missing = await hubCall("hub:update:config:get", {});
+      assert.deepEqual(missing, { ok: true, autoHotUpdate: true, currentVersion: "1.2.3" });
+
+      // Existing config.json without autoHotUpdate key defaults to true
+      fs.writeFileSync(configFile, JSON.stringify({ defaultLang: "zh", syncShellProfileTelemetryOptOut: false }));
       const initial = await hubCall("hub:update:config:get", {});
-      assert.deepEqual(initial, { ok: true, autoHotUpdate: false, currentVersion: "1.2.3" });
+      assert.deepEqual(initial, { ok: true, autoHotUpdate: true, currentVersion: "1.2.3" });
+
+      // Non-boolean set is rejected
       const bad = await hubCall("hub:update:config:set", { autoHotUpdate: "yes" });
       assert.equal(bad.ok, false);
       assert.match(bad.error, /boolean/);
+
+      // Explicit false disables autoHotUpdate
+      const disabled = await hubCall("hub:update:config:set", { autoHotUpdate: false });
+      assert.deepEqual(disabled, { ok: true, autoHotUpdate: false });
+      const afterDisable = await hubCall("hub:update:config:get", {});
+      assert.deepEqual(afterDisable, { ok: true, autoHotUpdate: false, currentVersion: "1.2.3" });
+
+      // Non-boolean on disk fails closed
+      for (const badValue of ["true", "false", 1, 0, null, {}, []]) {
+        fs.writeFileSync(configFile, JSON.stringify({ defaultLang: "zh", autoHotUpdate: badValue }));
+        const invalidGet = await hubCall("hub:update:config:get", {});
+        assert.deepEqual(invalidGet, {
+          ok: false,
+          autoHotUpdate: false,
+          currentVersion: "1.2.3",
+          error: "autoHotUpdate must be boolean",
+        });
+      }
+
+      // Corrupt JSON fails closed
+      fs.writeFileSync(configFile, "{corrupt json");
+      const corruptGet = await hubCall("hub:update:config:get", {});
+      assert.equal(corruptGet.ok, false);
+      assert.equal(corruptGet.autoHotUpdate, false);
+
+      // Symlink config.json fails closed
+      const outside = path.join(path.dirname(pluginDir), "outside-rpc.json");
+      fs.writeFileSync(outside, JSON.stringify({ autoHotUpdate: true }));
+      fs.unlinkSync(configFile);
+      fs.symlinkSync(outside, configFile);
+      const symGet = await hubCall("hub:update:config:get", {});
+      assert.equal(symGet.ok, false);
+      assert.equal(symGet.autoHotUpdate, false);
+
+      // Restore normal config and re-enable via RPC
+      fs.unlinkSync(configFile);
+      fs.writeFileSync(configFile, JSON.stringify({ defaultLang: "zh", syncShellProfileTelemetryOptOut: false }));
       const enabled = await hubCall("hub:update:config:set", { autoHotUpdate: true });
       assert.deepEqual(enabled, { ok: true, autoHotUpdate: true });
       const after = await hubCall("hub:update:config:get", {});
@@ -488,6 +536,66 @@ test("autoHotUpdate config persists atomically, defaults to false, rejects non-b
   assert.equal(onDisk.autoHotUpdate, true);
   assert.equal(onDisk.defaultLang, "zh");
   assert.equal(onDisk.syncShellProfileTelemetryOptOut, false);
+});
+
+test("auto apply defaults to enabled when config.json is absent or omits autoHotUpdate, honors explicit false, and fails closed on symlink/corrupt/non-boolean config", async t => {
+  // 1. Missing config.json (ENOENT) defaults to enabled
+  const fMissing = fixture(t);
+  fs.unlinkSync(path.join(fMissing.pluginDir, "config.json"));
+  assert.deepEqual(await fMissing.updater.apply(target, { auto: true }), {
+    ok: true, status: "updated", currentVersion: target,
+  });
+
+  // 2. Valid config.json without autoHotUpdate key defaults to enabled
+  const fOmitted = fixture(t);
+  fOmitted.put("config.json", JSON.stringify({ memory: "disabled", custom: "keep" }));
+  assert.deepEqual(await fOmitted.updater.apply(target, { auto: true }), {
+    ok: true, status: "updated", currentVersion: target,
+  });
+
+  // 3. Explicit false disables auto apply with 0 network/reload calls
+  const fFalse = fixture(t);
+  fFalse.put("config.json", JSON.stringify({ autoHotUpdate: false }));
+  const resFalse = await fFalse.updater.apply(target, { auto: true });
+  assert.equal(resFalse.ok, false);
+  assert.equal(resFalse.code, "AUTO_UPDATE_DISABLED");
+  assert.deepEqual(fFalse.paths, []);
+
+  // 4. Non-boolean values, corrupt JSON, and non-plain-object JSON all fail closed
+  const invalidPayloads = [
+    JSON.stringify({ autoHotUpdate: "true" }),
+    JSON.stringify({ autoHotUpdate: 1 }),
+    JSON.stringify({ autoHotUpdate: null }),
+    "{corrupt json",
+    "[]",
+    "null",
+    '"true"',
+  ];
+  for (const raw of invalidPayloads) {
+    const fBad = fixture(t);
+    fBad.put("config.json", raw);
+    const resBad = await fBad.updater.apply(target, { auto: true });
+    assert.equal(resBad.ok, false, `Expected fail-closed for payload: ${raw}`);
+    assert.equal(resBad.code, "AUTO_UPDATE_DISABLED");
+    assert.deepEqual(fBad.paths, []);
+  }
+
+  // 5. Symlinked config.json (pointing to valid true file OR dangling) fails closed
+  const fSym = fixture(t);
+  const outside = path.join(fSym.root, "outside-auto.json");
+  fs.writeFileSync(outside, JSON.stringify({ autoHotUpdate: true }));
+  fs.unlinkSync(path.join(fSym.pluginDir, "config.json"));
+  fs.symlinkSync(outside, path.join(fSym.pluginDir, "config.json"));
+  const resSym = await fSym.updater.apply(target, { auto: true });
+  assert.equal(resSym.ok, false);
+  assert.equal(resSym.code, "AUTO_UPDATE_DISABLED");
+  assert.deepEqual(fSym.paths, []);
+
+  fs.unlinkSync(outside); // dangling symlink
+  const resDangling = await fSym.updater.apply(target, { auto: true });
+  assert.equal(resDangling.ok, false);
+  assert.equal(resDangling.code, "AUTO_UPDATE_DISABLED");
+  assert.deepEqual(fSym.paths, []);
 });
 
 test("background check caches for 6h, deduplicates concurrent background checks, manual bypasses cache, and apply clears cache", async t => {
@@ -980,4 +1088,33 @@ test("P0 #1b: multi-version auto attempt dedup survives UPDATE_CHANGED across se
   assert.deepEqual(manualOk, { ok: true, status: "updated", currentVersion: v117 });
   assert.equal(v117Activations, 2);
   assert.equal(fs.existsSync(attemptPath), false);
+});
+
+test("v1.1.6 P1 #2: writerless FIFO at config.json returns AUTO_UPDATE_DISABLED immediately without blocking or downloading", { skip: process.platform === "win32" }, t => {
+  const f = fixture(t);
+  const configFile = path.join(f.pluginDir, "config.json");
+  fs.rmSync(configFile, { force: true });
+  const mkfifo = spawnSync("mkfifo", [configFile], { encoding: "utf8" });
+  assert.equal(mkfifo.status, 0, mkfifo.stderr || "mkfifo failed");
+  const probe = `
+    const { createHudUpdater } = require(${JSON.stringify(path.join(repo, "src", "hub-update.cjs"))});
+    let fetchCalls = 0;
+    const updater = createHudUpdater({
+      pluginDir: ${JSON.stringify(f.pluginDir)},
+      fetchImpl: async () => { fetchCalls += 1; throw new Error("unexpected fetch"); },
+    });
+    updater.apply(${JSON.stringify(target)}, { auto: true }).then(result => {
+      process.stdout.write(JSON.stringify({ result, fetchCalls }));
+    }).catch(err => {
+      console.error(err);
+      process.exitCode = 1;
+    });
+  `;
+  const run = spawnSync(process.execPath, ["-e", probe], { encoding: "utf8", timeout: 3000 });
+  assert.equal(run.signal, null, "FIFO read must not block until external timeout");
+  assert.equal(run.status, 0, run.stderr || String(run.error || ""));
+  const { result, fetchCalls } = JSON.parse(run.stdout);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "AUTO_UPDATE_DISABLED");
+  assert.equal(fetchCalls, 0);
 });

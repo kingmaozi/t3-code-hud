@@ -817,9 +817,12 @@ test("Fix #3: streaming model-turn kill persists latch across reader reload and 
   assert.equal(unkillableChild.unreffed, true);
 });
 
-// --- Fix #4: Hard 300s rate limit & 600s signed-out backoff (even with force:true) + mid-flight config disable ---
+// --- Fix #4: Hard 600s rate limit & 600s signed-out backoff (even with force:true) + mid-flight config disable ---
 
-test("Fix #4: 300s TTL & 600s signed-out backoff apply even to force:true, and mid-flight config disable immediately aborts", async (t) => {
+test("Fix #4: 600s TTL & 600s signed-out backoff apply even to force:true, and mid-flight config disable immediately aborts", async (t) => {
+  assert.equal(DEFAULT_CACHE_TTL_MS, 600_000);
+  assert.equal(DEFAULT_ERROR_BACKOFF_MS, 300_000);
+  assert.equal(DEFAULT_SIGNED_OUT_BACKOFF_MS, 600_000);
   assert.equal(outputLooksSignedOut("Authentication required. Please visit the URL: https://accounts.google.com/..."), true);
   assert.equal(outputLooksSignedOut("Error: not logged in"), true);
   assert.equal(outputLooksSignedOut("not signed in"), true);
@@ -829,7 +832,7 @@ test("Fix #4: 300s TTL & 600s signed-out backoff apply even to force:true, and m
   assert.equal(outputLooksSignedOut('{"type":"AGY_ERROR","error_code":401}'), true);
   assert.equal(outputLooksSignedOut('{"status":"SUCCESS"}'), false);
 
-  // 1. Concurrent normal + force:true dedupes to 1 spawn; subsequent force:true within 300s does NOT re-spawn
+  // 1. Concurrent normal + force:true dedupes to 1 spawn; subsequent force:true within 600s does NOT re-spawn
   const fx = createFixture(t);
   let clock = SAMPLE_REQUESTED_AT;
   let usageCalls = 0;
@@ -864,14 +867,14 @@ test("Fix #4: 300s TTL & 600s signed-out backoff apply even to force:true, and m
   assert.equal(b.available, true);
   assert.equal(usageCalls, 1, "Concurrent normal + force:true must trigger only 1 probe");
 
-  // Force calls inside 300s cache TTL must NOT bypass rate limit
+  // Force calls inside 600s cache TTL must NOT bypass rate limit
   clock += DEFAULT_CACHE_TTL_MS - 1_000;
   const forcedWithinTtl = await reader.readAgyQuotas({ force: true });
   assert.equal(forcedWithinTtl.available, true);
   assert.equal(forcedWithinTtl.cached, true);
-  assert.equal(usageCalls, 1, "force:true within 300s TTL must not trigger another /usage");
+  assert.equal(usageCalls, 1, "force:true within 600s TTL must not trigger another /usage");
 
-  // Past 300s TTL, trigger signed-out -> 600s backoff blocks even force:true
+  // Past 600s TTL, trigger signed-out -> 600s backoff blocks even force:true
   clock += 2_000;
   nextSignedOut = true;
   const signedOutRes = await reader.readAgyQuotas();

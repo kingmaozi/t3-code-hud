@@ -53,7 +53,7 @@ function harness(rpc = async () => ({}), environment = {}) {
     handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); settingsHandle = root.querySelector("#t3-hub-settings-handle"); updateHandle = root.querySelector("#t3-hub-update-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings, renderHubSettingsPanel, refreshOfficialTelemetry,
-      renderHudUpdatePill, renderHudUpdateSection, checkHudUpdate, applyHudUpdate, handleHudUpdatePillClick, loadHudUpdateConfig, setAutoHotUpdate, scheduleHudUpdateCheck, restoreHudUpdateCache, readHudUpdateCache, onExternalHudUpdateState, sanitizeHudReleaseUrl, copyHudUpdateCommand,
+      renderHudUpdatePill, renderHudUpdateSection, checkHudUpdate, applyHudUpdate, handleHudUpdatePillClick, loadHudUpdateConfig, setAutoHotUpdate, maybeTriggerAutoHotUpdate, scheduleHudUpdateCheck, restoreHudUpdateCache, readHudUpdateCache, onExternalHudUpdateState, sanitizeHudReleaseUrl, copyHudUpdateCommand,
       onInput, onChange, onClick, onEditorKeydown, renderMemory, renderMemoryConnections, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
       renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
       hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
@@ -3038,6 +3038,9 @@ test("topbar update pill hides on current/error, shows available/recoverable/uns
       if (applyGate) return applyGate.promise;
       return { ok: true, status: "updated", currentVersion: payload.expectedVersion };
     }
+    if (action === "hub:update:config:get") {
+      return { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+    }
     if (action === "hub:update:config:set") {
       return { ok: true, autoHotUpdate: payload.autoHotUpdate };
     }
@@ -3113,6 +3116,7 @@ test("topbar update pill hides on current/error, shows available/recoverable/uns
   assert.equal(ui.state.hubSettingsTab, "general");
   const generalHtml = ui.nodes.get("#t3-hub-settings-general-pane").innerHTML;
   assert.match(generalHtml, /HUD 版本与热更新/);
+  assert.match(generalHtml, /默认开启。仅在空闲（抽屉与设置均关闭、窗口可见）且新版本支持热更包时自动静默热加载，绝不重启 T3。/);
   assert.match(generalHtml, /git pull &amp;&amp; bash \.\/install\.sh/);
   assert.match(generalHtml, /href="https:\/\/github\.com\/kingmaozi\/t3-code-hud\/releases"/);
   assert.doesNotMatch(generalHtml, /javascript:/i);
@@ -3120,7 +3124,11 @@ test("topbar update pill hides on current/error, shows available/recoverable/uns
   await ui.copyHudUpdateCommand();
   assert.equal(copied.at(-1), "git pull && bash ./install.sh");
 
-  // Toggle autoHotUpdate persists via hub:update:config:set
+  // Toggle autoHotUpdate persists via hub:update:config:set (opt-out false, then back to true)
+  assert.equal(ui.state.autoHotUpdate, true);
+  await ui.setAutoHotUpdate(false);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.ok(calls.some(c => c.action === "hub:update:config:set" && c.payload.autoHotUpdate === false));
   await ui.setAutoHotUpdate(true);
   assert.equal(ui.state.autoHotUpdate, true);
   assert.ok(calls.some(c => c.action === "hub:update:config:set" && c.payload.autoHotUpdate === true));
@@ -3135,13 +3143,19 @@ test("topbar update pill hides on current/error, shows available/recoverable/uns
   assert.match(ui.updateHandle.innerHTML, /↑ v1\.3\.0/);
 });
 
-test("autoHotUpdate triggers only when idle, never retries same version after failure, and destroy clears timers", async () => {
+test("autoHotUpdate defaults to true, loads disk config before auto-apply, fails closed on error, triggers only when idle, never retries same version after failure, and destroy clears timers", async () => {
   const scheduled = [];
   const cleared = [];
   let nextTimerId = 10;
   const calls = [];
+  let configGetReply = { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+  let configGetGate = null;
   const ui = harness(async (action, payload) => {
     calls.push({ action, payload });
+    if (action === "hub:update:config:get") {
+      if (configGetGate) await configGetGate.promise;
+      return configGetReply;
+    }
     if (action === "hub:update:check") {
       return { ok: true, status: "available", currentVersion: "1.1.0", availableVersion: "1.2.0" };
     }
@@ -3157,47 +3171,94 @@ test("autoHotUpdate triggers only when idle, never retries same version after fa
   };
   ui.sandbox.clearTimeout = (id) => { cleared.push(id); };
 
-  // 1. Default autoHotUpdate === false does not auto-apply
-  assert.equal(ui.state.autoHotUpdate, false);
+  // 1. Default state is autoHotUpdate === true (unloaded until verified from disk)
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, false);
+
+  // 1a. If disk explicitly turned autoHotUpdate off, maybeTriggerAutoHotUpdate loads config first and sends 0 apply calls
+  configGetReply = { ok: true, autoHotUpdate: false, currentVersion: "1.1.0" };
   await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(calls.filter(c => c.action === "hub:update:config:get").length, 1);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
+
+  // 1b. If hub:update:config:get fails closed (ok: false, e.g. symlink/corrupt/non-boolean), state fails closed to false and sends 0 apply calls
+  ui.state.autoHotUpdate = true;
+  ui.state.autoHotUpdateLoaded = false;
+  configGetReply = { ok: false, autoHotUpdate: false, currentVersion: "1.1.0", error: "autoHotUpdate must be boolean" };
+  await ui.checkHudUpdate({ background: true });
+  await new Promise(setImmediate);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(ui.state.autoHotUpdateLoaded, false);
   assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
 
   // 2. When drawer or settings is open or document is hidden, autoHotUpdate === true does not trigger
-  ui.state.autoHotUpdate = true;
+  configGetReply = { ok: true, autoHotUpdate: true, currentVersion: "1.1.0" };
+  await ui.loadHudUpdateConfig();
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+  // Loading valid disk config while idle & available immediately triggers one auto-apply for v1.2.0
+  const applyAfterLoad = calls.filter(c => c.action === "hub:update:apply").length;
+  assert.equal(applyAfterLoad, 1);
+  assert.equal(ui.state.autoAttemptedVersion, "1.2.0");
+
+  // Reset attempted version to verify non-idle guards and idle auto-trigger with loaded config
+  ui.state.autoAttemptedVersion = "";
   ui.state.open = true;
   await ui.checkHudUpdate({ background: true });
-  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
 
   ui.state.open = false;
   ui.state.hubSettingsOpen = true;
   await ui.checkHudUpdate({ background: true });
-  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
+  await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
 
   ui.state.hubSettingsOpen = false;
   ui.sandbox.document.hidden = true;
   await ui.checkHudUpdate({ background: true });
-  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 0);
-
-  // 3. When idle and visible, autoHotUpdate triggers once for v1.2.0 with auto: true
-  ui.sandbox.document.hidden = false;
-  await ui.checkHudUpdate({ background: true });
   await new Promise(setImmediate);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+
+  // 3. Re-entrancy guard: concurrent maybeTriggerAutoHotUpdate while config:get is pending sends only 1 config:get and 1 apply
+  ui.sandbox.document.hidden = false;
+  ui.state.autoHotUpdateLoaded = false;
+  const configCallsBefore = calls.filter(c => c.action === "hub:update:config:get").length;
+  const applyCallsBefore = calls.filter(c => c.action === "hub:update:apply").length;
+  configGetGate = Promise.withResolvers();
+  const p1 = ui.maybeTriggerAutoHotUpdate();
+  const p2 = ui.maybeTriggerAutoHotUpdate();
+  configGetGate.resolve();
+  configGetGate = null;
+  await Promise.all([p1, p2]);
+  assert.equal(calls.filter(c => c.action === "hub:update:config:get").length, configCallsBefore + 1);
   const autoApplyCalls = calls.filter(c => c.action === "hub:update:apply");
-  assert.equal(autoApplyCalls.length, 1);
-  assert.deepEqual(JSON.parse(JSON.stringify(autoApplyCalls[0].payload)), { expectedVersion: "1.2.0", auto: true });
+  assert.equal(autoApplyCalls.length, applyCallsBefore + 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(autoApplyCalls.at(-1).payload)), { expectedVersion: "1.2.0", auto: true });
   assert.equal(ui.state.autoAttemptedVersion, "1.2.0");
 
   // 4. Same version is never auto-retried after a failed auto attempt
   await ui.checkHudUpdate({ background: true });
   await new Promise(setImmediate);
-  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, 1);
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, applyCallsBefore + 1);
 
-  // 5. destroy() cancels scheduled background check timer and blocks any stray callback
+  // 5. destroy() while config:get is pending prevents any post-dispose apply, and cancels scheduled timers
+  ui.state.autoAttemptedVersion = "";
+  ui.state.autoHotUpdateLoaded = false;
+  configGetGate = Promise.withResolvers();
+  const disposedPending = ui.maybeTriggerAutoHotUpdate();
   ui.scheduleHudUpdateCheck(true);
   assert.equal(scheduled.length, 1);
   assert.equal(scheduled[0].delay, 15000);
   const timerId = scheduled[0].id;
   ui.destroy();
+  configGetGate.resolve();
+  configGetGate = null;
+  await disposedPending;
+  assert.equal(calls.filter(c => c.action === "hub:update:apply").length, applyCallsBefore + 1);
   assert.ok(cleared.includes(timerId));
   assert.equal(ui.timers.size, 0);
   const countBefore = calls.length;
@@ -3609,4 +3670,60 @@ test("reload-before-RPC-return still emits confirmed recovered/updated completio
   assert.equal(store.has(cacheKey), false, "disposed drawer confirmed update must clear cache");
   assert.equal(uiDrawer2.updateHandle.hidden, true);
   uiDrawer2.destroy();
+});
+
+test("v1.1.6 P1 #1 + NOTE: autoHotUpdateSaving blocks auto apply while disabling, and failed config reads clear switch state for retry", async () => {
+  const calls = [];
+  let resolveCheck;
+  let resolveSave;
+  const ui = harness(async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "hub:update:config:get") return { ok: true, autoHotUpdate: true, currentVersion: "1.1.5" };
+    if (action === "hub:update:check") return await new Promise((resolve) => { resolveCheck = resolve; });
+    if (action === "hub:update:config:set") return await new Promise((resolve) => { resolveSave = resolve; });
+    if (action === "hub:update:apply") return { ok: true, status: "updated", currentVersion: payload.expectedVersion };
+    return { ok: true };
+  }, { window: { __t3HudReleaseVersion: "1.1.5" } });
+
+  await ui.loadHudUpdateConfig({ triggerAuto: false });
+  assert.equal(ui.state.autoHotUpdate, true);
+  assert.equal(ui.state.autoHotUpdateLoaded, true);
+
+  // Start background check (held pending), then user disables autoHotUpdate and closes settings before save finishes
+  const checkPromise = ui.checkHudUpdate({ background: true });
+  ui.state.hubSettingsOpen = true;
+  const savePromise = ui.setAutoHotUpdate(false);
+  assert.equal(ui.state.autoHotUpdateSaving, true);
+  ui.state.hubSettingsOpen = false;
+
+  // Background check completes while save is still in flight -> must NOT fire auto apply
+  resolveCheck({ ok: true, status: "available", currentVersion: "1.1.5", availableVersion: "1.1.6" });
+  await checkPromise;
+  assert.equal(calls.filter((c) => c.action === "hub:update:apply").length, 0);
+  assert.equal(ui.state.autoAttemptedVersion, "");
+
+  // Save resolves with autoHotUpdate: false -> still 0 auto apply calls
+  resolveSave({ ok: true, autoHotUpdate: false });
+  await savePromise;
+  assert.equal(ui.state.autoHotUpdateSaving, false);
+  assert.equal(ui.state.autoHotUpdate, false);
+  assert.equal(calls.filter((c) => c.action === "hub:update:apply").length, 0);
+  ui.destroy();
+
+  // NOTE: config read returning null, missing boolean, or throwing clears switch to false and keeps autoHotUpdateLoaded false for retry
+  for (const mode of ["null", "missing-bool", "throw"]) {
+    const uiErr = harness(async (action) => {
+      if (action === "hub:update:config:get") {
+        if (mode === "null") return null;
+        if (mode === "missing-bool") return { ok: true, currentVersion: "1.1.5" };
+        throw new Error("rpc offline");
+      }
+      return { ok: true };
+    }, { window: { __t3HudReleaseVersion: "1.1.5" } });
+    assert.equal(uiErr.state.autoHotUpdate, true);
+    await uiErr.loadHudUpdateConfig({ triggerAuto: false });
+    assert.equal(uiErr.state.autoHotUpdate, false, `mode=${mode} must clear switch to false`);
+    assert.equal(uiErr.state.autoHotUpdateLoaded, false, `mode=${mode} must remain unloaded for retry`);
+    uiErr.destroy();
+  }
 });

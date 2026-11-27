@@ -20,7 +20,7 @@
     let artifactDockTopPct = Number.isFinite(savedDockTop) && savedDockTop >= 8 && savedDockTop <= 92 ? savedDockTop : 44;
     let resizeDrag = null, lastComposer = null, boardSignature = "", boardRenderedSignature = "", boardRenderKey = "";
     let boardTabRenderPending = false, boardEditorNeedsSync = false, boardDraftEditSeq = 0, focusReturn = null;
-    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, memoryRuntimeHintsVersion = 0, memoryRuntimeHintsLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0;
+    let requestVersion = 0, contextVersion = 0, memoryVersion = 0, memoryAccessVersion = 0, memoryAccessLoading = null, memoryRuntimeHintsVersion = 0, memoryRuntimeHintsLoading = null, embedVersion = 0, embedProjectKey = "", settingsVersion = 0, settingsSelectionVersion = 0, hudUpdateConfigVersion = 0, hudUpdateConfigLoading = null, autoHotUpdateChecking = false;
     let lastRoute = "", lastBoardRoute = "", cachedRouter = null, unsubscribeRouter = null, routerProbeAt = 0;
     let boardDrag = null, contextLoading = true;
     const tabKeys = ["memory"];
@@ -53,7 +53,7 @@
  modelChoice: "", customModel: "", useMirror: false, mcpAddOpen: false, mcpForm: { kind: "form", name: "", transport: "stdio", command: "", args: "", url: "", json: "" },
  syncedTargets: [], embedInitialized: false, embedReadyDeadline: 0,
  hudUpdateStatus: "idle", hudUpdateBusy: false, hudUpdateBusyKind: "", hudUpdateVersion: "", hudUpdateAvailableVersion: "", hudUpdateReleaseUrl: "", hudUpdateErrorCode: "", hudUpdateFailedAction: "", hudUpdateCheckedAt: 0,
- autoHotUpdate: false, autoHotUpdateLoaded: false, autoHotUpdateSaving: false, autoAttemptedVersion: "",
+ autoHotUpdate: true, autoHotUpdateLoaded: false, autoHotUpdateSaving: false, autoAttemptedVersion: "",
     };
  if (!tabKeys.includes(state.tab)) state.tab = "memory";
  if (storedTab !== state.tab) storageSet("t3-hub-tab", state.tab);
@@ -2746,27 +2746,56 @@
  }
  return `<section id="t3-hub-update-section" class="hub-set-sec" tabindex="-1" aria-labelledby="t3-hub-update-title"><div class="hub-set-sec-title"><span id="t3-hub-update-title">${esc(tr("HUD 版本与热更新", "HUD Version & Hot Reload"))}</span><div style="display:flex;align-items:center;gap:6px"><span class="hub-badge">${esc(ver ? `v${ver}` : tr("版本未知", "Unknown"))}</span><button type="button" class="hub-arc-btn" data-action="hud-update-check" ${state.hudUpdateBusy ? "disabled" : ""}>${esc(tr("检查更新", "Check for updates"))}</button></div></div>
   <div class="hub-set-row"><div class="hub-set-meta"><strong role="status">${esc(hudUpdateStatusText())}</strong>${status === "unsupported" ? `<small><code>${esc(HUD_UPDATE_MANUAL_CMD)}</code></small>` : ""}</div>${actionButtons.length ? `<div class="hub-update-actions">${actionButtons.join("")}</div>` : ""}</div>
-  <div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(toggleLabel)}</strong><small>${esc(tr("默认关闭。开启后仅在空闲（抽屉与设置均关闭、窗口可见）且新版本支持热更包时自动静默热加载，绝不重启 T3。", "Off by default. When enabled, silently hot-reloads compatible updates only while idle (drawer and settings closed, window visible), never restarting T3."))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-auto-hot-update" aria-label="${esc(toggleLabel)}" aria-checked="${state.autoHotUpdate === true}" ${state.autoHotUpdateSaving ? "disabled" : ""}><span></span></button></div>
+  <div class="hub-set-row"><div class="hub-set-meta"><strong>${esc(toggleLabel)}</strong><small>${esc(tr("默认开启。仅在空闲（抽屉与设置均关闭、窗口可见）且新版本支持热更包时自动静默热加载，绝不重启 T3。", "On by default. Silently hot-reloads compatible updates only while idle (drawer and settings closed, window visible), never restarting T3."))}</small></div><button type="button" role="switch" class="hub-switch" data-action="toggle-auto-hot-update" aria-label="${esc(toggleLabel)}" aria-checked="${state.autoHotUpdate === true}" ${state.autoHotUpdateSaving ? "disabled" : ""}><span></span></button></div>
  </section>`;
     }
-    async function loadHudUpdateConfig() {
- if (disposed) return;
- try {
-  const res = await hubRpc("hub:update:config:get", {});
-  if (disposed || !res || res.ok === false) return;
-  state.autoHotUpdate = res.autoHotUpdate === true;
-  if (typeof res.currentVersion === "string" && res.currentVersion.trim()) {
-   state.hudUpdateVersion = res.currentVersion.trim();
+    async function loadHudUpdateConfig({ triggerAuto = true } = {}) {
+ if (disposed) return null;
+ if (hudUpdateConfigLoading) return hudUpdateConfigLoading;
+ const ver = hudUpdateConfigVersion;
+ const run = (async () => {
+  try {
+   const res = await hubRpc("hub:update:config:get", {});
+   if (disposed || ver !== hudUpdateConfigVersion) return res || null;
+   if (!res || typeof res !== "object") {
+    state.autoHotUpdate = false;
+    state.autoHotUpdateLoaded = false;
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+    return null;
+   }
+   if (typeof res.currentVersion === "string" && res.currentVersion.trim()) {
+    state.hudUpdateVersion = res.currentVersion.trim();
+   }
+   if (res.ok === true && typeof res.autoHotUpdate === "boolean") {
+    state.autoHotUpdate = res.autoHotUpdate;
+    state.autoHotUpdateLoaded = true;
+    if (state.hudUpdateStatus === "idle") restoreHudUpdateCache();
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+    if (triggerAuto) maybeTriggerAutoHotUpdate();
+    return res;
+   }
+   state.autoHotUpdate = false;
+   state.autoHotUpdateLoaded = false;
+   if (state.hubSettingsOpen) renderHubSettingsPanel();
+   return res;
+  } catch {
+   if (!disposed && ver === hudUpdateConfigVersion) {
+    state.autoHotUpdate = false;
+    state.autoHotUpdateLoaded = false;
+    if (state.hubSettingsOpen) renderHubSettingsPanel();
+   }
+   return null;
+  } finally {
+   if (hudUpdateConfigLoading === run) hudUpdateConfigLoading = null;
   }
-  state.autoHotUpdateLoaded = true;
-  if (state.hudUpdateStatus === "idle") restoreHudUpdateCache();
-  if (state.hubSettingsOpen) renderHubSettingsPanel();
-  maybeTriggerAutoHotUpdate();
- } catch {}
+ })();
+ hudUpdateConfigLoading = run;
+ return run;
     }
     async function setAutoHotUpdate(enabled) {
  if (disposed || state.autoHotUpdateSaving) return;
  const next = Boolean(enabled);
+ hudUpdateConfigVersion++;
  state.autoHotUpdateSaving = true;
  if (state.hubSettingsOpen) renderHubSettingsPanel();
  try {
@@ -2787,7 +2816,9 @@
     }
     function canAutoHotUpdate(availableVersion = state.hudUpdateAvailableVersion) {
  return !disposed &&
+  state.autoHotUpdateLoaded === true &&
   state.autoHotUpdate === true &&
+  !state.autoHotUpdateSaving &&
   state.hudUpdateStatus === "available" &&
   HUD_UPDATE_STABLE_RE.test(availableVersion) &&
   !state.open &&
@@ -2796,7 +2827,26 @@
   !state.hudUpdateBusy &&
   state.autoAttemptedVersion !== availableVersion;
     }
-    function maybeTriggerAutoHotUpdate() {
+    async function maybeTriggerAutoHotUpdate() {
+ if (disposed || autoHotUpdateChecking || state.autoHotUpdateSaving) return null;
+ if (state.hudUpdateStatus !== "available" ||
+     !HUD_UPDATE_STABLE_RE.test(state.hudUpdateAvailableVersion) ||
+     state.open ||
+     state.hubSettingsOpen ||
+     document.hidden ||
+     state.hudUpdateBusy ||
+     state.autoAttemptedVersion === state.hudUpdateAvailableVersion) {
+  return null;
+ }
+ if (!state.autoHotUpdateLoaded) {
+  autoHotUpdateChecking = true;
+  try {
+   await loadHudUpdateConfig({ triggerAuto: false });
+  } finally {
+   autoHotUpdateChecking = false;
+  }
+  if (disposed) return null;
+ }
  if (!canAutoHotUpdate()) return null;
  const version = state.hudUpdateAvailableVersion;
  state.autoAttemptedVersion = version;
@@ -4859,7 +4909,7 @@
  if (disposed) return;
  disposed = true;
  artifactDockSig = "";
- contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; memoryRuntimeHintsVersion++; embedVersion++; boardVersion++;
+ contextVersion++; boardScopeVersion++; requestVersion++; memoryVersion++; memoryAccessVersion++; memoryRuntimeHintsVersion++; embedVersion++; boardVersion++; hudUpdateConfigVersion++; hudUpdateConfigLoading = null; autoHotUpdateChecking = false;
  clearInterval(routeTimer); cancelTimer(updateBgTimer); updateBgTimer = null; timers.forEach(clearTimeout); timers.clear();
  observer?.disconnect(); anchorResize?.disconnect();
  if (updateFrame) cancelAnimationFrame(updateFrame);
