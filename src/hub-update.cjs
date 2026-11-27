@@ -19,6 +19,13 @@ const HOT_SOURCES = Object.freeze({
   "backend.cjs": "src/backend.cjs",
   "renderer-base.js": "src/renderer-ui.js",
 });
+const OPTIONAL_HOT_SOURCES = Object.freeze({
+  "hub-agy-quota.cjs": "src/hub-agy-quota.cjs",
+});
+const ALL_HOT_SOURCES = Object.freeze({
+  ...HOT_SOURCES,
+  ...OPTIONAL_HOT_SOURCES,
+});
 const STABLE_VERSION = /^(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})$/;
 
 function sha256(bytes) {
@@ -48,21 +55,33 @@ function isNewer(version, current) {
 
 function validateBundle(bundle, expectedVersion) {
   if (!bundle || bundle.schema !== 1 || !isStable(expectedVersion) || bundle.version !== expectedVersion ||
-      !bundle.files || typeof bundle.files !== "object" || Array.isArray(bundle.files) ||
-      Object.keys(bundle.files).length !== Object.keys(HOT_SOURCES).length) throw invalidPackage();
+      !bundle.files || typeof bundle.files !== "object" || Array.isArray(bundle.files)) throw invalidPackage();
+  const names = Object.keys(bundle.files);
+  if (!names.every(name => Object.hasOwn(ALL_HOT_SOURCES, name))) throw invalidPackage();
   for (const name of Object.keys(HOT_SOURCES)) {
+    if (!Object.hasOwn(bundle.files, name)) throw invalidPackage();
+  }
+  for (const name of names) {
     const code = bundle.files[name];
-    if (!Object.hasOwn(bundle.files, name) || typeof code !== "string" || !code.trim()) throw invalidPackage();
+    if (typeof code !== "string" || !code.trim()) throw invalidPackage();
     try { new Script(name.endsWith(".cjs") ? wrap(code) : code, { filename: name }); }
     catch { throw invalidPackage(); }
   }
   return bundle;
 }
 
-function createBundle(sourceDir) {
+// Publish a four-file transition release for the baseline updater first.
+// A subsequent, higher version can carry the optional modules.
+function createBundle(sourceDir, { includeOptional = true } = {}) {
   const { version } = JSON.parse(fs.readFileSync(path.join(sourceDir, "package.json"), "utf8"));
   const files = Object.fromEntries(Object.entries(HOT_SOURCES).map(([name, file]) =>
     [name, fs.readFileSync(path.join(sourceDir, file), "utf8")]));
+  if (includeOptional) {
+    for (const [name, file] of Object.entries(OPTIONAL_HOT_SOURCES)) {
+      const full = path.join(sourceDir, file);
+      if (fs.existsSync(full)) files[name] = fs.readFileSync(full, "utf8");
+    }
+  }
   return validateBundle({ schema: 1, version, files }, version);
 }
 
@@ -240,7 +259,8 @@ function restoreOriginal(pluginDir, directory, name, original) {
   fs.renameSync(temporary, destination);
 }
 
-const TARGETS = [...Object.keys(HOT_SOURCES), "renderer-ui.js", "hud-release.json"];
+const REQUIRED_TARGETS = [...Object.keys(HOT_SOURCES), "renderer-ui.js", "hud-release.json"];
+const ALL_TARGETS = new Set([...Object.keys(ALL_HOT_SOURCES), "renderer-ui.js", "hud-release.json"]);
 const recoveryError = () => new UpdateError("UPDATE_ROLLBACK_FAILED", "HUD recovery needs attention. A local backup was kept.");
 
 function loadJournal(pending) {
@@ -248,9 +268,13 @@ function loadJournal(pending) {
     const file = readOriginal(pending);
     if (!file) return null;
     const journal = JSON.parse(file.data);
+    const fileKeys = journal.files && typeof journal.files === "object" && !Array.isArray(journal.files)
+      ? Object.keys(journal.files)
+      : null;
     if (!/^hud-update-[A-Za-z0-9]{6}$/.test(journal.backup) || !isStable(journal.version) ||
-        !journal.files || Object.keys(journal.files).length !== TARGETS.length ||
-        !TARGETS.every(name => Object.hasOwn(journal.files, name) &&
+        !fileKeys ||
+        !REQUIRED_TARGETS.every(name => Object.hasOwn(journal.files, name)) ||
+        !fileKeys.every(name => ALL_TARGETS.has(name) &&
           (journal.files[name] === null || (/^[a-f0-9]{64}$/.test(journal.files[name]?.hash) &&
            Number.isInteger(journal.files[name]?.mode) && journal.files[name].mode >= 0 && journal.files[name].mode <= 0o777)))) {
       throw recoveryError();
@@ -264,9 +288,10 @@ function loadJournal(pending) {
 async function recoverUpdate(pluginDir, pending, journal, runtime) {
   const backup = path.join(pluginDir, "backups", journal.backup);
   const originals = new Map();
+  const journalTargets = Object.keys(journal.files);
   try {
     if (!fs.lstatSync(backup).isDirectory()) throw recoveryError();
-    for (const name of TARGETS) {
+    for (const name of journalTargets) {
       const entry = journal.files[name];
       const original = entry ? readOriginal(path.join(backup, name)) : null;
       if (entry && (!original || sha256(original.data) !== entry.hash)) throw recoveryError();
@@ -274,7 +299,7 @@ async function recoverUpdate(pluginDir, pending, journal, runtime) {
     }
     const stage = fs.mkdtempSync(path.join(pluginDir, ".hud-restore-"));
     try {
-      for (const name of TARGETS) restoreOriginal(pluginDir, stage, name, originals.get(name));
+      for (const name of journalTargets) restoreOriginal(pluginDir, stage, name, originals.get(name));
     } finally {
       fs.rmSync(stage, { recursive: true, force: true });
     }
