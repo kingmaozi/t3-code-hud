@@ -2840,20 +2840,105 @@
   let externalQuotaProviders = [];
   let hudLocalQuotaEnvironmentId = "";
   let externalQuotaFetchedAt = 0;
-  let externalQuotaInFlight = false;
-  function refreshExternalQuotas(force = false) {
-    if (disposed || document.hidden || externalQuotaInFlight) return;
+  let externalQuotaInFlight = null;
+  let externalQuotaNeedsRecheck = false;
+  let externalQuotaPendingTimer = null;
+  let externalQuotaPendingRetries = 0;
+  let lastExternalQuotaEnvId = "";
+  let lastLocalHasNativeAgy = false;
+  const EXTERNAL_QUOTA_PENDING_MAX_RETRIES = 3;
+  const EXTERNAL_QUOTA_PENDING_DELAY_MS = 6_000;
+  function clearExternalQuotaPendingTimer() {
+    if (externalQuotaPendingTimer) {
+      if (typeof clearTimeout === "function") clearTimeout(externalQuotaPendingTimer);
+      externalQuotaPendingTimer = null;
+    }
+  }
+  function isConfirmedLocalQuotaEnv(envId) {
+    return (
+      typeof envId === "string" &&
+      envId.length > 0 &&
+      typeof hudLocalQuotaEnvironmentId === "string" &&
+      hudLocalQuotaEnvironmentId.length > 0 &&
+      envId === hudLocalQuotaEnvironmentId
+    );
+  }
+  function hasNativeAgyQuotaWindows(liveState = null) {
+    try {
+      const state = liveState || readLiveT3State();
+      const envId = typeof state?.environmentId === "string" ? state.environmentId : "";
+      if (!envId || (hudLocalQuotaEnvironmentId && !isConfirmedLocalQuotaEnv(envId))) return false;
+      const live = state?.usage;
+      const providers = Array.isArray(live?.providers) ? live.providers : [];
+      const sources = hudUsageSources(live);
+      const merged = mergeUsageLimitProviders(providers, sources);
+      return merged.some(
+        (p) => String(p?.driver || "").toLowerCase() === "antigravity" && Array.isArray(p?.usageLimits?.windows) && p.usageLimits.windows.length > 0
+      );
+    } catch {
+      return false;
+    }
+  }
+  function readExternalQuotaObservation() {
+    const state = (() => { try { return readLiveT3State(); } catch { return null; } })();
+    return {
+      environmentId: typeof state?.environmentId === "string" ? state.environmentId : "",
+      hasNativeAgy: Boolean(state) && hasNativeAgyQuotaWindows(state),
+    };
+  }
+  function quotaObservationChanged(before, after) {
+    return before.environmentId !== after.environmentId || before.hasNativeAgy !== after.hasNativeAgy;
+  }
+  function refreshExternalQuotas(force = false, fromPendingFollowUp = false, fromEnvironmentRecheck = false) {
+    if (disposed || document.hidden) return;
+    const observation = readExternalQuotaObservation();
+    if (externalQuotaInFlight) {
+      if (quotaObservationChanged(externalQuotaInFlight, observation)) externalQuotaNeedsRecheck = true;
+      return;
+    }
+    const { environmentId: currentEnvId, hasNativeAgy } = observation;
+    const isLocal = isConfirmedLocalQuotaEnv(currentEnvId);
+    const switchedBackToLocal = Boolean(isLocal && lastExternalQuotaEnvId && lastExternalQuotaEnvId !== currentEnvId);
+    const localNativeAgyChanged = isLocal && lastLocalHasNativeAgy !== hasNativeAgy;
+    if (currentEnvId) lastExternalQuotaEnvId = currentEnvId;
+
     const now = Date.now();
-    if (!force && now - externalQuotaFetchedAt < 115_000) return;
+    const bypassThrottle = force || fromPendingFollowUp || fromEnvironmentRecheck || switchedBackToLocal || localNativeAgyChanged;
+    if (!bypassThrottle && now - externalQuotaFetchedAt < 115_000) return;
     if (typeof window.__t3HubRpc !== "function") return;
-    externalQuotaInFlight = true;
-    window.__t3HubRpc("quota:external", force ? { force: true } : {})
+    if (!fromPendingFollowUp) {
+      externalQuotaPendingRetries = 0;
+      clearExternalQuotaPendingTimer();
+    }
+    if (isLocal) lastLocalHasNativeAgy = hasNativeAgy;
+    externalQuotaInFlight = observation;
+    const rpcPayload = {};
+    if (force) rpcPayload.force = true;
+    if (currentEnvId) rpcPayload.environmentId = currentEnvId;
+    if (hasNativeAgy) {
+      rpcPayload.observedEnvId = currentEnvId;
+      rpcPayload.hasNativeAgyQuota = true;
+    }
+    window.__t3HubRpc("quota:external", rpcPayload)
       .then((res) => {
         if (disposed) return;
         externalQuotaFetchedAt = Date.now();
         if (res && res.ok && Array.isArray(res.providers)) {
-          externalQuotaProviders = res.providers;
-          hudLocalQuotaEnvironmentId = typeof res.t3EnvironmentId === "string" ? res.t3EnvironmentId : "";
+          if (typeof res.t3EnvironmentId === "string") {
+            if (hudLocalQuotaEnvironmentId && res.t3EnvironmentId !== hudLocalQuotaEnvironmentId) {
+              externalQuotaProviders = externalQuotaProviders.filter(p => String(p?.driver || "").toLowerCase() !== "antigravity");
+            }
+            hudLocalQuotaEnvironmentId = res.t3EnvironmentId;
+          }
+          if (isConfirmedLocalQuotaEnv(currentEnvId)) lastLocalHasNativeAgy = hasNativeAgy;
+          const isRemote = Boolean(currentEnvId && hudLocalQuotaEnvironmentId && currentEnvId !== hudLocalQuotaEnvironmentId);
+          const isAgy = p => String(p?.driver || "").toLowerCase() === "antigravity";
+          if (!(isRemote && res.providers.length === 0)) {
+            const preserveAgy = res.agySkippedNative === true || (isRemote && !res.providers.some(isAgy));
+            externalQuotaProviders = preserveAgy
+              ? [...res.providers, ...externalQuotaProviders.filter(isAgy)]
+              : res.providers;
+          }
           if (latestStats) renderTopbarStats(latestStats);
           else {
             const quota = computeQuotaAndContext(null);
@@ -2861,12 +2946,31 @@
             scheduleLayoutSync();
           }
         }
+        if (res?.pending === true && !disposed && externalQuotaPendingRetries < EXTERNAL_QUOTA_PENDING_MAX_RETRIES) {
+          externalQuotaPendingRetries += 1;
+          clearExternalQuotaPendingTimer();
+          externalQuotaPendingTimer = setTimeout(() => {
+            externalQuotaPendingTimer = null;
+            refreshExternalQuotas(false, true);
+          }, EXTERNAL_QUOTA_PENDING_DELAY_MS);
+        } else {
+          clearExternalQuotaPendingTimer();
+          externalQuotaPendingRetries = 0;
+        }
       })
       .catch(() => {
         externalQuotaFetchedAt = Date.now();
+        clearExternalQuotaPendingTimer();
+        externalQuotaPendingRetries = 0;
       })
       .finally(() => {
-        externalQuotaInFlight = false;
+        externalQuotaInFlight = null;
+        const current = readExternalQuotaObservation();
+        const recheck = externalQuotaNeedsRecheck || quotaObservationChanged(observation, current);
+        externalQuotaNeedsRecheck = false;
+        if (!disposed && recheck && isConfirmedLocalQuotaEnv(current.environmentId)) {
+          refreshExternalQuotas(false, false, true);
+        }
       });
   }
 
@@ -3946,7 +4050,10 @@
     const merged = mergeUsageLimitProviders(providers, sources);
     if (merged.length) hudQuotaSnapshots.set(key, { observedAt: now, providers: merged });
     const current = merged.length ? merged : hudQuotaSnapshots.get(key)?.providers || [];
-    return local && externalProviders.length ? mergeUsageLimitProviders(current, [], externalProviders) : current;
+    if (!local || !externalProviders.length) return current;
+    const eligible = environmentId ? externalProviders :
+      externalProviders.filter(provider => String(provider?.driver || "").toLowerCase() !== "antigravity");
+    return mergeUsageLimitProviders(current, [], eligible);
   }
 
   function computeQuotaAndContext(stats) {
@@ -5841,6 +5948,8 @@
     cachedRouter = null;
     clearInterval(routeWatchTimer);
     clearInterval(streamWatchTimer);
+    clearExternalQuotaPendingTimer();
+    externalQuotaPendingRetries = 0;
     if (pollTimer && typeof clearTimeout === "function") clearTimeout(pollTimer);
     if (trailingFastRefreshTimer) {
       if (typeof clearTimeout === "function") clearTimeout(trailingFastRefreshTimer);

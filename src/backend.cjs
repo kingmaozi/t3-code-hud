@@ -43,6 +43,72 @@ function getDevinQuotaReader() {
   _devinQuotaHome = curHome;
   return _devinQuotaInstance;
 }
+const agyQuotaModule = path.join(__dirname, "hub-agy-quota.cjs");
+function resolveActiveT3Paths() {
+  const homeDir = process.env.HOME || os.homedir();
+  const t3CodeHome = process.env.T3CODE_HOME || "";
+  if (fs.existsSync(agyQuotaModule)) {
+    try {
+      const mod = require(agyQuotaModule);
+      if (typeof mod.resolveT3Paths === "function") {
+        return mod.resolveT3Paths({ homeDir, t3CodeHome });
+      }
+    } catch {}
+  }
+  const resolvedHome = path.resolve(homeDir);
+  const rawCustom = String(t3CodeHome).trim();
+  if (!rawCustom) {
+    const baseDir = path.join(resolvedHome, ".t3");
+    return {
+      homeDir: resolvedHome,
+      baseDir,
+      userDataDir: path.join(baseDir, "userdata"),
+      toolsDir: path.join(baseDir, "tools"),
+      isCustom: false,
+      isDirectDataDir: false,
+    };
+  }
+  const baseDir = path.resolve(rawCustom);
+  const stdUserdata = path.join(baseDir, "userdata");
+  let hasStdUserdata = false;
+  try { fs.lstatSync(stdUserdata); hasStdUserdata = true; } catch {}
+  const hasDirectMarker = !hasStdUserdata && ["environment-id", "settings.json", "statev2.sqlite"].some((name) => {
+    try { fs.lstatSync(path.join(baseDir, name)); return true; } catch { return false; }
+  });
+  return {
+    homeDir: resolvedHome,
+    baseDir,
+    userDataDir: hasDirectMarker ? baseDir : stdUserdata,
+    toolsDir: path.join(baseDir, "tools"),
+    isCustom: true,
+    isDirectDataDir: hasDirectMarker,
+  };
+}
+let _agyQuotaInstance = null;
+let _agyQuotaKey = null;
+function getAgyQuotaReader() {
+  if (!fs.existsSync(agyQuotaModule)) return null;
+  const t3Paths = resolveActiveT3Paths();
+  const pluginDir = process.env.T3_HUD_DIR ? path.resolve(process.env.T3_HUD_DIR) : path.join(t3Paths.homeDir, ".t3", "hud-plugin");
+  const key = `${t3Paths.homeDir}\0${t3Paths.baseDir}\0${t3Paths.userDataDir}\0${t3Paths.toolsDir}\0${pluginDir}`;
+  if (_agyQuotaInstance && _agyQuotaKey === key) return _agyQuotaInstance;
+  try {
+    const { createAgyQuotaReader } = require(agyQuotaModule);
+    if (typeof createAgyQuotaReader !== "function") return null;
+    _agyQuotaInstance = createAgyQuotaReader({
+      homeDir: t3Paths.homeDir,
+      t3CodeHome: process.env.T3CODE_HOME || "",
+      baseDir: t3Paths.baseDir,
+      userDataDir: t3Paths.userDataDir,
+      toolsDir: t3Paths.toolsDir,
+      pluginDir,
+    });
+    _agyQuotaKey = key;
+    return _agyQuotaInstance;
+  } catch {
+    return null;
+  }
+}
 function getTaskBoard() {
   const curHome = process.env.HOME || os.homedir();
   if (_taskBoardInstance && _taskBoardHome === curHome) return _taskBoardInstance;
@@ -3752,11 +3818,31 @@ function projectMemoryPayload(payload) {
 
 function readHudLocalEnvironmentId() {
   try {
-    const activeUserdata = process.env.T3CODE_HOME ? path.resolve(process.env.T3CODE_HOME) : T3_USERDATA;
-    const id = fs.readFileSync(path.join(activeUserdata, "environment-id"), "utf8").trim();
-    if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) return id;
-  } catch {}
-  return null;
+    const paths = resolveActiveT3Paths();
+    if (fs.existsSync(agyQuotaModule)) {
+      const { readT3EnvironmentId } = require(agyQuotaModule);
+      if (typeof readT3EnvironmentId === "function") return readT3EnvironmentId(paths);
+    }
+    // The four-file transition can run before the optional quota reader is installed.
+    let file = path.join(paths.userDataDir, "environment-id");
+    const alias = process.platform === "darwin" && file.match(/^\/(?:tmp|var|etc)(?=\/)/)?.[0];
+    if (alias && fs.realpathSync(alias) === "/private" + alias) file = "/private" + file;
+    if (fs.realpathSync(file) !== file) return "";
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW || 0));
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > 128 || fs.realpathSync(file) !== file) return "";
+      const buffer = Buffer.alloc(129);
+      const size = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (size !== stat.size) return "";
+      const id = buffer.toString("utf8", 0, size).trim();
+      return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : "";
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
 }
 
 async function hubCall(action, payload = {}) {
@@ -4159,10 +4245,36 @@ async function hubCall(action, payload = {}) {
         return payload?.enabled === true ? mgr.enable() : mgr.disable();
       }
       case "quota:external": {
-        const devin = await getDevinQuotaReader().readDevinQuota({ force: payload?.force === true });
+        const force = payload?.force === true;
+        const localEnvId = readHudLocalEnvironmentId();
+        const observed = payload?.observedEnvId ?? payload?.environmentId;
+        const skipAgyForNative =
+          payload?.hasNativeAgyQuota === true &&
+          Boolean(localEnvId) &&
+          typeof observed === "string" &&
+          observed.trim() === localEnvId;
+        const skipAgy = skipAgyForNative || isTestEnv();
+        const agyReader = skipAgy ? null : getAgyQuotaReader();
+        const [devinRes, agyRes] = await Promise.allSettled([
+          getDevinQuotaReader().readDevinQuota({ force }),
+          agyReader ? agyReader.readAgyQuotas({ force }) : Promise.resolve(null),
+        ]);
+        const devin = devinRes.status === "fulfilled" ? devinRes.value : null;
+        const agy = agyRes.status === "fulfilled" ? agyRes.value : null;
         const providers = [];
         if (devin?.available && devin.provider) providers.push(devin.provider);
-        return { ok: true, providers, t3EnvironmentId: readHudLocalEnvironmentId() };
+        if (agy?.available && Array.isArray(agy.providers)) {
+          for (const p of agy.providers) {
+            if (p) providers.push(p);
+          }
+        }
+        return {
+          ok: true,
+          providers,
+          t3EnvironmentId: localEnvId,
+          ...(skipAgyForNative ? { agySkippedNative: true } : {}),
+          ...(agy?.pending === true ? { pending: true } : {}),
+        };
       }
       case "settings:get": return { ...getHostSettingsManager().getSettingsSnapshot(), t3EnvironmentId: readHudLocalEnvironmentId() };
       case "settings:update": return getHostSettingsManager().updateHostSetting(payload);

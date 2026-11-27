@@ -590,3 +590,536 @@ test("OpenCode and Devin recognize portable shell-wrapper MCP entries and setup 
   assert.equal(jsoncSummary.setupSummary.providers.find((p) => p.instanceId === "opencode").reason, "opencode_jsonc_manual");
   assert.equal(fs.existsSync(opencodeConfig), false, "must not create sibling opencode.json when opencode.jsonc is in use");
 });
+
+test("claudeAgent default ~/.claude.json onboarding preserves unrelated top-level keys, creates 0600 backup, and reads back configured", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true, displayName: "Claude Agent" } });
+  const target = path.join(f.homeDir, ".claude.json");
+  const original = {
+    oauthAccount: { emailAddress: "user@example.test", accountUuid: "acct-1" },
+    userID: "user-123",
+    projects: { "/workspace/demo": { allowedTools: ["Read"] } },
+    servers: { unrelatedTopLevel: true },
+    mcpServers: {
+      other_tool: { type: "stdio", command: "keep-mcp", args: ["--flag"], env: { TOKEN: "keep" } },
+    },
+  };
+  write(target, original);
+  fs.chmodSync(target, 0o600);
+
+  const beforeSummary = manager(f).getSetupSummary();
+  assert.equal(beforeSummary.missing, 1);
+  assert.equal(beforeSummary.providers[0].status, "missing");
+  assert.equal(beforeSummary.providers[0].reason, "entry_missing");
+
+  const result = manager(f).setup();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.changed, ["claudeAgent"]);
+  assert.equal(result.setupSummary.configured, 1);
+  assert.equal(result.setupSummary.providers[0].status, "configured");
+  assert.equal(result.setupSummary.providers[0].reason, "router_memory_only");
+
+  assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(target + ".t3hub.bak").mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target + ".t3hub.bak", "utf8")), original);
+
+  const after = JSON.parse(fs.readFileSync(target, "utf8"));
+  assert.deepEqual(after.oauthAccount, original.oauthAccount);
+  assert.equal(after.userID, original.userID);
+  assert.deepEqual(after.projects, original.projects);
+  assert.deepEqual(after.servers, original.servers);
+  assert.deepEqual(after.mcpServers.other_tool, original.mcpServers.other_tool);
+  assert.deepEqual(after.mcpServers.t3_hub, { type: "stdio", command: f.routerBin, args: ["--memory-only"] });
+
+  // Also works when ~/.claude.json does not exist yet and with driver alias "claude"
+  const fresh = fixture(); t.after(() => fs.rmSync(fresh.root, { recursive: true, force: true }));
+  settings(fresh, { claude: { driver: "claude", enabled: true, displayName: "Claude" } });
+  const freshTarget = path.join(fresh.homeDir, ".claude.json");
+  assert.equal(fs.existsSync(freshTarget), false);
+  const freshRes = manager(fresh).setup();
+  assert.equal(freshRes.ok, true);
+  assert.deepEqual(freshRes.changed, ["claude"]);
+  assert.equal(fs.statSync(freshTarget).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(fs.readFileSync(freshTarget, "utf8")), {
+    mcpServers: { t3_hub: { type: "stdio", command: fresh.routerBin, args: ["--memory-only"] } },
+  });
+});
+
+test("claudeAgent recognizes claude mcp add -s user entry with empty env and portable shell wrapper", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const target = path.join(f.homeDir, ".claude.json");
+  write(target, {
+    mcpServers: {
+      t3_hub: { type: "stdio", command: f.routerBin, args: ["--memory-only"], env: {} },
+    },
+  });
+  const before = fs.readFileSync(target, "utf8");
+  const summary = manager(f).getSetupSummary();
+  assert.equal(summary.configured, 1);
+  assert.equal(summary.providers[0].reason, "router_memory_only");
+  const setupRes = manager(f).setup();
+  assert.equal(setupRes.ok, true);
+  assert.deepEqual(setupRes.changed, []);
+  assert.equal(fs.readFileSync(target, "utf8"), before);
+
+  // Portable /bin/sh wrapper with empty env is also recognized as configured
+  write(target, {
+    mcpServers: {
+      t3_hub: { type: "stdio", command: "/bin/sh", args: ["-c", 'exec "$HOME/.t3/bin/t3-mcp-router" --memory-only'], env: {} },
+    },
+  });
+  const portableSummary = manager(f).getSetupSummary();
+  assert.equal(portableSummary.configured, 1);
+  assert.equal(portableSummary.providers[0].reason, "router_memory_only");
+});
+
+test("claudeAgent flags custom env, non-stdio type, disabled, extra keys, and duplicate entries as conflict without overwriting", (t) => {
+  const cases = [
+    ["custom env", { t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"], env: { CUSTOM: "1" } } }, "hub_entry_custom_options"],
+    ["non-object env", { t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"], env: null } }, "hub_entry_custom_options"],
+    ["http type", { t3_hub: { type: "http", command: "ROUTER", args: ["--memory-only"] } }, "hub_entry_custom_options"],
+    ["disabled entry", { t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"], disabled: true } }, "hub_entry_disabled"],
+    ["enabled false", { t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"], enabled: false } }, "hub_entry_disabled"],
+    ["extra unknown key", { t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"], headers: { X: "1" } } }, "hub_entry_custom_options"],
+    ["duplicate hub entries", {
+      t3_hub: { type: "stdio", command: "ROUTER", args: ["--memory-only"] },
+      "t3-hub": { type: "stdio", command: "ROUTER", args: ["--memory-only"] },
+    }, "duplicate_hub_entries"],
+  ];
+  for (const [label, serversTemplate, expectedReason] of cases) {
+    const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+    const target = path.join(f.homeDir, ".claude.json");
+    const servers = JSON.parse(JSON.stringify(serversTemplate).replaceAll("ROUTER", f.routerBin));
+    write(target, { mcpServers: servers });
+    const before = fs.readFileSync(target, "utf8");
+    const result = manager(f).setup();
+    assert.equal(result.ok, false, label);
+    assert.deepEqual(result.changed, [], label);
+    assert.equal(result.setupSummary.conflict, 1, label);
+    assert.equal(result.setupSummary.providers[0].reason, expectedReason, label);
+    assert.equal(fs.readFileSync(target, "utf8"), before, `${label}: must not overwrite conflicting entry`);
+  }
+
+  // Non-boolean toggle stays unknown and untouched
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const target = path.join(f.homeDir, ".claude.json");
+  write(target, { mcpServers: { t3_hub: { type: "stdio", command: f.routerBin, args: ["--memory-only"], enabled: "false" } } });
+  const before = fs.readFileSync(target, "utf8");
+  const res = manager(f).setup();
+  assert.equal(res.setupSummary.unknown, 1);
+  assert.equal(res.setupSummary.providers[0].reason, "hub_entry_toggle_invalid");
+  assert.equal(fs.readFileSync(target, "utf8"), before);
+});
+
+test("claudeAgent custom homePath validates bounds, pending readiness without mkdir, and rejects unsafe values", (t) => {
+  // 1. Valid existing homePath (with ~/ expansion) writes <homePath>/.claude.json
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const customDir = path.join(f.homeDir, ".claude-work");
+  fs.mkdirSync(customDir, { recursive: true });
+  settings(f, { claudeWork: { driver: "claudeAgent", enabled: true, config: { homePath: "~/.claude-work" } } });
+  const res = manager(f).setup();
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.changed, ["claudeWork"]);
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false, "must write custom homePath, not default ~/.claude.json");
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(customDir, ".claude.json"), "utf8")).mcpServers.t3_hub, {
+    type: "stdio", command: f.routerBin, args: ["--memory-only"],
+  });
+
+  // 2. Non-existent homePath stays pending/claude_home_not_ready and must not mkdir
+  const missingDir = path.join(f.homeDir, ".claude-missing");
+  settings(f, { claudeMissing: { driver: "claudeAgent", enabled: true, config: { homePath: missingDir } } });
+  const pendingRes = manager(f).setup();
+  assert.equal(pendingRes.ok, false);
+  assert.equal(pendingRes.setupSummary.pending, 1);
+  assert.equal(pendingRes.setupSummary.providers[0].reason, "claude_home_not_ready");
+  assert.equal(fs.existsSync(missingDir), false, "must not auto-mkdir missing claude homePath");
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false);
+
+  // 3. Invalid type, relative path, outside homeDir, and symlinked homePath all fail closed with zero writes
+  const outsideDir = path.join(f.root, "elsewhere");
+  fs.mkdirSync(outsideDir, { recursive: true });
+  const symlinkDir = path.join(f.homeDir, ".claude-link");
+  fs.symlinkSync(outsideDir, symlinkDir);
+  const badCases = [
+    [123, "claude_home_invalid"],
+    ["relative/claude", "claude_home_not_absolute"],
+    [outsideDir, "claude_home_outside_home"],
+    [symlinkDir, "claude_home_unsafe"],
+  ];
+  for (const [homePath, expectedReason] of badCases) {
+    settings(f, { claudeBad: { driver: "claudeAgent", enabled: true, config: { homePath } } });
+    const badRes = manager(f).setup();
+    assert.equal(badRes.ok, false, expectedReason);
+    assert.deepEqual(badRes.changed, [], expectedReason);
+    assert.equal(badRes.setupSummary.unknown, 1, expectedReason);
+    assert.equal(badRes.setupSummary.providers[0].reason, expectedReason, expectedReason);
+    assert.equal(fs.existsSync(path.join(outsideDir, ".claude.json")), false, expectedReason);
+    assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false, expectedReason);
+  }
+});
+
+test("claudeAgent options.claudeConfigDir takes effect when homePath is absent and fails closed on unsafe paths", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true, config: { homePath: "" } } });
+  const envDir = path.join(f.homeDir, ".claude-env");
+  fs.mkdirSync(envDir, { recursive: true });
+  const okRes = manager(f, { claudeConfigDir: envDir }).setup();
+  assert.equal(okRes.ok, true);
+  assert.deepEqual(okRes.changed, ["claudeAgent"]);
+  assert.equal(fs.existsSync(path.join(envDir, ".claude.json")), true);
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false);
+
+  // Outside homeDir fails closed and does NOT silently fall back to ~/.claude.json
+  const outsideDir = path.join(f.root, "outside-claude");
+  fs.mkdirSync(outsideDir, { recursive: true });
+  const failRes = manager(f, { claudeConfigDir: outsideDir }).setup();
+  assert.equal(failRes.ok, false);
+  assert.deepEqual(failRes.changed, []);
+  assert.equal(failRes.setupSummary.unknown, 1);
+  assert.equal(failRes.setupSummary.providers[0].reason, "claude_home_outside_home");
+  assert.equal(fs.existsSync(path.join(outsideDir, ".claude.json")), false);
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false);
+
+  // Missing claudeConfigDir stays pending without mkdir or fallback to ~/.claude.json
+  const missingEnvDir = path.join(f.homeDir, ".claude-env-missing");
+  const pendingRes = manager(f, { claudeConfigDir: missingEnvDir }).setup();
+  assert.equal(pendingRes.ok, false);
+  assert.equal(pendingRes.setupSummary.pending, 1);
+  assert.equal(pendingRes.setupSummary.providers[0].reason, "claude_home_not_ready");
+  assert.equal(fs.existsSync(missingEnvDir), false);
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false);
+});
+
+test("claudeAgent treats symlinked or corrupted ~/.claude.json as unknown with zero writes and preserves Magpie ownership", (t) => {
+  // 1. Symlinked ~/.claude.json
+  const sym = fixture(); t.after(() => fs.rmSync(sym.root, { recursive: true, force: true }));
+  settings(sym, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const realFile = path.join(sym.root, "outside.json");
+  write(realFile, { mcpServers: {} });
+  const linkTarget = path.join(sym.homeDir, ".claude.json");
+  fs.symlinkSync(realFile, linkTarget);
+  const symRes = manager(sym).setup();
+  assert.equal(symRes.ok, false);
+  assert.deepEqual(symRes.changed, []);
+  assert.equal(symRes.setupSummary.unknown, 1);
+  assert.equal(symRes.setupSummary.providers[0].reason, "target_symlink");
+  assert.deepEqual(JSON.parse(fs.readFileSync(realFile, "utf8")), { mcpServers: {} });
+
+  // 2. Corrupted JSON in ~/.claude.json
+  const bad = fixture(); t.after(() => fs.rmSync(bad.root, { recursive: true, force: true }));
+  settings(bad, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const badTarget = path.join(bad.homeDir, ".claude.json");
+  write(badTarget, "{ broken-json");
+  const badRes = manager(bad).setup();
+  assert.equal(badRes.ok, false);
+  assert.deepEqual(badRes.changed, []);
+  assert.equal(badRes.setupSummary.unknown, 1);
+  assert.equal(badRes.setupSummary.providers[0].reason, "json_invalid");
+  assert.equal(fs.readFileSync(badTarget, "utf8"), "{ broken-json");
+
+  // 3. Magpie ownership stays respected for host === "claude"
+  const mag = fixture(); t.after(() => fs.rmSync(mag.root, { recursive: true, force: true }));
+  settings(mag, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const magTarget = path.join(mag.homeDir, ".claude.json");
+  write(magTarget, { mcpServers: {} });
+  const magpie = path.join(mag.homeDir, ".config", "magpie", "library.json");
+  write(magpie, { mcp: [{ name: "existing", agents: ["claude"] }], agents: ["claude"] });
+  const magBefore = fs.readFileSync(magTarget, "utf8");
+  const magRes = manager(mag).setup();
+  assert.equal(magRes.setupSummary.pending, 1);
+  assert.equal(magRes.setupSummary.providers[0].reason, "managed_by_magpie");
+  assert.equal(fs.readFileSync(magTarget, "utf8"), magBefore);
+});
+
+test("claudeAgent implicit enablement and legacy config.enabled:false match T3 0.1.13 rules", (t) => {
+  // 1. Missing providerInstances entry when selected as defaultModelSelection / fallbackModelSelection
+  const missingEntry = fixture(); t.after(() => fs.rmSync(missingEntry.root, { recursive: true, force: true }));
+  settings(missingEntry, {}, { defaultModelSelection: { instanceId: "claudeAgent" } });
+  const target1 = path.join(missingEntry.homeDir, ".claude.json");
+  const res1 = manager(missingEntry).setup();
+  assert.equal(res1.ok, true);
+  assert.deepEqual(res1.changed, ["claudeAgent"]);
+  assert.equal(res1.setupSummary.configured, 1);
+  assert.equal(res1.setupSummary.providers[0].host, "claude");
+  assert.equal(res1.setupSummary.providers[0].customConfigDir, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target1, "utf8")).mcpServers.t3_hub, {
+    type: "stdio", command: missingEntry.routerBin, args: ["--memory-only"],
+  });
+
+  // 2. Entry present with omitted top-level enabled and selected in fallbackModelSelection
+  const omittedEnabled = fixture(); t.after(() => fs.rmSync(omittedEnabled.root, { recursive: true, force: true }));
+  settings(omittedEnabled, { claudeAgent: { driver: "claudeAgent", displayName: "Claude Default" } }, {
+    defaultModelSelection: { instanceId: "" },
+    fallbackModelSelection: { instanceId: "claudeAgent" },
+  });
+  const res2 = manager(omittedEnabled).setup();
+  assert.equal(res2.ok, true);
+  assert.deepEqual(res2.changed, ["claudeAgent"]);
+  assert.equal(res2.setupSummary.configured, 1);
+
+  // 3. Legacy config.enabled:false overrides top-level enabled:true (unselected -> skipped; selected -> unknown/selected_provider_disabled; zero writes)
+  const legacyOff = fixture(); t.after(() => fs.rmSync(legacyOff.root, { recursive: true, force: true }));
+  settings(legacyOff, {
+    muse: { driver: "muse", enabled: true },
+    claudeAgent: { driver: "claudeAgent", enabled: true, config: { enabled: false } },
+  }, { defaultModelSelection: { instanceId: "muse" } });
+  write(path.join(legacyOff.homeDir, ".config", "muse", "settings.json"), { mcpServers: {} });
+  const legacyTarget = path.join(legacyOff.homeDir, ".claude.json");
+  const res3 = manager(legacyOff).setup();
+  assert.deepEqual(res3.changed, ["muse"]);
+  assert.equal(res3.setupSummary.providers.some((p) => p.instanceId === "claudeAgent"), false);
+  assert.equal(fs.existsSync(legacyTarget), false, "config.enabled:false must never write ~/.claude.json");
+
+  settings(legacyOff, {
+    claudeAgent: { driver: "claudeAgent", enabled: true, config: { enabled: false } },
+  }, { defaultModelSelection: { instanceId: "claudeAgent" } });
+  const res4 = manager(legacyOff).setup();
+  assert.equal(res4.ok, false);
+  assert.equal(res4.setupSummary.unknown, 1);
+  assert.equal(res4.setupSummary.providers[0].reason, "selected_provider_disabled");
+  assert.equal(fs.existsSync(legacyTarget), false);
+});
+
+test("claudeAgent resolves instance environment CLAUDE_CONFIG_DIR and fails closed on homePath:null or invalid env", (t) => {
+  // 1. homePath: "" + instance environment array [{ name: "CLAUDE_CONFIG_DIR", value: "<dir>" }]
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const envDir = path.join(f.homeDir, ".claude-inst-env");
+  fs.mkdirSync(envDir, { recursive: true });
+  settings(f, {
+    personal: {
+      driver: "claudeAgent",
+      enabled: true,
+      displayName: "Personal",
+      config: { homePath: "" },
+      environment: [{ name: "OTHER", value: "1" }, { name: "CLAUDE_CONFIG_DIR", value: envDir }],
+    },
+  });
+  const res = manager(f).setup();
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.changed, ["personal"]);
+  assert.equal(res.setupSummary.providers[0].host, "claude");
+  assert.equal(res.setupSummary.providers[0].customConfigDir, true);
+  assert.equal(JSON.stringify(res.setupSummary).includes(envDir), false, "summary must not leak config paths");
+  assert.equal(fs.existsSync(path.join(envDir, ".claude.json")), true);
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false, "must not create/touch default ~/.claude.json");
+
+  // 2. Top-level environment plain object form { CLAUDE_CONFIG_DIR: "<dir>" }
+  const fObj = fixture(); t.after(() => fs.rmSync(fObj.root, { recursive: true, force: true }));
+  const objDir = path.join(fObj.homeDir, ".claude-top-obj-env");
+  fs.mkdirSync(objDir, { recursive: true });
+  settings(fObj, {
+    work: { driver: "claudeAgent", enabled: true, config: { homePath: "" }, environment: { CLAUDE_CONFIG_DIR: objDir } },
+  });
+  const objRes = manager(fObj).setup();
+  assert.equal(objRes.ok, true);
+  assert.equal(objRes.setupSummary.providers[0].customConfigDir, true);
+  assert.equal(fs.existsSync(path.join(objDir, ".claude.json")), true);
+  assert.equal(fs.existsSync(path.join(fObj.homeDir, ".claude.json")), false);
+
+  // 3. Explicit homePath: null fails closed with claude_home_invalid and never falls back to ~/.claude.json
+  const fNull = fixture(); t.after(() => fs.rmSync(fNull.root, { recursive: true, force: true }));
+  settings(fNull, { claudeNull: { driver: "claudeAgent", enabled: true, config: { homePath: null } } });
+  const nullRes = manager(fNull).setup();
+  assert.equal(nullRes.ok, false);
+  assert.deepEqual(nullRes.changed, []);
+  assert.equal(nullRes.setupSummary.unknown, 1);
+  assert.equal(nullRes.setupSummary.providers[0].reason, "claude_home_invalid");
+  assert.equal(fs.existsSync(path.join(fNull.homeDir, ".claude.json")), false);
+
+  // 4. Invalid instance environment formats (non-array/non-object, or CLAUDE_CONFIG_DIR value null) fail closed
+  for (const badEnv of ["bad-string", null, [{ name: "CLAUDE_CONFIG_DIR", value: null }], { CLAUDE_CONFIG_DIR: 42 }]) {
+    const fBad = fixture(); t.after(() => fs.rmSync(fBad.root, { recursive: true, force: true }));
+    settings(fBad, { claudeBadEnv: { driver: "claudeAgent", enabled: true, config: { homePath: "" }, environment: badEnv } });
+    const badRes = manager(fBad).setup();
+    assert.equal(badRes.ok, false);
+    assert.deepEqual(badRes.changed, []);
+    assert.equal(badRes.setupSummary.unknown, 1);
+    assert.equal(badRes.setupSummary.providers[0].reason, "claude_home_invalid");
+    assert.equal(fs.existsSync(path.join(fBad.homeDir, ".claude.json")), false);
+  }
+});
+
+test("claudeAgent tightens existing 0644 .claude.json to 0600 while preserving oauthAccount", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  settings(f, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const target = path.join(f.homeDir, ".claude.json");
+  const original = { oauthAccount: { emailAddress: "acct@example.test" }, mcpServers: {} };
+  write(target, original);
+  fs.chmodSync(target, 0o644);
+  assert.equal(fs.statSync(target).mode & 0o777, 0o644);
+
+  const res = manager(f).setup();
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.changed, ["claudeAgent"]);
+  assert.equal(fs.statSync(target).mode & 0o777, 0o600, "main .claude.json must be tightened to 0600");
+  assert.equal(fs.statSync(target + ".t3hub.bak").mode & 0o777, 0o600, "backup must be 0600");
+  const after = JSON.parse(fs.readFileSync(target, "utf8"));
+  assert.deepEqual(after.oauthAccount, original.oauthAccount);
+  assert.deepEqual(after.mcpServers.t3_hub, { type: "stdio", command: f.routerBin, args: ["--memory-only"] });
+});
+
+test("claudeAgent detects duplicate JSON keys for literal t3_hub conflict and non-hub duplicate sections without modifying bytes", (t) => {
+  // 1. Literal duplicate "t3_hub" (custom HTTP first, canonical stdio second) -> conflict/duplicate_hub_entries
+  const dupHub = fixture(); t.after(() => fs.rmSync(dupHub.root, { recursive: true, force: true }));
+  settings(dupHub, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const dupHubTarget = path.join(dupHub.homeDir, ".claude.json");
+  const dupHubRaw = `{\n  "mcpServers": {\n    "t3_hub": { "type": "http", "url": "https://example.test/mcp" },\n    "t3_hub": { "type": "stdio", "command": ${JSON.stringify(dupHub.routerBin)}, "args": ["--memory-only"] }\n  }\n}\n`;
+  write(dupHubTarget, dupHubRaw);
+  const dupHubRes = manager(dupHub).setup();
+  assert.equal(dupHubRes.ok, false);
+  assert.deepEqual(dupHubRes.changed, []);
+  assert.equal(dupHubRes.setupSummary.conflict, 1);
+  assert.equal(dupHubRes.setupSummary.providers[0].reason, "duplicate_hub_entries");
+  assert.equal(fs.readFileSync(dupHubTarget, "utf8"), dupHubRaw);
+
+  // 2. Unicode-escaped duplicate "t3\u005fhub" + "t3_hub" -> conflict/duplicate_hub_entries
+  const escDup = fixture(); t.after(() => fs.rmSync(escDup.root, { recursive: true, force: true }));
+  settings(escDup, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const escTarget = path.join(escDup.homeDir, ".claude.json");
+  const escRaw = `{"mcpServers":{"t3\\u005fhub":{"type":"http"},"t3_hub":{"type":"stdio","command":${JSON.stringify(escDup.routerBin)},"args":["--memory-only"]}}}\n`;
+  write(escTarget, escRaw);
+  const escRes = manager(escDup).setup();
+  assert.equal(escRes.setupSummary.conflict, 1);
+  assert.equal(escRes.setupSummary.providers[0].reason, "duplicate_hub_entries");
+  assert.equal(fs.readFileSync(escTarget, "utf8"), escRaw);
+
+  // 3. Duplicate non-hub key ("projects") -> unknown/json_duplicate_keys and exact original bytes preserved
+  const dupProj = fixture(); t.after(() => fs.rmSync(dupProj.root, { recursive: true, force: true }));
+  settings(dupProj, { claudeAgent: { driver: "claudeAgent", enabled: true } });
+  const dupProjTarget = path.join(dupProj.homeDir, ".claude.json");
+  const dupProjRaw = `{\n  "projects": { "/first": { "keep": true } },\n  "projects": { "/second": { "keep": true } },\n  "mcpServers": {}\n}\n`;
+  write(dupProjTarget, dupProjRaw);
+  const dupProjRes = manager(dupProj).setup();
+  assert.equal(dupProjRes.ok, false);
+  assert.deepEqual(dupProjRes.changed, []);
+  assert.equal(dupProjRes.setupSummary.unknown, 1);
+  assert.equal(dupProjRes.setupSummary.providers[0].reason, "json_duplicate_keys");
+  assert.equal(fs.readFileSync(dupProjTarget, "utf8"), dupProjRaw);
+});
+
+test("claudeAgent explicit empty CLAUDE_CONFIG_DIR clears host override instead of inheriting options.claudeConfigDir", (t) => {
+  for (const [label, environment] of [
+    ["array empty string", [{ name: "CLAUDE_CONFIG_DIR", value: "" }]],
+    ["array later empty overrides earlier set", [{ name: "CLAUDE_CONFIG_DIR", value: "/ignored" }, { name: "CLAUDE_CONFIG_DIR", value: "   " }]],
+    ["object empty string", { CLAUDE_CONFIG_DIR: "" }],
+  ]) {
+    const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const hostCustomDir = path.join(f.homeDir, ".claude-host-env");
+    fs.mkdirSync(hostCustomDir, { recursive: true });
+    settings(f, {
+      personal: {
+        driver: "claudeAgent",
+        enabled: true,
+        displayName: "Personal",
+        config: { homePath: "" },
+        environment,
+      },
+    });
+    const res = manager(f, { claudeConfigDir: hostCustomDir }).setup();
+    assert.equal(res.ok, true, label);
+    assert.deepEqual(res.changed, ["personal"], label);
+    assert.equal(res.setupSummary.providers[0].customConfigDir, false, label);
+    assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), true, `${label}: must write default ~/.claude.json`);
+    assert.equal(fs.existsSync(path.join(hostCustomDir, ".claude.json")), false, `${label}: must not write host claudeConfigDir`);
+  }
+
+  // Absent CLAUDE_CONFIG_DIR in instance environment still inherits host options.claudeConfigDir
+  const fInherit = fixture(); t.after(() => fs.rmSync(fInherit.root, { recursive: true, force: true }));
+  const hostDir = path.join(fInherit.homeDir, ".claude-host-inherit");
+  fs.mkdirSync(hostDir, { recursive: true });
+  settings(fInherit, {
+    personal: {
+      driver: "claudeAgent",
+      enabled: true,
+      config: { homePath: "" },
+      environment: [{ name: "OTHER", value: "1" }],
+    },
+  });
+  const inheritRes = manager(fInherit, { claudeConfigDir: hostDir }).setup();
+  assert.equal(inheritRes.ok, true);
+  assert.equal(inheritRes.setupSummary.providers[0].customConfigDir, true);
+  assert.equal(fs.existsSync(path.join(hostDir, ".claude.json")), true);
+  assert.equal(fs.existsSync(path.join(fInherit.homeDir, ".claude.json")), false);
+});
+
+test("claudeAgent rejects invalid non-object config (e.g. 42 or null) fail-closed with zero writes", (t) => {
+  for (const badConfig of [42, null, [], true, "bad"]) {
+    const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const hostDir = path.join(f.homeDir, ".claude-host");
+    fs.mkdirSync(hostDir, { recursive: true });
+    settings(f, {
+      claudeBadCfg: { driver: "claudeAgent", enabled: true, config: badConfig },
+    });
+    const res = manager(f, { claudeConfigDir: hostDir }).setup();
+    assert.equal(res.ok, false, `config=${JSON.stringify(badConfig)}`);
+    assert.deepEqual(res.changed, [], `config=${JSON.stringify(badConfig)}`);
+    assert.equal(res.setupSummary.unknown, 1, `config=${JSON.stringify(badConfig)}`);
+    assert.equal(res.setupSummary.providers[0].reason, "claude_home_invalid", `config=${JSON.stringify(badConfig)}`);
+    assert.equal(res.setupSummary.providers[0].customConfigDir, false, `config=${JSON.stringify(badConfig)}`);
+    assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false, `config=${JSON.stringify(badConfig)}`);
+    assert.equal(fs.existsSync(path.join(hostDir, ".claude.json")), false, `config=${JSON.stringify(badConfig)}`);
+  }
+
+  // Implicitly enabled selected claudeAgent with non-object config also fails closed
+  const fImplicit = fixture(); t.after(() => fs.rmSync(fImplicit.root, { recursive: true, force: true }));
+  settings(fImplicit, {
+    claudeAgent: { driver: "claudeAgent", config: 42 },
+  }, { defaultModelSelection: { instanceId: "claudeAgent" } });
+  const implicitRes = manager(fImplicit).setup();
+  assert.equal(implicitRes.ok, false);
+  assert.deepEqual(implicitRes.changed, []);
+  assert.equal(implicitRes.setupSummary.unknown, 1);
+  assert.equal(implicitRes.setupSummary.providers[0].reason, "claude_home_invalid");
+  assert.equal(fs.existsSync(path.join(fImplicit.homeDir, ".claude.json")), false);
+});
+
+test("claudeAgent ignores nested config.environment and only reads top-level target.environment", (t) => {
+  for (const [label, nestedEnv] of [
+    ["nested array", (dir) => [{ name: "CLAUDE_CONFIG_DIR", value: dir }]],
+    ["nested object", (dir) => ({ CLAUDE_CONFIG_DIR: dir })],
+  ]) {
+    const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const nestedDir = path.join(f.homeDir, ".claude-nested-ignored");
+    fs.mkdirSync(nestedDir, { recursive: true });
+    settings(f, {
+      work: {
+        driver: "claudeAgent",
+        enabled: true,
+        config: { homePath: "", environment: nestedEnv(nestedDir) },
+      },
+    });
+    const res = manager(f).setup();
+    assert.equal(res.ok, true, label);
+    assert.deepEqual(res.changed, ["work"], label);
+    assert.equal(res.setupSummary.providers[0].customConfigDir, false, label);
+    assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), true, `${label}: must write default ~/.claude.json`);
+    assert.equal(fs.existsSync(path.join(nestedDir, ".claude.json")), false, `${label}: nested config.environment must not be used`);
+  }
+});
+
+test("selected custom Claude instance with custom homePath and config.enabled:false reports selected_provider_disabled with zero writes", (t) => {
+  const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const customDir = path.join(f.homeDir, ".claude-personal");
+  fs.mkdirSync(customDir, { recursive: true });
+  settings(f, {
+    personal: {
+      driver: "claudeAgent",
+      enabled: true,
+      displayName: "Personal",
+      config: { homePath: customDir, enabled: false },
+    },
+  }, { defaultModelSelection: { instanceId: "personal" } });
+  const res = manager(f).setup();
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.changed, []);
+  assert.equal(res.setupSummary.unknown, 1);
+  assert.equal(res.setupSummary.providers[0].instanceId, "personal");
+  assert.equal(res.setupSummary.providers[0].host, "claude");
+  assert.equal(res.setupSummary.providers[0].status, "unknown");
+  assert.equal(res.setupSummary.providers[0].reason, "selected_provider_disabled");
+  assert.equal(fs.existsSync(path.join(customDir, ".claude.json")), false, "must not write custom homePath/.claude.json");
+  assert.equal(fs.existsSync(path.join(f.homeDir, ".claude.json")), false, "must not write default ~/.claude.json");
+});

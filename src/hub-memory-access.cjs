@@ -40,6 +40,8 @@ const DRIVER_HOSTS = Object.freeze({
   antigravity: "antigravity",
   opencode: "opencode",
   devin: "devin",
+  claudeagent: "claude",
+  claude: "claude",
 });
 function resolveTargetHost(target) {
   const driver = String(target?.driver || "").toLowerCase();
@@ -521,19 +523,27 @@ function createMemoryAccessManager(options = {}) {
           if (selectedIds.has(instanceId)) targets.push({ instanceId: safeReason(instanceId), displayName: "T3 Agent", driver: "unknown", state: "unknown", reason: "provider_invalid" });
           continue;
         }
-        if (value.enabled === false) {
+        const driverLower = String(value.driver || "").toLowerCase();
+        const isClaudeEntry = instanceId === "claudeAgent" || driverLower === "claudeagent" || driverLower === "claude";
+        const rawConfig = isPlainObject(value.config) ? value.config : {};
+        const configInvalid = isClaudeEntry && Object.prototype.hasOwnProperty.call(value, "config") && value.config !== undefined && !isPlainObject(value.config);
+        const envExtra = Object.prototype.hasOwnProperty.call(value, "environment") ? { environment: value.environment } : {};
+        if (value.enabled === false || (isClaudeEntry && rawConfig.enabled === false)) {
           if (selectedIds.has(instanceId)) targets.push({ instanceId, displayName: safeLabel(value.displayName || instanceId), driver: String(value.driver || ""), state: "unknown", reason: "selected_provider_disabled" });
           continue;
         }
         if (value.enabled !== true) {
-          if (instanceId === "codex" && selectedIds.has(instanceId) && String(value.driver || "").toLowerCase() === "codex") {
-            targets.push({ instanceId, displayName: safeLabel(value.displayName || "Codex"), driver: "codex", config: isPlainObject(value.config) ? value.config : {}, implicit: true });
+          if (instanceId === "codex" && selectedIds.has(instanceId) && driverLower === "codex") {
+            targets.push({ instanceId, displayName: safeLabel(value.displayName || "Codex"), driver: "codex", config: rawConfig, implicit: true });
+          } else if (isClaudeEntry && value.enabled === undefined && selectedIds.has(instanceId)) {
+            const effectiveDriver = driverLower === "claude" ? "claude" : "claudeAgent";
+            targets.push({ instanceId, displayName: safeLabel(value.displayName || "Claude"), driver: effectiveDriver, config: rawConfig, configInvalid, ...envExtra, implicit: true });
           } else if (selectedIds.has(instanceId)) {
             targets.push({ instanceId: safeReason(instanceId), displayName: safeLabel(value.displayName), driver: safeReason(value.driver), state: "unknown", reason: "enabled_state_unknown" });
           }
           continue;
         }
-        targets.push({ instanceId, displayName: safeLabel(value.displayName || instanceId), driver: typeof value.driver === "string" ? value.driver : "", config: isPlainObject(value.config) ? value.config : {}, implicit: false });
+        targets.push({ instanceId, displayName: safeLabel(value.displayName || instanceId), driver: typeof value.driver === "string" ? value.driver : "", config: rawConfig, ...(isClaudeEntry ? { configInvalid } : {}), ...envExtra, implicit: false });
       }
       for (const selectionName of ["defaultModelSelection", "fallbackModelSelection"]) {
         const instanceId = settings[selectionName]?.instanceId;
@@ -543,6 +553,7 @@ function createMemoryAccessManager(options = {}) {
           continue;
         }
         if (instanceId === "codex") targets.push({ instanceId: "codex", displayName: "Codex", driver: "codex", config: {}, implicit: true });
+        else if (instanceId === "claudeAgent") targets.push({ instanceId: "claudeAgent", displayName: "Claude", driver: "claudeAgent", config: {}, implicit: true });
         else targets.push({ instanceId, displayName: safeLabel(instanceId), driver: "", config: {}, implicit: true, unknownSelection: true });
       }
       const deduped = new Map();
@@ -588,13 +599,100 @@ function createMemoryAccessManager(options = {}) {
     } catch { return { state: "unknown", hosts: new Set(), hubStatus: new Map() }; }
   }
 
+  function validateClaudeHomePath(raw) {
+    const trimmed = raw.trim();
+    const expanded = trimmed === "~" ? homeDir : trimmed.startsWith("~/") ? path.join(homeDir, trimmed.slice(2)) : trimmed;
+    if (!path.isAbsolute(expanded)) return { ok: false, status: "unknown", reason: "claude_home_not_absolute", file: null, format: null, customConfigDir: true };
+    const claudeHome = path.resolve(expanded);
+    if (!within(homeDir, claudeHome)) return { ok: false, status: "unknown", reason: "claude_home_outside_home", file: null, format: null, customConfigDir: true };
+    let dirStat;
+    try {
+      assertNoSymlinkPath(claudeHome, { includeTarget: true });
+      dirStat = lstatOptional(claudeHome);
+    } catch {
+      return { ok: false, status: "unknown", reason: "claude_home_unsafe", file: null, format: null, customConfigDir: true };
+    }
+    const targetFile = path.join(claudeHome, ".claude.json");
+    if (!dirStat) return { ok: false, status: "pending", reason: "claude_home_not_ready", file: targetFile, format: "claude-json", customConfigDir: true };
+    if (!isDirectoryEntry(claudeHome, dirStat)) return { ok: false, status: "unknown", reason: "claude_home_unsafe", file: null, format: null, customConfigDir: true };
+    return { ok: true, file: targetFile, customConfigDir: true };
+  }
+
+  function extractClaudeConfigDirFromEnv(envValue) {
+    if (envValue === undefined) return { invalid: false, state: "absent", value: "" };
+    if (Array.isArray(envValue)) {
+      let seen = false;
+      let matched = "";
+      for (const item of envValue) {
+        if (!isPlainObject(item)) return { invalid: true, state: "absent", value: "" };
+        if (item.name === "CLAUDE_CONFIG_DIR") {
+          if (typeof item.value !== "string") return { invalid: true, state: "absent", value: "" };
+          seen = true;
+          matched = item.value.trim();
+        }
+      }
+      if (!seen) return { invalid: false, state: "absent", value: "" };
+      return matched
+        ? { invalid: false, state: "set", value: matched }
+        : { invalid: false, state: "cleared", value: "" };
+    }
+    if (isPlainObject(envValue)) {
+      if (Object.prototype.hasOwnProperty.call(envValue, "CLAUDE_CONFIG_DIR")) {
+        const val = envValue.CLAUDE_CONFIG_DIR;
+        if (val === undefined) return { invalid: false, state: "absent", value: "" };
+        if (typeof val !== "string") return { invalid: true, state: "absent", value: "" };
+        const trimmed = val.trim();
+        return trimmed
+          ? { invalid: false, state: "set", value: trimmed }
+          : { invalid: false, state: "cleared", value: "" };
+      }
+      return { invalid: false, state: "absent", value: "" };
+    }
+    return { invalid: true, state: "absent", value: "" };
+  }
+
+  function resolveClaudeHome(target) {
+    if (target.configInvalid) {
+      return { ok: false, status: "unknown", reason: "claude_home_invalid", file: null, format: null, customConfigDir: false };
+    }
+    const config = isPlainObject(target.config) ? target.config : {};
+    if (Object.prototype.hasOwnProperty.call(config, "homePath") && config.homePath !== undefined) {
+      if (typeof config.homePath !== "string") {
+        return { ok: false, status: "unknown", reason: "claude_home_invalid", file: null, format: null, customConfigDir: true };
+      }
+      const trimmedHome = config.homePath.trim();
+      if (trimmedHome) return validateClaudeHomePath(trimmedHome);
+    }
+    const envSource = Object.prototype.hasOwnProperty.call(target, "environment") ? target.environment : undefined;
+    const extracted = extractClaudeConfigDirFromEnv(envSource);
+    if (extracted.invalid) {
+      return { ok: false, status: "unknown", reason: "claude_home_invalid", file: null, format: null, customConfigDir: true };
+    }
+    if (extracted.state === "set") return validateClaudeHomePath(extracted.value);
+    if (extracted.state === "cleared") {
+      return { ok: true, file: path.join(homeDir, ".claude.json"), customConfigDir: false };
+    }
+    let rawHostDir = "";
+    if (options.claudeConfigDir !== undefined) {
+      if (typeof options.claudeConfigDir !== "string") {
+        return { ok: false, status: "unknown", reason: "claude_home_invalid", file: null, format: null, customConfigDir: true };
+      }
+      rawHostDir = options.claudeConfigDir.trim();
+    }
+    if (!rawHostDir && path.resolve(homeDir) === path.resolve(os.homedir()) && process.env.CLAUDE_CONFIG_DIR) {
+      rawHostDir = String(process.env.CLAUDE_CONFIG_DIR).trim();
+    }
+    if (rawHostDir) return validateClaudeHomePath(rawHostDir);
+    return { ok: true, file: path.join(homeDir, ".claude.json"), customConfigDir: false };
+  }
+
   function detectTarget(target, magpie) {
     const driver = String(target.driver || "").toLowerCase();
     if (target.state === "unknown") return { target, status: "unknown", reason: target.reason || "provider_invalid", file: null, format: null, managedByMagpie: false };
     if (target.unknownSelection) return { target, status: "unsupported", reason: "unknown_default_provider", file: null, format: null, managedByMagpie: false };
     const host = resolveTargetHost(target);
     if (!host) return { target, status: "unsupported", reason: driver ? "unsupported_driver" : "driver_missing", file: null, format: null, managedByMagpie: false };
-    let file, format;
+    let file, format, customConfigDir = false;
     if (host === "codex") {
       let codexHome = path.join(homeDir, ".codex");
       if (Object.prototype.hasOwnProperty.call(target.config || {}, "homePath")) {
@@ -607,6 +705,14 @@ function createMemoryAccessManager(options = {}) {
         try { assertNoSymlinkPath(codexHome, { includeTarget: true }); } catch { return { target, status: "unknown", reason: "codex_home_unsafe", file: null, format: null, managedByMagpie: false }; }
       }
       file = path.join(codexHome, "config.toml"); format = "toml";
+    } else if (host === "claude") {
+      const resolved = resolveClaudeHome(target);
+      customConfigDir = Boolean(resolved.customConfigDir);
+      if (!resolved.ok) {
+        return { target, status: resolved.status, reason: resolved.reason, file: resolved.file, format: resolved.format, managedByMagpie: false, customConfigDir };
+      }
+      file = resolved.file;
+      format = "claude-json";
     } else if (host === "muse") {
       file = path.join(resolveConfigHome(), "muse", "settings.json"); format = "json";
     } else if (host === "opencode") {
@@ -642,11 +748,13 @@ function createMemoryAccessManager(options = {}) {
       targetFileExists = read.exists;
       if (read.exists) {
         sourceText = read.text; mode = read.mode;
-        const identity = format === "opencode-json"
-          ? inspectOpenCodeJsonEntry(sourceText, routerBin)
-          : format === "json"
-            ? inspectJsonEntry(sourceText, routerBin)
-            : inspectTomlEntry(sourceText, routerBin);
+        const identity = format === "claude-json"
+          ? inspectClaudeJsonEntry(sourceText, routerBin)
+          : format === "opencode-json"
+            ? inspectOpenCodeJsonEntry(sourceText, routerBin)
+            : format === "json"
+              ? inspectJsonEntry(sourceText, routerBin)
+              : inspectTomlEntry(sourceText, routerBin);
         status = identity.status; reason = identity.reason;
       } else if (format === "toml") {
         // Validate the existing Codex document before allowing an appended table.
@@ -658,15 +766,15 @@ function createMemoryAccessManager(options = {}) {
     const managedByMagpie = magpie.state === "ok" && magpie.hosts.has(host) || magpie.state === "unknown" && host === "codex";
     if (managedByMagpie && status !== "configured") {
       if (status === "missing" && magpie.hubStatus?.get(host) === "configured") {
-        return { target, status: "configured", reason: "managed_by_magpie", file, format, sourceText, mode, managedByMagpie: true };
+        return { target, status: "configured", reason: "managed_by_magpie", file, format, sourceText, mode, managedByMagpie: true, customConfigDir };
       }
-      return { target, status: "pending", reason: "managed_by_magpie", underlyingStatus: status, file, format, sourceText, mode, managedByMagpie: true };
+      return { target, status: "pending", reason: "managed_by_magpie", underlyingStatus: status, file, format, sourceText, mode, managedByMagpie: true, customConfigDir };
     }
     if (magpie.state === "unknown" && !managedByMagpie && status === "missing") {
-      return { target, status: "unknown", reason: "magpie_ownership_unknown", file, format, sourceText, mode, managedByMagpie: false };
+      return { target, status: "unknown", reason: "magpie_ownership_unknown", file, format, sourceText, mode, managedByMagpie: false, customConfigDir };
     }
     if (driver === "antigravity" && !targetFileExists) {
-      return { target, status: "pending", reason: "agy_native_helper_compatibility", file, format, sourceText, mode, managedByMagpie };
+      return { target, status: "pending", reason: "agy_native_helper_compatibility", file, format, sourceText, mode, managedByMagpie, customConfigDir };
     }
     if (driver === "antigravity" && status === "missing") {
       let hasOtherMcp = false;
@@ -675,9 +783,9 @@ function createMemoryAccessManager(options = {}) {
         const servers = document.mcpServers || {};
         hasOtherMcp = isPlainObject(servers) && Object.keys(servers).some((name) => !isHubName(name));
       } catch {}
-      if (!hasOtherMcp) return { target, status: "pending", reason: "agy_native_helper_compatibility", file, format, sourceText, mode, managedByMagpie };
+      if (!hasOtherMcp) return { target, status: "pending", reason: "agy_native_helper_compatibility", file, format, sourceText, mode, managedByMagpie, customConfigDir };
     }
-    return { target, status, reason, file, format, sourceText, mode, managedByMagpie };
+    return { target, status, reason, file, format, sourceText, mode, managedByMagpie, customConfigDir };
   }
 
   function inspectJsonEntry(text, expectedRouter) {
@@ -727,6 +835,143 @@ function createMemoryAccessManager(options = {}) {
       return { status: "conflict", reason: "hub_command_unknown" };
     }
     const identity = routerCommand(entry.command[0], entry.command.slice(1), expectedRouter);
+    if (!identity.ok) return { status: "conflict", reason: identity.reason };
+    return identity.memoryOnly ? { status: "configured", reason: "router_memory_only" } : { status: "configured", reason: "legacy_broad_mode" };
+  }
+
+  function scanJsonDuplicateKeys(text) {
+    const len = text.length;
+    let i = 0;
+    const stack = [];
+    let duplicateHub = false;
+    let duplicateOther = false;
+    let pendingKey = null;
+
+    function skipWs() {
+      while (i < len) {
+        const c = text.charCodeAt(i);
+        if (c === 32 || c === 9 || c === 10 || c === 13) i += 1;
+        else break;
+      }
+    }
+    function readString() {
+      const start = i;
+      i += 1;
+      while (i < len) {
+        const c = text.charCodeAt(i);
+        if (c === 92) { i += 2; continue; }
+        if (c === 34) { i += 1; break; }
+        i += 1;
+      }
+      return JSON.parse(text.slice(start, i));
+    }
+    function skipPrimitive() {
+      const start = i;
+      while (i < len) {
+        const c = text.charCodeAt(i);
+        if (c === 32 || c === 9 || c === 10 || c === 13 || c === 44 || c === 93 || c === 125) break;
+        i += 1;
+      }
+      if (i === start) i += 1;
+    }
+    function finishValue() {
+      const top = stack[stack.length - 1];
+      if (top) top.state = "comma_or_end";
+    }
+
+    while (true) {
+      skipWs();
+      if (i >= len) break;
+      const top = stack[stack.length - 1];
+      const ch = text[i];
+
+      if (top && top.type === "object") {
+        if (top.state === "key_or_end") {
+          if (ch === "}") { i += 1; stack.pop(); finishValue(); continue; }
+          const key = readString();
+          if (top.keys.has(key)) {
+            if (top.isMcpServers && isHubName(key)) duplicateHub = true;
+            else duplicateOther = true;
+          } else {
+            top.keys.add(key);
+          }
+          if (top.isMcpServers && isHubName(key)) {
+            top.hubCount += 1;
+            if (top.hubCount > 1) duplicateHub = true;
+          }
+          pendingKey = key;
+          top.state = "colon";
+          continue;
+        }
+        if (top.state === "colon") {
+          i += 1;
+          top.state = "value";
+          continue;
+        }
+        if (top.state === "comma_or_end") {
+          if (ch === ",") { i += 1; top.state = "key_or_end"; continue; }
+          if (ch === "}") { i += 1; stack.pop(); finishValue(); continue; }
+        }
+      } else if (top && top.type === "array") {
+        if (top.state === "value_or_end" && ch === "]") {
+          i += 1; stack.pop(); finishValue(); continue;
+        }
+        if (top.state === "comma_or_end") {
+          if (ch === ",") { i += 1; top.state = "value_or_end"; continue; }
+          if (ch === "]") { i += 1; stack.pop(); finishValue(); continue; }
+        }
+      }
+
+      if (ch === "{") {
+        const isMcpServers = stack.length === 1 && stack[0].type === "object" && stack[0].state === "value" && pendingKey === "mcpServers";
+        pendingKey = null;
+        i += 1;
+        stack.push({ type: "object", state: "key_or_end", keys: new Set(), hubCount: 0, isMcpServers });
+      } else if (ch === "[") {
+        pendingKey = null;
+        i += 1;
+        stack.push({ type: "array", state: "value_or_end" });
+      } else if (ch === '"') {
+        pendingKey = null;
+        readString();
+        finishValue();
+      } else {
+        pendingKey = null;
+        skipPrimitive();
+        finishValue();
+      }
+    }
+    return { duplicateHub, duplicateOther };
+  }
+
+  function inspectClaudeJsonEntry(text, expectedRouter) {
+    let document;
+    try { document = JSON.parse(text); } catch { return { status: "unknown", reason: "json_invalid" }; }
+    if (!isPlainObject(document)) return { status: "unknown", reason: "json_root_invalid" };
+    const dup = scanJsonDuplicateKeys(text);
+    if (dup.duplicateHub) return { status: "conflict", reason: "duplicate_hub_entries" };
+    if (dup.duplicateOther) return { status: "unknown", reason: "json_duplicate_keys" };
+    if (document.mcpServers != null && !isPlainObject(document.mcpServers)) return { status: "unknown", reason: "mcp_servers_invalid" };
+    const servers = document.mcpServers || {};
+    const matches = Object.entries(servers).filter(([name]) => isHubName(name));
+    if (!matches.length) return { status: "missing", reason: "entry_missing" };
+    if (matches.length !== 1) return { status: "conflict", reason: "duplicate_hub_entries" };
+    return inspectClaudeJsonRouter(matches[0][1], expectedRouter);
+  }
+
+  function inspectClaudeJsonRouter(entry, expectedRouter) {
+    if (!isPlainObject(entry)) return { status: "conflict", reason: "hub_entry_invalid" };
+    if (hasInvalidToggle(entry)) return { status: "unknown", reason: "hub_entry_toggle_invalid" };
+    if (entry.enabled === false || entry.disabled === true) return { status: "conflict", reason: "hub_entry_disabled" };
+    if (entry.type !== undefined && entry.type !== "stdio") return { status: "conflict", reason: "hub_entry_custom_options" };
+    if (entry.env !== undefined && (!isPlainObject(entry.env) || Object.keys(entry.env).length > 0)) {
+      return { status: "conflict", reason: "hub_entry_custom_options" };
+    }
+    const keys = Object.keys(entry);
+    if (keys.some(key => !["type", "command", "args", "env", "enabled", "disabled"].includes(key))) {
+      return { status: "conflict", reason: "hub_entry_custom_options" };
+    }
+    const identity = routerCommand(entry.command, entry.args, expectedRouter);
     if (!identity.ok) return { status: "conflict", reason: identity.reason };
     return identity.memoryOnly ? { status: "configured", reason: "router_memory_only" } : { status: "configured", reason: "legacy_broad_mode" };
   }
@@ -806,6 +1051,8 @@ function createMemoryAccessManager(options = {}) {
         const result = detectTarget(target, magpie);
         providers.push({
           instanceId: safeLabel(target.instanceId), displayName: safeLabel(target.displayName),
+          host: resolveTargetHost(target) || null,
+          customConfigDir: Boolean(result.customConfigDir),
           status: SUMMARY_STATES.includes(result.status) ? result.status : "unknown",
           reason: safeReason(result.reason), runtime: "unverified",
         });
@@ -892,6 +1139,38 @@ function createMemoryAccessManager(options = {}) {
       document.mcp.t3_hub = { type: "local", command: [routerBin, ...MEMORY_ONLY_ARGS], enabled: true };
     }
     atomicWrite(file, JSON.stringify(document, null, 2) + "\n", { backup: true, mode: 0o600, expectedText: before.text });
+  }
+
+  function writeClaudeJsonTarget(target, detected) {
+    const file = detected.file;
+    if (!file) throw new Error("target_unknown");
+    const parent = path.dirname(file);
+    const parentStat = lstatOptional(parent);
+    if (!parentStat || !parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("target_directory_missing");
+    assertNoSymlinkPath(file, { includeTarget: true });
+    const before = readRegular(file);
+    if (detected.sourceText !== undefined && before.text !== detected.sourceText) throw new Error("concurrent_change");
+    let document = {};
+    if (before.exists) {
+      try { document = JSON.parse(before.text); } catch { throw new Error("json_invalid"); }
+      if (!isPlainObject(document)) throw new Error("json_root_invalid");
+      const dup = scanJsonDuplicateKeys(before.text);
+      if (dup.duplicateHub) throw new Error("duplicate_hub_entries");
+      if (dup.duplicateOther) throw new Error("json_duplicate_keys");
+    }
+    if (document.mcpServers != null && !isPlainObject(document.mcpServers)) throw new Error("mcp_servers_invalid");
+    document.mcpServers ||= {};
+    const matches = Object.keys(document.mcpServers).filter(isHubName);
+    if (matches.length) {
+      if (matches.length !== 1) throw new Error("duplicate_hub_entries");
+      const current = document.mcpServers[matches[0]];
+      const identity = inspectClaudeJsonRouter(current, routerBin);
+      if (!current || !isPlainObject(current) || identity.status !== "configured") throw new Error(identity.reason || "hub_entry_conflict");
+      document.mcpServers[matches[0]] = { ...current, type: "stdio", args: MEMORY_ONLY_ARGS };
+    } else {
+      document.mcpServers.t3_hub = { type: "stdio", command: routerBin, args: MEMORY_ONLY_ARGS };
+    }
+    atomicWrite(file, JSON.stringify(document, null, 2) + "\n", { backup: true, mode: 0o600, preserveMode: false, expectedText: before.text });
   }
 
   function writeJsonTarget(target, detected) {
@@ -1033,7 +1312,8 @@ function createMemoryAccessManager(options = {}) {
       if (!detected.file) { skipped.push({ instanceId: safeLabel(target.instanceId), status: "unknown", reason: "target_unavailable" }); continue; }
       if (!fs.existsSync(routerBin)) { skipped.push({ instanceId: safeLabel(target.instanceId), status: "unsupported", reason: "router_not_installed" }); continue; }
       try {
-        if (detected.format === "opencode-json") writeOpenCodeJsonTarget(target, detected);
+        if (detected.format === "claude-json") writeClaudeJsonTarget(target, detected);
+        else if (detected.format === "opencode-json") writeOpenCodeJsonTarget(target, detected);
         else if (detected.format === "json") writeJsonTarget(target, detected);
         else if (detected.format === "toml") writeTomlTarget(target, detected);
         else throw new Error("format_unsupported");

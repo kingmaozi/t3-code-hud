@@ -241,7 +241,7 @@ test("reload preserves release metadata after copying the raw renderer base", ma
   const server = http.createServer((request, response) => {
     requests.push([request.method, request.url, request.headers["x-t3-hud-token"]]);
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end('{"ok":true,"injected":true}');
+    response.end('{"ok":true,"results":[{"injected":true}]}');
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

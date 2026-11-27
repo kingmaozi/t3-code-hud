@@ -19,6 +19,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const electron = require("electron");
+const { readLiveBridgeRecord } = require("./hud-runtime.cjs");
 if (process.env) {
   process.env.PATH = [...new Set([
     path.join(os.homedir(), ".local", "bin"), path.join(os.homedir(), ".t3", "bin"),
@@ -106,6 +107,32 @@ async function isWindowMounted(win) {
   finally { clearTimeout(timer); }
 }
 
+const EXACT_T3_ORIGINS = new Set(["t3code://app", "t3code-dev://app"]);
+
+function extractT3CandidateOrigin(urlOrOrigin) {
+  if (!urlOrOrigin || typeof urlOrOrigin !== "string") return null;
+  let u;
+  try {
+    u = new URL(urlOrOrigin);
+  } catch {
+    return null;
+  }
+  if (u.username || u.password) return null;
+  if (u.protocol === "t3code:" || u.protocol === "t3code-dev:") {
+    if (u.hostname === "app" && !u.port) {
+      return `${u.protocol}//app`;
+    }
+    return null;
+  }
+  if (u.protocol === "http:" || u.protocol === "https:") {
+    if (u.hostname === "127.0.0.1" || u.hostname === "localhost") {
+      return u.origin;
+    }
+    return null;
+  }
+  return null;
+}
+
 function captureT3Origin() {
   if (capturedT3Origin) return capturedT3Origin;
   try {
@@ -115,24 +142,18 @@ function captureT3Origin() {
       if (!wc || wc.isDestroyed()) continue;
       const url = wc.getURL();
       if (!url) continue;
+      const candidateOrigin = extractT3CandidateOrigin(url);
+      if (!candidateOrigin) continue;
+      if (EXACT_T3_ORIGINS.has(candidateOrigin)) {
+        capturedT3Origin = candidateOrigin;
+        return capturedT3Origin;
+      }
       const title = win.getTitle() || "";
       const isT3Title = title === "T3 Code" || title === "T3 Code (Beta)";
       const urlHasT3 = url.includes("t3code");
-      if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) {
-        try {
-          capturedT3Origin = new URL(url).origin;
-        } catch {
-          capturedT3Origin = url.split("/").slice(0, 3).join("/");
-        }
-        return capturedT3Origin;
-      }
       if (isT3Title || urlHasT3) {
-        if (url.match(/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/)) {
-          try {
-            capturedT3Origin = new URL(url).origin;
-          } catch {}
-          if (capturedT3Origin) return capturedT3Origin;
-        }
+        capturedT3Origin = candidateOrigin;
+        return capturedT3Origin;
       }
     }
   } catch {}
@@ -140,23 +161,14 @@ function captureT3Origin() {
 }
 
 function isMainT3Url(url) {
-  if (!url || typeof url !== "string") return false;
-  if (url.startsWith("t3code://") || url.startsWith("t3code-dev://")) return true;
+  const candidateOrigin = extractT3CandidateOrigin(url);
+  if (!candidateOrigin) return false;
+  if (EXACT_T3_ORIGINS.has(candidateOrigin)) return true;
   // For http(s) loopback URLs, strictly require match to captured origin or t3code marker,
   // and reject arbitrary localhost preview windows.
-  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)) {
-    if (capturedT3Origin) {
-      try {
-        const u = new URL(url);
-        return u.origin === capturedT3Origin;
-      } catch {
-        return false;
-      }
-    }
-    // No capture yet: only accept if URL itself mentions t3code (heuristic upgrade path).
-    return url.includes("t3code");
-  }
-  return false;
+  if (capturedT3Origin) return candidateOrigin === capturedT3Origin;
+  // No capture yet: only accept if URL itself mentions t3code (heuristic upgrade path).
+  return url.includes("t3code");
 }
 
 function isHelperWindow(win) {
@@ -184,29 +196,27 @@ let sidecarBridgePromise = null;
 async function ensureSidecarBridge() {
   if (sidecarBridgePromise) return sidecarBridgePromise;
   sidecarBridgePromise = (async () => {
-    const bridgeFile = path.join(HUD_RUN_DIR, "hub-bridge.json");
-    const readRecord = () => {
-      try { return JSON.parse(fs.readFileSync(bridgeFile, "utf8")); } catch { return null; }
-    };
-    const isOwnedLiveBridge = (b) => {
-      if (!b || !Number.isInteger(b.pid) || b.pid <= 0 || typeof b.url !== "string" || !b.url ||
-          typeof b.token !== "string" || !b.token || !(process.pid > 0) || Number(b.watchPid) !== process.pid) return false;
-      try { process.kill(b.pid, 0); return true; } catch { return false; }
-    };
+    const readRecord = () => readLiveBridgeRecord(HUD_RUN_DIR, process.pid)?.record || null;
     const previous = readRecord();
-    if (isOwnedLiveBridge(previous)) return previous;
-    if (previous?.pid > 0 && Number(previous.watchPid) > 0 && Number(previous.watchPid) !== process.pid) {
-      let ownerDead = false;
-      try { process.kill(Number(previous.watchPid), 0); } catch { ownerDead = true; }
-      if (ownerDead) {
-        try { process.kill(previous.pid, "SIGTERM"); } catch {}
-        try { fs.unlinkSync(bridgeFile); } catch {}
-      }
-    }
+    if (previous) return previous;
     const bridgePath = path.join(__dirname, "hub-bridge.cjs");
     if (!fs.existsSync(bridgePath)) return null;
+    const origin = captureT3Origin();
+    const childEnv = {
+      ...(process.env || {}),
+      ELECTRON_RUN_AS_NODE: "1",
+      T3_HUD_DIR: path.dirname(HUD_RUN_DIR),
+      T3_WATCH_PID: String(process.pid),
+    };
+    delete childEnv.T3_DESKTOP_ORIGIN;
+    delete childEnv.T3_ALLOWED_LOOPBACK_ORIGIN;
+    if (origin && EXACT_T3_ORIGINS.has(origin)) {
+      childEnv.T3_DESKTOP_ORIGIN = origin;
+    } else if (origin) {
+      childEnv.T3_ALLOWED_LOOPBACK_ORIGIN = origin;
+    }
     const child = spawn(process.execPath, [bridgePath], {
-      env: { ...(process.env || {}), ELECTRON_RUN_AS_NODE: "1", T3_HUD_DIR: __dirname, T3_WATCH_PID: String(process.pid) },
+      env: childEnv,
       detached: true,
       stdio: "ignore",
     });
@@ -215,7 +225,7 @@ async function ensureSidecarBridge() {
     for (let attempt = 0; attempt < 30; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 80));
       const b = readRecord();
-      if (isOwnedLiveBridge(b)) return b;
+      if (b) return b;
     }
     return null;
   })().catch(() => null).finally(() => { sidecarBridgePromise = null; });
@@ -232,15 +242,8 @@ async function injectHudIntoWindow(win, forceReload = false) {
 
   try {
     if (typeof ensureSidecarBridge === "function") await ensureSidecarBridge();
-    let validBridge = null;
-    try {
-      const b = JSON.parse(fs.readFileSync(path.join(HUD_RUN_DIR, "hub-bridge.json"), "utf8"));
-      if (b && Number.isInteger(b.pid) && b.pid > 0 && typeof b.url === "string" && b.url && typeof b.token === "string" && b.token &&
-          process.pid > 0 && Number(b.watchPid) === process.pid) {
-        process.kill(b.pid, 0);
-        validBridge = { url: b.url, token: b.token };
-      }
-    } catch {}
+    const bridge = readLiveBridgeRecord(HUD_RUN_DIR, process.pid)?.record;
+    const validBridge = bridge ? { url: bridge.url, token: bridge.token } : null;
     if (!forceReload) {
       const bridgeMatches = validBridge
         ? `window.__t3HubSidecarBridge?.url === ${JSON.stringify(validBridge.url)} && window.__t3HubSidecarBridge?.token === ${JSON.stringify(validBridge.token)}`
@@ -280,10 +283,18 @@ async function injectHudIntoWindow(win, forceReload = false) {
   }
 }
 
+function strippedDesktopOrigin() {
+  if (!capturedT3Origin) captureT3Origin();
+  return capturedT3Origin && EXACT_T3_ORIGINS.has(capturedT3Origin) ? capturedT3Origin : null;
+}
+
 function allowedOrigin(origin) {
-  if (!origin || origin === "null") return null;
-  if (origin.startsWith("t3code://") || origin.startsWith("t3code-dev://")) return origin;
-  if (capturedT3Origin && origin === capturedT3Origin) return origin;
+  if (!origin || typeof origin !== "string" || origin === "null") return null;
+  const canonical = extractT3CandidateOrigin(origin);
+  if (!canonical || canonical !== origin) return null;
+  if (EXACT_T3_ORIGINS.has(canonical)) return canonical;
+  if (!capturedT3Origin) captureT3Origin();
+  if (capturedT3Origin && canonical === capturedT3Origin) return canonical;
   return null;
 }
 
@@ -294,12 +305,13 @@ function startLoopbackFallbackServer() {
       adminToken = crypto.randomBytes(32).toString("hex");
       const server = http.createServer(async (req, res) => {
         const reqOrigin = req.headers.origin || "";
-        const corsOrigin = allowedOrigin(reqOrigin);
+        const corsOrigin = reqOrigin ? allowedOrigin(reqOrigin) : strippedDesktopOrigin();
         if (corsOrigin) {
           res.setHeader("Access-Control-Allow-Origin", corsOrigin);
           res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-T3-Hud-Token");
           res.setHeader("Access-Control-Allow-Private-Network", "true");
+          res.setHeader("Vary", "Origin");
         }
 
         if (req.method === "OPTIONS") {

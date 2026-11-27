@@ -84,6 +84,133 @@ if [[ ! "$hud_release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.+-]+)?$
   exit 1
 fi
 
+install_electron_run_as_node_disabled() {
+  local app="$1"
+  [[ -n "$app" ]] || return 1
+  local fw="$app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+  [[ -f "$fw" ]] || fw="$app/Contents/Frameworks/Electron Framework.framework/Electron Framework"
+  [[ -f "$fw" ]] || return 1
+  local probe_node="" cand
+  for cand in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null || true)"; do
+    if [[ -n "$cand" && -x "$cand" ]]; then probe_node="$cand"; break; fi
+  done
+  if [[ -n "$probe_node" ]]; then
+    "$probe_node" -e '
+      const fs = require("node:fs");
+      const sentinel = Buffer.from("dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX", "ascii");
+      const fd = fs.openSync(process.argv[1], "r");
+      try {
+        const chunk = Buffer.allocUnsafe(4 * 1024 * 1024);
+        let tail = Buffer.alloc(0);
+        for (;;) {
+          const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+          if (n <= 0) break;
+          const view = tail.length ? Buffer.concat([tail, chunk.subarray(0, n)]) : chunk.subarray(0, n);
+          const idx = view.indexOf(sentinel);
+          if (idx >= 0) {
+            const after = idx + sentinel.length;
+            if (after + 3 <= view.length) {
+              const b0 = view[after];
+              const fuse0 = (b0 === 0x30 || b0 === 0x31) ? b0 : (b0 === 1 && view[after + 1] >= 1 ? view[after + 2] : 0x31);
+              process.exit(fuse0 === 0x30 ? 0 : 1);
+            }
+          }
+          const keep = Math.min(view.length, sentinel.length + 16);
+          tail = Buffer.from(view.subarray(view.length - keep));
+        }
+      } finally { fs.closeSync(fd); }
+      process.exit(1);
+    ' "$fw" 2>/dev/null
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import sys
+s = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX"
+with open(sys.argv[1], "rb") as f:
+    tail = b""
+    while True:
+        c = f.read(4 * 1024 * 1024)
+        if not c: break
+        v = tail + c
+        i = v.find(s)
+        if i >= 0 and i + len(s) + 3 <= len(v):
+            a = v[i + len(s)]
+            f0 = a if a in (48, 49) else (v[i + len(s) + 2] if a == 1 and v[i + len(s) + 1] >= 1 else 49)
+            sys.exit(0 if f0 == 48 else 1)
+        tail = v[-(len(s) + 16):]
+sys.exit(1)
+' "$fw" 2>/dev/null
+    return $?
+  fi
+  return 1
+}
+
+install_node_has_capabilities() {
+  local bin="$1"
+  local use_run_as_node="$2"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  if [[ "$use_run_as_node" == 1 ]]; then
+    env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$bin" -e 'require("node:sqlite"); if (typeof WebSocket !== "function") process.exit(2);' >/dev/null 2>&1
+  else
+    env -u NODE_OPTIONS -u ELECTRON_RUN_AS_NODE "$bin" -e 'require("node:sqlite"); if (typeof WebSocket !== "function") process.exit(2);' >/dev/null 2>&1
+  fi
+}
+
+JS_RUNNER=""
+JS_RUNNER_USE_RUN_AS_NODE=0
+if [[ -n "${T3_APP_PATH:-}" ]]; then
+  t3_app_candidates=("$T3_APP_PATH")
+else
+  t3_app_candidates=(
+    "/Applications/T3 Code (Beta).app"
+    "/Applications/T3 Code.app"
+    "/Applications/T3 Code (Nightly).app"
+    "$HOME/Applications/T3 Code (Beta).app"
+    "$HOME/Applications/T3 Code.app"
+    "$HOME/Applications/T3 Code (Nightly).app"
+  )
+fi
+for cand in "${t3_app_candidates[@]}"; do
+  if [[ -n "$cand" && -d "$cand/Contents/MacOS" ]]; then
+    if install_electron_run_as_node_disabled "$cand"; then
+      continue
+    fi
+    T3_CAND_BIN="$(find "$cand/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
+    if [[ -n "$T3_CAND_BIN" && -x "$T3_CAND_BIN" ]] && install_node_has_capabilities "$T3_CAND_BIN" 1; then
+      JS_RUNNER="$T3_CAND_BIN"
+      JS_RUNNER_USE_RUN_AS_NODE=1
+      break
+    fi
+  fi
+done
+if [[ -z "$JS_RUNNER" ]]; then
+  if [[ -n "${T3_HUD_NODE_BIN:-}" ]]; then
+    node_candidates=("$T3_HUD_NODE_BIN")
+  else
+    node_candidates=("/opt/homebrew/bin/node" "/usr/local/bin/node" "$(command -v node 2>/dev/null || true)")
+  fi
+  for node_cand in "${node_candidates[@]}"; do
+    if [[ -n "$node_cand" && -x "$node_cand" ]] && install_node_has_capabilities "$node_cand" 0; then
+      JS_RUNNER="$node_cand"
+      JS_RUNNER_USE_RUN_AS_NODE=0
+      break
+    fi
+  done
+fi
+if [[ -z "$JS_RUNNER" ]]; then
+  echo "[t3-hud] 未找到支持 node:sqlite 与 WebSocket 的可用 Node 运行时。安装已中止。" >&2
+  exit 1
+fi
+
+run_js_runner() {
+  if [[ "$JS_RUNNER_USE_RUN_AS_NODE" == 1 ]]; then
+    env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" "$@"
+  else
+    env -u NODE_OPTIONS -u ELECTRON_RUN_AS_NODE "$JS_RUNNER" "$@"
+  fi
+}
+
 DEST_DIR="$HOME/.t3/hud-plugin"
 BIN_DIR="$HOME/.t3/bin"
 RUN_DIR="$DEST_DIR/run"
@@ -100,6 +227,8 @@ mkdir -p "$DEST_DIR"
 cp "$SCRIPT_DIR/src/"*.cjs "$SCRIPT_DIR/src/"*.py "$SCRIPT_DIR/src/hub-drawer-ui.js" "$DEST_DIR/" 2>/dev/null || \
 cp "$SCRIPT_DIR/src/backend.cjs" \
    "$SCRIPT_DIR/src/main-hook.cjs" \
+   "$SCRIPT_DIR/src/hud-cdp-host.cjs" \
+   "$SCRIPT_DIR/src/hud-runtime.cjs" \
    "$SCRIPT_DIR/src/preload-bridge.cjs" \
    "$SCRIPT_DIR/src/bootstrap.cjs" \
    "$SCRIPT_DIR/src/hud-health.cjs" \
@@ -112,7 +241,7 @@ cp "$SCRIPT_DIR/src/backend.cjs" \
    "$DEST_DIR/"
 
 # Ensure sidecar modules present (explicit list for older clones)
-for f in hub-plugins.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs hub-memory-access.cjs hub-memory-connections.cjs hub-provider-resources.cjs hub-devin-quota.cjs update-guardian.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
+for f in hub-plugins.cjs hud-cdp-host.cjs hud-runtime.cjs hub-hooks.cjs hub-bridge.cjs hub-subagents.cjs hub-skills.cjs hub-memory-access.cjs hub-memory-connections.cjs hub-provider-resources.cjs hub-devin-quota.cjs hub-agy-quota.cjs update-guardian.cjs mcp-router.cjs memory-vault.cjs embed-manager.cjs hub-drawer-ui.js hub-task-board.cjs hub-artifact-access.cjs hub-host-settings.cjs hub-dream-scheduler.cjs; do
   if [[ -f "$SCRIPT_DIR/src/$f" && ! -f "$DEST_DIR/$f" ]]; then cp "$SCRIPT_DIR/src/$f" "$DEST_DIR/"; fi
 done
 
@@ -1045,28 +1174,13 @@ for hs in pc-lite.mjs memory-setup.mjs memory-stop-hook.mjs subagent-route-guard
   fi
 done
 
-JS_RUNNER=""
-for cand in "${T3_APP_PATH:-}" "/Applications/T3 Code (Beta).app" "/Applications/T3 Code.app" "/Applications/T3 Code (Nightly).app" "$HOME/Applications/T3 Code (Beta).app" "$HOME/Applications/T3 Code.app" "$HOME/Applications/T3 Code (Nightly).app"; do
-  if [[ -n "$cand" && -d "$cand/Contents/MacOS" ]]; then
-    T3_CAND_BIN="$(find "$cand/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n 1)"
-    if [[ -n "$T3_CAND_BIN" && -x "$T3_CAND_BIN" ]]; then
-      JS_RUNNER="$T3_CAND_BIN"
-      break
-    fi
-  fi
-done
-if [[ -z "$JS_RUNNER" ]] && command -v node >/dev/null 2>&1; then
-  JS_RUNNER="$(command -v node)"
-fi
-
 # Keep the release stamp in independent metadata so a later raw base copy
 # cannot erase it. Stage the complete bundle before exposing it to a live T3.
 # Embedding the drawer keeps it in the same CSP-safe executeJavaScript payload.
 TMP_RENDERER="$(mktemp -d "$DEST_DIR/.t3-hud-renderer.XXXXXX")"
 cp "$SCRIPT_DIR/src/renderer-ui.js" "$TMP_RENDERER/renderer-base.js"
 printf '{"version":"%s"}\n' "$hud_release_version" > "$TMP_RENDERER/hud-release.json"
-if [[ -n "$JS_RUNNER" ]]; then
-  env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" -e '
+run_js_runner -e '
     const fs = require("node:fs"), path = require("node:path");
     const [pluginDir, stageDir, version] = process.argv.slice(1);
     const { assembleRenderer } = require(path.resolve(pluginDir, "hud-release.cjs"));
@@ -1074,17 +1188,6 @@ if [[ -n "$JS_RUNNER" ]]; then
     const drawer = fs.readFileSync(path.join(pluginDir, "hub-drawer-ui.js"), "utf8");
     process.stdout.write(assembleRenderer(base, drawer, { version }));
   ' "$DEST_DIR" "$TMP_RENDERER" "$hud_release_version" > "$TMP_RENDERER/renderer-ui.js"
-else
-  # Allow installation before either T3 Code or Node is available. Both files
-  # come straight from the source tree, so there are no old headers to remove.
-  {
-    printf 'window.__t3HubDrawerEmbedded = true;\nwindow.__t3HudReleaseVersion = "%s";\n' "$hud_release_version"
-    cat "$TMP_RENDERER/renderer-base.js"
-    printf '\n;/* __T3_HUB_DRAWER_EMBED_START__ */\n'
-    cat "$DEST_DIR/hub-drawer-ui.js"
-    printf '\n/* __T3_HUB_DRAWER_EMBED_END__ */\n'
-  } > "$TMP_RENDERER/renderer-ui.js"
-fi
 chmod 0600 "$TMP_RENDERER/renderer-ui.js" "$TMP_RENDERER/renderer-base.js" "$TMP_RENDERER/hud-release.json"
 for renderer_file in renderer-base.js hud-release.json renderer-ui.js; do
   mv -f "$TMP_RENDERER/$renderer_file" "$DEST_DIR/$renderer_file"
@@ -1092,8 +1195,8 @@ done
 
 # Install only a new skill or the exact known legacy template; preserve custom
 # instructions and symlinks. This does not start a host, model, or MCP process.
-if [[ -n "$JS_RUNNER" && -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
-  if ! env -u NODE_OPTIONS ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" "$SCRIPT_DIR/scripts/install-memory-skill.cjs"; then
+if [[ -f "$SCRIPT_DIR/scripts/install-memory-skill.cjs" ]]; then
+  if ! run_js_runner "$SCRIPT_DIR/scripts/install-memory-skill.cjs"; then
     echo "[t3-hud] Memory skill setup skipped. HUD installation will continue." >&2
   fi
 fi
@@ -1257,7 +1360,7 @@ fi
 
 mkdir -p "$DEST_DIR"
 if [[ -n "$JS_RUNNER" && -x "$JS_RUNNER" ]]; then
-  ELECTRON_RUN_AS_NODE=1 "$JS_RUNNER" -e '
+  run_js_runner -e '
     const path = require("node:path");
     const [cfgFile, defLang, explicitLang] = process.argv.slice(1);
     const { updateHudLanguage } = require(path.resolve(path.dirname(cfgFile), "hud-config.cjs"));
@@ -1303,6 +1406,23 @@ if [[ -f "$RPC_INFO_FILE" ]]; then
   RPC_PID="$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' "$RPC_INFO_FILE" 2>/dev/null | grep -o '[0-9]\+' | head -n 1 || true)"
   if [[ -n "${RPC_PID:-}" ]] && kill -0 "$RPC_PID" 2>/dev/null; then
     "$BIN_DIR/t3-hud" reload >/dev/null 2>&1 || true
+  fi
+fi
+
+# Enable macOS LaunchAgent upgrade anti-drop guardian automatically and report status
+GUARDIAN_STATUS_MSG=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  guardian_out=""
+  if guardian_out="$("$BIN_DIR/t3-hud" guardian enable 2>&1)"; then
+    if [[ "$guardian_out" == *'"loaded":true'* ]]; then
+      GUARDIAN_STATUS_MSG="enabled (launchd loaded)"
+    else
+      GUARDIAN_STATUS_MSG="plist written, launchd not loaded ($guardian_out)"
+      echo "[t3-hud] Warning: upgrade guardian plist written but launchd did not confirm load: $guardian_out" >&2
+    fi
+  else
+    GUARDIAN_STATUS_MSG="failed ($guardian_out)"
+    echo "[t3-hud] Warning: failed to enable upgrade guardian: $guardian_out" >&2
   fi
 fi
 
