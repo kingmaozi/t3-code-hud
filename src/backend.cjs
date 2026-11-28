@@ -120,6 +120,17 @@ function getTaskBoard() {
   _taskBoardHome = curHome;
   return _taskBoardInstance;
 }
+let _lastHostPlanMirrorSweepAt = 0;
+const HOST_PLAN_MIRROR_SWEEP_MS = 15_000;
+function sweepHostPlanMirrors() {
+  if (isTestEnv()) return;
+  const nowMs = Date.now();
+  if (nowMs - _lastHostPlanMirrorSweepAt < HOST_PLAN_MIRROR_SWEEP_MS) return;
+  _lastHostPlanMirrorSweepAt = nowMs;
+  try {
+    getTaskBoard()?.queueActiveMainThreadMirrors?.();
+  } catch {}
+}
 function getHostSettingsManager() {
   const curHome = process.env.HOME || os.homedir();
   const curKey = `${curHome}\0${process.env.T3_HUB_DIR || ""}\0${process.env.T3CODE_HOME || ""}`;
@@ -4303,7 +4314,10 @@ async function hubCall(action, payload = {}) {
         return { ok: res?.ok !== false, config: latest, ...(res || {}) };
       }
       case "subagents:slashPrompt": return { prompt: hubSubagents.buildSlashCommandPrompt(payload?.mode) };
-      case "board:get": return getTaskBoard().getBoardSnapshot(payload || {});
+      case "board:get": {
+        sweepHostPlanMirrors();
+        return getTaskBoard().getBoardSnapshot(payload || {});
+      }
       case "board:update": return getTaskBoard().updatePlan(payload || {});
       case "board:clear": return getTaskBoard().clearPlan(payload || {});
       case "board:openArtifact": return await createArtifactAccess({ board: getTaskBoard(), homeDir: process.env.HOME || os.homedir() })(payload || {});
@@ -4335,13 +4349,20 @@ async function hubCall(action, payload = {}) {
       case "quota:external": {
         const force = payload?.force === true;
         const localEnvId = readHudLocalEnvironmentId();
-        const observed = payload?.observedEnvId ?? payload?.environmentId;
+        const rawObserved = payload?.observedEnvId ?? payload?.environmentId;
+        const observed = typeof rawObserved === "string" ? rawObserved.trim() : "";
+        const targetEnv = typeof payload?.environmentId === "string" ? payload.environmentId.trim() : "";
+        const isRemoteObserved = Boolean(
+          targetEnv && (!localEnvId || targetEnv.toLowerCase() !== localEnvId.toLowerCase())
+        );
+        const skipLocalAgy = payload?.skipLocalAgy === true || isRemoteObserved;
         const skipAgyForNative =
+          !skipLocalAgy &&
           payload?.hasNativeAgyQuota === true &&
           Boolean(localEnvId) &&
-          typeof observed === "string" &&
-          observed.trim() === localEnvId;
-        const skipAgy = skipAgyForNative || isTestEnv();
+          Boolean(observed) &&
+          observed.toLowerCase() === localEnvId.toLowerCase();
+        const skipAgy = skipLocalAgy || skipAgyForNative || isTestEnv();
         const agyReader = skipAgy ? null : getAgyQuotaReader();
         const [devinRes, agyRes] = await Promise.allSettled([
           getDevinQuotaReader().readDevinQuota({ force }),
@@ -4356,10 +4377,17 @@ async function hubCall(action, payload = {}) {
             if (p) providers.push(p);
           }
         }
+        if (!skipAgy && !isTestEnv() && localEnvId && agy?.available && Array.isArray(agy.providers) && agy.providers.length > 0) {
+          try {
+            agyReader?.queueQuotaMirror?.({ environmentId: localEnvId, providers: agy.providers });
+          } catch {}
+        }
+        if (!skipLocalAgy) sweepHostPlanMirrors();
         return {
           ok: true,
           providers,
           t3EnvironmentId: localEnvId,
+          ...(isRemoteObserved ? { agySkippedRemote: true } : {}),
           ...(skipAgyForNative ? { agySkippedNative: true } : {}),
           ...(agy?.pending === true ? { pending: true } : {}),
         };

@@ -16,6 +16,8 @@ const {
   DEFAULT_ERROR_BACKOFF_MS,
   DEFAULT_SIGNED_OUT_BACKOFF_MS,
   createAgyQuotaReader,
+  createAgyQuotaMirror,
+  buildQuotaMirrorPayload,
   parseAgyCliUsageWindows,
   parseStrictCliVersionOutput,
   normalizeResetTime,
@@ -1412,7 +1414,8 @@ test("Fix #5: decouples remote Connect native AGY from local CLI, handles cold-s
   assert.equal(clearedCall.payload.hasNativeAgyQuota, undefined);
   assert.equal(clearedCall.payload.environmentId, LOCAL_ENV);
 
-  // Hold the remote RPC open, then return to a local route before resolving it.
+  // Hold a cold-start remote RPC open (before localEnvId is known), then return to a local route before resolving it.
+  vm.runInContext('hudLocalQuotaEnvironmentId = ""; externalQuotaFetchedAt = 0;', ctx);
   fakeNow += 120_000;
   ctx.live = { environmentId: REMOTE_ENV, usage: { providers: [remoteNativeAgy] } };
   let finishRemote;
@@ -1523,4 +1526,432 @@ test("renderer refreshExternalQuotas schedules bounded pending follow-up retries
   for (let i = 1; i < rpcCalls.length; i++) {
     assert.equal(rpcCalls[i].payload.force, undefined, "Pending follow-up must NOT pass force:true");
   }
+});
+
+// --- Passive Sanitized AGY Quota Mirror (.t3-hub/quota/snapshot.json) & skipLocalAgy ---
+
+test("buildQuotaMirrorPayload enforces opaque canonical sanitization, zero email/label leakage, and bounds", () => {
+  const envId = "12345678-1234-4123-8123-123456789abc";
+  const checkedAt = "2026-11-28T10:00:00.000Z";
+  const resetsAt = "2026-11-28T15:00:00.000Z";
+
+  assert.equal(buildQuotaMirrorPayload({ environmentId: "not-a-uuid", providers: [] }), null);
+  assert.equal(buildQuotaMirrorPayload({ environmentId: envId, providers: [] }), null);
+
+  const dirtyProviders = [
+    {
+      instanceId: "devin",
+      driver: "devin",
+      displayName: "Devin",
+      usageLimits: { checkedAt, windows: [{ id: "d-1", kind: "weekly", label: "D", usedPercent: 10 }] },
+    },
+    {
+      instanceId: "antigravity:owner@example.com",
+      driver: "antigravity",
+      displayName: "owner@example.com (Work)",
+      email: "owner@example.com",
+      account: "acct-secret",
+      path: "/Users/secret/.t3",
+      token: "tok-secret",
+      stderr: "debug stderr",
+      usageLimits: {
+        checkedAt,
+        extraSecret: "nope",
+        windows: [
+          { id: "bad-neg", kind: "session", label: "Bad", usedPercent: -1 },
+          { id: "bad-over", kind: "session", label: "Bad", usedPercent: 100.1 },
+          { id: "bad-nan", kind: "session", label: "Bad", usedPercent: Number.NaN },
+          {
+            id: "owner@example.com-gemini-5h",
+            kind: "session",
+            label: "owner@example.com · 5-hour",
+            usedPercent: 25.5,
+            resetsAt,
+            windowDurationMins: 300,
+            token: "leak-attempt",
+            stderr: "leak-attempt",
+          },
+          {
+            id: "gemini-carbon-5h",
+            kind: "session",
+            label: "Duplicate 5h should dedupe",
+            usedPercent: 99,
+            windowDurationMins: 300,
+          },
+          {
+            id: "owner@example.com-gemini-weekly",
+            kind: "weekly",
+            label: "owner@example.com · Weekly",
+            usedPercent: 40,
+            windowDurationMins: 10080,
+          },
+          {
+            id: "owner@example.com-claude-5h",
+            kind: "session",
+            label: "Claude owner@example.com 5h",
+            usedPercent: 15,
+            windowDurationMins: 300,
+          },
+          {
+            id: "owner@example.com-3p-weekly",
+            kind: "weekly",
+            label: "GPT owner@example.com Weekly",
+            usedPercent: 55,
+            windowDurationMins: 10080,
+          },
+          ...Array.from({ length: 16 }, (_, i) => ({
+            id: `owner@example.com-custom-${i}`,
+            kind: "other",
+            label: `owner@example.com custom ${i}`,
+            usedPercent: i,
+          })),
+        ],
+      },
+    },
+    ...Array.from({ length: 10 }, (_, i) => ({
+      instanceId: `owner@example.com-extra-${i}`,
+      driver: "antigravity",
+      displayName: `owner@example.com #${i}`,
+      usageLimits: {
+        checkedAt,
+        windows: [{ id: `w-${i}`, kind: "weekly", label: `owner@example.com W ${i}`, usedPercent: 12 }],
+      },
+    })),
+  ];
+
+  const payload = buildQuotaMirrorPayload({ environmentId: envId, providers: dirtyProviders });
+  assert.ok(payload);
+  assert.equal(payload.schemaVersion, 1);
+  assert.equal(payload.source, "hub-quota-mirror");
+  assert.equal(payload.environmentId, envId);
+  assert.equal(payload.updatedAt, checkedAt);
+  assert.equal(payload.providers.length, 8, "Must cap providers at 8");
+  assert.equal(payload.providers[0].instanceId, "antigravity");
+  assert.equal(payload.providers[1].instanceId, "antigravity-2");
+  assert.equal(payload.providers[2].instanceId, "antigravity-3");
+  assert.equal(payload.providers[0].driver, "antigravity");
+  assert.equal(payload.providers[0].displayName, "AGY");
+  assert.equal(payload.providers[1].displayName, "AGY");
+  assert.equal(payload.providers[0].usageLimits.windows.length, 16, "Must cap windows at 16");
+  assert.deepEqual(
+    payload.providers[0].usageLimits.windows.slice(0, 5).map((w) => [w.id, w.kind, w.label, w.usedPercent]),
+    [
+      ["gemini-5h", "session", "Gemini · 5-hour", 25.5],
+      ["gemini-weekly", "weekly", "Gemini · Weekly", 40],
+      ["3p-5h", "session", "Claude & GPT (shared) · 5-hour", 15],
+      ["3p-weekly", "weekly", "Claude & GPT (shared) · Weekly", 55],
+      ["gemini-quota-1", "other", "Gemini · Quota", 0],
+    ]
+  );
+  assert.deepEqual(Object.keys(payload.providers[0]).sort(), ["displayName", "driver", "instanceId", "usageLimits"]);
+  assert.deepEqual(Object.keys(payload.providers[0].usageLimits).sort(), ["checkedAt", "windows"]);
+  assert.deepEqual(Object.keys(payload.providers[0].usageLimits.windows[0]).sort(), [
+    "id",
+    "kind",
+    "label",
+    "resetsAt",
+    "usedPercent",
+    "windowDurationMins",
+  ]);
+  const text = JSON.stringify(payload);
+  for (const forbidden of ["owner@example.com", "acct-secret", "/Users/secret", "tok-secret", "debug stderr", "leak-attempt", "devin", "Duplicate 5h"]) {
+    assert.equal(text.includes(forbidden), false, `Must never leak ${forbidden}`);
+  }
+  assert.ok(Buffer.byteLength(JSON.stringify(payload, null, 2) + "\n", "utf8") <= 32768);
+});
+
+test("passive quota mirror discovers SQLite roots, enforces Git exclude/negation/unmanaged guards, caches fingerprints, and invokes zero spawns", async (t) => {
+  const { DatabaseSync } = require("node:sqlite");
+  const { execFileSync } = require("node:child_process");
+
+  const fx = createFixture(t);
+  const envId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const nowMs = Date.parse("2026-11-28T12:00:00.000Z");
+  let clock = nowMs;
+
+  const base = fs.realpathSync(fx.root);
+  const git = (cwd, ...args) =>
+    execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+
+  // 1. Main Git repo + linked worktree
+  const repoA = path.join(base, "repo-a");
+  fs.mkdirSync(repoA);
+  git(repoA, "init", "-q");
+  git(repoA, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "init");
+  const worktreeA = path.join(base, "repo-a-wt");
+  git(repoA, "worktree", "add", "-qb", "wt-branch", worktreeA);
+
+  // 2. Non-Git directory (must be skipped)
+  const nonGitDir = path.join(base, "plain-dir");
+  fs.mkdirSync(nonGitDir);
+
+  // 3. Symlinked Git directory (must be skipped)
+  const repoSymReal = path.join(base, "repo-sym-real");
+  fs.mkdirSync(repoSymReal);
+  git(repoSymReal, "init", "-q");
+  const repoSymLink = path.join(base, "repo-sym-link");
+  fs.symlinkSync(repoSymReal, repoSymLink);
+
+  // 4. Git repo with unmanaged snapshot.json (must never be overwritten)
+  const repoUnmanaged = path.join(base, "repo-unmanaged");
+  fs.mkdirSync(repoUnmanaged);
+  git(repoUnmanaged, "init", "-q");
+  const unmanagedFile = path.join(repoUnmanaged, ".t3-hub", "quota", "snapshot.json");
+  fs.mkdirSync(path.dirname(unmanagedFile), { recursive: true });
+  fs.writeFileSync(unmanagedFile, '{"personal":"keep"}\n');
+
+  // 5. Git repo with tracked .t3-hub/quota/snapshot.json (must never be overwritten)
+  const repoTracked = path.join(base, "repo-tracked");
+  fs.mkdirSync(repoTracked);
+  git(repoTracked, "init", "-q");
+  const trackedFile = path.join(repoTracked, ".t3-hub", "quota", "snapshot.json");
+  fs.mkdirSync(path.dirname(trackedFile), { recursive: true });
+  fs.writeFileSync(trackedFile, '{"schemaVersion":1,"source":"hub-quota-mirror","tracked":true}\n');
+  git(repoTracked, "add", "-f", ".t3-hub/quota/snapshot.json");
+
+  // 6. Git repo with stale (>7d) worktree and child thread worktree (both must be skipped)
+  const staleWt = path.join(base, "repo-a-stale-wt");
+  git(repoA, "worktree", "add", "-qb", "stale-wt", staleWt);
+  const childWt = path.join(base, "repo-a-child-wt");
+  git(repoA, "worktree", "add", "-qb", "child-wt", childWt);
+
+  // Build read-only statev2.sqlite
+  const dbPath = path.join(fx.userDataDir, "statev2.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, updated_at TEXT, deleted_at TEXT);
+    CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, project_id TEXT, updated_at TEXT, created_at TEXT, deleted_at TEXT, payload_json TEXT);
+    CREATE TABLE orchestration_v2_projection_subagents (child_thread_id TEXT);
+  `);
+  const insertProj = db.prepare("INSERT INTO projection_projects VALUES (?, ?, ?, ?)");
+  insertProj.run("p1", repoA, "2026-11-28T11:00:00.000Z", null);
+  insertProj.run("p2", nonGitDir, "2026-11-28T11:00:00.000Z", null);
+  insertProj.run("p3", repoSymLink, "2026-11-28T11:00:00.000Z", null);
+  insertProj.run("p4", repoUnmanaged, "2026-11-28T11:00:00.000Z", null);
+  insertProj.run("p5", repoTracked, "2026-11-28T11:00:00.000Z", null);
+  insertProj.run("p-del", staleWt, "2026-11-28T11:00:00.000Z", "2026-11-28T11:05:00.000Z");
+
+  const insertThread = db.prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, ?)");
+  insertThread.run("t-main", "p1", "2026-11-27T12:00:00.000Z", "2026-11-27T12:00:00.000Z", null, JSON.stringify({ lineage: { parentThreadId: null }, worktreePath: worktreeA }));
+  insertThread.run("t-stale", "p1", "2026-11-10T12:00:00.000Z", "2026-11-10T12:00:00.000Z", null, JSON.stringify({ lineage: { parentThreadId: null }, worktreePath: staleWt }));
+  insertThread.run("t-child", "p1", "2026-11-28T10:00:00.000Z", "2026-11-28T10:00:00.000Z", null, JSON.stringify({ lineage: { parentThreadId: "t-main" }, worktreePath: childWt }));
+  db.close();
+
+  let agySpawns = 0;
+  let gitCalls = 0;
+  const { execFile } = require("node:child_process");
+  const reader = createAgyQuotaReader({
+    homeDir: fx.root,
+    t3DbPath: dbPath,
+    now: () => clock,
+    spawnImpl: () => {
+      agySpawns++;
+      throw new Error("mirror must NEVER spawn agy CLI");
+    },
+    execFileImpl: (file, args, opts, cb) => {
+      gitCalls++;
+      return execFile(file, args, opts, cb);
+    },
+  });
+  t.after(() => reader.disposeQuotaMirrors());
+
+  const providers = [
+    {
+      instanceId: "antigravity",
+      driver: "antigravity",
+      displayName: "AGY",
+      email: "private@example.invalid",
+      usageLimits: {
+        checkedAt: "2026-11-28T11:55:00.000Z",
+        windows: [
+          { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 18, windowDurationMins: 300 },
+          { id: "gemini-weekly", kind: "weekly", label: "Gemini · Weekly", usedPercent: 34, windowDurationMins: 10080 },
+        ],
+      },
+    },
+  ];
+
+  assert.equal(reader.queueQuotaMirror({ environmentId: envId, providers }), true);
+  await reader.flushQuotaMirrors();
+  assert.equal(agySpawns, 0, "Zero AGY CLI spawns during mirror");
+
+  // Main repo & recent main worktree received clean ignored mirror
+  for (const dir of [repoA, worktreeA]) {
+    const snap = path.join(dir, ".t3-hub", "quota", "snapshot.json");
+    assert.equal(fs.existsSync(snap), true, `snapshot should exist in ${dir}`);
+    assert.equal(fs.lstatSync(snap).mode & 0o777, 0o600);
+    assert.equal(fs.lstatSync(path.dirname(snap)).mode & 0o777, 0o700);
+    const parsed = JSON.parse(fs.readFileSync(snap, "utf8"));
+    assert.equal(parsed.schemaVersion, 1);
+    assert.equal(parsed.source, "hub-quota-mirror");
+    assert.equal(parsed.environmentId, envId);
+    assert.equal(parsed.providers[0].email, undefined);
+    assert.equal(git(dir, "status", "--porcelain"), "", `git status must stay clean in ${dir}`);
+  }
+  const excludeText = fs.readFileSync(path.join(repoA, ".git", "info", "exclude"), "utf8");
+  assert.match(excludeText, /# t3-hub connect quota mirror v1 \(local only\)/);
+  assert.match(excludeText, /^\/\.t3-hub\/quota\/$/m);
+
+  // Non-git, symlink, stale worktree, child worktree all skipped
+  assert.equal(fs.existsSync(path.join(nonGitDir, ".t3-hub")), false);
+  assert.equal(fs.existsSync(path.join(repoSymReal, ".t3-hub")), false);
+  assert.equal(fs.existsSync(path.join(staleWt, ".t3-hub")), false);
+  assert.equal(fs.existsSync(path.join(childWt, ".t3-hub")), false);
+  // Unmanaged & tracked files untouched
+  assert.equal(fs.readFileSync(unmanagedFile, "utf8"), '{"personal":"keep"}\n');
+  assert.equal(fs.readFileSync(trackedFile, "utf8"), '{"schemaVersion":1,"source":"hub-quota-mirror","tracked":true}\n');
+
+  // 60s fingerprint cache + byte-identical skip avoids re-invoking Git on repoA/worktreeA
+  const snapA = path.join(repoA, ".t3-hub", "quota", "snapshot.json");
+  const mtimeBefore = fs.statSync(snapA).mtimeMs;
+  const cachedMirror = createAgyQuotaMirror({
+    targetRoots: [repoA],
+    now: () => clock,
+    execFileImpl: (file, args, opts, cb) => {
+      gitCalls++;
+      return execFile(file, args, opts, cb);
+    },
+  });
+  t.after(() => cachedMirror.disposeQuotaMirrors());
+  cachedMirror.queueQuotaMirror({ environmentId: envId, providers });
+  await cachedMirror.flushQuotaMirrors();
+  const gitCallsAfterFirst = gitCalls;
+  clock += 30_000;
+  cachedMirror.queueQuotaMirror({ environmentId: envId, providers });
+  await cachedMirror.flushQuotaMirrors();
+  assert.equal(gitCalls, gitCallsAfterFirst, "60s fingerprint cache must skip redundant Git calls for identical snapshot");
+  assert.equal(fs.statSync(snapA).mtimeMs, mtimeBefore, "Byte-identical mirror must not rewrite file");
+
+  // Higher-priority .gitignore negation refuses write AND safely unlinks managed mirror to keep git status clean
+  fs.writeFileSync(
+    path.join(repoA, ".gitignore"),
+    "!/.t3-hub/\n!/.t3-hub/quota/\n!/.t3-hub/quota/snapshot.json\n"
+  );
+  cachedMirror.queueQuotaMirror({ environmentId: envId, providers });
+  await cachedMirror.flushQuotaMirrors();
+  assert.equal(fs.existsSync(snapA), false, "Managed mirror must be safely unlinked when negation overrides exclude");
+  assert.doesNotMatch(git(repoA, "status", "--porcelain", "--untracked-files=all"), /\.t3-hub/);
+
+  // Negation must NEVER unlink an unmanaged file
+  fs.writeFileSync(
+    path.join(repoUnmanaged, ".gitignore"),
+    "!/.t3-hub/\n!/.t3-hub/quota/\n!/.t3-hub/quota/snapshot.json\n"
+  );
+  const unmanagedMirror = createAgyQuotaMirror({ targetRoots: [repoUnmanaged], now: () => clock });
+  t.after(() => unmanagedMirror.disposeQuotaMirrors());
+  unmanagedMirror.queueQuotaMirror({ environmentId: envId, providers });
+  await unmanagedMirror.flushQuotaMirrors();
+  assert.equal(fs.readFileSync(unmanagedFile, "utf8"), '{"personal":"keep"}\n');
+  assert.equal(agySpawns, 0);
+});
+
+test("backend quota:external supports skipLocalAgy with zero AGY spawns and passively mirrors live AGY quota", (t) => {
+  const { DatabaseSync } = require("node:sqlite");
+  const { execFileSync } = require("node:child_process");
+
+  const fx = createFixture(t);
+  const envId = "44444444-4444-4444-8444-444444444444";
+  fs.writeFileSync(path.join(fx.userDataDir, "environment-id"), envId + "\n");
+
+  const repo = path.join(fs.realpathSync(fx.root), "mirror-repo");
+  fs.mkdirSync(repo);
+  execFileSync("git", ["init", "-q"], { cwd: repo, stdio: "ignore" });
+
+  const dbPath = path.join(fx.userDataDir, "statev2.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec("CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT, updated_at TEXT, deleted_at TEXT);");
+  db.prepare("INSERT INTO projection_projects VALUES (?, ?, ?, NULL)").run("p1", repo, "2026-11-28T10:00:00.000Z");
+  db.close();
+
+  const spawnMarker = path.join(fx.root, "agy-was-spawned");
+  const usageJson = makeUsageEnvelope({ requestedAt: Date.now() });
+  const fakeScript = [
+    "#!/bin/sh",
+    `touch "${spawnMarker}"`,
+    'if [ "$1" = "--version" ]; then',
+    '  echo "1.5.15"',
+    "  exit 0",
+    "fi",
+    `printf '%s\\n' '${usageJson.replace(/'/g, "'\\''")}'`,
+    "exit 0",
+    "",
+  ].join("\n");
+  fs.writeFileSync(fx.managedBinPath, fakeScript, { mode: 0o755 });
+
+  const backendPath = path.join(__dirname, "../src/backend.cjs");
+  const baseSubEnv = {
+    PATH: process.env.PATH || "/usr/bin:/bin",
+    HOME: fx.root,
+    XDG_DATA_HOME: fx.root,
+    T3_HUD_DIR: fx.pluginDir,
+    T3_HUB_DIR: path.join(fx.t3Dir, "hub"),
+  };
+
+  // 1. skipLocalAgy: true -> zero AGY CLI spawns, still returns t3EnvironmentId
+  const skipRun = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `require(process.argv[1]).hubCall("quota:external", { skipLocalAgy: true }).then(r => { process.stdout.write(JSON.stringify(r)); process.exit(0); });`,
+      backendPath,
+    ],
+    { env: baseSubEnv, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(skipRun.status, 0, skipRun.stderr || String(skipRun.error || ""));
+  assert.deepEqual(JSON.parse(skipRun.stdout), { ok: true, providers: [], t3EnvironmentId: envId });
+  assert.equal(fs.existsSync(spawnMarker), false, "skipLocalAgy:true must never spawn local AGY CLI");
+
+  // 1b. Cold-start remote environmentId !== localEnvId -> zero AGY CLI spawns, returns agySkippedRemote: true
+  const remoteEnvId = "55555555-5555-4555-8555-555555555555";
+  const remoteSkipRun = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `require(process.argv[1]).hubCall("quota:external", { environmentId: process.argv[2] }).then(r => { process.stdout.write(JSON.stringify(r)); process.exit(0); });`,
+      backendPath,
+      remoteEnvId,
+    ],
+    { env: baseSubEnv, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(remoteSkipRun.status, 0, remoteSkipRun.stderr || String(remoteSkipRun.error || ""));
+  assert.deepEqual(JSON.parse(remoteSkipRun.stdout), {
+    ok: true,
+    providers: [],
+    t3EnvironmentId: envId,
+    agySkippedRemote: true,
+  });
+  assert.equal(fs.existsSync(spawnMarker), false, "Remote observed environmentId must never spawn local AGY CLI");
+
+  // 2. Normal local call -> returns providers AND fire-and-forget mirrors into repo/.t3-hub/quota/snapshot.json
+  const liveRun = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `const b = require(process.argv[1]);
+       const q = require(process.argv[2]);
+       b.hubCall("quota:external", {}).then(async r => {
+         await new Promise(res => setTimeout(res, 600));
+         process.stdout.write(JSON.stringify(r));
+         process.exit(0);
+       });`,
+      backendPath,
+      path.join(__dirname, "../src/hub-agy-quota.cjs"),
+    ],
+    { env: baseSubEnv, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(liveRun.status, 0, liveRun.stderr || String(liveRun.error || ""));
+  const liveRes = JSON.parse(liveRun.stdout);
+  assert.equal(liveRes.ok, true);
+  assert.equal(liveRes.t3EnvironmentId, envId);
+  assert.equal(liveRes.providers.length, 1);
+  assert.equal(fs.existsSync(spawnMarker), true);
+
+  const mirrorFile = path.join(repo, ".t3-hub", "quota", "snapshot.json");
+  assert.equal(fs.existsSync(mirrorFile), true, "quota:external must trigger passive quota mirror");
+  const mirrorData = JSON.parse(fs.readFileSync(mirrorFile, "utf8"));
+  assert.equal(mirrorData.schemaVersion, 1);
+  assert.equal(mirrorData.source, "hub-quota-mirror");
+  assert.equal(mirrorData.environmentId, envId);
+  assert.equal(mirrorData.providers[0].driver, "antigravity");
+  assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }), "");
 });
