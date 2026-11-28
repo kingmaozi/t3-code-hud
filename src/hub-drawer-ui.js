@@ -2138,10 +2138,84 @@
  const environmentId = remotePlanEnvironmentId(), board = cache.board;
  return !!environmentId && board?.remote === true && String(board.environmentId || "").toLowerCase() === environmentId.toLowerCase() && String(board.threadId || "") === currentThreadId();
     }
-    function normalizeRemoteThreadPlan(projection, environmentId, threadId) {
+    function normalizeRemoteThreadPlan(projection, environmentId, threadId, projectRoot = "") {
  if (String(projection?.thread?.id || "") !== threadId) throw new Error("remote thread mismatch");
  const plans = Array.isArray(projection.plans) ? projection.plans : [];
- const turns = [...items(projection, ["turnItems"]), ...items(projection, ["visibleTurnItems"])].map((turn) => turn?.item && typeof turn.item === "object" ? turn.item : turn);
+ const turns = [...items(projection, ["turnItems"]), ...items(projection, ["visibleTurnItems"])].map((turn) => {
+  if (turn?.item && typeof turn.item === "object") {
+   const inner = turn.item;
+   return {
+    ...inner,
+    parentItemId: inner.parentItemId ?? turn.parentItemId,
+    parent_item_id: inner.parent_item_id ?? turn.parent_item_id,
+    ordinal: Number.isFinite(inner.ordinal) ? inner.ordinal : turn.ordinal,
+   };
+  }
+  return turn;
+ });
+ function extractRemotePlanUpdateItem(turnList, targetThreadId, targetProjectRoot) {
+  const toolTypes = ["mcp_tool_call", "dynamic_tool", "dynamic_tool_call", "tool_call"];
+  const completedStatuses = new Set(["completed", "succeeded", "success", "done"]);
+  const firstText = (...values) => values.find((value) => typeof value === "string" && value) || "";
+  const knownServer = /^(?:t3[_-](?:hub|code)|briking[_-]t3[_-]hub)$/i;
+  const normalizeRoot = (value) => value.replace(/[\\/]+$/, "") || (value.startsWith("/") ? "/" : value);
+  const expectedRoot = typeof targetProjectRoot === "string" && targetProjectRoot ? normalizeRoot(targetProjectRoot) : "";
+  let newest = null;
+  for (const item of turnList) {
+   if (!item || typeof item !== "object") continue;
+   const type = String(item.type || item.kind || "");
+   if (!toolTypes.includes(type)) continue;
+   if (item.parentItemId || item.parent_item_id) continue;
+   if ((item.threadId && String(item.threadId) !== targetThreadId) || (item.thread?.id && String(item.thread.id) !== targetThreadId)) continue;
+   const status = String(item.status || "").toLowerCase();
+   if (!completedStatuses.has(status) || item.output?.isError === true) continue;
+   const name = firstText(item.toolName, item.tool, item.name);
+   const server = firstText(item.serverName, item.server);
+   const qualified = /^(?:mcp__(.+)__plan_update|([\w.-]+)\.plan_update)$/.exec(name);
+   const mcpSource = item.toolSource?.kind === "integration" ? firstText(item.toolSource.key) : "";
+   const sourceNamespace = /^mcp:([\w.-]+)$/.exec(mcpSource)?.[1] || "";
+   const qualifiedNs = qualified?.[1] || qualified?.[2] || "";
+   const serverNs = server || "";
+   const sourceNs = sourceNamespace || "";
+   const namespaces = [qualifiedNs, serverNs, sourceNs].filter(Boolean);
+   if (namespaces.length > 1 && new Set(namespaces.map((ns) => ns.toLowerCase())).size > 1) continue;
+   const namespace = qualifiedNs || serverNs || sourceNs;
+   const isPlanTool = Boolean(qualified || name === "plan_update") && knownServer.test(namespace);
+   if (!isPlanTool) continue;
+   const args = item.input ?? item.arguments;
+   if (!args || typeof args !== "object" || Array.isArray(args)) continue;
+   if (args.threadId != null && args.threadId !== "" && args.threadId !== targetThreadId) continue;
+   if (args.projectRoot != null && args.projectRoot !== "") {
+    if (typeof args.projectRoot !== "string" || !expectedRoot || normalizeRoot(args.projectRoot) !== expectedRoot) continue;
+   }
+   const cleared = args.clear === true;
+   if (!cleared && !Array.isArray(args.steps)) continue;
+   const steps = cleared ? [] : args.steps.slice(0, 300).flatMap((step, i) => {
+    if (!step || typeof step !== "object" || typeof step.text !== "string" || !step.text.trim() || typeof step.status !== "string") return [];
+    const rawStatus = step.status.toLowerCase().trim().replace(/_/g, "-");
+    const stepStatus = ["completed", "done", "success", "succeeded"].includes(rawStatus)
+     ? "completed"
+     : ["running", "active", "started", "in-progress"].includes(rawStatus)
+      ? "in-progress"
+      : "pending";
+    const id = (firstText(step.id) || `step-${i + 1}`).slice(0, 120);
+    return [{ id, text: step.text.slice(0, 2000), status: stepStatus }];
+   });
+   if (!cleared && !steps.length) continue;
+   const updatedAt = firstText(item.updatedAt, item.completedAt, item.startedAt);
+   const callTime = [item.startedAt, item.updatedAt, item.completedAt]
+    .map((value) => typeof value === "string" && value ? Date.parse(value) : NaN)
+    .find(Number.isFinite) || 0;
+   const ordinal = Number.isFinite(item.ordinal) ? item.ordinal : 0;
+   const candidate = { steps, cleared, updatedAt, callTime };
+   if (!newest || callTime > newest.callTime ||
+    (callTime === newest.callTime && (ordinal > newest.ordinal ||
+     (ordinal === newest.ordinal && cleared && !newest.candidate.cleared)))) {
+    newest = { candidate, callTime, ordinal };
+   }
+  }
+  return newest?.candidate || null;
+ }
  const matches = [];
  for (const plan of plans) {
  const kind = String(plan?.kind || plan?.type || "");
@@ -2156,13 +2230,32 @@
  }
  matches.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
  const latest = matches[0]?.plan;
+ const nativeUpdatedAt = matches[0]?.updatedAt || "";
+ const nativeTime = Date.parse(nativeUpdatedAt) || 0;
+ const toolPlan = extractRemotePlanUpdateItem(turns, threadId, projectRoot);
+ const toolTime = toolPlan ? (Date.parse(toolPlan.updatedAt || "") || toolPlan.callTime || 0) : 0;
+ if (toolPlan && (!latest || toolTime > nativeTime || (toolTime === nativeTime && toolPlan.cleared === true))) {
+  return {
+   remote: true,
+   environmentId,
+   threadId,
+   source: "t3-connect-plan-update",
+   planStatus: toolPlan.cleared ? "" : "active",
+   planMarkdown: "",
+   steps: toolPlan.steps,
+   updatedAt: toolPlan.updatedAt,
+   ...(toolPlan.cleared ? { cleared: true } : {}),
+   subagents: [],
+   artifacts: [],
+  };
+ }
  const rawSteps = Array.isArray(latest?.steps) ? latest.steps : [];
  const steps = rawSteps.map((step, index) => {
  const rawStatus = String(typeof step === "object" ? step.status || step.state || "pending" : "pending").toLowerCase().replace(/_/g, "-");
  const status = ["completed", "done", "success", "succeeded"].includes(rawStatus) ? "completed" : ["running", "active", "started", "in-progress"].includes(rawStatus) ? "in-progress" : "pending";
  return { id: typeof step === "object" ? String(step.id ?? index) : String(index), text: String(typeof step === "string" ? step : step?.text || step?.title || step?.content || step?.step || ""), status };
  });
- return { remote: true, environmentId, threadId, source: "t3-connect", planStatus: latest?.status || "", planMarkdown: typeof latest?.markdown === "string" ? latest.markdown : "", steps, updatedAt: matches[0]?.updatedAt || "", subagents: [], artifacts: [] };
+ return { remote: true, environmentId, threadId, source: "t3-connect", planStatus: latest?.status || "", planMarkdown: typeof latest?.markdown === "string" ? latest.markdown : "", steps, updatedAt: nativeUpdatedAt, subagents: [], artifacts: [] };
     }
     async function planMirrorRelativePath(threadId) {
  let key = String(threadId || "");
@@ -2198,7 +2291,10 @@
  if (!mirroredPlan) return nativePlan;
  if (!nativePlan) return mirroredPlan;
  const nativeUpdated = Date.parse(nativePlan.updatedAt || "") || 0, mirrorUpdated = Date.parse(mirroredPlan.updatedAt || "") || 0;
- return mirrorUpdated > nativeUpdated || mirrorUpdated === nativeUpdated && (mirroredPlan.cleared || mirroredPlan.unavailable) ? mirroredPlan : nativePlan;
+ if (mirrorUpdated > nativeUpdated) return mirroredPlan;
+ if (nativeUpdated > mirrorUpdated) return nativePlan;
+ if (nativePlan.cleared === true && !mirroredPlan.cleared) return nativePlan;
+ return mirroredPlan.cleared || mirroredPlan.unavailable ? mirroredPlan : nativePlan;
     }
     function elapsedLabel(run) {
  const ms = Number(run.elapsedMs ?? run.durationMs ?? (run.startedAt ? (run.completedAt || run.endedAt ? new Date(run.completedAt || run.endedAt).getTime() : Date.now()) - new Date(run.startedAt).getTime() : (run.elapsedSeconds ?? run.elapsed ?? 0) * 1000));
@@ -2208,6 +2304,7 @@
     }
     function boardSourceLabel(source) {
  const name = typeof source === "object" ? source?.label || source?.kind || source?.type : source;
+ if (/plan[-_]?update/i.test(name || "")) return tr("Hub 打卡", "Hub plan");
  return /native|t3/i.test(name || "") ? tr("T3 原生", "T3 native") : /agy|brain|antigravity/i.test(name || "") ? "AGY Brain" : tr("Hub 打卡", "Hub plan");
     }
     function planSourceSummary(board) {
@@ -3158,7 +3255,8 @@
     }
     function renderArtifactDock() {
  if (!artifactDock || disposed) return;
- const show = state.artifactDockEnabled && !state.open && !state.hubSettingsOpen && !root.classList.contains("is-occluded") && Boolean(state.threadId && state.threadId !== "__NEW__");
+ const isRemote = Boolean(remotePlanEnvironmentId() || cache.board?.remote === true);
+ const show = !isRemote && state.artifactDockEnabled && !state.open && !state.hubSettingsOpen && !root.classList.contains("is-occluded") && Boolean(state.threadId && state.threadId !== "__NEW__");
  const list = show ? dockArtifacts() : [];
  const count = list.length;
  const activeArt = state.artifactMenuIndex != null ? list[state.artifactMenuIndex] : null;
@@ -3329,12 +3427,12 @@
  if (typeof window.__t3HudRemoteRpc !== "function") throw new Error("remote plan unavailable");
  const response = await window.__t3HudRemoteRpc(environmentId, "orchestration.getThreadProjection", { threadId }, 4500);
  if (!isCurrent()) return false;
+ const project = remotePlanProject(environmentId, threadId), projectRoot = project?.projectRoot || "";
  let nativePlan = null;
  if (response?.ok && response.value) {
- try { nativePlan = normalizeRemoteThreadPlan(response.value, environmentId, threadId); } catch {}
+ try { nativePlan = normalizeRemoteThreadPlan(response.value, environmentId, threadId, projectRoot); } catch {}
  }
  let mirroredPlan = null;
- const project = remotePlanProject(environmentId, threadId), projectRoot = project?.projectRoot || "";
  if (projectRoot) {
  try {
  const relativePath = await planMirrorRelativePath(threadId);

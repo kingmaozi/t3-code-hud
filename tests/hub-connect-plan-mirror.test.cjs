@@ -88,3 +88,242 @@ test('a later clear advances an existing tombstone past an unpublished newer pla
  const f=fixture(t);let now=Date.parse('2026-11-17T10:00:00Z');const board=createTaskBoard({homeDir:f.home,t3DbPath:f.dbPath,agyBrainDirs:[],now:()=>now});board.updatePlan(f.plan);await board.flushPlanMirrors();board.clearPlan({threadId:tid,projectRoot:f.root});await board.flushPlanMirrors();const initial=JSON.parse(fs.readFileSync(f.file)).updatedAt;
  fs.renameSync(f.dbPath,f.dbPath+'.away');now+=60000;board.updatePlan(f.plan);await board.flushPlanMirrors();now+=60000;board.clearPlan({threadId:tid,projectRoot:f.root});await board.flushPlanMirrors();fs.renameSync(f.dbPath+'.away',f.dbPath);await new Promise(r=>setTimeout(r,350));await board.flushPlanMirrors();const data=JSON.parse(fs.readFileSync(f.file));assert.equal(data.updatedAt,new Date(now).toISOString());assert.ok(data.updatedAt>initial);board.disposePlanMirrors();
 });
+
+test('mirrors threadless AGY t3_hub.plan_update turn_items across workspace and worktree without leaking private fields',async t=>{
+ const f=fixture(t,{worktree:true});
+ const db=new DatabaseSync(f.dbPath);
+ db.exec('CREATE TABLE orchestration_v2_projection_turn_items(thread_id TEXT,type TEXT,status TEXT,updated_at TEXT,ordinal INTEGER,parent_item_id TEXT,payload_json TEXT);');
+ const insert=db.prepare('INSERT INTO orchestration_v2_projection_turn_items VALUES(?,?,?,?,?,?,?)');
+ // 1. Unrelated projectRoot must be ignored
+ insert.run(tid,'dynamic_tool','completed','2026-11-17T10:05:00.000Z',1,null,JSON.stringify({
+  type:'dynamic_tool',toolName:'t3_hub.plan_update',status:'completed',startedAt:'2026-11-17T10:05:00.000Z',
+  input:{projectRoot:path.join(f.dir,'unrelated'),title:'Wrong',steps:[{text:'Do not mirror',status:'pending'}]}
+ }));
+ // 2. Threadless plan_update matching binding.cwd (worktree) with secret title/background/note
+ insert.run(tid,'dynamic_tool','completed','2026-11-17T10:01:00.000Z',2,null,JSON.stringify({
+  type:'dynamic_tool',toolName:'t3_hub.plan_update',status:'completed',startedAt:'2026-11-17T10:01:00.000Z',
+  input:{projectRoot:f.cwd,title:'Secret AGY Title',background:'Secret AGY Background',steps:[{text:'Step from worktree',status:'completed',note:'Private note'},{text:'Step two',status:'in_progress'}]}
+ }));
+ db.close();
+
+ f.board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await f.board.flushPlanMirrors();
+ assert.ok(fs.existsSync(f.file));
+ const data=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.deepEqual(Object.keys(data).sort(),['schemaVersion','threadId','projectRoot','steps','progress','source','updatedAt'].sort());
+ assert.equal(data.schemaVersion,1);
+ assert.equal(data.source,'hub-mcp');
+ assert.equal(data.projectRoot,f.cwd);
+ assert.equal(data.steps.length,2);
+ assert.equal(data.steps[0].text,'Step from worktree');
+ assert.equal(data.steps[0].note,undefined);
+ assert.equal(data.title,undefined);
+ assert.equal(data.background,undefined);
+ assert.equal(f.git('status','--porcelain'),'');
+
+ // 3. Newer threadless plan_update with no projectRoot at all also updates the mirror
+ const db2=new DatabaseSync(f.dbPath);
+ db2.prepare('INSERT INTO orchestration_v2_projection_turn_items VALUES(?,?,?,?,?,?,?)').run(
+  tid,'mcp_tool_call','completed','2026-11-17T10:02:00.000Z',3,null,JSON.stringify({
+   type:'mcp_tool_call',serverName:'t3_hub',toolName:'plan_update',status:'completed',startedAt:'2026-11-17T10:02:00.000Z',
+   input:{steps:[{text:'No-root step',status:'completed'}]}
+  })
+ );
+ db2.close();
+ f.board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await f.board.flushPlanMirrors();
+ const data2=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(data2.steps.length,1);
+ assert.equal(data2.steps[0].text,'No-root step');
+ assert.equal(data2.source,'hub-mcp');
+ f.board.disposePlanMirrors();
+});
+
+test('mirrors agy-brain task.md steps only, never raw implementation_plan.md, and competes fairly with clearPlan tombstones',async t=>{
+ const f=fixture(t);
+ const brainRoot=path.join(f.home,'agy-brain');
+ const nativeId='agy-conv-native-42';
+ const sessionDir=path.join(brainRoot,nativeId);
+ fs.mkdirSync(sessionDir,{recursive:true});
+
+ const db=new DatabaseSync(f.dbPath);
+ db.exec('CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT,payload_json TEXT,provider_session_id TEXT);');
+ db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?)').run(
+  tid,JSON.stringify({nativeThreadRef:{nativeId}}),nativeId
+ );
+ db.close();
+
+ let now=Date.parse('2026-11-17T10:00:00.000Z');
+ const board=createTaskBoard({homeDir:f.home,t3DbPath:f.dbPath,agyBrainDirs:[brainRoot],now:()=>now});
+ t.after(()=>board.disposePlanMirrors());
+
+ // 1. Only implementation_plan.md present (no steps) -> must NOT create a mirror
+ const implPath=path.join(sessionDir,'implementation_plan.md');
+ fs.writeFileSync(implPath,'# Private Architecture Plan\n\nSensitive implementation prose.\n');
+ const implTime=new Date(now);
+ fs.utimesSync(implPath,implTime,implTime);
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ assert.equal(fs.existsSync(f.file),false,'Raw implementation_plan.md must never be mirrored');
+
+ // 2. Add task.md with checkbox steps newer than implementation_plan.md -> mirrored as strict 7-field hub-mcp schema
+ const taskPath=path.join(sessionDir,'task.md');
+ fs.writeFileSync(taskPath,'# Brain Title\n- [x] Parsed step one\n- [/] Parsed step two\n');
+ const taskTime=new Date(now+10_000);
+ fs.utimesSync(taskPath,taskTime,taskTime);
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ assert.ok(fs.existsSync(f.file));
+ const mirrored=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.deepEqual(Object.keys(mirrored).sort(),['schemaVersion','threadId','projectRoot','steps','progress','source','updatedAt'].sort());
+ assert.equal(mirrored.source,'hub-mcp');
+ assert.deepEqual(mirrored.steps.map(s=>[s.text,s.status]),[['Parsed step one','completed'],['Parsed step two','in_progress']]);
+ assert.equal(f.git('status','--porcelain'),'');
+
+ // 3. clearPlan at same timestamp beats task.md (tie favors cleared) and polling does not resurrect older task.md
+ now=taskTime.getTime();
+ board.clearPlan({threadId:tid,projectRoot:f.root});
+ await board.flushPlanMirrors();
+ const cleared=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(cleared.source,'hub-clear');
+ assert.equal(cleared.cleared,true);
+ assert.deepEqual(cleared.steps,[]);
+
+ now+=5_000;
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ const afterPoll=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(afterPoll.cleared,true,'Polling must not resurrect older task.md over tombstone');
+ assert.equal(afterPoll.updatedAt,cleared.updatedAt);
+
+ // 4. Newer task.md after tombstone supersedes the cleared mirror
+ const newerTime=new Date(now+10_000);
+ fs.writeFileSync(taskPath,'# Brain Title\n- [x] Fresh step after clear\n');
+ fs.utimesSync(taskPath,newerTime,newerTime);
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ const revived=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(revived.source,'hub-mcp');
+ assert.equal(revived.cleared,undefined);
+ assert.deepEqual(revived.steps.map(s=>s.text),['Fresh step after clear']);
+
+ // 5. Updating implementation_plan.md to a newer timestamp must NOT overwrite task.md mirror with hub-clear
+ const implNewer=new Date(newerTime.getTime()+30_000);
+ fs.writeFileSync(implPath,'# Newer Implementation Plan\n\nUpdated long prose.\n');
+ fs.utimesSync(implPath,implNewer,implNewer);
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ const afterImplUpdate=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(afterImplUpdate.source,'hub-mcp');
+ assert.equal(afterImplUpdate.cleared,undefined);
+ assert.deepEqual(afterImplUpdate.steps.map(s=>s.text),['Fresh step after clear']);
+
+ // 6. Empty task.md without a real clear intent must preserve existing valid mirror rather than synthesizing hub-clear
+ fs.writeFileSync(taskPath,'# Empty Brain Note\n');
+ const emptyTime=new Date(implNewer.getTime()+10_000);
+ fs.utimesSync(taskPath,emptyTime,emptyTime);
+ board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ await board.flushPlanMirrors();
+ const preserved=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(preserved.source,'hub-mcp');
+ assert.equal(preserved.cleared,undefined);
+ assert.deepEqual(preserved.steps.map(s=>s.text),['Fresh step after clear']);
+});
+
+test('rejects untrusted MCP namespaces and non-completed plan_update tool statuses',async t=>{
+ const f=fixture(t);
+ const db=new DatabaseSync(f.dbPath);
+ db.exec('CREATE TABLE orchestration_v2_projection_turn_items(thread_id TEXT,type TEXT,status TEXT,updated_at TEXT,ordinal INTEGER,parent_item_id TEXT,payload_json TEXT);');
+ const insert=db.prepare('INSERT INTO orchestration_v2_projection_turn_items VALUES(?,?,?,?,?,?,?)');
+ // Trusted completed baseline
+ insert.run(tid,'dynamic_tool','completed','2026-11-17T10:01:00.000Z',1,null,JSON.stringify({
+  type:'dynamic_tool',toolName:'t3_hub.plan_update',status:'completed',startedAt:'2026-11-17T10:01:00.000Z',
+  toolSource:{kind:'integration',key:'mcp:t3_hub'},
+  input:{steps:[{text:'Trusted step',status:'in_progress'}]}
+ }));
+ // Adversarial: untrusted third-party MCP server (both dynamic_tool & mcp_tool_call)
+ insert.run(tid,'mcp_tool_call','completed','2026-11-17T10:05:00.000Z',2,null,JSON.stringify({
+  type:'mcp_tool_call',serverName:'evil_mcp',toolName:'evil_mcp.plan_update',status:'completed',startedAt:'2026-11-17T10:05:00.000Z',
+  toolSource:{kind:'integration',key:'mcp:evil_mcp'},
+  input:{clear:true}
+ }));
+ // Adversarial: mismatched namespaces
+ insert.run(tid,'dynamic_tool','completed','2026-11-17T10:06:00.000Z',3,null,JSON.stringify({
+  type:'dynamic_tool',toolName:'evil_mcp.plan_update',status:'completed',startedAt:'2026-11-17T10:06:00.000Z',
+  toolSource:{kind:'integration',key:'mcp:t3_hub'},
+  input:{clear:true}
+ }));
+ // Adversarial: non-completed statuses (running / pending / in_progress / empty) with clear:true
+ for (const [idx, badStatus] of ['running','in_progress','pending','starting',''].entries()) {
+  insert.run(tid,'dynamic_tool',badStatus,'2026-11-17T10:07:00.000Z',4+idx,null,JSON.stringify({
+   type:'dynamic_tool',toolName:'t3_hub.plan_update',status:badStatus,startedAt:'2026-11-17T10:07:00.000Z',
+   toolSource:{kind:'integration',key:'mcp:t3_hub'},
+   input:{clear:true}
+  }));
+ }
+ db.close();
+
+ const snap=f.board.getBoardSnapshot({threadId:tid,projectRoot:f.root,strictThreadMatch:true});
+ assert.equal(snap.source,'t3-mcp-plan-update');
+ assert.deepEqual(snap.steps.map(s=>s.text),['Trusted step']);
+ await f.board.flushPlanMirrors();
+ const mirrored=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(mirrored.source,'hub-mcp');
+ assert.equal(mirrored.cleared,undefined);
+ assert.deepEqual(mirrored.steps.map(s=>s.text),['Trusted step']);
+ f.board.disposePlanMirrors();
+});
+
+test('pure Connect session publishes task.md via queueActiveMainThreadMirrors and threadless updatePlan without local getBoardSnapshot',async t=>{
+ const f=fixture(t);
+ const brainRoot=path.join(f.home,'agy-brain');
+ const nativeId='agy-connect-only-99';
+ const sessionDir=path.join(brainRoot,nativeId);
+ fs.mkdirSync(sessionDir,{recursive:true});
+
+ const nowMs=Date.parse('2026-11-28T12:00:00.000Z');
+ const staleTid='22cdefab-1234-4234-9234-123456789abc';
+ const childTid='33cdefab-1234-4234-9234-123456789abc';
+ const db=new DatabaseSync(f.dbPath);
+ db.exec('CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT,payload_json TEXT,provider_session_id TEXT);');
+ // Update main thread timestamp to recent (<24h), add stale (>24h) and child threads
+ db.prepare('UPDATE orchestration_v2_projection_threads SET updated_at=? WHERE thread_id=?').run('2026-11-28T11:30:00.000Z',tid);
+ db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,NULL,?)').run(
+  staleTid,'p','Stale','2026-11-20T00:00:00.000Z','2026-11-20T00:00:00.000Z',JSON.stringify({lineage:{parentThreadId:null},worktreePath:null})
+ );
+ db.prepare('INSERT INTO orchestration_v2_projection_threads VALUES(?,?,?,?,?,NULL,?)').run(
+  childTid,'p','Child','2026-11-28T11:50:00.000Z','2026-11-28T11:50:00.000Z',JSON.stringify({lineage:{parentThreadId:tid},worktreePath:null})
+ );
+ db.prepare('INSERT INTO orchestration_v2_projection_provider_threads VALUES(?,?,?)').run(
+  tid,JSON.stringify({nativeThreadRef:{nativeId}}),nativeId
+ );
+ db.close();
+
+ const taskPath=path.join(sessionDir,'task.md');
+ fs.writeFileSync(taskPath,'# Connect Session\n- [x] Remote step 1\n- [ ] Remote step 2\n');
+ const t1=new Date(nowMs-60_000);
+ fs.utimesSync(taskPath,t1,t1);
+
+ const board=createTaskBoard({homeDir:f.home,t3DbPath:f.dbPath,agyBrainDirs:[brainRoot],now:()=>nowMs});
+ t.after(()=>board.disposePlanMirrors());
+
+ // 1. Without calling getBoardSnapshot, queueActiveMainThreadMirrors discovers and mirrors the recent main thread only
+ const queued=board.queueActiveMainThreadMirrors();
+ assert.equal(queued,1);
+ await board.flushPlanMirrors();
+ assert.ok(fs.existsSync(f.file));
+ assert.equal(fs.existsSync(path.join(f.cwd,'.t3-hub/plans',staleTid+'.json')),false);
+ assert.equal(fs.existsSync(path.join(f.cwd,'.t3-hub/plans',childTid+'.json')),false);
+ const m1=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.deepEqual(m1.steps.map(s=>s.text),['Remote step 1','Remote step 2']);
+
+ // 2. Threadless updatePlan({ projectRoot }) also triggers active main thread mirror refresh
+ fs.writeFileSync(taskPath,'# Connect Session\n- [x] Remote step 1\n- [x] Remote step 2\n');
+ const t2=new Date(nowMs);
+ fs.utimesSync(taskPath,t2,t2);
+ board.updatePlan({projectRoot:f.root,steps:[{text:'Project draft',status:'pending'}]});
+ await board.flushPlanMirrors();
+ const m2=JSON.parse(fs.readFileSync(f.file,'utf8'));
+ assert.equal(m2.progress.completed,2);
+ assert.equal(f.git('status','--porcelain'),'');
+});

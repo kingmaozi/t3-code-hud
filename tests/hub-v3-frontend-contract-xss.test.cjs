@@ -50,13 +50,13 @@ function harness(rpc = async () => ({}), environment = {}) {
   const expose = `if (opts.__testHarness) {
     root = opts.root; content = opts.content;
     settingsPanel = root.querySelector("#t3-hub-settings-panel"); settingsPanel.querySelector = root.querySelector;
-    handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); settingsHandle = root.querySelector("#t3-hub-settings-handle"); updateHandle = root.querySelector("#t3-hub-update-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
+    handle = null; titleControls = root.querySelector("#t3-hub-title-controls"); memoryHandle = root.querySelector("#t3-hub-memory-handle"); memoryToggle = root.querySelector("#t3-hub-memory-toggle"); settingsHandle = root.querySelector("#t3-hub-settings-handle"); updateHandle = root.querySelector("#t3-hub-update-handle"); planHandle = root.querySelector("#t3-hub-plan-handle"); artifactDock = root.querySelector("#t3-hub-artifact-dock"); drawer = root.querySelector("#t3-hub-drawer"); liveBoard = root.querySelector("#t3-hub-live-board");
 
     return {state, cache, errors, settingsValues, renderSettings, loadSettings, saveNativeSettings, renderHubSettingsPanel, refreshOfficialTelemetry,
       renderHudUpdatePill, renderHudUpdateSection, checkHudUpdate, applyHudUpdate, handleHudUpdatePillClick, loadHudUpdateConfig, setAutoHotUpdate, maybeTriggerAutoHotUpdate, scheduleHudUpdateCheck, restoreHudUpdateCache, readHudUpdateCache, onExternalHudUpdateState, sanitizeHudReleaseUrl, copyHudUpdateCommand,
       onInput, onChange, onClick, onEditorKeydown, renderMemory, renderMemoryConnections, renderMemoryList, renderHooks, renderSkillList, renderMcpList,
-      renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, brandIcon, request, esc, agentHosts,
-      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderBoardTab, loadTab, flushBoardRender,
+      renderSubagents, renderCommander, renderPlugins, subagentItems, persistSubagent, setCooperationMode, hookItems, setDomainScope, saveHook, deleteHook, boardMarkup, boardSourceLabel, brandIcon, request, esc, agentHosts,
+      hubThemes, themeSwitcher, applyTheme, setTheme, currentThreadId, syncThread, checkRoute, pollBoard, updateBoard, renderLiveBoard, renderArtifactDock, renderBoardTab, loadTab, flushBoardRender,
       composerSurface, findSessionRelationsCard, positionConversationTools, startBoardDrag, moveBoardDrag, endBoardDrag, cancelBoardDrag, formatExactTime, renderMemoryHistory,
       refreshContext, routeHint, routeKey, boardMismatch, projectContextReady, syncOcclusion,
       findConversationTitleAnchor, placePlanHandle, handlePlanPointerDown, handlePlanPointerEnter, handlePlanPointerLeave, handlePlanClick, setPlanPopover,
@@ -71,8 +71,8 @@ function harness(rpc = async () => ({}), environment = {}) {
       snapshot: ${drawerSource.match(/snapshot: (.*),\n destroy:/)[1]}, ready: () => { contextLoading = false; },
       setCurrentRoute: () => { lastRoute = routeKey(); lastBoardRoute = boardScopeRoute(); },
       routeScope: () => ({ cached: lastBoardRoute, current: boardScopeRoute() }),
-      titleControls, memoryHandle, memoryToggle, settingsHandle, updateHandle, timers,
-      setStyle: (fn) => { getComputedStyle = fn; }, destroy: () => { disposed = true; cancelTimer(updateBgTimer); updateBgTimer = null; timers.forEach(clearTimeout); timers.clear(); liveBoard?.remove(); titleControls?.remove(); planHandle?.remove(); }};
+      titleControls, memoryHandle, memoryToggle, settingsHandle, updateHandle, artifactDock, timers,
+      setStyle: (fn) => { getComputedStyle = fn; }, destroy: () => { disposed = true; cancelTimer(updateBgTimer); updateBgTimer = null; timers.forEach(clearTimeout); timers.clear(); liveBoard?.remove(); artifactDock?.remove(); titleControls?.remove(); planHandle?.remove(); }};
   }`;
   vm.runInNewContext(drawerSource.replace("    const api = {", expose + "\n    const api = {"), sandbox, { filename: "hub-drawer-ui.js" });
   const ui = sandbox.window.__t3MountSidecarHub({ __testHarness: true, root, content, hubRpc: rpc });
@@ -3726,4 +3726,358 @@ test("v1.1.6 P1 #1 + NOTE: autoHotUpdateSaving blocks auto apply while disabling
     assert.equal(uiErr.state.autoHotUpdateLoaded, false, `mode=${mode} must remain unloaded for retry`);
     uiErr.destroy();
   }
+});
+
+test("Connect projection parses t3_hub.plan_update with strict filtering, clear semantics, source label, and timestamp competition", async () => {
+  const ui = harness();
+  const env = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const threadId = "main-thread";
+  const projectRoot = "/remote/workspace";
+
+  // boardSourceLabel must identify plan_update sources as Hub plan, not T3 native
+  ui.state.lang = "zh";
+  assert.equal(ui.boardSourceLabel("t3-connect-plan-update"), "Hub 打卡");
+  assert.equal(ui.boardSourceLabel("t3-mcp-plan-update"), "Hub 打卡");
+  assert.equal(ui.boardSourceLabel("t3-connect"), "T3 原生");
+  ui.state.lang = "en";
+  assert.equal(ui.boardSourceLabel("t3-connect-plan-update"), "Hub plan");
+  assert.equal(ui.boardSourceLabel("t3-connect"), "T3 native");
+
+  // Strict filtering: subagent, wrong thread, failed/isError, unknown dynamic tool, wrong/invalid projectRoot are rejected
+  const filteredProjection = {
+    thread: { id: threadId },
+    plans: [
+      { id: "native-old", threadId, kind: "todo_list", status: "active", steps: [{ id: "n1", text: "Old native", status: "pending" }] },
+    ],
+    turnItems: [
+      { threadId, type: "todo_list", planId: "native-old", updatedAt: "2026-11-28T08:00:00Z" },
+      // Valid earlier plan_update (trailing slash on projectRoot must normalize and match)
+      {
+        threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T09:00:00Z", ordinal: 1,
+        toolSource: { kind: "integration", key: "mcp:t3_hub" },
+        input: {
+          projectRoot: "/remote/workspace/",
+          steps: [
+            { id: "s1".repeat(80), text: "Done step", status: "done" },
+            { text: "Working <img src=x onerror=alert(1)>", status: "in_progress" },
+            { text: "   ", status: "pending" },
+            { text: "Bad status", status: 123 },
+          ],
+        },
+      },
+      // Rejected: subagent parentItemId
+      {
+        threadId, type: "mcp_tool_call", toolName: "mcp__t3_hub__plan_update", status: "completed",
+        parentItemId: "sub-1", startedAt: "2026-11-28T10:00:00Z", ordinal: 2,
+        input: { steps: [{ text: "Subagent leak", status: "pending" }] },
+      },
+      // Rejected: wrapper parent_item_id
+      {
+        parent_item_id: "sub-2",
+        item: {
+          threadId, type: "mcp_tool_call", toolName: "plan_update", status: "completed",
+          startedAt: "2026-11-28T10:01:00Z", ordinal: 3,
+          input: { steps: [{ text: "Wrapper subagent leak", status: "pending" }] },
+        },
+      },
+      // Rejected: different threadId on item & args
+      {
+        threadId: "other-thread", type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:02:00Z", ordinal: 4,
+        input: { steps: [{ text: "Wrong item thread", status: "pending" }] },
+      },
+      {
+        threadId, type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:03:00Z", ordinal: 5,
+        input: { threadId: "other-thread", steps: [{ text: "Wrong args thread", status: "pending" }] },
+      },
+      // Rejected: failed status & output.isError
+      {
+        threadId, type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "failed",
+        startedAt: "2026-11-28T10:04:00Z", ordinal: 6,
+        input: { steps: [{ text: "Failed call", status: "pending" }] },
+      },
+      {
+        threadId, type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:05:00Z", ordinal: 7, output: { isError: true },
+        input: { steps: [{ text: "Errored output", status: "pending" }] },
+      },
+      // Rejected: spoofed dynamic_tool without known namespace or matching integration source
+      {
+        threadId, type: "dynamic_tool", toolName: "evil.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:06:00Z", ordinal: 8,
+        input: { steps: [{ text: "Spoofed tool", status: "pending" }] },
+      },
+      // Rejected: wrong projectRoot
+      {
+        threadId, type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:07:00Z", ordinal: 9,
+        input: { projectRoot: "/remote/other", steps: [{ text: "Wrong project", status: "pending" }] },
+      },
+      // Rejected: non-string projectRoot
+      {
+        threadId, type: "mcp_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+        startedAt: "2026-11-28T10:08:00Z", ordinal: 10,
+        input: { projectRoot: 42, steps: [{ text: "Invalid projectRoot type", status: "pending" }] },
+      },
+    ],
+    visibleTurnItems: [],
+  };
+
+  const parsed = ui.normalizeRemoteThreadPlan(filteredProjection, env, threadId, projectRoot);
+  assert.equal(parsed.source, "t3-connect-plan-update");
+  assert.equal(parsed.planStatus, "active");
+  assert.equal(parsed.steps.length, 2);
+  assert.equal(parsed.steps[0].id.length, 120);
+  assert.equal(parsed.steps[0].status, "completed");
+  assert.equal(parsed.steps[1].id, "step-2");
+  assert.equal(parsed.steps[1].status, "in-progress");
+  assert.equal(parsed.steps[1].text, "Working <img src=x onerror=alert(1)>");
+
+  // When projectRoot is unresolved (""), explicit args.projectRoot MUST be rejected (fail closed),
+  // while a same-thread call without args.projectRoot is still accepted.
+  const parsedNoRoot = ui.normalizeRemoteThreadPlan(
+    {
+      thread: { id: threadId },
+      plans: [],
+      turnItems: [
+        {
+          threadId, type: "tool_call", toolName: "briking_t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T09:00:00Z", ordinal: 1,
+          arguments: { steps: [{ text: "Allowed without projectRoot", status: "pending" }] },
+        },
+        {
+          threadId, type: "tool_call", toolName: "briking_t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T09:04:00Z", ordinal: 2,
+          arguments: { projectRoot: "/other/project", steps: [{ text: "Must reject when expected root missing", status: "pending" }] },
+        },
+        {
+          threadId, type: "tool_call", toolName: "briking_t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T09:05:00Z", ordinal: 3,
+          arguments: { projectRoot: { bad: true }, steps: [{ text: "Must reject non-string", status: "pending" }] },
+        },
+      ],
+    },
+    env,
+    threadId,
+    ""
+  );
+  assert.equal(parsedNoRoot.source, "t3-connect-plan-update");
+  assert.deepEqual(JSON.parse(JSON.stringify(parsedNoRoot.steps)), [{ id: "step-1", text: "Allowed without projectRoot", status: "pending" }]);
+
+  // P1 #3 regressions:
+  // (a) Third-party evil_mcp.plan_update (even as mcp_tool_call with mcp:evil_mcp integration source or conflicting namespace) cannot overwrite or clear plans
+  // (b) Incomplete statuses (running / pending / in_progress / empty) cannot clear or overwrite plans
+  // (c) Unresolved projectRoot rejects explicit args.projectRoot: "/other/project" even when clearing
+  const hardenedProjection = ui.normalizeRemoteThreadPlan(
+    {
+      thread: { id: threadId },
+      plans: [],
+      turnItems: [
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T09:00:00Z", ordinal: 1,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { steps: [{ text: "Legit Hub step", status: "in_progress" }] },
+        },
+        {
+          threadId, type: "mcp_tool_call", toolName: "evil_mcp.plan_update", status: "completed",
+          startedAt: "2026-11-28T10:00:00Z", ordinal: 2,
+          toolSource: { kind: "integration", key: "mcp:evil_mcp" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "mcp_tool_call", toolName: "plan_update", status: "completed",
+          startedAt: "2026-11-28T10:01:00Z", ordinal: 3,
+          input: { steps: [{ text: "Bare mcp_tool_call without Hub namespace", status: "pending" }] },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T10:02:00Z", ordinal: 4,
+          toolSource: { kind: "integration", key: "mcp:evil_mcp" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "running",
+          startedAt: "2026-11-28T10:03:00Z", ordinal: 5,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "pending",
+          startedAt: "2026-11-28T10:04:00Z", ordinal: 6,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "in_progress",
+          startedAt: "2026-11-28T10:05:00Z", ordinal: 7,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "",
+          startedAt: "2026-11-28T10:06:00Z", ordinal: 8,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { clear: true },
+        },
+        {
+          threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T10:07:00Z", ordinal: 9,
+          toolSource: { kind: "integration", key: "mcp:t3_hub" },
+          input: { projectRoot: "/other/project", clear: true },
+        },
+      ],
+    },
+    env,
+    threadId,
+    ""
+  );
+  assert.equal(hardenedProjection.source, "t3-connect-plan-update");
+  assert.equal(hardenedProjection.cleared, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(hardenedProjection.steps)), [
+    { id: "step-1", text: "Legit Hub step", status: "in-progress" },
+  ]);
+
+  // Native plan wins when newer than plan_update (preserves source: "t3-connect")
+  const nativeNewer = ui.normalizeRemoteThreadPlan(
+    {
+      thread: { id: threadId },
+      plans: [{ id: "n-new", threadId, kind: "todo_list", status: "active", steps: [{ id: "n", text: "Native newer", status: "completed" }] }],
+      turnItems: [
+        { threadId, type: "todo_list", planId: "n-new", updatedAt: "2026-11-28T11:00:00Z" },
+        {
+          threadId, type: "dynamic_tool_call", toolName: "t3_hub.plan_update", status: "completed",
+          startedAt: "2026-11-28T10:00:00Z",
+          input: { steps: [{ text: "Older tool plan", status: "pending" }] },
+        },
+      ],
+    },
+    env,
+    threadId,
+    projectRoot
+  );
+  assert.equal(nativeNewer.source, "t3-connect");
+  assert.equal(nativeNewer.steps[0].text, "Native newer");
+
+  // Clear wins on timestamp tie against native plan AND wins against same-time active mirror in newestRemotePlan
+  const sameTs = "2026-11-28T12:00:00.000Z";
+  const clearedTool = ui.normalizeRemoteThreadPlan(
+    {
+      thread: { id: threadId },
+      plans: [{ id: "n-tie", threadId, kind: "todo_list", status: "active", steps: [{ text: "Tie native", status: "pending" }] }],
+      turnItems: [
+        { threadId, type: "todo_list", planId: "n-tie", updatedAt: sameTs },
+        {
+          threadId, type: "mcp_tool_call", serverName: "t3_hub", toolName: "plan_update", status: "completed",
+          startedAt: sameTs, ordinal: 1,
+          input: { steps: [{ text: "Same-ts active", status: "pending" }] },
+        },
+      ],
+      visibleTurnItems: [
+        {
+          item: {
+            threadId, type: "mcp_tool_call", serverName: "t3_hub", toolName: "plan_update", status: "completed",
+            startedAt: sameTs, ordinal: 1,
+            input: { clear: true },
+          },
+        },
+      ],
+    },
+    env,
+    threadId,
+    projectRoot
+  );
+  assert.equal(clearedTool.source, "t3-connect-plan-update");
+  assert.equal(clearedTool.cleared, true);
+  assert.equal(clearedTool.planStatus, "");
+  assert.deepEqual(JSON.parse(JSON.stringify(clearedTool.steps)), []);
+
+  const sameTimeMirror = ui.normalizeRemotePlanMirror(
+    JSON.stringify({
+      schemaVersion: 1, threadId, projectRoot,
+      steps: [{ id: "m1", text: "Stale mirror", status: "pending" }],
+      source: "hub-mcp", updatedAt: sameTs,
+    }),
+    env,
+    threadId,
+    projectRoot
+  );
+  const winner = ui.newestRemotePlan(clearedTool, sameTimeMirror);
+  assert.equal(winner.cleared, true, "cleared plan_update must win timestamp tie over active mirror");
+  assert.deepEqual(JSON.parse(JSON.stringify(winner.steps)), []);
+  ui.destroy();
+});
+
+test("Connect remote sessions hide the artifact dock while local sessions keep showing it", async () => {
+  const env = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  const projectRoot = "/remote/project";
+  const ui = harness(async () => ({}), {
+    location: { pathname: `/${env}/${threadId}`, hash: `#/${env}/${threadId}` },
+    window: {
+      __TSR_ROUTER__: { state: { location: { pathname: `/${env}/${threadId}`, searchStr: "" } } },
+      __t3HudRemoteProject: (identity) => identity.environmentId === env && identity.threadId === threadId ? { environmentId: env, threadId, projectRoot } : null,
+      __t3HudRemoteRpc: async (environmentId, tag) => {
+        if (tag === "orchestration.getThreadProjection") {
+          return {
+            ok: true,
+            value: {
+              thread: { id: threadId },
+              plans: [],
+              turnItems: [{
+                threadId, type: "dynamic_tool", toolName: "t3_hub.plan_update", status: "completed",
+                startedAt: "2026-11-28T13:00:00Z",
+                toolSource: { kind: "integration", key: "mcp:t3_hub" },
+                input: { projectRoot, steps: [{ text: "Remote plan step", status: "in_progress" }] },
+              }],
+              visibleTurnItems: [],
+            },
+          };
+        }
+        return { ok: true, value: { contents: null } };
+      },
+    },
+  });
+  ui.ready();
+  Object.assign(ui.state, {
+    threadId,
+    connected: false,
+    artifactDockEnabled: true,
+    open: false,
+    hubSettingsOpen: false,
+    context: { threadId, environmentId: env, remote: true },
+  });
+  await ui.pollBoard();
+  assert.equal(ui.cache.board.source, "t3-connect-plan-update");
+  assert.equal(ui.cache.board.steps[0].text, "Remote plan step");
+  ui.renderArtifactDock();
+  assert.equal(ui.artifactDock.hidden, true, "remote Connect session must hide the empty artifact dock");
+
+  // Local session with verified local context must still show the artifact dock
+  const localUi = harness(async () => ({}), {
+    location: { pathname: "/threads/local-thread", hash: "#/threads/local-thread" },
+  });
+  localUi.ready();
+  Object.assign(localUi.state, {
+    threadId: "local-thread",
+    projectRoot: "/local/project",
+    connected: true,
+    artifactDockEnabled: true,
+    open: false,
+    hubSettingsOpen: false,
+    context: { threadId: "local-thread", projectRoot: "/local/project" },
+  });
+  localUi.cache.board = { threadId: "local-thread", projectRoot: "/local/project", steps: [], artifacts: [{ name: "report.md", path: "/local/project/report.md", sizeBytes: 128 }] };
+  localUi.renderArtifactDock();
+  assert.equal(localUi.artifactDock.hidden, false, "local session must keep showing the artifact dock");
+  assert.match(localUi.artifactDock.innerHTML, /hub-arc-badge">1</);
+
+  // Even without remote route, a board marked remote: true hides the dock
+  localUi.cache.board = { remote: true, environmentId: env, threadId: "local-thread", steps: [], artifacts: [] };
+  localUi.renderArtifactDock();
+  assert.equal(localUi.artifactDock.hidden, true);
+  ui.destroy();
+  localUi.destroy();
 });

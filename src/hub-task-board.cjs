@@ -602,6 +602,9 @@ function readThreadPlanUpdateItems(db, threadId, projectRoot) {
     rows = db.prepare(`SELECT ${fields.join(", ")} FROM ${table} WHERE thread_id = ?${byType} AND instr(payload_json, 'plan_update') > 0`)
       .all(String(threadId), ...(byType ? toolTypes : []));
   } catch { return null; }
+  const allowedRoots = Array.isArray(projectRoot)
+    ? projectRoot.filter((r) => typeof r === "string" && r)
+    : typeof projectRoot === "string" && projectRoot ? [projectRoot] : [];
   let newest = null;
   for (const row of rows) {
     const item = safeJson(row.payload_json, null);
@@ -617,17 +620,22 @@ function readThreadPlanUpdateItems(db, threadId, projectRoot) {
     const knownServer = /^(?:t3[_-](?:hub|code)|briking[_-]t3[_-]hub)$/i;
     const mcpSource = item.toolSource?.kind === "integration" ? firstText(item.toolSource.key) : "";
     const sourceNamespace = /^mcp:([\w.-]+)$/.exec(mcpSource)?.[1];
-    const namespace = qualified?.[1] || qualified?.[2] || server || sourceNamespace;
-    const isPlanTool = (qualified || name === "plan_update") &&
-      (type === "mcp_tool_call" || knownServer.test(namespace) ||
-       (namespace && mcpSource === `mcp:${namespace.toLowerCase()}`));
-    const status = item.status || row.status;
-    if (!isPlanTool || ["failed", "error", "declined", "cancelled", "interrupted"].includes(status) ||
+    const qualifiedNs = qualified?.[1] || qualified?.[2] || "";
+    const serverNs = server || "";
+    const sourceNs = sourceNamespace || "";
+    const presentNamespaces = [qualifiedNs, serverNs, sourceNs].filter(Boolean).map((ns) => ns.toLowerCase());
+    if (new Set(presentNamespaces).size > 1) continue;
+    const namespace = qualifiedNs || serverNs || sourceNs;
+    const isPlanTool = Boolean(qualified || name === "plan_update") && knownServer.test(namespace);
+    const completedStatuses = new Set(["completed", "succeeded", "success", "done"]);
+    const status = firstText(item.status, row.status).toLowerCase();
+    const rowStatus = typeof row.status === "string" ? row.status.trim().toLowerCase() : "";
+    if (!isPlanTool || !completedStatuses.has(status) || (rowStatus && !completedStatuses.has(rowStatus)) ||
         item.output?.isError === true) continue;
     const args = item.input ?? item.arguments;
     if (!args || typeof args !== "object" || Array.isArray(args) ||
         (args.threadId && args.threadId !== threadId) ||
-        (args.projectRoot && (!projectRoot || typeof args.projectRoot !== "string" || !sameProject(projectRoot, args.projectRoot)))) continue;
+        (args.projectRoot && (!allowedRoots.length || typeof args.projectRoot !== "string" || !allowedRoots.some((root) => sameProject(root, args.projectRoot))))) continue;
     const cleared = args.clear === true;
     if (!cleared && !Array.isArray(args.steps)) continue;
     const steps = cleared ? [] : args.steps.flatMap((step, i) => {
@@ -1037,12 +1045,17 @@ function readAgyBrain(brainRoots, threadOrIds, opts = {}) {
     if (matching.length) sessions = matching;
   }
   if (!sessions.length) return null;
+  const allowedBrainDocs = new Set(["task.md", "implementation_plan.md"]);
+  const documents = Array.isArray(opts && opts.documents)
+    ? opts.documents.filter((name) => allowedBrainDocs.has(name))
+    : ["task.md", "implementation_plan.md"];
+  if (!documents.length) return null;
   const candidates = [], artifactsByPath = new Map();
   // Several provider runs can belong to one verified T3 thread. Compare only
   // those exact directories, and retain their independently scoped artifacts.
   for (const session of sessions) {
     const sessionArtifacts = collectArtifacts(session), sessionPlans = [];
-    for (const name of ["task.md", "implementation_plan.md"]) {
+    for (const name of documents) {
       const document = readAgyPlanDocument(session, name);
       if (!document) continue;
       const raw = document.markdown || "";
@@ -1319,11 +1332,73 @@ function createTaskBoard(opts = {}) {
   }
   function currentMirrorData(binding, previous, intent = {}) {
     const roots = [...new Set([binding.workspace, binding.cwd])];
-    const candidates = roots.map(projectRoot => findHubPlan(hubPlansDir, { threadId: binding.threadId, projectRoot })).filter(Boolean);
-    candidates.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.planRevision).localeCompare(String(b.planRevision)));
-    const current = candidates[0];
-    if (!current && !previous && !intent.cleared) return null;
-    const data = safePlanMirrorPayload({ ...(current || { steps: [], cleared: true, updatedAt: intent.cleared && intent.updatedAt ? intent.updatedAt : previous?.data.cleared ? previous.data.updatedAt : new Date(nowFn()).toISOString() }), threadId: binding.threadId, projectRoot: binding.cwd });
+    const hubCandidates = roots.map(projectRoot => findHubPlan(hubPlansDir, { threadId: binding.threadId, projectRoot })).filter(Boolean);
+    const candidates = [...hubCandidates];
+    let db = null;
+    try {
+      db = openDbReadOnly(t3DbPath);
+      if (db) {
+        const toolPlan = readThreadPlanUpdateItems(db, binding.threadId, roots);
+        if (toolPlan) candidates.push(toolPlan);
+        const agy = readAgyBrain(brainRoots, readThreadNativeIds(db, binding.threadId), {
+          strictThreadMatch: true,
+          homeDir,
+          documents: ["task.md"],
+        });
+        if (agy && Array.isArray(agy.steps) && agy.steps.length > 0) {
+          candidates.push({ steps: agy.steps, updatedAt: agy.updatedAt || "", source: "agy-brain" });
+        }
+      }
+    } catch {}
+    finally { try { db?.close(); } catch {} }
+    if (!hubCandidates.length) {
+      if (intent.cleared === true) {
+        candidates.push({
+          steps: [],
+          cleared: true,
+          updatedAt: intent.updatedAt || new Date(nowFn()).toISOString(),
+          source: "hub-clear",
+        });
+      }
+      if (previous?.data?.cleared) {
+        candidates.push({
+          steps: [],
+          cleared: true,
+          updatedAt: previous.data.updatedAt || "",
+          source: "hub-clear",
+        });
+      }
+    }
+    const valid = candidates.filter((candidate) => freshnessScore(candidate) !== -Infinity);
+    valid.sort((a, b) =>
+      freshnessScore(b) - freshnessScore(a) ||
+      Number(!!b.cleared) - Number(!!a.cleared) ||
+      String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")) ||
+      String(a.planRevision || "").localeCompare(String(b.planRevision || ""))
+    );
+    const current = valid[0];
+    if (!current) {
+      if (intent.cleared !== true && !previous?.data?.cleared) return null;
+      const clearedAt =
+        intent.cleared && intent.updatedAt
+          ? intent.updatedAt
+          : previous?.data?.cleared && previous.data.updatedAt
+            ? previous.data.updatedAt
+            : new Date(nowFn()).toISOString();
+      return safePlanMirrorPayload({
+        steps: [],
+        cleared: true,
+        updatedAt: clearedAt,
+        threadId: binding.threadId,
+        projectRoot: binding.cwd,
+      });
+    }
+    const data = safePlanMirrorPayload({
+      ...current,
+      updatedAt: current.updatedAt || new Date(nowFn()).toISOString(),
+      threadId: binding.threadId,
+      projectRoot: binding.cwd,
+    });
     if (Buffer.byteLength(JSON.stringify(data)) > 240 * 1024) return { ...data, steps: [], progress: computeProgress([]), source: "hub-unavailable", unavailable: true };
     return data;
   }
@@ -1489,6 +1564,65 @@ function createTaskBoard(opts = {}) {
   }
   function startMirrorDrain() {
     if (!mirrorStopped && !mirrorDrain && mirrorQueue.size) mirrorDrain = new Promise(resolve => setImmediate(resolve)).then(drainMirrors).finally(() => { mirrorDrain = null; startMirrorDrain(); });
+  }
+  function queueActiveMainThreadMirrors(filterProjectRoot = null) {
+    if (mirrorStopped) return 0;
+    const hasFilter = typeof filterProjectRoot === "string" && filterProjectRoot.trim().length > 0;
+    const filterRoot = hasFilter ? filterProjectRoot.trim() : null;
+    if (filterRoot && (!path.isAbsolute(filterRoot) || /[\u0000-\u001f\u007f]/.test(filterRoot))) return 0;
+    let db = null;
+    let queued = 0;
+    try {
+      db = openDbReadOnly(t3DbPath);
+      const picked = db && pickThreadsTable(db);
+      if (!picked) return 0;
+      const columns = tableColumns(db, picked.table);
+      const childIds = new Set();
+      if (tableExists(db, "orchestration_v2_projection_subagents") && tableColumns(db, "orchestration_v2_projection_subagents").has("child_thread_id")) {
+        try {
+          for (const r of db.prepare("SELECT child_thread_id FROM orchestration_v2_projection_subagents").all()) {
+            if (r?.child_thread_id != null && String(r.child_thread_id)) childIds.add(String(r.child_thread_id));
+          }
+        } catch {}
+      }
+      const clauses = [];
+      if (columns.has("deleted_at")) clauses.push("deleted_at IS NULL");
+      if (!picked.modern && columns.has("parent_thread_id")) clauses.push("parent_thread_id IS NULL");
+      const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+      const order = columns.has("updated_at") ? " ORDER BY updated_at DESC" : columns.has("created_at") ? " ORDER BY created_at DESC" : "";
+      const rows = db.prepare(`SELECT * FROM ${picked.table}${where}${order}`).all();
+      const cutoffMs = nowFn() - 24 * 60 * 60 * 1000;
+      for (const row of rows) {
+        if (queued >= 12) break;
+        const tid = row?.thread_id != null ? String(row.thread_id) : "";
+        if (!tid || tid === "__NEW__" || childIds.has(tid)) continue;
+        const rawTs = row.updated_at ?? row.created_at;
+        const tsMs = typeof rawTs === "number" && Number.isFinite(rawTs)
+          ? (rawTs > 1e12 ? rawTs : rawTs * 1000)
+          : Date.parse(String(rawTs || ""));
+        if (!Number.isFinite(tsMs) || tsMs < cutoffMs) continue;
+        const payload = safeJson(row.payload_json, null);
+        if (picked.modern) {
+          if (!payload?.lineage || !Object.hasOwn(payload.lineage, "parentThreadId")) continue;
+          if (payload.lineage.parentThreadId != null) continue;
+        } else if (!columns.has("parent_thread_id") || row.parent_thread_id != null) {
+          continue;
+        }
+        const workspace = lookupThreadWorkspaceRoot(db, picked, tid);
+        const worktree = payload?.worktreePath;
+        if (!workspace || !path.isAbsolute(workspace) || /[\u0000-\u001f\u007f]/.test(workspace)) continue;
+        if (worktree != null && (typeof worktree !== "string" || !path.isAbsolute(worktree) || /[\u0000-\u001f\u007f]/.test(worktree))) continue;
+        const cwd = worktree || workspace;
+        if (filterRoot && !sameProject(filterRoot, workspace) && !sameProject(filterRoot, cwd)) continue;
+        queuePlanMirror({ threadId: tid, projectRoot: workspace });
+        queued += 1;
+      }
+      return queued;
+    } catch {
+      return queued;
+    } finally {
+      try { db?.close(); } catch {}
+    }
   }
   async function flushPlanMirrors() { while (mirrorDrain) await mirrorDrain; }
   // Recover only metadata describing an unfinished mirror operation, never
@@ -1684,7 +1818,7 @@ function createTaskBoard(opts = {}) {
       updatedAt: new Date(nowFn()).toISOString(),
     };
     checkPlansStore();
-    return withPlansLock(hubPlansDir, { threadId, projectRoot }, () => {
+    const result = withPlansLock(hubPlansDir, { threadId, projectRoot }, () => {
       checkPlansStore();
       const file = planPath(hubPlansDir, planFileKey({ threadId: threadId || undefined, projectRoot: projectRoot || undefined }) + ".json");
       const matched = matchingHubPlans(listHubPlans(hubPlansDir), { threadId, projectRoot });
@@ -1698,6 +1832,10 @@ function createTaskBoard(opts = {}) {
       }
       return { ...record, planRevision: planRevision([{ file, data: record }]) };
     }, lockOptions);
+    if (!threadId && projectRoot) {
+      try { queueActiveMainThreadMirrors(projectRoot); } catch {}
+    }
+    return result;
   }
 
   function clearPlan(input) {
@@ -1705,7 +1843,7 @@ function createTaskBoard(opts = {}) {
     validatePlanInput(o);
     if (!o.threadId && !o.projectRoot) throw new Error("clearPlan requires threadId or projectRoot");
     checkPlansStore();
-    return withPlansLock(hubPlansDir, o, () => {
+    const result = withPlansLock(hubPlansDir, o, () => {
       checkPlansStore();
       let deleted = 0;
       let plansAnchor;
@@ -1722,9 +1860,13 @@ function createTaskBoard(opts = {}) {
       }
       return { deleted };
     }, lockOptions);
+    if (!o.threadId && o.projectRoot) {
+      try { queueActiveMainThreadMirrors(o.projectRoot); } catch {}
+    }
+    return result;
   }
 
-  return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope, flushPlanMirrors, disposePlanMirrors };
+  return { getBoardSnapshot, updatePlan, clearPlan, verifyArtifactScope, queueActiveMainThreadMirrors, flushPlanMirrors, disposePlanMirrors };
 }
 
 module.exports = {

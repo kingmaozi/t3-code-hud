@@ -26,7 +26,8 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
 
 const MIN_USAGE_CLI_VERSION = "1.1.11";
 const DEFAULT_CACHE_TTL_MS = 600_000;
@@ -1199,6 +1200,612 @@ function runCliProcess({
   });
 }
 
+const QUOTA_MIRROR_DIR = ".t3-hub/quota";
+const QUOTA_MIRROR_FILE = ".t3-hub/quota/snapshot.json";
+const QUOTA_MIRROR_MARKER = "# t3-hub connect quota mirror v1 (local only)";
+const QUOTA_MIRROR_SOURCE = "hub-quota-mirror";
+const MAX_MIRROR_PROVIDERS = 8;
+const MAX_MIRROR_WINDOWS = 16;
+const MAX_MIRROR_BYTES = 32 * 1024;
+const MAX_EXISTING_MIRROR_BYTES = 64 * 1024;
+const MAX_MIRROR_TARGET_ROOTS = 24;
+const RECENT_WORKTREE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const MIRROR_VERIFY_TTL_MS = 60_000;
+const MIRROR_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const ALLOWED_MIRROR_WINDOW_KINDS = new Set(["session", "weekly", "other", "daily", "monthly"]);
+
+function sanitizeMirrorText(value, maxLen) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLen);
+}
+
+function normalizeMirrorIso(raw) {
+  const ms = parseResetTimestampMs(raw);
+  if (ms === null || !Number.isFinite(ms) || ms < MIN_VALID_RESET_MS || ms > MAX_VALID_RESET_MS) {
+    return null;
+  }
+  const date = new Date(ms);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function buildQuotaMirrorPayload(input, { now = () => Date.now() } = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const environmentId = typeof input.environmentId === "string" ? input.environmentId.trim() : "";
+  if (!MIRROR_UUID_RE.test(environmentId)) return null;
+
+  const rawProviders = Array.isArray(input.providers) ? input.providers : [];
+  if (!rawProviders.length) return null;
+
+  const providers = [];
+  let latestCheckedAtMs = -Infinity;
+  let latestCheckedAtIso = null;
+
+  for (const raw of rawProviders) {
+    if (providers.length >= MAX_MIRROR_PROVIDERS) break;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    if (String(raw.driver || "").trim().toLowerCase() !== "antigravity") continue;
+    if (!sanitizeMirrorText(raw.instanceId, 128)) continue;
+
+    const ul = raw.usageLimits && typeof raw.usageLimits === "object" && !Array.isArray(raw.usageLimits)
+      ? raw.usageLimits
+      : null;
+    if (!ul || !Array.isArray(ul.windows)) continue;
+
+    const windows = [];
+    const seenWindowIds = new Set();
+    const otherIndexByPool = { gemini: 0, "3p": 0 };
+
+    for (const w of ul.windows) {
+      if (windows.length >= MAX_MIRROR_WINDOWS) break;
+      if (!w || typeof w !== "object" || Array.isArray(w)) continue;
+      if (typeof w.usedPercent !== "number" || !Number.isFinite(w.usedPercent) || w.usedPercent < 0 || w.usedPercent > 100) {
+        continue;
+      }
+
+      const rawId = typeof w.id === "string" ? w.id : "";
+      const rawLabel = typeof w.label === "string" ? w.label : "";
+      const rawKind = typeof w.kind === "string" ? w.kind.trim().toLowerCase() : "";
+      const descriptor = `${rawId} ${rawLabel}`;
+      const pool = /claude|gpt|3p/i.test(descriptor) ? "3p" : "gemini";
+      const windowDurationMins =
+        typeof w.windowDurationMins === "number" && Number.isFinite(w.windowDurationMins) && w.windowDurationMins > 0
+          ? w.windowDurationMins
+          : null;
+
+      const is5h =
+        rawKind !== "weekly" &&
+        (windowDurationMins === 300 ||
+          rawKind === "session" ||
+          /5\s*[-_ ]?\s*h|five\s*[-_ ]?\s*hour|session/i.test(descriptor));
+      const isWeekly =
+        !is5h &&
+        (rawKind === "weekly" || windowDurationMins === 10080 || /week/i.test(descriptor));
+
+      let id;
+      let kind;
+      let label;
+      if (is5h) {
+        id = `${pool}-5h`;
+        kind = "session";
+        label = pool === "3p" ? "Claude & GPT (shared) · 5-hour" : "Gemini · 5-hour";
+      } else if (isWeekly) {
+        id = `${pool}-weekly`;
+        kind = "weekly";
+        label = pool === "3p" ? "Claude & GPT (shared) · Weekly" : "Gemini · Weekly";
+      } else {
+        otherIndexByPool[pool] += 1;
+        id = `${pool}-quota-${otherIndexByPool[pool]}`;
+        kind = "other";
+        label = pool === "3p" ? "Claude & GPT (shared) · Quota" : "Gemini · Quota";
+      }
+
+      if (seenWindowIds.has(id)) continue;
+      seenWindowIds.add(id);
+
+      const resetsAt = normalizeMirrorIso(w.resetsAt);
+      windows.push({
+        id,
+        kind,
+        label,
+        usedPercent: w.usedPercent,
+        ...(resetsAt !== null ? { resetsAt } : {}),
+        ...(windowDurationMins !== null ? { windowDurationMins } : {}),
+      });
+    }
+
+    if (!windows.length) continue;
+
+    const checkedAtIso = normalizeMirrorIso(ul.checkedAt);
+    if (checkedAtIso) {
+      const ms = Date.parse(checkedAtIso);
+      if (Number.isFinite(ms) && ms > latestCheckedAtMs) {
+        latestCheckedAtMs = ms;
+        latestCheckedAtIso = checkedAtIso;
+      }
+    }
+
+    const opaqueInstanceId = providers.length === 0 ? "antigravity" : `antigravity-${providers.length + 1}`;
+    providers.push({
+      instanceId: opaqueInstanceId,
+      driver: "antigravity",
+      displayName: "AGY",
+      usageLimits: {
+        checkedAt: checkedAtIso,
+        windows,
+      },
+    });
+  }
+
+  if (!providers.length) return null;
+
+  const updatedAt = normalizeMirrorIso(input.updatedAt) || latestCheckedAtIso || new Date(now()).toISOString();
+  for (const p of providers) {
+    if (!p.usageLimits.checkedAt) p.usageLimits.checkedAt = updatedAt;
+  }
+
+  const payload = {
+    schemaVersion: 1,
+    source: QUOTA_MIRROR_SOURCE,
+    environmentId,
+    updatedAt,
+    providers,
+  };
+
+  if (Buffer.byteLength(JSON.stringify(payload, null, 2) + "\n", "utf8") > MAX_MIRROR_BYTES) {
+    return null;
+  }
+  return payload;
+}
+
+function isStrictInsidePath(rootPath, candidatePath) {
+  const rel = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return Boolean(rel) && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
+}
+
+function assertNoSymlinkTail(targetPath, { expectFinalType = null, allowMissingTail = true } = {}) {
+  if (
+    typeof targetPath !== "string" ||
+    !targetPath.trim() ||
+    !path.isAbsolute(targetPath) ||
+    /[\u0000-\u001f\u007f]/.test(targetPath)
+  ) {
+    return { ok: false, missing: false, reason: "invalid_path" };
+  }
+  try {
+    const normalized = normalizeSystemPath(targetPath);
+    const parsed = path.parse(normalized);
+    let current = parsed.root;
+    let stat = fs.lstatSync(current);
+    for (const part of normalized.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      let next;
+      try {
+        next = fs.lstatSync(current);
+      } catch (err) {
+        if (err && err.code === "ENOENT" && allowMissingTail) {
+          return { ok: true, missing: true, resolvedPath: normalized };
+        }
+        return { ok: false, missing: err?.code === "ENOENT", reason: "missing" };
+      }
+      if (next.isSymbolicLink()) return { ok: false, missing: false, reason: "symlink" };
+      if (current !== normalized && !next.isDirectory()) return { ok: false, missing: false, reason: "not_dir" };
+      stat = next;
+    }
+    if (expectFinalType === "dir" && !stat.isDirectory()) return { ok: false, missing: false, reason: "not_dir" };
+    if (expectFinalType === "file" && !stat.isFile()) return { ok: false, missing: false, reason: "not_file" };
+    const realPath = fs.realpathSync(normalized);
+    return { ok: true, missing: false, stat, resolvedPath: normalized, realPath };
+  } catch {
+    return { ok: false, missing: false, reason: "stat_failed" };
+  }
+}
+
+function mirrorTableExists(db, table) {
+  try {
+    return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table));
+  } catch {
+    return false;
+  }
+}
+
+function mirrorTableColumns(db, table) {
+  try {
+    return new Set(db.prepare(`PRAGMA table_info(${JSON.stringify(table)})`).all().map((r) => r.name));
+  } catch {
+    return new Set();
+  }
+}
+
+function parseTimestampMsLoose(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw > 1e12 ? raw : raw * 1000;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const ms = Date.parse(raw.trim());
+    return Number.isFinite(ms) ? ms : NaN;
+  }
+  return NaN;
+}
+
+function discoverQuotaMirrorRoots({ t3DbPath, targetRoots, now = () => Date.now() } = {}) {
+  const roots = [];
+  const seen = new Set();
+  const addRoot = (raw) => {
+    if (roots.length >= MAX_MIRROR_TARGET_ROOTS) return;
+    if (typeof raw !== "string") return;
+    const trimmed = raw.trim();
+    if (!trimmed || !path.isAbsolute(trimmed) || /[\u0000-\u001f\u007f]/.test(trimmed)) return;
+    const key = normalizeSystemPath(trimmed);
+    if (seen.has(key)) return;
+    seen.add(key);
+    roots.push(trimmed);
+  };
+
+  if (typeof targetRoots === "function") {
+    const list = targetRoots();
+    if (Array.isArray(list)) {
+      for (const item of list) addRoot(item);
+    }
+    return roots;
+  }
+  if (Array.isArray(targetRoots)) {
+    for (const item of targetRoots) addRoot(item);
+    return roots;
+  }
+
+  if (typeof t3DbPath !== "string" || !t3DbPath.trim()) return roots;
+  const dbCheck = assertNoSymlinkTail(t3DbPath, { expectFinalType: "file", allowMissingTail: false });
+  if (!dbCheck.ok || !dbCheck.realPath) return roots;
+
+  let db = null;
+  try {
+    db = new DatabaseSync(dbCheck.realPath, { readOnly: true });
+
+    if (mirrorTableExists(db, "projection_projects")) {
+      const cols = mirrorTableColumns(db, "projection_projects");
+      if (cols.has("workspace_root")) {
+        const where = cols.has("deleted_at") ? " WHERE deleted_at IS NULL" : "";
+        const order = cols.has("updated_at") ? " ORDER BY updated_at DESC" : "";
+        try {
+          const rows = db.prepare(`SELECT workspace_root FROM projection_projects${where}${order}`).all();
+          for (const row of rows) {
+            if (roots.length >= MAX_MIRROR_TARGET_ROOTS) break;
+            addRoot(row?.workspace_root);
+          }
+        } catch {}
+      }
+    }
+
+    if (roots.length < MAX_MIRROR_TARGET_ROOTS) {
+      const childIds = new Set();
+      if (mirrorTableExists(db, "orchestration_v2_projection_subagents")) {
+        const subCols = mirrorTableColumns(db, "orchestration_v2_projection_subagents");
+        if (subCols.has("child_thread_id")) {
+          try {
+            for (const r of db.prepare("SELECT child_thread_id FROM orchestration_v2_projection_subagents").all()) {
+              if (r?.child_thread_id != null && String(r.child_thread_id)) childIds.add(String(r.child_thread_id));
+            }
+          } catch {}
+        }
+      }
+
+      const table = mirrorTableExists(db, "orchestration_v2_projection_threads")
+        ? "orchestration_v2_projection_threads"
+        : mirrorTableExists(db, "projection_threads")
+          ? "projection_threads"
+          : null;
+
+      if (table) {
+        const cols = mirrorTableColumns(db, table);
+        const sel = ["thread_id", "updated_at", "created_at", "payload_json", "parent_thread_id", "worktree_path"].filter((c) => cols.has(c));
+        if (sel.length && (cols.has("payload_json") || cols.has("worktree_path"))) {
+          const clauses = [];
+          if (cols.has("deleted_at")) clauses.push("deleted_at IS NULL");
+          if (table === "projection_threads" && cols.has("parent_thread_id")) clauses.push("parent_thread_id IS NULL");
+          const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+          const order = cols.has("updated_at") ? " ORDER BY updated_at DESC" : cols.has("created_at") ? " ORDER BY created_at DESC" : "";
+          const cutoffMs = now() - RECENT_WORKTREE_WINDOW_MS;
+          try {
+            const rows = db.prepare(`SELECT ${sel.join(", ")} FROM ${table}${where}${order}`).all();
+            for (const row of rows) {
+              if (roots.length >= MAX_MIRROR_TARGET_ROOTS) break;
+              if (row?.thread_id != null && childIds.has(String(row.thread_id))) continue;
+              const tsMs = parseTimestampMsLoose(row?.updated_at ?? row?.created_at);
+              if (!Number.isFinite(tsMs) || tsMs < cutoffMs) continue;
+              let payload = null;
+              if (typeof row?.payload_json === "string" && row.payload_json) {
+                try { payload = JSON.parse(row.payload_json); } catch {}
+              }
+              if (table === "orchestration_v2_projection_threads") {
+                if (payload?.lineage?.parentThreadId != null) continue;
+              }
+              const wt =
+                typeof payload?.worktreePath === "string" && payload.worktreePath
+                  ? payload.worktreePath
+                  : typeof row?.worktree_path === "string" && row.worktree_path
+                    ? row.worktree_path
+                    : "";
+              if (wt) addRoot(wt);
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {
+    // Read-only discovery must never fail callers.
+  } finally {
+    try { db?.close(); } catch {}
+  }
+
+  return roots;
+}
+
+function createAgyQuotaMirror({
+  t3DbPath = null,
+  targetRoots = null,
+  now = () => Date.now(),
+  execFileImpl = execFile,
+} = {}) {
+  const pendingByEnv = new Map();
+  const verifiedCache = new Map();
+  let drainPromise = null;
+  let disposed = false;
+
+  function runLocalGit(cwd, args) {
+    return new Promise((resolve) => {
+      try {
+        execFileImpl(
+          "git",
+          args,
+          { cwd, encoding: "utf8", windowsHide: true, timeout: 3000, maxBuffer: 1024 * 1024 },
+          (error, stdout) => resolve(error ? null : String(stdout || "").replace(/\r?\n$/, ""))
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  function fileFingerprint(file) {
+    try {
+      const st = fs.lstatSync(file);
+      return [st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs, st.mode].join(":");
+    } catch {
+      return "missing";
+    }
+  }
+
+  function existingQuotaMirror(file) {
+    const check = assertNoSymlinkTail(file, { allowMissingTail: true });
+    if (!check.ok) return false;
+    if (check.missing) return null;
+    try {
+      const stat = fs.lstatSync(check.resolvedPath);
+      if (
+        !stat.isFile() ||
+        stat.nlink !== 1 ||
+        stat.size > MAX_EXISTING_MIRROR_BYTES ||
+        (typeof process.getuid === "function" && stat.uid !== process.getuid())
+      ) {
+        return false;
+      }
+      const text = fs.readFileSync(check.resolvedPath, "utf8");
+      const data = JSON.parse(text);
+      if (
+        !data ||
+        typeof data !== "object" ||
+        Array.isArray(data) ||
+        data.schemaVersion !== 1 ||
+        data.source !== QUOTA_MIRROR_SOURCE
+      ) {
+        return false;
+      }
+      return { text, data, stat, mode: stat.mode & 0o777, resolvedPath: check.resolvedPath };
+    } catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      return false;
+    }
+  }
+
+  function unlinkManagedQuotaMirror(file) {
+    const existing = existingQuotaMirror(file);
+    if (!existing || !existing.stat) return false;
+    try {
+      const after = fs.lstatSync(existing.resolvedPath);
+      if (
+        after.isFile() &&
+        after.dev === existing.stat.dev &&
+        after.ino === existing.stat.ino &&
+        after.size === existing.stat.size &&
+        after.mtimeMs === existing.stat.mtimeMs
+      ) {
+        fs.unlinkSync(existing.resolvedPath);
+        verifiedCache.delete(existing.resolvedPath);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  async function ensureLocalQuotaIgnore(cwd, repoRoot, canonicalGitDir, relFile) {
+    const relDir = path.posix.dirname(relFile);
+    const tracked = await runLocalGit(repoRoot, ["ls-files", "-z", "--", relDir]);
+    if (tracked == null) return { ok: false, reason: "git_unavailable" };
+    if (tracked) return { ok: false, reason: "mirror_dir_tracked" };
+
+    const excludeRaw = await runLocalGit(cwd, ["rev-parse", "--git-path", "info/exclude"]);
+    if (!excludeRaw) return { ok: false, reason: "exclude_unavailable" };
+    const absoluteExclude = normalizeSystemPath(path.resolve(cwd, excludeRaw));
+    if (!isStrictInsidePath(canonicalGitDir, absoluteExclude)) {
+      return { ok: false, reason: "exclude_outside_gitdir" };
+    }
+    const excludeCheck = assertNoSymlinkTail(absoluteExclude, { allowMissingTail: true });
+    if (!excludeCheck.ok) return { ok: false, reason: "exclude_unsafe" };
+
+    try {
+      fs.mkdirSync(path.dirname(absoluteExclude), { recursive: true, mode: 0o700 });
+      let content = "";
+      try {
+        const st = fs.lstatSync(absoluteExclude);
+        if (!st.isFile() || st.nlink !== 1 || (typeof process.getuid === "function" && st.uid !== process.getuid())) {
+          return { ok: false, reason: "exclude_unsafe" };
+        }
+        content = fs.readFileSync(absoluteExclude, "utf8");
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") throw error;
+      }
+
+      const pattern = "/" + relDir.replace(/[\\*?\[\] ]/g, "\\$&") + "/";
+      const lines = content.split(/\r?\n/);
+      if (!lines.includes(pattern)) {
+        const addition = `${content && !content.endsWith("\n") ? "\n" : ""}${QUOTA_MIRROR_MARKER}\n${pattern}\n`;
+        fs.writeFileSync(absoluteExclude, addition, { encoding: "utf8", flag: "a", mode: 0o600 });
+      }
+
+      const ignored = await runLocalGit(repoRoot, ["check-ignore", "-q", "--no-index", "--", relFile]);
+      if (ignored == null) return { ok: false, reason: "exclude_not_effective" };
+      return { ok: true, excludePath: absoluteExclude, relDir };
+    } catch {
+      return { ok: false, reason: "exclude_write_failed" };
+    }
+  }
+
+  async function publishToRoot(targetRoot, serializedText) {
+    if (disposed) return false;
+    const rootCheck = assertNoSymlinkTail(targetRoot, { expectFinalType: "dir", allowMissingTail: false });
+    if (!rootCheck.ok || !rootCheck.realPath) return false;
+
+    const cwd = rootCheck.realPath;
+    const file = path.join(cwd, QUOTA_MIRROR_FILE);
+    let previous = existingQuotaMirror(file);
+    if (previous === false) return false;
+
+    const cached = verifiedCache.get(file);
+    const unchanged = previous && previous.text === serializedText && (process.platform === "win32" || previous.mode === 0o600);
+    if (unchanged && cached && cached.until > now() && cached.files.every(([name, sig]) => fileFingerprint(name) === sig)) {
+      return true;
+    }
+
+    const [repoRootRaw, commonRaw, indexRaw] = await Promise.all([
+      runLocalGit(cwd, ["rev-parse", "--show-toplevel"]),
+      runLocalGit(cwd, ["rev-parse", "--git-common-dir"]),
+      runLocalGit(cwd, ["rev-parse", "--git-path", "index"]),
+    ]);
+    if (!repoRootRaw || !commonRaw || !indexRaw) return false;
+
+    const repoCheck = assertNoSymlinkTail(repoRootRaw, { expectFinalType: "dir", allowMissingTail: false });
+    const commonCheck = assertNoSymlinkTail(path.resolve(cwd, commonRaw), { expectFinalType: "dir", allowMissingTail: false });
+    if (!repoCheck.ok || !commonCheck.ok) return false;
+
+    const repoRoot = repoCheck.realPath;
+    const canonicalGitDir = commonCheck.realPath;
+    if (!isStrictInsidePath(repoRoot, file)) return false;
+
+    const relFile = path.relative(repoRoot, file).split(path.sep).join("/");
+    const ignored = await ensureLocalQuotaIgnore(cwd, repoRoot, canonicalGitDir, relFile);
+    if (!ignored.ok) {
+      if (ignored.reason === "exclude_not_effective") {
+        unlinkManagedQuotaMirror(file);
+      }
+      return false;
+    }
+
+    if (disposed) return false;
+    previous = existingQuotaMirror(file);
+    if (previous === false) return false;
+
+    if (!(previous && previous.text === serializedText && (process.platform === "win32" || previous.mode === 0o600))) {
+      const pathCheck = assertNoSymlinkTail(file, { allowMissingTail: true });
+      if (!pathCheck.ok) return false;
+      const mirrorDir = path.dirname(file);
+      fs.mkdirSync(mirrorDir, { recursive: true, mode: 0o700 });
+      const dirCheck = assertNoSymlinkTail(mirrorDir, { expectFinalType: "dir", allowMissingTail: false });
+      if (!dirCheck.ok) return false;
+
+      const tmp = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
+      try {
+        fs.writeFileSync(tmp, serializedText, { flag: "wx", mode: 0o600 });
+        fs.renameSync(tmp, file);
+      } finally {
+        try { fs.unlinkSync(tmp); } catch {}
+      }
+    }
+
+    const watchedFiles = [
+      ignored.excludePath,
+      path.resolve(cwd, indexRaw),
+      path.join(canonicalGitDir, "config"),
+      cwd,
+      path.join(cwd, ".git"),
+    ];
+    for (let dir = path.dirname(file); dir === repoRoot || isStrictInsidePath(repoRoot, dir); dir = path.dirname(dir)) {
+      watchedFiles.push(path.join(dir, ".gitignore"));
+      if (dir === repoRoot) break;
+    }
+    verifiedCache.set(file, {
+      until: now() + MIRROR_VERIFY_TTL_MS,
+      files: watchedFiles.map((name) => [name, fileFingerprint(name)]),
+    });
+    if (verifiedCache.size > 64) {
+      verifiedCache.delete(verifiedCache.keys().next().value);
+    }
+    return true;
+  }
+
+  async function drainQueue() {
+    while (!disposed && pendingByEnv.size > 0) {
+      const [envId, payload] = pendingByEnv.entries().next().value;
+      pendingByEnv.delete(envId);
+      const serializedText = JSON.stringify(payload, null, 2) + "\n";
+      const roots = discoverQuotaMirrorRoots({ t3DbPath, targetRoots, now });
+      for (const root of roots) {
+        if (disposed) break;
+        try {
+          await publishToRoot(root, serializedText);
+        } catch {}
+      }
+    }
+  }
+
+  function startDrain() {
+    if (!disposed && !drainPromise && pendingByEnv.size > 0) {
+      drainPromise = new Promise((resolve) => setImmediate(resolve))
+        .then(drainQueue)
+        .finally(() => {
+          drainPromise = null;
+          if (!disposed && pendingByEnv.size > 0) startDrain();
+        });
+    }
+  }
+
+  function queueQuotaMirror(input) {
+    if (disposed) return false;
+    const payload = buildQuotaMirrorPayload(input, { now });
+    if (!payload) return false;
+    pendingByEnv.set(payload.environmentId, payload);
+    startDrain();
+    return true;
+  }
+
+  async function flushQuotaMirrors() {
+    while (drainPromise) {
+      await drainPromise;
+    }
+  }
+
+  function disposeQuotaMirrors() {
+    disposed = true;
+    pendingByEnv.clear();
+    verifiedCache.clear();
+  }
+
+  return {
+    queueQuotaMirror,
+    flushQuotaMirrors,
+    disposeQuotaMirrors,
+  };
+}
+
 function createAgyQuotaReader({
   homeDir = os.homedir(),
   t3CodeHome,
@@ -1206,10 +1813,13 @@ function createAgyQuotaReader({
   userDataDir,
   toolsDir,
   pluginDir,
+  t3DbPath,
+  targetRoots,
   platform = process.platform,
   arch = process.arch,
   baseEnv = process.env,
   spawnImpl = spawn,
+  execFileImpl = execFile,
   now = () => Date.now(),
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
   errorBackoffMs = DEFAULT_ERROR_BACKOFF_MS,
@@ -1474,7 +2084,23 @@ function createAgyQuotaReader({
     }
   }
 
-  return { readAgyQuotas };
+  const resolvedT3DbPath =
+    typeof t3DbPath === "string" && t3DbPath.trim()
+      ? path.resolve(t3DbPath)
+      : path.join(resolvedUserDataDir, "statev2.sqlite");
+  const quotaMirror = createAgyQuotaMirror({
+    t3DbPath: resolvedT3DbPath,
+    targetRoots,
+    now,
+    execFileImpl,
+  });
+
+  return {
+    readAgyQuotas,
+    queueQuotaMirror: quotaMirror.queueQuotaMirror,
+    flushQuotaMirrors: quotaMirror.flushQuotaMirrors,
+    disposeQuotaMirrors: quotaMirror.disposeQuotaMirrors,
+  };
 }
 
 module.exports = {
@@ -1491,6 +2117,8 @@ module.exports = {
   MIN_VALID_RESET_MS,
   MAX_VALID_RESET_MS,
   createAgyQuotaReader,
+  createAgyQuotaMirror,
+  buildQuotaMirrorPayload,
   parseAgyCliUsageWindows,
   parseStrictCliVersionOutput,
   normalizeResetTime,

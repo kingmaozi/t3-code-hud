@@ -495,3 +495,430 @@ test("stdio plan_update updates and clears only the project checklist when neith
   assert.deepEqual(f.board.getBoardSnapshot({ projectRoot: f.project }).steps, []);
   assert.equal(f.snapshot().steps[0].text, "Keep the thread checklist");
 });
+
+test("parseRemoteQuotaMirror validates schema, environmentId, TTL, clock skew, and whitelists AGY windows", () => {
+  const ttl = 30 * 60_000;
+  const now = Date.parse("2026-11-28T12:00:00.000Z");
+  const dom = renderer(["parseRemoteQuotaMirror"], { HUD_QUOTA_SNAPSHOT_TTL_MS: ttl });
+  const makeMirror = (overrides = {}) => JSON.stringify({
+    schemaVersion: 1,
+    source: "hub-quota-mirror",
+    environmentId: envB.toUpperCase(),
+    updatedAt: new Date(now - 60_000).toISOString(),
+    providers: [
+      {
+        instanceId: "antigravity",
+        driver: "antigravity",
+        displayName: "Antigravity",
+        injected: "<script>alert(1)</script>",
+        usageLimits: {
+          checkedAt: new Date(now - 30_000).toISOString(),
+          windows: [
+            {
+              id: "gemini-5h",
+              kind: "session",
+              label: "Gemini 5h",
+              usedPercent: 42,
+              resetsAt: new Date(now + 3600_000).toISOString(),
+              windowDurationMins: 300,
+              evilField: "drop-me",
+            },
+            { id: "bad-pct", usedPercent: 150 },
+            { id: "neg-pct", usedPercent: -5 },
+          ],
+        },
+      },
+      {
+        instanceId: "codex-main",
+        driver: "codex",
+        usageLimits: { windows: [{ id: "weekly", usedPercent: 10 }] },
+      },
+    ],
+    ...overrides,
+  });
+
+  const valid = plain(dom.parseRemoteQuotaMirror(makeMirror(), envB, now));
+  assert.equal(valid.length, 1, "only antigravity driver is accepted");
+  assert.equal(valid[0].driver, "antigravity");
+  assert.equal(valid[0].instanceId, "antigravity");
+  assert.equal(valid[0].injected, undefined, "unknown provider fields are stripped");
+  assert.equal(valid[0].usageLimits.windows.length, 1, "invalid usedPercent windows are dropped");
+  assert.deepEqual(Object.keys(valid[0].usageLimits.windows[0]).sort(), ["id", "kind", "label", "resetsAt", "usedPercent", "windowDurationMins"]);
+  assert.equal(valid[0].usageLimits.windows[0].usedPercent, 42);
+  assert.equal(valid[0].usageLimits.windows[0].windowDurationMins, 300);
+
+  // Reject cross-environment leak, wrong schema/source, expired TTL, future skew, oversized payload, bad checkedAt
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror(), envA, now)), [], "must block cross-environment quota leak");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({ schemaVersion: 2 }), envB, now)), []);
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({ source: "other" }), envB, now)), []);
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({ updatedAt: new Date(now - ttl).toISOString() }), envB, now)), [], "expired updatedAt must be rejected");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({ updatedAt: new Date(now + 5 * 60_000 + 1000).toISOString() }), envB, now)), [], "future skew >5m must be rejected");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({
+    providers: [{
+      instanceId: "antigravity", driver: "antigravity",
+      usageLimits: { checkedAt: new Date(now - ttl).toISOString(), windows: [{ id: "w1", usedPercent: 20 }] },
+    }],
+  }), envB, now)), [], "expired checkedAt must be rejected");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror({
+    providers: [{
+      instanceId: "antigravity", driver: "antigravity",
+      usageLimits: { checkedAt: new Date(now + 6 * 60_000).toISOString(), windows: [{ id: "w1", usedPercent: 20 }] },
+    }],
+  }), envB, now)), [], "future checkedAt must be rejected");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror("x".repeat(65537), envB, now)), [], "oversized snapshot must be rejected");
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror("{not json", envB, now)), []);
+  assert.deepEqual(plain(dom.parseRemoteQuotaMirror(makeMirror(), "", now)), []);
+});
+
+test("readHudQuotaProviders merges remote mirror AGY on remote envs, yields to native AGY, and stays isolated", () => {
+  const ttl = 30 * 60_000;
+  const now = 1_700_000_000_000;
+  const remoteMap = new Map();
+  const globals = {
+    hudQuotaSnapshots: new Map(),
+    remoteExternalQuotaByEnv: remoteMap,
+    hudLocalQuotaEnvironmentId: envA,
+    HUD_QUOTA_SNAPSHOT_TTL_MS: ttl,
+  };
+  const dom = renderer(["toEpochMs", "hudUsageSources", "mergeUsageLimitProviders", "readHudQuotaProviders", "getValidRemoteExternalQuotas"], globals);
+  const localExt = [provider("antigravity", "antigravity", [quota(15, { id: "gemini-wk", label: "Local AGY" })])];
+  const remoteMirrorAgy = [provider("antigravity", "antigravity", [quota(72, { id: "gemini-wk", label: "Remote AGY" })])];
+  remoteMap.set(envB.toLowerCase(), { providers: remoteMirrorAgy, fetchedAt: now, observedAt: now });
+
+  // getValidRemoteExternalQuotas enforces env isolation and TTL
+  assert.deepEqual(plain(dom.getValidRemoteExternalQuotas(envA, now)), [], "local env must never read remote cache");
+  assert.equal(plain(dom.getValidRemoteExternalQuotas(envB, now)).length, 1);
+  assert.deepEqual(plain(dom.getValidRemoteExternalQuotas(envB, now + ttl)), [], "expired remote cache must be purged");
+
+  // Remote env without native AGY merges remote mirror alongside remote native codex (never local external)
+  const remoteCodex = { providers: [provider("codex-remote", "codex", [quota(30)])] };
+  const mergedRemote = plain(dom.readHudQuotaProviders(remoteCodex, envB, envA, localExt, now, remoteMirrorAgy));
+  assert.deepEqual(mergedRemote.map((p) => [p.instanceId, p.usageLimits.windows[0].usedPercent]), [
+    ["codex-remote", 30],
+    ["antigravity", 72],
+  ]);
+
+  // Native remote AGY (even under a different instanceId) takes precedence and remote mirror yields
+  const remoteWithNativeAgy = { providers: [provider("agy-main", "antigravity", [quota(25, { id: "gemini-wk", label: "Native Remote AGY" })])] };
+  const nativePreferred = plain(dom.readHudQuotaProviders(remoteWithNativeAgy, envB, envA, localExt, now, remoteMirrorAgy));
+  assert.deepEqual(nativePreferred.map((p) => [p.instanceId, p.usageLimits.windows[0].usedPercent]), [
+    ["agy-main", 25],
+  ]);
+
+  // Local env ignores remoteExternalProviders and keeps 5-arg behavior
+  const localResult = plain(dom.readHudQuotaProviders({ providers: [provider("codex", "codex", [quota(10)])] }, envA, envA, localExt, now, remoteMirrorAgy));
+  assert.deepEqual(localResult.map((p) => [p.instanceId, p.usageLimits.windows[0].usedPercent]), [
+    ["codex", 10],
+    ["antigravity", 15],
+  ]);
+});
+
+test("refreshExternalQuotas skips local quota:external on confirmed remote envs and fetches remote snapshot with throttle", async () => {
+  const now = Date.parse("2026-11-28T12:00:00.000Z");
+  let currentEnv = envB;
+  let currentRoute = `/${envB}/thread-remote`;
+  let remoteCwd = "/studio/project";
+  const localRpcCalls = [];
+  const remoteRpcCalls = [];
+  let renderRingCount = 0;
+  let layoutSyncCount = 0;
+
+  const mirrorContents = JSON.stringify({
+    schemaVersion: 1,
+    source: "hub-quota-mirror",
+    environmentId: envB,
+    updatedAt: new Date(Date.now() - 10_000).toISOString(),
+    providers: [{
+      instanceId: "antigravity",
+      driver: "antigravity",
+      displayName: "Antigravity",
+      usageLimits: { checkedAt: new Date(Date.now() - 10_000).toISOString(), windows: [{ id: "gemini-5h", kind: "session", label: "Gemini 5h", usedPercent: 35, windowDurationMins: 300 }] },
+    }],
+  });
+
+  const globals = {
+    disposed: false,
+    document: { hidden: false },
+    latestStats: null,
+    externalQuotaProviders: [],
+    hudLocalQuotaEnvironmentId: "",
+    externalQuotaFetchedAt: 0,
+    externalQuotaInFlight: null,
+    externalQuotaNeedsRecheck: false,
+    externalQuotaPendingTimer: null,
+    externalQuotaPendingRetries: 0,
+    lastExternalQuotaEnvId: "",
+    lastLocalHasNativeAgy: false,
+    externalQuotaSkippedLocalAgy: false,
+    remoteExternalQuotaByEnv: new Map(),
+    remoteExternalQuotaInFlight: new Set(),
+    remoteExternalQuotaLastFetchAt: new Map(),
+    REMOTE_EXTERNAL_QUOTA_POLL_MS: 60_000,
+    EXTERNAL_QUOTA_PENDING_MAX_RETRIES: 3,
+    EXTERNAL_QUOTA_PENDING_DELAY_MS: 6_000,
+    HUD_QUOTA_SNAPSHOT_TTL_MS: 30 * 60_000,
+    hudQuotaSnapshots: new Map(),
+    getRouteHint: () => currentRoute,
+    readLiveT3State: () => ({ environmentId: currentEnv, usage: null }),
+    getHudRemoteProject: ({ environmentId, threadId }) => (
+      remoteCwd && environmentId === envB && threadId === "thread-remote"
+        ? { environmentId, threadId, projectRoot: remoteCwd }
+        : null
+    ),
+    computeQuotaAndContext: () => ({ providerQuotas: [], activeQuotaRingId: null }),
+    renderQuotaRing: () => { renderRingCount += 1; },
+    scheduleLayoutSync: () => { layoutSyncCount += 1; },
+    setTimeout,
+    clearTimeout,
+    window: {
+      __t3HubRpc: async (action, payload) => {
+        localRpcCalls.push({ action, payload });
+        return { ok: true, providers: [], t3EnvironmentId: envA };
+      },
+      __t3HudRemoteRpc: async (envId, tag, payload, timeoutMs) => {
+        remoteRpcCalls.push({ envId, tag, payload, timeoutMs });
+        return { ok: true, value: { contents: mirrorContents } };
+      },
+    },
+  };
+
+  const dom = renderer([
+    "toEpochMs",
+    "extractLastThreadIdFromHint",
+    "hudUsageSources",
+    "mergeUsageLimitProviders",
+    "clearExternalQuotaPendingTimer",
+    "isConfirmedLocalQuotaEnv",
+    "parseRemoteQuotaMirror",
+    "getValidRemoteExternalQuotas",
+    "refreshRemoteExternalQuotas",
+    "hasNativeAgyQuotaWindows",
+    "readExternalQuotaObservation",
+    "quotaObservationChanged",
+    "refreshExternalQuotas",
+  ], globals);
+
+  // First call with unknown local env discovers envA via quota:external and immediately triggers remote snapshot read
+  dom.refreshExternalQuotas();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localRpcCalls.length, 1);
+  assert.equal(remoteRpcCalls.length, 1);
+  assert.equal(remoteRpcCalls[0].envId, envB);
+  assert.equal(remoteRpcCalls[0].tag, "projects.readFile");
+  assert.deepEqual(plain(remoteRpcCalls[0].payload), {
+    cwd: "/studio/project",
+    relativePath: ".t3-hub/quota/snapshot.json",
+    allowMissing: true,
+  });
+  assert.equal(plain(dom.getValidRemoteExternalQuotas(envB)).length, 1);
+  assert.ok(renderRingCount >= 1 && layoutSyncCount >= 1);
+
+  // Subsequent calls while on remote envB must make ZERO local quota:external calls and respect 60s throttle
+  dom.refreshExternalQuotas();
+  dom.refreshExternalQuotas();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localRpcCalls.length, 1, "must NOT call local quota:external while on confirmed remote env");
+  assert.equal(remoteRpcCalls.length, 1, "must throttle remote snapshot reads within 60s");
+
+  // Force refresh skips when remote cwd cannot be resolved (never guesses)
+  remoteCwd = "";
+  dom.refreshExternalQuotas(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localRpcCalls.length, 1);
+  assert.equal(remoteRpcCalls.length, 1, "must skip remote RPC when cwd is unavailable");
+
+  // Switching back to local envA immediately triggers local quota:external refresh
+  currentEnv = envA;
+  currentRoute = `/${envA}/thread-local`;
+  dom.refreshExternalQuotas();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localRpcCalls.length, 2, "switching back to local must trigger local refresh immediately");
+  assert.equal(now > 0, true);
+});
+
+test("cold-start unknown route sends skipLocalAgy:true and rechecks immediately on local switch; cold-start remote preserves agySkippedRemote and fetches mirror", async () => {
+  const mirrorContents = JSON.stringify({
+    schemaVersion: 1,
+    source: "hub-quota-mirror",
+    environmentId: envB,
+    updatedAt: new Date(Date.now() - 5_000).toISOString(),
+    providers: [{
+      instanceId: "antigravity",
+      driver: "antigravity",
+      displayName: "AGY",
+      usageLimits: {
+        checkedAt: new Date(Date.now() - 5_000).toISOString(),
+        windows: [
+          { id: "gemini-5h", kind: "session", label: "Gemini 5h", usedPercent: 20, windowDurationMins: 300 },
+          { id: "gemini-weekly", kind: "weekly", label: "Gemini Weekly", usedPercent: 40, windowDurationMins: 10080 },
+          { id: "3p-5h", kind: "session", label: "Claude 5h", usedPercent: 55, windowDurationMins: 300 },
+          { id: "3p-weekly", kind: "weekly", label: "Claude Weekly", usedPercent: 70, windowDurationMins: 10080 },
+        ],
+      },
+    }],
+  });
+
+  // Case 1: Cold start with unrecognized route (environmentId: "") -> sends skipLocalAgy: true, then resolves while switched to local envA -> immediate recheck without skipLocalAgy
+  let currentEnv1 = "";
+  const localCalls1 = [];
+  let resolveFirst;
+  const globals1 = {
+    disposed: false,
+    document: { hidden: false },
+    latestStats: null,
+    externalQuotaProviders: [],
+    hudLocalQuotaEnvironmentId: "",
+    externalQuotaFetchedAt: 0,
+    externalQuotaInFlight: null,
+    externalQuotaNeedsRecheck: false,
+    externalQuotaPendingTimer: null,
+    externalQuotaPendingRetries: 0,
+    lastExternalQuotaEnvId: "",
+    lastLocalHasNativeAgy: false,
+    externalQuotaSkippedLocalAgy: false,
+    remoteExternalQuotaByEnv: new Map(),
+    remoteExternalQuotaInFlight: new Set(),
+    remoteExternalQuotaLastFetchAt: new Map(),
+    REMOTE_EXTERNAL_QUOTA_POLL_MS: 60_000,
+    EXTERNAL_QUOTA_PENDING_MAX_RETRIES: 3,
+    EXTERNAL_QUOTA_PENDING_DELAY_MS: 6_000,
+    HUD_QUOTA_SNAPSHOT_TTL_MS: 30 * 60_000,
+    hudQuotaSnapshots: new Map(),
+    getRouteHint: () => currentEnv1 ? `/${currentEnv1}/thread-1` : "/new",
+    readLiveT3State: () => ({ environmentId: currentEnv1, usage: null }),
+    getHudRemoteProject: () => null,
+    computeQuotaAndContext: () => ({ providerQuotas: [], activeQuotaRingId: null }),
+    renderQuotaRing: () => {},
+    scheduleLayoutSync: () => {},
+    setTimeout,
+    clearTimeout,
+    window: {
+      __t3HubRpc: (action, payload) => {
+        localCalls1.push({ action, payload: plain(payload) });
+        if (localCalls1.length === 1) {
+          return new Promise((resolve) => { resolveFirst = resolve; });
+        }
+        return Promise.resolve({
+          ok: true,
+          t3EnvironmentId: envA,
+          providers: [provider("antigravity", "antigravity", [quota(12, { id: "gemini-5h", windowDurationMins: 300 })])],
+        });
+      },
+      __t3HudRemoteRpc: async () => ({ ok: true, value: { contents: null } }),
+    },
+  };
+  const dom1 = renderer([
+    "toEpochMs",
+    "extractLastThreadIdFromHint",
+    "hudUsageSources",
+    "mergeUsageLimitProviders",
+    "clearExternalQuotaPendingTimer",
+    "isConfirmedLocalQuotaEnv",
+    "parseRemoteQuotaMirror",
+    "getValidRemoteExternalQuotas",
+    "refreshRemoteExternalQuotas",
+    "hasNativeAgyQuotaWindows",
+    "readExternalQuotaObservation",
+    "quotaObservationChanged",
+    "refreshExternalQuotas",
+  ], globals1);
+
+  dom1.refreshExternalQuotas();
+  assert.equal(localCalls1.length, 1);
+  assert.equal(localCalls1[0].payload.skipLocalAgy, true, "cold start with empty environmentId must send skipLocalAgy: true");
+  // Route resolves to local envA before identity probe completes
+  currentEnv1 = envA;
+  resolveFirst({ ok: true, providers: [], t3EnvironmentId: envA });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localCalls1.length, 2, "must immediately recheck local quota after skipLocalAgy cold start lands on local env");
+  assert.equal(localCalls1[1].payload.skipLocalAgy, undefined);
+  assert.equal(localCalls1[1].payload.environmentId, envA);
+
+  // Case 2: Cold start directly on remote envB -> sends environmentId: envB (no skipLocalAgy), backend returns agySkippedRemote: true -> preserves existing local AGY and immediately reads remote canonical mirror
+  const existingLocalAgy = provider("antigravity", "antigravity", [quota(10, { id: "gemini-weekly" })]);
+  const localCalls2 = [];
+  const remoteCalls2 = [];
+  const globals2 = {
+    disposed: false,
+    document: { hidden: false },
+    latestStats: null,
+    externalQuotaProviders: [existingLocalAgy],
+    hudLocalQuotaEnvironmentId: "",
+    externalQuotaFetchedAt: 0,
+    externalQuotaInFlight: null,
+    externalQuotaNeedsRecheck: false,
+    externalQuotaPendingTimer: null,
+    externalQuotaPendingRetries: 0,
+    lastExternalQuotaEnvId: "",
+    lastLocalHasNativeAgy: false,
+    externalQuotaSkippedLocalAgy: false,
+    remoteExternalQuotaByEnv: new Map(),
+    remoteExternalQuotaInFlight: new Set(),
+    remoteExternalQuotaLastFetchAt: new Map(),
+    REMOTE_EXTERNAL_QUOTA_POLL_MS: 60_000,
+    EXTERNAL_QUOTA_PENDING_MAX_RETRIES: 3,
+    EXTERNAL_QUOTA_PENDING_DELAY_MS: 6_000,
+    HUD_QUOTA_SNAPSHOT_TTL_MS: 30 * 60_000,
+    hudQuotaSnapshots: new Map(),
+    getRouteHint: () => `/${envB}/thread-remote`,
+    readLiveT3State: () => ({ environmentId: envB, usage: null }),
+    getHudRemoteProject: ({ environmentId, threadId }) => (
+      environmentId === envB && threadId === "thread-remote"
+        ? { environmentId, threadId, projectRoot: "/studio/workspace" }
+        : null
+    ),
+    computeQuotaAndContext: () => ({ providerQuotas: [], activeQuotaRingId: null }),
+    renderQuotaRing: () => {},
+    scheduleLayoutSync: () => {},
+    setTimeout,
+    clearTimeout,
+    window: {
+      __t3HubRpc: async (action, payload) => {
+        localCalls2.push({ action, payload: plain(payload) });
+        return {
+          ok: true,
+          t3EnvironmentId: envA,
+          agySkippedRemote: true,
+          providers: [provider("devin", "devin", [quota(5)])],
+        };
+      },
+      __t3HudRemoteRpc: async (envId, tag, payload) => {
+        remoteCalls2.push({ envId, tag, payload: plain(payload) });
+        return { ok: true, value: { contents: mirrorContents } };
+      },
+    },
+  };
+  const dom2 = renderer([
+    "toEpochMs",
+    "extractLastThreadIdFromHint",
+    "hudUsageSources",
+    "mergeUsageLimitProviders",
+    "clearExternalQuotaPendingTimer",
+    "isConfirmedLocalQuotaEnv",
+    "parseRemoteQuotaMirror",
+    "getValidRemoteExternalQuotas",
+    "refreshRemoteExternalQuotas",
+    "hasNativeAgyQuotaWindows",
+    "readExternalQuotaObservation",
+    "quotaObservationChanged",
+    "refreshExternalQuotas",
+  ], globals2);
+
+  dom2.refreshExternalQuotas();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(localCalls2.length, 1);
+  assert.equal(localCalls2[0].payload.environmentId, envB);
+  assert.equal(localCalls2[0].payload.skipLocalAgy, undefined);
+  assert.ok(globals2.externalQuotaProviders.some((p) => p.driver === "antigravity"), "agySkippedRemote: true must preserve cached local AGY state");
+  assert.equal(remoteCalls2.length, 1, "cold-start remote must immediately fetch remote quota mirror");
+  const remoteCached = plain(dom2.getValidRemoteExternalQuotas(envB));
+  assert.equal(remoteCached.length, 1);
+  assert.equal(remoteCached[0].instanceId, "antigravity");
+  assert.equal(remoteCached[0].displayName, "AGY");
+  assert.deepEqual(remoteCached[0].usageLimits.windows.map((w) => w.id), [
+    "gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly",
+  ]);
+});
